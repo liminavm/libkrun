@@ -87,6 +87,25 @@ pub struct FenceState {
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
 }
 
+/// Mark a fence as already completed without a renderer (software-2D mode).
+///
+/// Bumps the ring's completed-fence watermark to at least `fence.fence_id`, so a
+/// following `process_fence()` sees the fence as already signaled and retires the
+/// descriptor immediately. Used when `rutabaga` is `None`: there is no async fence
+/// callback to ever signal it otherwise, and 2D commands are synchronous anyway.
+fn mark_fence_completed_sync(fence_state: &Mutex<FenceState>, fence: &RutabagaFence) {
+    let ring = match fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+        0 => VirtioGpuRing::Global,
+        _ => VirtioGpuRing::ContextSpecific {
+            ctx_id: fence.ctx_id,
+            ring_idx: fence.ring_idx,
+        },
+    };
+    let mut fence_state = fence_state.lock().unwrap();
+    let entry = fence_state.completed_fences.entry(ring).or_insert(0);
+    *entry = (*entry).max(fence.fence_id);
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 struct AssociatedScanouts(u32);
 
@@ -147,9 +166,61 @@ pub struct VirtioGpuScanout {
     resource_id: u32,
 }
 
+/// A host-side software 2D resource (limina patch).
+///
+/// libkrun normally routes `RESOURCE_CREATE_2D` through virglrenderer as a GL render
+/// target — which has no host context on macOS, so creation fails and nothing ever
+/// reaches the display. To give a working *software* scanout (the degraded-but-correct
+/// baseline tier, e.g. fbcon, EFI GOP, simpledrm), limina shadows 2D resources entirely in
+/// host CPU memory, never touching rutabaga:
+///   CREATE_2D -> allocate `host`; ATTACH_BACKING -> remember the guest `backing`
+///   iovecs; TRANSFER_TO_HOST_2D -> copy backing -> `host`; FLUSH -> hand `host` to the
+///   display backend. No GL/Metal involved. The accelerated path (Venus/blob, 3D
+///   resources) is untouched and still goes through rutabaga.
+struct Sw2dResource {
+    /// `width * height * BYTES_PER_PIXEL`, in the resource's pixel format. (Geometry +
+    /// format live in the matching `resources` entry.)
+    host: Vec<u8>,
+    /// Guest backing as host pointers (from `sglist_to_rutabaga_iovecs`), valid for the
+    /// lifetime of the guest memory mapping; only read on the GPU worker thread.
+    backing: Vec<RutabagaIovec>,
+}
+
+impl Sw2dResource {
+    /// Gather the guest backing into the host buffer (the guest holds the full current
+    /// framebuffer in its backing, so copying it whole satisfies any transfer rect).
+    fn copy_from_backing(&mut self) {
+        let mut off = 0usize;
+        for iov in &self.backing {
+            if off >= self.host.len() {
+                break;
+            }
+            let n = iov.len.min(self.host.len() - off);
+            // SAFETY: `iov` is a host pointer/len pair derived from the guest memory
+            // mapping (sglist_to_rutabaga_iovecs); `host` owns `off..off+n`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    iov.base as *const u8,
+                    self.host.as_mut_ptr().add(off),
+                    n,
+                );
+            }
+            off += n;
+        }
+    }
+}
+
 pub struct VirtioGpu {
-    rutabaga: Rutabaga,
+    /// The host 3D renderer. `None` in limina software-2D-only mode, where the device serves
+    /// only the 2D scanout path (see [`Sw2dResource`]) and never initializes
+    /// virglrenderer/rutabaga — so a GL-less host (e.g. macOS without a usable Metal/GL
+    /// context) doesn't pay for, or hang on, renderer init. All renderer-backed commands
+    /// (3D/blob/context/capset/fence) degrade to `ErrUnspec` in that mode; the guest sees a
+    /// plain 2D virtio-gpu (no VIRGL feature, no capsets — see `Gpu`) and won't issue them.
+    rutabaga: Option<Rutabaga>,
     resources: BTreeMap<u32, VirtioGpuResource>,
+    /// limina software 2D resources, keyed by resource id (see [`Sw2dResource`]).
+    sw2d: BTreeMap<u32, Sw2dResource>,
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
@@ -305,6 +376,7 @@ impl VirtioGpu {
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         virgl_flags: u32,
+        software_2d: bool,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -312,27 +384,32 @@ impl VirtioGpu {
     ) -> Self {
         let fence_state = Arc::new(Mutex::new(Default::default()));
 
-        let rutabaga = match Self::create_rutabaga(
-            mem.clone(),
-            queue_ctl.clone(),
-            interrupt.clone(),
-            fence_state.clone(),
-            virgl_flags,
-            export_table.clone(),
-        ) {
-            Some(rutabaga) => rutabaga,
-            None => {
-                warn!(
-                    "Failed to create virtio_gpu backend with the requested parameters. Falling back to safe defaults."
-                );
-                Self::create_fallback_rutabaga(
+        // limina software-2D-only mode: skip renderer init entirely (no virglrenderer/Metal).
+        let rutabaga = if software_2d {
+            None
+        } else {
+            Some(
+                match Self::create_rutabaga(
                     mem.clone(),
                     queue_ctl.clone(),
                     interrupt.clone(),
                     fence_state.clone(),
-                )
-                .expect("Fallback rutabaga initialization failed")
-            }
+                    virgl_flags,
+                    export_table.clone(),
+                ) {
+                    Some(rutabaga) => rutabaga,
+                    None => {
+                        warn!("Failed to create virtio_gpu backend with the requested parameters. Falling back to safe defaults.");
+                        Self::create_fallback_rutabaga(
+                            mem.clone(),
+                            queue_ctl.clone(),
+                            interrupt.clone(),
+                            fence_state.clone(),
+                        )
+                        .expect("Fallback rutabaga initialization failed")
+                    }
+                },
+            )
         };
 
         let display_backend = display_backend
@@ -342,6 +419,7 @@ impl VirtioGpu {
         Self {
             rutabaga,
             resources: Default::default(),
+            sw2d: Default::default(),
             fence_state,
             scanouts: Default::default(),
             displays,
@@ -353,7 +431,10 @@ impl VirtioGpu {
 
     // Non-public function -- no doc comment needed!
     fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
-        match self.rutabaga.query(resource_id) {
+        let Some(rutabaga) = self.rutabaga.as_ref() else {
+            return OkNoData;
+        };
+        match rutabaga.query(resource_id) {
             Ok(query) => {
                 let mut plane_info = Vec::with_capacity(4);
                 for plane_index in 0..4 {
@@ -373,7 +454,45 @@ impl VirtioGpu {
     }
 
     pub fn force_ctx_0(&self) {
-        self.rutabaga.force_ctx_0()
+        // Called for every command; a no-op in software-2D-only mode (no rutabaga).
+        if let Some(rutabaga) = self.rutabaga.as_ref() {
+            rutabaga.force_ctx_0()
+        }
+    }
+
+    /// Creates a software 2D resource (limina patch) — see [`Sw2dResource`]. Unlike the
+    /// stock path (which maps CREATE_2D onto a virgl GL render target and fails on a
+    /// GL-less host such as macOS), this allocates a host CPU buffer and never touches
+    /// rutabaga. The matching metadata entry in `resources` carries the format/scanout
+    /// bookkeeping that `set_scanout`/`flush_resource`/`unref_resource` rely on.
+    pub fn resource_create_2d(
+        &mut self,
+        resource_id: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+    ) -> VirtioGpuResult {
+        let format = ResourceFormat::try_from(format).map_err(|()| {
+            warn!("resource_create_2d: unsupported format {format} for resource {resource_id}");
+            ErrUnspec
+        })?;
+        let len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(ResourceFormat::BYTES_PER_PIXEL))
+            .ok_or(ErrUnspec)?;
+
+        self.sw2d.insert(
+            resource_id,
+            Sw2dResource {
+                host: vec![0u8; len],
+                backing: Vec::new(),
+            },
+        );
+        self.resources.insert(
+            resource_id,
+            VirtioGpuResource::new(resource_id, width, height, Some(format), 0),
+        );
+        Ok(OkNoData)
     }
 
     /// Creates a 3D resource with the given properties and resource_id.
@@ -383,6 +502,8 @@ impl VirtioGpu {
         resource_create_3d: ResourceCreate3D,
     ) -> VirtioGpuResult {
         self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
             .resource_create_3d(resource_id, resource_create_3d)?;
 
         let format = ResourceFormat::try_from(resource_create_3d.format).ok();
@@ -421,11 +542,22 @@ impl VirtioGpu {
             return Err(ErrUnspec);
         }
 
-        if resource.rutabaga_external_mapping {
-            self.rutabaga.unmap(resource_id)?;
+        // limina software 2D resources have no rutabaga state.
+        if self.sw2d.remove(&resource_id).is_some() {
+            return Ok(OkNoData);
         }
 
-        self.rutabaga.unref_resource(resource_id)?;
+        if resource.rutabaga_external_mapping {
+            self.rutabaga
+                .as_mut()
+                .ok_or(ErrUnspec)?
+                .unmap(resource_id)?;
+        }
+
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .unref_resource(resource_id)?;
         Ok(OkNoData)
     }
 
@@ -529,8 +661,20 @@ impl VirtioGpu {
 
         for scanout_id in resource.scanouts.iter_enabled() {
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
-                log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
+            // limina software 2D: the pixels already live in the host buffer; copy them out.
+            // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
+            if let Some(sw) = self.sw2d.get(&resource_id) {
+                let n = buffer.len().min(sw.host.len());
+                buffer[..n].copy_from_slice(&sw.host[..n]);
+            } else if let Some(rutabaga) = self.rutabaga.as_mut() {
+                if let Err(e) = Self::read_2d_resource(rutabaga, resource, buffer) {
+                    log::error!(
+                        "Failed to read resource {resource_id} for scanout {scanout_id}: {e}"
+                    );
+                    return Err(ErrUnspec);
+                }
+            } else {
+                // No software-2D buffer and no renderer: nothing to present.
                 return Err(ErrUnspec);
             }
             self.display_backend
@@ -538,10 +682,12 @@ impl VirtioGpu {
         }
 
         #[cfg(windows)]
-        match self.rutabaga.resource_flush(resource_id) {
-            Ok(_) => return Ok(OkNoData),
-            Err(RutabagaError::Unsupported) => {}
-            Err(e) => return Err(ErrRutabaga(e)),
+        if let Some(rutabaga) = self.rutabaga.as_mut() {
+            match rutabaga.resource_flush(resource_id) {
+                Ok(_) => return Ok(OkNoData),
+                Err(RutabagaError::Unsupported) => {}
+                Err(e) => return Err(ErrRutabaga(e)),
+            }
         }
 
         Ok(OkNoData)
@@ -573,7 +719,14 @@ impl VirtioGpu {
         resource_id: u32,
         transfer: Transfer3D,
     ) -> VirtioGpuResult {
+        // limina software 2D: copy the guest backing into our host buffer.
+        if let Some(sw) = self.sw2d.get_mut(&resource_id) {
+            sw.copy_from_backing();
+            return Ok(OkNoData);
+        }
         self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
             .transfer_write(ctx_id, resource_id, transfer)?;
         Ok(OkNoData)
     }
@@ -603,13 +756,29 @@ impl VirtioGpu {
         vecs: Vec<(GuestAddress, usize)>,
     ) -> VirtioGpuResult {
         let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
-        self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
+        // limina software 2D: keep the backing host pointers; don't involve rutabaga.
+        if let Some(sw) = self.sw2d.get_mut(&resource_id) {
+            sw.backing = rutabaga_iovecs;
+            return Ok(OkNoData);
+        }
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .attach_backing(resource_id, rutabaga_iovecs)?;
         Ok(OkNoData)
     }
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> VirtioGpuResult {
-        self.rutabaga.detach_backing(resource_id)?;
+        // limina software 2D: drop the backing pointers.
+        if let Some(sw) = self.sw2d.get_mut(&resource_id) {
+            sw.backing.clear();
+            return Ok(OkNoData);
+        }
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .detach_backing(resource_id)?;
         Ok(OkNoData)
     }
 
@@ -631,7 +800,11 @@ impl VirtioGpu {
 
     /// Gets rutabaga's capset information associated with `index`.
     pub fn get_capset_info(&self, index: u32) -> VirtioGpuResult {
-        let (capset_id, version, size) = self.rutabaga.get_capset_info(index)?;
+        let (capset_id, version, size) = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .get_capset_info(index)?;
         Ok(OkCapsetInfo {
             capset_id,
             version,
@@ -641,7 +814,11 @@ impl VirtioGpu {
 
     /// Gets a capset from rutabaga.
     pub fn get_capset(&self, capset_id: u32, version: u32) -> VirtioGpuResult {
-        let capset = self.rutabaga.get_capset(capset_id, version)?;
+        let capset = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .get_capset(capset_id, version)?;
         Ok(OkCapset(capset))
     }
 
@@ -652,26 +829,38 @@ impl VirtioGpu {
         context_init: u32,
         context_name: Option<&str>,
     ) -> VirtioGpuResult {
-        self.rutabaga
-            .create_context(ctx_id, context_init, context_name)?;
+        self.rutabaga.as_mut().ok_or(ErrUnspec)?.create_context(
+            ctx_id,
+            context_init,
+            context_name,
+        )?;
         Ok(OkNoData)
     }
 
     /// Destroys a rutabaga context.
     pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
-        self.rutabaga.destroy_context(ctx_id)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .destroy_context(ctx_id)?;
         Ok(OkNoData)
     }
 
     /// Attaches a resource to a rutabaga context.
     pub fn context_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
-        self.rutabaga.context_attach_resource(ctx_id, resource_id)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .context_attach_resource(ctx_id, resource_id)?;
         Ok(OkNoData)
     }
 
     /// Detaches a resource from a rutabaga context.
     pub fn context_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
-        self.rutabaga.context_detach_resource(ctx_id, resource_id)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .context_detach_resource(ctx_id, resource_id)?;
         Ok(OkNoData)
     }
 
@@ -682,14 +871,27 @@ impl VirtioGpu {
         commands: &mut [u8],
         fence_ids: &[u64],
     ) -> VirtioGpuResult {
-        self.rutabaga.submit_command(ctx_id, commands, fence_ids)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .submit_command(ctx_id, commands, fence_ids)?;
         Ok(OkNoData)
     }
 
     /// Creates a fence with the RutabagaFence that can be used to determine when the previous
     /// command completed.
     pub fn create_fence(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
-        self.rutabaga.create_fence(rutabaga_fence)?;
+        let Some(rutabaga) = self.rutabaga.as_mut() else {
+            // Software-2D mode: there is no renderer and no async fence handler.
+            // Every 2D command finishes synchronously before its response is
+            // encoded, so a guest-requested fence is already signaled by the time
+            // we get here. Record it as completed up-front; process_fence() then
+            // retires the descriptor immediately instead of parking it forever
+            // (which would hang any guest that fences a 2D command, e.g. GTK4).
+            mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+            return Ok(OkNoData);
+        };
+        rutabaga.create_fence(rutabaga_fence)?;
         Ok(OkNoData)
     }
 
@@ -735,13 +937,16 @@ impl VirtioGpu {
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
         }
 
-        self.rutabaga.resource_create_blob(
-            ctx_id,
-            resource_id,
-            resource_create_blob,
-            rutabaga_iovecs,
-            None,
-        )?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .resource_create_blob(
+                ctx_id,
+                resource_id,
+                resource_create_blob,
+                rutabaga_iovecs,
+                None,
+            )?;
 
         let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
 
@@ -768,9 +973,10 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let rutabaga = self.rutabaga.as_ref().ok_or(ErrUnspec)?;
+        let map_info = rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
+        if let Ok(export) = rutabaga.export_blob(resource_id) {
             if export.handle_type != RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
                 let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
                     RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
@@ -828,7 +1034,12 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let map_info = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .map_info(resource_id)
+            .map_err(|_| ErrUnspec)?;
 
         let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
             RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
@@ -845,7 +1056,12 @@ impl VirtioGpu {
         )
         .ok_or(ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
+        if let Ok(export) = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .export_blob(resource_id)
+        {
             // SHM and DMABUF are both regular host fds whose pages can be exposed
             // to the guest by mmap'ing them directly into the virtio shm region.
             // For SHM (memfd) this has always worked. For DMABUF it had been
@@ -878,7 +1094,7 @@ impl VirtioGpu {
                     return Err(ErrUnspec);
                 }
             } else {
-                self.rutabaga.resource_map(
+                self.rutabaga.as_mut().ok_or(ErrUnspec)?.resource_map(
                     resource_id,
                     addr,
                     resource.size,
@@ -906,10 +1122,11 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
+        let rutabaga = self.rutabaga.as_mut().ok_or(ErrUnspec)?;
+        let map_info = rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let map_ptr = rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
+        if let Ok(export) = rutabaga.export_blob(resource_id) {
             if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
                 let guest_addr = checked_blob_map_addr(
                     shm_region.guest_addr,
@@ -1034,6 +1251,42 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    // Software-2D mode (rutabaga == None) has no async fence handler. A fence the
+    // guest requests on a 2D command must be retired synchronously, otherwise the
+    // response is parked forever and the guest hangs (observed: GTK4/nautilus on
+    // the tier-1 software-2D scanout). This guards mark_fence_completed_sync().
+    #[test]
+    fn test_software_2d_fence_retires_synchronously() {
+        use super::{mark_fence_completed_sync, FenceState, RutabagaFence, VirtioGpuRing};
+        use std::sync::Mutex;
+
+        let fence_state = Mutex::new(FenceState::default());
+        let fence = RutabagaFence {
+            flags: 0, // VIRTIO_GPU_FLAG_INFO_RING_IDX clear -> Global ring
+            fence_id: 1,
+            ctx_id: 0,
+            ring_idx: 0,
+        };
+
+        // Before: nothing completed, so process_fence() would defer (id > 0) and
+        // park the descriptor with no handler to ever wake it.
+        {
+            let st = fence_state.lock().unwrap();
+            let completed = *st.completed_fences.get(&VirtioGpuRing::Global).unwrap_or(&0);
+            assert!(fence.fence_id > completed, "precondition: fence not yet complete");
+        }
+
+        mark_fence_completed_sync(&fence_state, &fence);
+
+        // After: the watermark covers the fence, so process_fence() retires it now.
+        let st = fence_state.lock().unwrap();
+        let completed = *st.completed_fences.get(&VirtioGpuRing::Global).unwrap_or(&0);
+        assert!(
+            fence.fence_id <= completed,
+            "software-2D fence must be marked completed synchronously"
+        );
+    }
 
     #[test]
     fn checked_blob_map_addr_rejects_out_of_range_and_wrapping_offsets() {
