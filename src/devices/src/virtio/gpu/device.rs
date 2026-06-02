@@ -27,6 +27,13 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT)
     | (1u64 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT);
 
+// limina software-2D-only mode: advertise a plain 2D virtio-gpu — no VIRGL/BLOB/CONTEXT_INIT
+// (all renderer-backed) and no capsets — so the guest never probes for or issues 3D
+// commands and falls back to the 2D scanout path (efifb/simpledrm/fbcon). See `Gpu::new`.
+pub(crate) const AVAIL_FEATURES_SOFTWARE_2D: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
+    | (1u64 << uapi::VIRTIO_GPU_F_EDID)
+    | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID);
+
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
     [QueueConfig::new(QUEUE_SIZE); defs::NUM_QUEUES];
@@ -37,6 +44,8 @@ pub struct Gpu {
     pub(crate) device_state: DeviceState,
     shm_region: Option<VirtioShmRegion>,
     virgl_flags: u32,
+    /// limina: serve only software-2D scanout; don't init virglrenderer/rutabaga (see module).
+    software_2d: bool,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -48,16 +57,22 @@ pub struct Gpu {
 impl Gpu {
     pub fn new(
         virgl_flags: u32,
+        software_2d: bool,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
         Ok(Gpu {
-            avail_features: AVAIL_FEATURES,
+            avail_features: if software_2d {
+                AVAIL_FEATURES_SOFTWARE_2D
+            } else {
+                AVAIL_FEATURES
+            },
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
             virgl_flags,
+            software_2d,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table: None,
@@ -168,7 +183,8 @@ impl VirtioDevice for Gpu {
             events_read: 0,
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            num_capsets: 5,
+            // No renderer in software-2D-only mode → no capsets to advertise.
+            num_capsets: if self.software_2d { 0 } else { 5 },
             blob_alignment: self.blob_alignment,
         };
 
@@ -219,6 +235,7 @@ impl VirtioDevice for Gpu {
             interrupt.clone(),
             shm_region,
             self.virgl_flags,
+            self.software_2d,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
@@ -252,6 +269,7 @@ mod tests {
     fn blob_alignment_offered() {
         let gpu = Gpu::new(
             0,
+            false,
             Box::new([]),
             NoopDisplayBackend::into_display_backend(None),
             #[cfg(target_os = "macos")]

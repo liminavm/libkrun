@@ -1625,6 +1625,7 @@ export_bitflags! {
 #[cfg(feature = "gpu")]
 pub struct GpuDevice {
     virgl_flags: u32,
+    software_2d: bool,
     backend: DisplayBackend,
     shm_size: usize,
 }
@@ -1637,6 +1638,7 @@ impl GpuDevice {
     pub fn new(virgl_flags: VirglRendererFlags, backend: DisplayBackend) -> Self {
         Self {
             virgl_flags: virgl_flags.bits(),
+            software_2d: false,
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
         }
@@ -1644,6 +1646,14 @@ impl GpuDevice {
 
     pub fn shm_size(mut self, size: usize) -> Self {
         self.shm_size = size;
+        self
+    }
+
+    /// limina: run the virtio-gpu in software-2D-only mode — skip virglrenderer/rutabaga init
+    /// (no host GL/Metal renderer) and serve only the 2D scanout path. The compatibility
+    /// floor (tier-1) for GL-less hosts. When false, the device inits the renderer normally.
+    pub fn software_2d(mut self, software_2d: bool) -> Self {
+        self.software_2d = software_2d;
         self
     }
 }
@@ -1665,6 +1675,7 @@ impl<'a> AttachDevice<'a> for GpuDevice {
 
         let gpu = devices::virtio::Gpu::new(
             self.virgl_flags,
+            self.software_2d,
             displays,
             self.backend.inner,
             #[cfg(target_os = "macos")]
