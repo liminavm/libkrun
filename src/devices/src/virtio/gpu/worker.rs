@@ -8,10 +8,7 @@ use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
-use rutabaga_gfx::{
-    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
-    ResourceCreateBlob, RutabagaFence, Transfer3D,
-};
+use rutabaga_gfx::{ResourceCreate3D, ResourceCreateBlob, RutabagaFence, Transfer3D};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -37,6 +34,8 @@ pub struct Worker {
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
+    /// limina: serve only the software-2D scanout path; don't init virglrenderer/rutabaga.
+    software_2d: bool,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -52,6 +51,7 @@ impl Worker {
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
+        software_2d: bool,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -72,6 +72,7 @@ impl Worker {
             interrupt,
             shm_region,
             virgl_flags,
+            software_2d,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table,
@@ -93,6 +94,7 @@ impl Worker {
             self.control_queue.clone(),
             self.interrupt.clone(),
             self.virgl_flags,
+            self.software_2d,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
@@ -127,22 +129,15 @@ impl Worker {
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
-                let resource_id = info.resource_id;
-
-                let resource_create_3d = ResourceCreate3D {
-                    target: RUTABAGA_PIPE_TEXTURE_2D,
-                    format: info.format,
-                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
-                    width: info.width,
-                    height: info.height,
-                    depth: 1,
-                    array_size: 1,
-                    last_level: 0,
-                    nr_samples: 0,
-                    flags: 0,
-                };
-
-                virtio_gpu.resource_create_3d(resource_id, resource_create_3d)
+                // limina: handle 2D resources in software (host CPU memory) instead of
+                // mapping them onto a virgl GL render target — the stock path fails on a
+                // GL-less host (e.g. macOS). See VirtioGpu::resource_create_2d.
+                virtio_gpu.resource_create_2d(
+                    info.resource_id,
+                    info.format,
+                    info.width,
+                    info.height,
+                )
             }
             GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
             GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
