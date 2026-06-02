@@ -1083,6 +1083,7 @@ pub fn build_microvm(
             export_table.clone(),
             intc.clone(),
             virgl_flags,
+            vm_resources.gpu_software_2d,
             Box::from(&vm_resources.displays[..]),
             display_backend,
             #[cfg(target_os = "macos")]
@@ -2719,6 +2720,7 @@ fn attach_gpu_device(
     #[cfg(not(feature = "tee"))] mut export_table: Option<ExportTable>,
     intc: IrqChip,
     virgl_flags: u32,
+    software_2d: bool,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
@@ -2728,6 +2730,7 @@ fn attach_gpu_device(
     let gpu = Arc::new(Mutex::new(
         devices::virtio::Gpu::new(
             virgl_flags,
+            software_2d,
             displays,
             display_backend,
             #[cfg(target_os = "macos")]

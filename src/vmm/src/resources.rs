@@ -207,6 +207,10 @@ pub struct VmResources {
     pub tee_config: TeeConfig,
     /// Flags for the virtio-gpu device.
     pub gpu_virgl_flags: Option<u32>,
+    /// limina: run the virtio-gpu in software-2D-only mode — skip virglrenderer/rutabaga init
+    /// (no host GL/Metal renderer) and serve only the 2D scanout path. The compatibility
+    /// floor (tier-1) for GL-less hosts. When false, the device inits the renderer normally.
+    pub gpu_software_2d: bool,
     pub gpu_shm_size: Option<usize>,
     #[cfg(feature = "gpu")]
     pub display_backend: Option<DisplayBackend<'static>>,
@@ -381,6 +385,11 @@ impl VmResources {
         self.gpu_virgl_flags = Some(virgl_flags);
     }
 
+    /// limina: enable software-2D-only mode for the virtio-gpu (skip virglrenderer/rutabaga).
+    pub fn set_gpu_software_2d(&mut self, software_2d: bool) {
+        self.gpu_software_2d = software_2d;
+    }
+
     pub fn set_gpu_shm_size(&mut self, shm_size: usize) {
         self.gpu_shm_size = Some(shm_size);
     }
@@ -452,6 +461,7 @@ mod tests {
             #[cfg(feature = "net")]
             net: Default::default(),
             gpu_virgl_flags: None,
+            gpu_software_2d: false,
             gpu_shm_size: None,
             #[cfg(feature = "gpu")]
             display_backend: None,
