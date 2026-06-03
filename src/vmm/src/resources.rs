@@ -146,6 +146,14 @@ pub enum PortConfig {
         input_fd: RawFd,
         output_fd: RawFd,
     },
+    /// A *console* port (the guest sees it as `hvcN`, not a `vportNpM` data port) with
+    /// separate, non-tty input/output fds. Unlike `Tty`, the fds need not be terminals
+    /// (a file/FIFO is fine — a fixed terminal size is reported); unlike `InOut`, the port
+    /// is marked as a console so `console=hvcN` binds to it. `-1` for either fd = none.
+    ConsoleInOut {
+        input_fd: RawFd,
+        output_fd: RawFd,
+    },
 }
 
 #[cfg(windows)]

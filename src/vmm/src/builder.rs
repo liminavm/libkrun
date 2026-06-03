@@ -2414,7 +2414,15 @@ fn setup_terminal_raw_mode(
                 })));
             }
             Err(e) => {
-                log::error!("Failed to set terminal to raw mode: {e}")
+                // A serial fd that isn't a classic tty — e.g. a pty master, which doesn't
+                // support termios — can't be put in raw mode. That's expected and harmless
+                // (whatever attaches to the other end sets its own mode), so don't surface
+                // it as an error. Real failures still log loudly.
+                if e == nix::errno::Errno::ENOTTY {
+                    log::debug!("serial console fd does not support raw mode (not a tty): {e}")
+                } else {
+                    log::error!("Failed to set terminal to raw mode: {e}")
+                }
             }
         };
     }
@@ -2481,6 +2489,24 @@ fn create_explicit_ports(
                 },
                 terminal: None,
             },
+            PortConfig::ConsoleInOut {
+                input_fd,
+                output_fd,
+            } => PortDescription::console(
+                if *input_fd < 0 {
+                    None
+                } else {
+                    Some(port_io::input_to_raw_fd_dup(*input_fd).unwrap())
+                },
+                if *output_fd < 0 {
+                    None
+                } else {
+                    Some(port_io::output_to_raw_fd_dup(*output_fd).unwrap())
+                },
+                // Non-tty fds (file/FIFO) have no window size; report a fixed default. A
+                // console port (terminal = Some) is what makes the guest expose it as hvcN.
+                port_io::term_fixed_size(0, 0),
+            ),
         };
 
         ports.push(port_desc);
