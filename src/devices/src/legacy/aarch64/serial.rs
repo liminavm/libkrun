@@ -245,9 +245,15 @@ impl Serial {
             UARTDR => {
                 self.int_level |= PL011_INT_TX;
                 if let Some(out) = self.out.as_mut() {
-                    out.write_all(&[val.to_le_bytes()[0]])
-                        .map_err(Error::WriteAllFailure)?;
-                    out.flush().map_err(Error::FlushFailure)?;
+                    // This runs on the vCPU thread, so `out` may be non-blocking (e.g. a pty
+                    // master with no reader attached): a full buffer returns WouldBlock. Drop
+                    // the byte rather than stalling the vCPU or logging per byte — serial
+                    // output is best-effort when nothing is draining the other end.
+                    match out.write_all(&[val.to_le_bytes()[0]]) {
+                        Ok(()) => out.flush().map_err(Error::FlushFailure)?,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(Error::WriteAllFailure(e)),
+                    }
                 }
             }
             UARTRSR_UARTECR => {
