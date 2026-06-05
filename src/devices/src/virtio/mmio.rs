@@ -469,7 +469,21 @@ impl BusDevice for MmioTransport {
                     0x24 => self.acked_features_select = v,
                     0x30 => self.queue_select = v,
                     0x38 => self.update_queue_field(|q| q.size = v as u16),
-                    0x44 => self.update_queue_field(|q| q.ready = v == 1),
+                    0x44 => self.update_queue_field(|q| {
+                        q.ready = v == 1;
+                        // limina: QEMU-compatible leniency. A driver must program QueueNum
+                        // (reg 0x38) before marking the queue ready, but EDK2's VirtioGpuDxe
+                        // over virtio-mmio leaves it at 0 (its mmio path is normally unused;
+                        // virtio-gpu is almost always virtio-pci). QEMU tolerates this because
+                        // its vring.num defaults to the maximum; we init size to 0, so without
+                        // this the queue's actual_size() stays 0 and pop() ignores the avail
+                        // ring entirely. The driver sized its ring to QueueNumMax, so snapping
+                        // a ready-but-unsized queue to max_size matches the ring it allocated.
+                        if q.ready && q.size == 0 {
+                            warn!("virtio queue marked ready with QueueNum=0; defaulting to max_size={}", q.max_size);
+                            q.size = q.max_size;
+                        }
+                    }),
                     0x50 => {
                         // Queue notification - write to the eventfd for the specified queue.
                         if let Some(eventfd) = self.queue_evts.get(v as usize) {
@@ -994,6 +1008,46 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK
         );
         assert!(d.locked_device().is_activated());
+    }
+
+    #[test]
+    fn test_queue_ready_without_queuenum_defaults_to_max() {
+        // limina regression: EDK2's VirtioGpuDxe over virtio-mmio marks the control queue
+        // ready (reg 0x44) WITHOUT ever programming QueueNum (reg 0x38), leaving size=0.
+        // QEMU tolerates this (its vring.num defaults to the maximum); we must too, or the
+        // queue's actual_size() stays 0 and pop() never sees the descriptors the driver
+        // queued -- which deadlocked the GOP firmware boot. A ready-but-unsized queue must
+        // snap to max_size (the ring size the driver actually allocated from QueueNumMax).
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+        let mut buf = [0; 4];
+
+        set_device_status(&mut d, device_status::ACKNOWLEDGE);
+        set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+        set_device_status(
+            &mut d,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        );
+
+        // Select queue 0 (max_size 16) and mark it ready WITHOUT writing QueueNum (0x38).
+        write_le_u32(&mut buf[..], 0);
+        d.write(0, 0x30, &buf[..]);
+        assert_eq!(d.queues.as_ref().unwrap()[0].size, 0);
+
+        write_le_u32(&mut buf[..], 1);
+        d.write(0, 0x44, &buf[..]);
+
+        assert!(d.queues.as_ref().unwrap()[0].ready);
+        assert_eq!(
+            d.queues.as_ref().unwrap()[0].size,
+            16,
+            "queue marked ready with QueueNum=0 must default to max_size"
+        );
     }
 
     #[test]
