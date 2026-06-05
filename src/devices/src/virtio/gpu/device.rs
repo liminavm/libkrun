@@ -1,7 +1,9 @@
 use std::io::Write;
+use std::thread::JoinHandle;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
@@ -52,6 +54,10 @@ pub struct Gpu {
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     blob_alignment: u32,
+    /// Handle to the running worker thread, present only while activated.
+    worker_thread: Option<JoinHandle<()>>,
+    /// Signals the worker to exit so it can be joined on reset/re-activation.
+    worker_stopfd: EventFd,
 }
 
 impl Gpu {
@@ -81,6 +87,8 @@ impl Gpu {
             // Blobs are mapped into the guest in host pages, which can be
             // larger than the guest's (16 KiB on Apple silicon).
             blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
+            worker_thread: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?,
         })
     }
 
@@ -215,6 +223,11 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        if self.worker_thread.is_some() {
+            // reset() must have joined the previous worker before re-activation.
+            panic!("virtio_gpu: worker thread already exists");
+        }
+
         let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
@@ -236,13 +249,14 @@ impl VirtioDevice for Gpu {
             shm_region,
             self.virgl_flags,
             self.software_2d,
+            self.worker_stopfd.try_clone().unwrap(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
             self.displays.clone(),
             self.display_backend,
         );
-        worker.run();
+        self.worker_thread = Some(worker.run());
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 
@@ -251,6 +265,21 @@ impl VirtioDevice for Gpu {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        // Stop and join the worker so a stale thread doesn't keep running on the old queue
+        // when the guest re-initializes the device (firmware -> kernel hand-off, driver
+        // rebind, reboot). Returning true lets the transport recreate the queues and a later
+        // activate() spawn a fresh worker.
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = worker.join() {
+                error!("error waiting for gpu worker thread: {e:?}");
+            }
+        }
+        self.device_state = DeviceState::Inactive;
+        true
     }
 
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
@@ -262,8 +291,119 @@ impl VirtioDevice for Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::{InterruptTransport, Queue};
+    use krun_display::{
+        DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBackendNew, IntoDisplayBackend,
+        Rect, ResourceFormat,
+    };
+    use std::sync::Arc;
+    use vm_memory::GuestAddress;
+
+    /// Minimal no-op display backend so the reset test can spin a real worker thread
+    /// without a window/capture sink. Its frame methods are never reached (no queue
+    /// activity); only `new` is invoked, via `VirtioGpu::new`'s `create_instance`.
+    struct StubBackend {
+        buf: Vec<u8>,
+    }
+    impl DisplayBackendNew<()> for StubBackend {
+        fn new(_userdata: Option<&()>) -> Self {
+            StubBackend { buf: vec![0u8; 4] }
+        }
+    }
+    impl DisplayBackendBasicFramebuffer for StubBackend {
+        fn configure_scanout(
+            &mut self,
+            _scanout_id: u32,
+            _display_width: u32,
+            _display_height: u32,
+            _width: u32,
+            _height: u32,
+            _format: ResourceFormat,
+        ) -> Result<(), DisplayBackendError> {
+            Ok(())
+        }
+        fn disable_scanout(&mut self, _scanout_id: u32) -> Result<(), DisplayBackendError> {
+            Ok(())
+        }
+        fn alloc_frame(
+            &mut self,
+            _scanout_id: u32,
+        ) -> Result<(u32, &mut [u8]), DisplayBackendError> {
+            Ok((0, &mut self.buf))
+        }
+        fn present_frame(
+            &mut self,
+            _scanout_id: u32,
+            _frame_id: u32,
+            _rect: Option<&Rect>,
+        ) -> Result<(), DisplayBackendError> {
+            Ok(())
+        }
+    }
+
+    fn dummy_device_queue() -> DeviceQueue {
+        DeviceQueue::new(
+            Queue::new(QUEUE_SIZE),
+            Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+        )
+    }
+
+    fn test_gpu() -> Gpu {
+        let backend = StubBackend::into_display_backend(None);
+        Gpu::new(
+            0,
+            true, // software_2d -> no rutabaga, no renderer init
+            Vec::<DisplayInfo>::new().into_boxed_slice(),
+            backend,
+            #[cfg(target_os = "macos")]
+            crossbeam_channel::unbounded().0,
+        )
+        .unwrap()
+    }
+
+    /// Re-activating virtio-gpu (firmware -> kernel hand-off, driver rebind, reboot) must not
+    /// leave the previous worker thread running on the stale queue. `reset()` must stop+join
+    /// the worker and return true so a fresh `activate()` can spawn a new one. If the stop
+    /// signal were broken, `reset()`'s `join()` would hang and this test would time out.
+    #[test]
+    fn test_reset_stops_worker_and_allows_reactivation() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let intc =
+            InterruptTransport::new(DummyIrqChip::new().into(), "gpu-test".to_string()).unwrap();
+
+        let mut gpu = test_gpu();
+        gpu.set_shm_region(VirtioShmRegion {
+            host_addr: 0,
+            guest_addr: 0,
+            size: 0,
+        });
+
+        // Activate -> a worker thread is running.
+        gpu.activate(
+            mem.clone(),
+            intc.clone(),
+            vec![dummy_device_queue(), dummy_device_queue()],
+        )
+        .unwrap();
+        assert!(gpu.is_activated());
+        assert!(gpu.worker_thread.is_some());
+
+        // Reset -> worker stopped+joined, device inactive (join() hangs if stop is broken).
+        assert!(gpu.reset());
+        assert!(!gpu.is_activated());
+        assert!(gpu.worker_thread.is_none());
+
+        // Re-activate -> a fresh worker, no "already exists" panic.
+        gpu.activate(mem, intc, vec![dummy_device_queue(), dummy_device_queue()])
+            .unwrap();
+        assert!(gpu.is_activated());
+
+        // Clean up the second worker.
+        assert!(gpu.reset());
+    }
+
     use crate::display::NoopDisplayBackend;
-    use krun_display::IntoDisplayBackend;
 
     #[test]
     fn blob_alignment_offered() {

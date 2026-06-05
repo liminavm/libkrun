@@ -1,9 +1,9 @@
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
@@ -29,6 +29,9 @@ use krun_display::Rect;
 
 pub struct Worker {
     control_evt: EventFd,
+    /// Signalled by the device on reset so the worker exits its epoll loop and the
+    /// thread can be joined (otherwise a stale worker keeps running across re-activation).
+    stop_fd: EventFd,
     control_queue: Arc<Mutex<VirtQueue>>,
     mem: GuestMemoryMmap,
     interrupt: InterruptTransport,
@@ -52,21 +55,19 @@ impl Worker {
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
         software_2d: bool,
+        stop_fd: EventFd,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
     ) -> Self {
-        // Clone the eventfd so we have our own file description, then set it to blocking mode.
+        // Clone the eventfd so we own a file descriptor we can register with epoll. It stays
+        // non-blocking; epoll does the waiting and we drain the counter after a readable event.
         let control_evt = control_q.event.try_clone().unwrap();
-        // SAFETY: control_evt is valid for the duration of the fcntl calls.
-        let fd = unsafe { BorrowedFd::borrow_raw(control_evt.as_raw_fd()) };
-        let flags =
-            OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
 
         Self {
             control_evt,
+            stop_fd,
             control_queue: Arc::new(Mutex::new(control_q.queue)),
             mem,
             interrupt,
@@ -81,11 +82,11 @@ impl Worker {
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("gpu worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
     fn work(mut self) {
@@ -102,15 +103,48 @@ impl Worker {
             self.display_backend,
         );
 
+        let control_ev_fd = self.control_evt.as_raw_fd();
+        let stop_ev_fd = self.stop_fd.as_raw_fd();
+
+        let mut epoll = Epoll::new().unwrap();
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            control_ev_fd,
+            &EpollEvent::new(EventSet::IN, control_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_ev_fd,
+            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
+
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            if let Err(e) = self.control_evt.read() {
-                error!("Failed to read control_evt: {e:?}");
-                continue;
-            }
-            if self.process_queue(&mut virtio_gpu, &self.control_queue.clone())
-                && let Err(e) = self.interrupt.try_signal_used_queue()
-            {
-                error!("Error signaling queue: {e:?}");
+            let ev_cnt = match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!("gpu worker epoll wait failed: {e}");
+                    continue;
+                }
+            };
+            for event in &epoll_events[0..ev_cnt] {
+                let source = event.fd();
+                if source == stop_ev_fd {
+                    // Device reset: drain and exit so the thread can be joined.
+                    let _ = self.stop_fd.read();
+                    return;
+                }
+                if source == control_ev_fd {
+                    if let Err(e) = self.control_evt.read() {
+                        error!("Failed to read control_evt: {e:?}");
+                        continue;
+                    }
+                    if self.process_queue(&mut virtio_gpu, &self.control_queue.clone()) {
+                        if let Err(e) = self.interrupt.try_signal_used_queue() {
+                            error!("Error signaling queue: {e:?}");
+                        }
+                    }
+                }
             }
         }
     }
