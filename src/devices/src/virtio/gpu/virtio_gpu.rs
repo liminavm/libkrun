@@ -15,7 +15,8 @@ use super::protocol::{
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{Sender, unbounded};
 use krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
+    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBackendInstance,
+    Rect, ResourceFormat,
 };
 use libc::c_void;
 #[cfg(target_os = "macos")]
@@ -691,6 +692,76 @@ impl VirtioGpu {
         }
 
         Ok(OkNoData)
+    }
+
+    /// limina: render the guest hardware cursor as a host overlay (`VIRTIO_GPU_CMD_UPDATE_CURSOR`).
+    ///
+    /// The cursor image is an ordinary 2D resource (`CREATE_2D` + `TRANSFER_TO_HOST_2D`), so its
+    /// pixels already live in the software-2D host buffer. `resource_id == 0` hides the cursor
+    /// (virtio-gpu spec). The display backend draws it as an overlay — never into the scanout —
+    /// so cursor motion never re-enters the framebuffer present path. A backend without cursor
+    /// support (headless capture, stock GTK) returns `MethodNotSupported`, which we treat as a
+    /// no-op: the guest keeps whatever software-cursor fallback it had.
+    pub fn update_cursor(
+        &mut self,
+        resource_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+    ) -> VirtioGpuResult {
+        if resource_id == 0 {
+            Self::cursor_ok(self.display_backend.set_cursor(
+                0,
+                0,
+                0,
+                0,
+                ResourceFormat::BGRA,
+                &[],
+            ))?;
+            return Ok(OkNoData);
+        }
+
+        let resource = *self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        let format = resource.format.unwrap_or(ResourceFormat::BGRA);
+        // Clone the (tiny, ~64x64) cursor pixels so we don't hold a borrow of `self` across the
+        // &mut self backend call.
+        let Some(pixels) = self.sw2d.get(&resource_id).map(|sw| sw.host.clone()) else {
+            warn!("update_cursor: resource {resource_id} has no software-2D pixels");
+            return Err(ErrUnspec);
+        };
+        Self::cursor_ok(self.display_backend.set_cursor(
+            resource.width,
+            resource.height,
+            hot_x,
+            hot_y,
+            format,
+            &pixels,
+        ))?;
+        Self::cursor_ok(self.display_backend.move_cursor(x, y))?;
+        Ok(OkNoData)
+    }
+
+    /// limina: reposition the host cursor overlay (`VIRTIO_GPU_CMD_MOVE_CURSOR`).
+    pub fn move_cursor(&mut self, x: u32, y: u32) -> VirtioGpuResult {
+        Self::cursor_ok(self.display_backend.move_cursor(x, y))?;
+        Ok(OkNoData)
+    }
+
+    /// Map a cursor backend result to a GPU response, treating `MethodNotSupported` as success
+    /// (a backend without a cursor overlay simply ignores cursor commands — the queue still
+    /// drains so the guest never stalls).
+    fn cursor_ok(r: std::result::Result<(), DisplayBackendError>) -> VirtioGpuResult {
+        match r {
+            Ok(()) | Err(DisplayBackendError::MethodNotSupported) => Ok(OkNoData),
+            Err(e) => {
+                warn!("cursor backend error: {e}");
+                Err(ErrUnspec)
+            }
+        }
     }
 
     pub fn display_info(&self) -> VirtioGpuResult {
