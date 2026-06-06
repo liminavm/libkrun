@@ -359,24 +359,6 @@ impl VirtioGpu {
         }
     }
 
-    pub fn create_fallback_rutabaga(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
-        interrupt: InterruptTransport,
-        fence_state: Arc<Mutex<FenceState>>,
-    ) -> Option<Rutabaga> {
-        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-        let builder = RutabagaBuilder::new(
-            rutabaga_gfx::RutabagaComponentType::VirglRenderer,
-            VIRGLRENDERER_NO_VIRGL,
-            0,
-        );
-
-        let fence =
-            Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-        builder.clone().build(fence.clone(), None).ok()
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mem: GuestMemoryMmap,
@@ -392,31 +374,29 @@ impl VirtioGpu {
         let fence_state = Arc::new(Mutex::new(Default::default()));
 
         // limina software-2D-only mode: skip renderer init entirely (no virglrenderer/Metal).
+        // Coexist mode (software_2d == false): try the (Venus) renderer for 3D while the
+        // software-2D path keeps serving 2D/scanout. If the renderer fails to init, degrade
+        // gracefully to software-2D only (rutabaga = None): 2D keeps working and the guest's
+        // 3D commands return ErrUnspec, so Mesa falls back to llvmpipe rather than the worker
+        // crashing. We deliberately do NOT fall back to a NO_VIRGL rutabaga — it can't serve
+        // 2D either (CREATE_2D -> virgl GL render target, dead on macOS) and just wedges boot.
         let rutabaga = if software_2d {
             None
         } else {
-            Some(
-                match Self::create_rutabaga(
-                    mem.clone(),
-                    queue_ctl.clone(),
-                    interrupt.clone(),
-                    fence_state.clone(),
-                    virgl_flags,
-                    export_table.clone(),
-                ) {
-                    Some(rutabaga) => rutabaga,
-                    None => {
-                        warn!("Failed to create virtio_gpu backend with the requested parameters. Falling back to safe defaults.");
-                        Self::create_fallback_rutabaga(
-                            mem.clone(),
-                            queue_ctl.clone(),
-                            interrupt.clone(),
-                            fence_state.clone(),
-                        )
-                        .expect("Fallback rutabaga initialization failed")
-                    }
-                },
-            )
+            match Self::create_rutabaga(
+                mem.clone(),
+                queue_ctl.clone(),
+                interrupt.clone(),
+                fence_state.clone(),
+                virgl_flags,
+                export_table.clone(),
+            ) {
+                Some(rutabaga) => Some(rutabaga),
+                None => {
+                    warn!("virtio-gpu: renderer init failed; degrading to software-2D (no 3D)");
+                    None
+                }
+            }
         };
 
         let display_backend = display_backend
@@ -958,17 +938,22 @@ impl VirtioGpu {
     /// Creates a fence with the RutabagaFence that can be used to determine when the previous
     /// command completed.
     pub fn create_fence(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
-        let Some(rutabaga) = self.rutabaga.as_mut() else {
-            // Software-2D mode: there is no renderer and no async fence handler.
-            // Every 2D command finishes synchronously before its response is
-            // encoded, so a guest-requested fence is already signaled by the time
-            // we get here. Record it as completed up-front; process_fence() then
-            // retires the descriptor immediately instead of parking it forever
-            // (which would hang any guest that fences a 2D command, e.g. GTK4).
-            mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
-            return Ok(OkNoData);
-        };
-        rutabaga.create_fence(rutabaga_fence)?;
+        // Route the fence by ring. Software-2D (Global-ring) commands finish synchronously
+        // before their response is encoded, so the fence is already signaled by the time we
+        // get here: record it as completed up-front and let process_fence() retire the
+        // descriptor immediately instead of parking it forever (which would hang any guest
+        // that fences a 2D command, e.g. GTK4, or the EDK2 firmware GOP).
+        //
+        // Only context-specific fences belong to a real 3D context and go to rutabaga. In the
+        // coexist device (software-2D 2D + VENUS|NO_VIRGL 3D) a venus rutabaga is present but
+        // cannot fence the Global ring (ctx 0 isn't a venus context) — routing a 2D fence there
+        // fails with ComponentError and wedges the firmware. So: Global ring -> sync, always;
+        // context ring -> rutabaga (falling back to sync if somehow there is no renderer).
+        let context_ring = rutabaga_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0;
+        match self.rutabaga.as_mut() {
+            Some(rutabaga) if context_ring => rutabaga.create_fence(rutabaga_fence)?,
+            _ => mark_fence_completed_sync(&self.fence_state, &rutabaga_fence),
+        }
         Ok(OkNoData)
     }
 
