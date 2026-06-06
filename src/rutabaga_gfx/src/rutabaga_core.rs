@@ -992,15 +992,19 @@ impl Rutabaga {
 
     /// Attaches the resource given by `resource_id` to the context given by `ctx_id`.
     pub fn context_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> RutabagaResult<()> {
-        let ctx = self
-            .contexts
-            .get_mut(&ctx_id)
-            .ok_or(RutabagaError::InvalidContextId)?;
-
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(RutabagaError::InvalidResourceId)?;
+        // In limina's coexist GPU mode the 2D scanout resources (the boot framebuffer, fbcon)
+        // live in the software-2D path, not in this 3D renderer's resource map. The guest kernel
+        // still issues CTX_ATTACH_RESOURCE for them against its 3D context; that attach has no 3D
+        // resource to bind and doesn't need one (the 2D path serves the resource directly), so a
+        // missing endpoint is an idempotent no-op rather than an error — returning one only
+        // surfaces a benign ErrUnspec dmesg line in the guest. Real 3D resources are present in
+        // the map and attach normally.
+        let Some(resource) = self.resources.get_mut(&resource_id) else {
+            return Ok(());
+        };
+        let Some(ctx) = self.contexts.get_mut(&ctx_id) else {
+            return Ok(());
+        };
 
         ctx.attach(resource);
         Ok(())
@@ -1008,15 +1012,17 @@ impl Rutabaga {
 
     /// Detaches the resource given by `resource_id` from the context given by `ctx_id`.
     pub fn context_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> RutabagaResult<()> {
-        let ctx = self
-            .contexts
-            .get_mut(&ctx_id)
-            .ok_or(RutabagaError::InvalidContextId)?;
-
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(RutabagaError::InvalidResourceId)?;
+        // Detaching a resource whose context — or the resource itself — has already been torn
+        // down is a no-op, not an error: the attachment we would remove is already gone. The
+        // guest legitimately races CTX_DETACH_RESOURCE against context/resource destruction at
+        // teardown; erroring there only surfaces a benign ErrUnspec dmesg line in the guest.
+        // Treat the missing-endpoint case as idempotent success.
+        let Some(resource) = self.resources.get_mut(&resource_id) else {
+            return Ok(());
+        };
+        let Some(ctx) = self.contexts.get_mut(&ctx_id) else {
+            return Ok(());
+        };
 
         ctx.detach(resource);
         Ok(())
