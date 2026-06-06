@@ -130,6 +130,32 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
             }
         }
     }
+
+    fn set_cursor(
+        &mut self,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        format: ResourceFormat,
+        buffer: &[u8],
+    ) -> Result<(), DisplayBackendError> {
+        // method_call! short-circuits to MethodNotSupported if the backend left the pointer
+        // NULL (e.g. the headless capture backend or a stock GTK backend) — no cursor, fine.
+        into_rust_result! {
+            method_call!{
+                self.set_cursor(width, height, hot_x, hot_y, format as u32, buffer.as_ptr(), buffer.len())
+            }
+        }
+    }
+
+    fn move_cursor(&mut self, x: u32, y: u32) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.move_cursor(x, y)
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
