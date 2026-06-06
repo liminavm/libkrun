@@ -146,6 +146,51 @@ struct krun_rect {
 typedef int32_t (*krun_display_present_frame_fn)(void *instance, uint32_t scanout_id, uint32_t frame_id, const struct krun_rect* damage_area);
 
 /**
+ * (limina extension, optional) Sets the hardware cursor image and hotspot.
+ *
+ * Called when the guest issues VIRTIO_GPU_CMD_UPDATE_CURSOR. The backend should render this
+ * image as an overlay (NOT into the scanout) at the position last given by move_cursor, with
+ * the hotspot subtracted. A width/height of 0 (or a NULL buffer) means hide the cursor.
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "width"       - cursor image width in pixels (0 to hide)
+ *  "height"      - cursor image height in pixels (0 to hide)
+ *  "hot_x"       - cursor hotspot x within the image
+ *  "hot_y"       - cursor hotspot y within the image
+ *  "format"      - pixel format of `buffer` (see KRUN_DISPLAY_FORMAT_* constants)
+ *  "buffer"      - cursor pixels, `width * height * 4` bytes in `format` (NULL to hide)
+ *  "buffer_size" - length of `buffer` in bytes
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_set_cursor_fn)(void *instance,
+    uint32_t width,
+    uint32_t height,
+    uint32_t hot_x,
+    uint32_t hot_y,
+    uint32_t format,
+    const uint8_t *buffer,
+    size_t buffer_size);
+
+/**
+ * (limina extension, optional) Moves the hardware cursor.
+ *
+ * Called when the guest issues VIRTIO_GPU_CMD_MOVE_CURSOR (and on UPDATE_CURSOR). The
+ * position is in scanout pixels; the backend applies the hotspot from the last set_cursor.
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "x"           - cursor x position in scanout pixels
+ *  "y"           - cursor y position in scanout pixels
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_move_cursor_fn)(void *instance, uint32_t x, uint32_t y);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -168,6 +213,8 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_configure_scanout_fn   configure_scanout; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_alloc_frame_fn         alloc_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_present_frame_fn       present_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
+    krun_display_set_cursor_fn          set_cursor; // (optional) limina: hardware cursor image+hotspot
+    krun_display_move_cursor_fn         move_cursor; // (optional) limina: hardware cursor position
 };
 
 union krun_display_vtable {
