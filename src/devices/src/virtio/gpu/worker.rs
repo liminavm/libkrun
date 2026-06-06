@@ -33,6 +33,11 @@ pub struct Worker {
     /// thread can be joined (otherwise a stale worker keeps running across re-activation).
     stop_fd: EventFd,
     control_queue: Arc<Mutex<VirtQueue>>,
+    /// limina: the cursor queue — serviced so the guest uses its hardware cursor plane (and
+    /// stops compositing the cursor into the scanout). Cursor commands become host overlay
+    /// updates via the display backend.
+    cursor_evt: EventFd,
+    cursor_queue: Arc<Mutex<VirtQueue>>,
     mem: GuestMemoryMmap,
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
@@ -50,6 +55,7 @@ impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         control_q: DeviceQueue,
+        cursor_q: DeviceQueue,
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
@@ -64,11 +70,14 @@ impl Worker {
         // Clone the eventfd so we own a file descriptor we can register with epoll. It stays
         // non-blocking; epoll does the waiting and we drain the counter after a readable event.
         let control_evt = control_q.event.try_clone().unwrap();
+        let cursor_evt = cursor_q.event.try_clone().unwrap();
 
         Self {
             control_evt,
             stop_fd,
             control_queue: Arc::new(Mutex::new(control_q.queue)),
+            cursor_evt,
+            cursor_queue: Arc::new(Mutex::new(cursor_q.queue)),
             mem,
             interrupt,
             shm_region,
@@ -104,6 +113,7 @@ impl Worker {
         );
 
         let control_ev_fd = self.control_evt.as_raw_fd();
+        let cursor_ev_fd = self.cursor_evt.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
         let mut epoll = Epoll::new().unwrap();
@@ -111,6 +121,11 @@ impl Worker {
             ControlOperation::Add,
             control_ev_fd,
             &EpollEvent::new(EventSet::IN, control_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            cursor_ev_fd,
+            &EpollEvent::new(EventSet::IN, cursor_ev_fd as u64),
         );
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -142,6 +157,17 @@ impl Worker {
                     if self.process_queue(&mut virtio_gpu, &self.control_queue.clone()) {
                         if let Err(e) = self.interrupt.try_signal_used_queue() {
                             error!("Error signaling queue: {e:?}");
+                        }
+                    }
+                }
+                if source == cursor_ev_fd {
+                    if let Err(e) = self.cursor_evt.read() {
+                        error!("Failed to read cursor_evt: {e:?}");
+                        continue;
+                    }
+                    if self.process_cursor_queue(&mut virtio_gpu) {
+                        if let Err(e) = self.interrupt.try_signal_used_queue() {
+                            error!("Error signaling cursor queue: {e:?}");
                         }
                     }
                 }
@@ -216,12 +242,14 @@ impl Worker {
                 }
             }
             GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
-            GpuCommand::UpdateCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand:UpdateCursor unimplemented");
-            }
-            GpuCommand::MoveCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
-            }
+            GpuCommand::UpdateCursor(info) => virtio_gpu.update_cursor(
+                info.resource_id,
+                info.hot_x,
+                info.hot_y,
+                info.pos.x,
+                info.pos.y,
+            ),
+            GpuCommand::MoveCursor(info) => virtio_gpu.move_cursor(info.pos.x, info.pos.y),
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id;
                 virtio_gpu.resource_assign_uuid(resource_id)
@@ -480,6 +508,44 @@ impl Worker {
         }
 
         debug!("gpu: process_queue exit");
+        used_any
+    }
+
+    /// limina: drain the cursor queue. Each entry is an `UPDATE_CURSOR`/`MOVE_CURSOR` command
+    /// (read-only from the guest, no response payload), dispatched to the display backend as a
+    /// host overlay update. Draining it is what lets the guest use its hardware cursor plane;
+    /// an unserviced cursor queue makes the guest fall back to compositing the cursor into the
+    /// scanout (or stall once the ring fills).
+    fn process_cursor_queue(&mut self, virtio_gpu: &mut VirtioGpu) -> bool {
+        let mut used_any = false;
+        let mem = self.mem.clone();
+        let cursor_queue = self.cursor_queue.clone();
+
+        loop {
+            let head = cursor_queue.lock().unwrap().pop(&mem);
+            let Some(head) = head else { break };
+
+            let mut reader = Reader::new(&mem, head.clone())
+                .map_err(GpuError::QueueReader)
+                .unwrap();
+            match GpuCommand::decode(&mut reader) {
+                Ok((hdr, cmd)) => {
+                    if let Err(resp) =
+                        self.process_gpu_command(virtio_gpu, &mem, hdr, cmd, &mut reader)
+                    {
+                        debug!("cursor cmd {cmd:?} -> {resp:?}");
+                    }
+                }
+                Err(e) => debug!("cursor descriptor decode error: {e:?}"),
+            }
+
+            // Cursor commands carry no response data; return the descriptor with len 0 so the
+            // guest's cursor queue keeps making progress.
+            if let Err(e) = cursor_queue.lock().unwrap().add_used(&mem, head.index, 0) {
+                error!("failed to add used elements to the cursor queue: {e:?}");
+            }
+            used_any = true;
+        }
         used_any
     }
 }

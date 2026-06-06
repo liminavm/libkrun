@@ -33,6 +33,27 @@ pub trait DisplayBackendBasicFramebuffer {
         frame_id: u32,
         rect: Option<&Rect>,
     ) -> Result<(), DisplayBackendError>;
+
+    /// (Optional, limina) Set the hardware cursor image + hotspot. `width`/`height` of 0 (or an
+    /// empty `buffer`) hides the cursor. Default: unsupported (backends without an overlay
+    /// simply don't get a hardware cursor — the guest keeps its software fallback).
+    fn set_cursor(
+        &mut self,
+        _width: u32,
+        _height: u32,
+        _hot_x: u32,
+        _hot_y: u32,
+        _format: ResourceFormat,
+        _buffer: &[u8],
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) Move the hardware cursor to scanout pixel (`x`, `y`). Default:
+    /// unsupported.
+    fn move_cursor(&mut self, _x: u32, _y: u32) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -132,6 +153,48 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             from_rust_result(cast_instance::<I>(instance).present_frame(scanout_id, frame_id, rect))
         }
 
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn set_cursor_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            width: u32,
+            height: u32,
+            hot_x: u32,
+            hot_y: u32,
+            format: u32,
+            buffer: *const u8,
+            buffer_size: usize,
+        ) -> i32 {
+            // A hide (width/height 0) carries no pixels and no meaningful format; default it.
+            let format = if width == 0 || height == 0 {
+                ResourceFormat::BGRA
+            } else {
+                match ResourceFormat::try_from(format) {
+                    Ok(f) => f,
+                    Err(()) => {
+                        error!("set_cursor: unknown format: {format}");
+                        return DisplayBackendError::InvalidParam as i32;
+                    }
+                }
+            };
+            // SAFETY: the GPU device passes a valid pointer/len for the call's duration, or NULL.
+            let pixels: &[u8] = if buffer.is_null() || buffer_size == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(buffer, buffer_size) }
+            };
+            from_rust_result(cast_instance::<I>(instance).set_cursor(
+                width, height, hot_x, hot_y, format, pixels,
+            ))
+        }
+
+        extern "C" fn move_cursor_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            x: u32,
+            y: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).move_cursor(x, y))
+        }
+
         DisplayBackend {
             create_userdata: userdata.map_or(null(), |t| ptr::from_ref(t) as *const c_void),
             create_userdata_lifetime: PhantomData,
@@ -144,6 +207,8 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     present_frame: Some(present_frame::<I>),
                     alloc_frame: Some(alloc_frame::<I>),
                     disable_scanout: Some(disable_scanout_fb::<I>),
+                    set_cursor: Some(set_cursor_fn::<I>),
+                    move_cursor: Some(move_cursor_fn::<I>),
                 },
             },
         }
