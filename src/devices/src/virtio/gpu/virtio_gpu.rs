@@ -350,7 +350,13 @@ impl VirtioGpu {
 
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-        builder.clone().build(fence.clone(), None).ok()
+        match builder.clone().build(fence.clone(), None) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!("create_rutabaga(virgl_flags={virgl_flags:#x}) build failed: {e:?}");
+                None
+            }
+        }
     }
 
     pub fn create_fallback_rutabaga(
