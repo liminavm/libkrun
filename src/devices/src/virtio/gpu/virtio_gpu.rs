@@ -19,8 +19,6 @@ use krun_display::{
     Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(target_os = "macos")]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
@@ -1186,38 +1184,36 @@ impl VirtioGpu {
 
         let rutabaga = self.rutabaga.as_mut().ok_or(ErrUnspec)?;
         let map_info = rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        // limina: `map_ptr` maps the (venus host-visible) blob and returns the host pointer; with
+        // upstream virglrenderer 1.3.0 this goes through `virgl_renderer_resource_map`. We then
+        // hv_vm_map that pointer into the guest's SHM window. The old slp `0.10.4e-krunkit` bottle
+        // gated this on `export_blob().handle_type == APPLE` (a krunkit-only blob fd type); upstream
+        // 1.3.0 has no APPLE fd type (only DMABUF/OPAQUE/SHM), so we no longer require it — the
+        // `map_ptr` call itself is the gate (it errors for a non-mappable resource).
         let map_ptr = rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
 
-        if let Ok(export) = rutabaga.export_blob(resource_id) {
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
-                let guest_addr = checked_blob_map_addr(
-                    shm_region.guest_addr,
-                    offset,
-                    resource.size,
-                    shm_region.size as u64,
-                )
-                .ok_or(ErrUnspec)?;
-                debug!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
-                );
+        let guest_addr = checked_blob_map_addr(
+            shm_region.guest_addr,
+            offset,
+            resource.size,
+            shm_region.size as u64,
+        )
+        .ok_or(ErrUnspec)?;
+        debug!(
+            "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
+            map_ptr, guest_addr, resource.size
+        );
 
-                let (reply_sender, reply_receiver) = unbounded();
-                self.map_sender
-                    .send(WorkerMessage::GpuAddMapping(
-                        reply_sender,
-                        map_ptr,
-                        guest_addr,
-                        resource.size,
-                    ))
-                    .unwrap();
-                if !reply_receiver.recv().unwrap() {
-                    return Err(ErrUnspec);
-                }
-            } else {
-                return Err(ErrUnspec);
-            }
-        } else {
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                map_ptr,
+                guest_addr,
+                resource.size,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
             return Err(ErrUnspec);
         }
 
