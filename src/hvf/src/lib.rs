@@ -280,6 +280,17 @@ impl HvfVm {
             )
         };
         if ret != HV_SUCCESS {
+            // hv_vm_map rejects any host addr, guest addr, or size that is not a multiple of
+            // the host page size (16 KiB on Apple Silicon) with HV_BAD_ARGUMENT (0xfae94003).
+            // Surface which operand is misaligned to make blob-mapping bugs diagnosable.
+            const HOST_PAGE: u64 = 16384;
+            error!(
+                "hv_vm_map failed: ret={ret:#x} host={host_start_addr:#x} guest={guest_start_addr:#x} size={size:#x} \
+                 (host%16k={} guest%16k={} size%16k={})",
+                host_start_addr % HOST_PAGE,
+                guest_start_addr % HOST_PAGE,
+                size % HOST_PAGE,
+            );
             Err(Error::MemoryMap)
         } else {
             Ok(())
