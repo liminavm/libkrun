@@ -388,8 +388,23 @@ impl Worker {
                     mem,
                 )
             }
-            GpuCommand::SetScanoutBlob(_info) => {
-                panic!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+            GpuCommand::SetScanoutBlob(info) => {
+                // limina tier-2 (macOS): present an IOSurface-backed blob scanout zero-copy.
+                #[cfg(target_os = "macos")]
+                {
+                    virtio_gpu.set_scanout_blob(
+                        info.scanout_id,
+                        info.resource_id,
+                        info.width,
+                        info.height,
+                        info.format,
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = info;
+                    Err(GpuResponse::ErrUnspec)
+                }
             }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;

@@ -54,6 +54,18 @@ pub trait DisplayBackendBasicFramebuffer {
     fn move_cursor(&mut self, _x: u32, _y: u32) -> Result<(), DisplayBackendError> {
         Err(DisplayBackendError::MethodNotSupported)
     }
+
+    /// (Optional, limina) Present an externally-rendered global IOSurface to the display
+    /// zero-copy (venus SET_SCANOUT_BLOB scanouts). No prior `alloc_frame`; the surface is
+    /// owned by the renderer. Default: unsupported (device falls back to the readback path).
+    fn present_surface(
+        &mut self,
+        _scanout_id: u32,
+        _iosurface_id: u32,
+        _rect: Option<&Rect>,
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -195,6 +207,19 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             from_rust_result(cast_instance::<I>(instance).move_cursor(x, y))
         }
 
+        extern "C" fn present_surface_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            iosurface_id: u32,
+            rect: *const Rect,
+        ) -> i32 {
+            // SAFETY: The pointer obtained from the bindings should be safe
+            let rect: Option<&Rect> = unsafe { ptr_to_option_ref(rect) };
+            from_rust_result(
+                cast_instance::<I>(instance).present_surface(scanout_id, iosurface_id, rect),
+            )
+        }
+
         DisplayBackend {
             create_userdata: userdata.map_or(null(), |t| ptr::from_ref(t) as *const c_void),
             create_userdata_lifetime: PhantomData,
@@ -209,6 +234,7 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     disable_scanout: Some(disable_scanout_fb::<I>),
                     set_cursor: Some(set_cursor_fn::<I>),
                     move_cursor: Some(move_cursor_fn::<I>),
+                    present_surface: Some(present_surface_fn::<I>),
                 },
             },
         }
