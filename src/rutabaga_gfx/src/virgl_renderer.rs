@@ -367,6 +367,18 @@ impl VirglRenderer {
         Ok(map_ptr)
     }
 
+    // limina tier-2: the global IOSurface id backing a scanout resource, or 0 if not
+    // IOSurface-backed. Cached on the RutabagaResource for zero-copy SET_SCANOUT_BLOB present.
+    #[cfg(target_os = "macos")]
+    fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
+        let mut iosurface_id = 0;
+        let ret =
+            unsafe { virgl_renderer_resource_get_iosurface_id(resource_id, &mut iosurface_id) };
+        ret_to_res(ret)?;
+
+        Ok(iosurface_id)
+    }
+
     fn query(&self, resource_id: u32) -> RutabagaResult<Resource3DInfo> {
         let query = export_query(resource_id)?;
         if query.out_num_fds == 0 {
@@ -511,6 +523,8 @@ impl RutabagaComponent for VirglRenderer {
             map_info: None,
             #[cfg(target_os = "macos")]
             map_ptr: None,
+            #[cfg(target_os = "macos")]
+            iosurface_id: None,
             info_2d: None,
             info_3d: self.query(resource_id).ok(),
             vulkan_info: None,
@@ -683,6 +697,8 @@ impl RutabagaComponent for VirglRenderer {
                 map_info: self.map_info(resource_id).ok(),
                 #[cfg(target_os = "macos")]
                 map_ptr: self.map_ptr(resource_id).ok(),
+                #[cfg(target_os = "macos")]
+                iosurface_id: self.iosurface_id(resource_id).ok().filter(|&id| id != 0),
                 info_2d: None,
                 info_3d: self.query(resource_id).ok(),
                 vulkan_info: None,

@@ -48,6 +48,10 @@ pub struct RutabagaResource {
     pub map_info: Option<u32>,
     #[cfg(target_os = "macos")]
     pub map_ptr: Option<u64>,
+    /// limina tier-2: global IOSurface id backing this scanout resource (0/None = not
+    /// IOSurface-backed), cached at create for zero-copy SET_SCANOUT_BLOB present.
+    #[cfg(target_os = "macos")]
+    pub iosurface_id: Option<u32>,
     pub info_2d: Option<Rutabaga2DInfo>,
     pub info_3d: Option<Resource3DInfo>,
     pub vulkan_info: Option<VulkanInfo>,
@@ -114,6 +118,8 @@ pub trait RutabagaComponent {
             map_info: None,
             #[cfg(target_os = "macos")]
             map_ptr: None,
+            #[cfg(target_os = "macos")]
+            iosurface_id: None,
             info_2d: None,
             info_3d: None,
             vulkan_info: None,
@@ -462,6 +468,8 @@ impl Rutabaga {
                     map_info: None,
                     #[cfg(target_os = "macos")]
                     map_ptr: None,
+                    #[cfg(target_os = "macos")]
+                    iosurface_id: None,
                     info_2d: Some(Rutabaga2DInfo {
                         width: s.width,
                         height: s.height,
@@ -884,6 +892,21 @@ impl Rutabaga {
         resource
             .map_ptr
             .ok_or(RutabagaError::SpecViolation("no map ptr available"))
+    }
+
+    /// limina tier-2: returns the global IOSurface id backing a scanout resource (cached at
+    /// create), or an error if the resource is not IOSurface-backed. Used by SET_SCANOUT_BLOB
+    /// to present the IOSurface zero-copy instead of reading the SHM carrier.
+    #[cfg(target_os = "macos")]
+    pub fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
+        let resource = self
+            .resources
+            .get(&resource_id)
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
+        resource
+            .iosurface_id
+            .ok_or(RutabagaError::SpecViolation("not IOSurface-backed"))
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device
