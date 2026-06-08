@@ -191,6 +191,27 @@ typedef int32_t (*krun_display_set_cursor_fn)(void *instance,
 typedef int32_t (*krun_display_move_cursor_fn)(void *instance, uint32_t x, uint32_t y);
 
 /**
+ * (limina extension, optional) Presents an externally-rendered surface to the display zero-copy.
+ *
+ * Called for VIRTIO_GPU_CMD_SET_SCANOUT_BLOB scanouts whose resource is backed by a global
+ * IOSurface (venus rendered straight into it). The backend presents that IOSurface directly
+ * by its global id (e.g. forwarding it to the supervisor, which IOSurfaceLookup()s it) — no
+ * alloc_frame/copy. Unlike present_frame there is no prior alloc_frame; the surface is owned
+ * by the renderer, not the backend. A backend without zero-copy support returns
+ * KRUN_DISPLAY_ERR_METHOD_UNSUPPORTED and the device falls back to the readback path.
+ *
+ * Arguments:
+ *  "instance"     - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id"   - The identifier of the scanout on which to present.
+ *  "iosurface_id" - The global IOSurface id (IOSurfaceGetID) to present.
+ *  "damage_area"  - (Optional) changed-area hint; NULL means the whole surface is damaged.
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_present_surface_fn)(void *instance, uint32_t scanout_id, uint32_t iosurface_id, const struct krun_rect* damage_area);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -215,6 +236,7 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_present_frame_fn       present_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_set_cursor_fn          set_cursor; // (optional) limina: hardware cursor image+hotspot
     krun_display_move_cursor_fn         move_cursor; // (optional) limina: hardware cursor position
+    krun_display_present_surface_fn     present_surface; // (optional) limina: zero-copy IOSurface scanout present
 };
 
 union krun_display_vtable {
