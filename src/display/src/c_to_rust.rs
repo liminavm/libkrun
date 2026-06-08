@@ -156,6 +156,21 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
             }
         }
     }
+
+    fn present_surface(
+        &mut self,
+        scanout_id: u32,
+        iosurface_id: u32,
+        rect: Option<&Rect>,
+    ) -> Result<(), DisplayBackendError> {
+        // method_call! short-circuits to MethodNotSupported if the backend left the pointer
+        // NULL (e.g. the headless capture backend) — the device falls back to readback then.
+        into_rust_result! {
+            method_call!{
+                self.present_surface(scanout_id, iosurface_id, rect.map(|r| r as *const _).unwrap_or(null()))
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
