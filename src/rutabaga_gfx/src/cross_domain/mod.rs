@@ -1120,6 +1120,8 @@ impl RutabagaContext for CrossDomainContext {
                 map_info: Some(reqs.map_info | RUTABAGA_MAP_ACCESS_RW),
                 #[cfg(target_os = "macos")]
                 map_ptr: None,
+                #[cfg(target_os = "macos")]
+                iosurface_id: None,
                 info_2d: None,
                 info_3d: Some(info_3d),
                 vulkan_info: reqs.vulkan_info,
@@ -1171,6 +1173,8 @@ impl RutabagaContext for CrossDomainContext {
                     map_info: Some(RUTABAGA_MAP_CACHE_CACHED | access),
                     #[cfg(target_os = "macos")]
                     map_ptr: None,
+                    #[cfg(target_os = "macos")]
+                    iosurface_id: None,
                     info_2d: None,
                     info_3d: None,
                     vulkan_info: None,
@@ -1197,6 +1201,8 @@ impl RutabagaContext for CrossDomainContext {
                     map_info: Some(RUTABAGA_MAP_CACHE_CACHED | access),
                     #[cfg(target_os = "macos")]
                     map_ptr: None,
+                    #[cfg(target_os = "macos")]
+                    iosurface_id: None,
                     info_2d: None,
                     info_3d: None,
                     vulkan_info: None,
@@ -1403,6 +1409,8 @@ impl RutabagaComponent for CrossDomain {
             map_info: None,
             #[cfg(target_os = "macos")]
             map_ptr: None,
+            #[cfg(target_os = "macos")]
+            iosurface_id: None,
             info_2d: None,
             info_3d: None,
             vulkan_info: None,
