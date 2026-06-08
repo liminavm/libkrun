@@ -166,6 +166,11 @@ pub struct VirtioGpuScanout {
     resource_id: u32,
     width: u32,
     height: u32,
+    /// limina tier-2: if `Some`, this scanout's resource is backed by a global IOSurface
+    /// (venus SET_SCANOUT_BLOB) and `flush_resource` presents it zero-copy via
+    /// `present_surface` instead of the readback + `present_frame` path.
+    #[cfg(target_os = "macos")]
+    iosurface_id: Option<u32>,
 }
 
 /// A host-side software 2D resource (limina patch).
@@ -610,6 +615,97 @@ impl VirtioGpu {
             resource_id,
             width,
             height,
+            #[cfg(target_os = "macos")]
+            iosurface_id: None,
+        });
+        Ok(OkNoData)
+    }
+
+    /// limina tier-2: VIRTIO_GPU_CMD_SET_SCANOUT_BLOB. The guest (mutter on venus) scans out a
+    /// blob resource that is its KMS framebuffer; on macOS that blob's bound VkImage is backed
+    /// by a global IOSurface (vkr fix A + the bind linkage), which we present zero-copy.
+    ///
+    /// Mirrors `set_scanout`, but the format/size come from the command (a blob has no 2D
+    /// format of its own) and we resolve + remember the resource's IOSurface id so
+    /// `flush_resource` can `present_surface` it without a readback. If the resource is not
+    /// IOSurface-backed (e.g. a stock guest), `iosurface_id` stays `None` and flush falls back
+    /// to the readback path.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_scanout_blob(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> VirtioGpuResult {
+        let scanout = self
+            .scanouts
+            .get_mut(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        // Disable this scanout for any resource currently bound to it.
+        if let Some(prev) = scanout.as_ref().map(|s| s.resource_id) {
+            if let Some(resource) = self.resources.get_mut(&prev) {
+                resource.scanouts.disable(scanout_id);
+            }
+        }
+
+        // resource_id == 0 disables the scanout (virtio spec).
+        if resource_id == 0 {
+            debug!("Disabling scanout {scanout_id:?} (blob)");
+            *scanout = None;
+            self.display_backend.disable_scanout(scanout_id)?;
+            return Ok(OkNoData);
+        }
+
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.scanouts.enable(scanout_id);
+        resource.width = width;
+        resource.height = height;
+
+        let res_format = ResourceFormat::try_from(format).unwrap_or(ResourceFormat::BGRA);
+        resource.format = Some(res_format);
+
+        let display_info = self
+            .displays
+            .get(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        self.display_backend.configure_scanout(
+            scanout_id,
+            display_info.width,
+            display_info.height,
+            width,
+            height,
+            res_format,
+        )?;
+
+        // Resolve the resource to its backing IOSurface (0/err -> not IOSurface-backed).
+        let iosurface_id = self
+            .rutabaga
+            .as_ref()
+            .and_then(|r| r.iosurface_id(resource_id).ok())
+            .filter(|&id| id != 0);
+        if let Some(id) = iosurface_id {
+            log::info!(
+                "SET_SCANOUT_BLOB scanout={scanout_id} res={resource_id} -> IOSurface {id} (zero-copy)"
+            );
+        } else {
+            log::warn!(
+                "SET_SCANOUT_BLOB scanout={scanout_id} res={resource_id} not IOSurface-backed; using readback"
+            );
+        }
+
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+            iosurface_id,
         });
         Ok(OkNoData)
     }
@@ -650,6 +746,31 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            // limina tier-2: an IOSurface-backed SET_SCANOUT_BLOB scanout is presented zero-copy
+            // (venus already rendered into the IOSurface) — no alloc_frame, no readback.
+            #[cfg(target_os = "macos")]
+            if let Some(iosurface_id) = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .and_then(|s| s.iosurface_id)
+            {
+                match self
+                    .display_backend
+                    .present_surface(scanout_id, iosurface_id, Some(&rect))
+                {
+                    Ok(()) => continue,
+                    Err(DisplayBackendError::MethodNotSupported) => {
+                        // Backend has no zero-copy path (e.g. headless capture); fall through
+                        // to the readback path below.
+                    }
+                    Err(e) => {
+                        log::error!("present_surface failed for scanout {scanout_id}: {e}");
+                        return Err(ErrUnspec);
+                    }
+                }
+            }
+
             let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize) else {
                 continue;
             };
