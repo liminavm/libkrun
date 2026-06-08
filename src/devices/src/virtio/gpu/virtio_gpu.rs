@@ -721,10 +721,18 @@ impl VirtioGpu {
             offset: 0,
         };
 
-        rutabaga
-            .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+        if let Err(e) =
+            rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
+        {
+            // A blob / 3D (Venus) scanout resource has no 2D readback path -> EINVAL.
+            // Never panic the GPU worker (that wedges the whole guest); report the failure
+            // so the caller logs it and returns an error response for the flush.
+            log::warn!(
+                "transfer_read failed for scanout resource {} (blob/3D, no 2D readback): {e}",
+                resource.id
+            );
+            return Err(ErrUnspec);
+        }
 
         Ok(OkNoData)
     }
