@@ -404,6 +404,15 @@ unsafe extern "C" {
         map_ptr: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
+// limina tier-2: resolve a scanout resource to the global IOSurface id backing it (0 = none),
+// for zero-copy SET_SCANOUT_BLOB present. See docs/design/tier2-iosurface-zerocopy-present.md.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    pub fn virgl_renderer_resource_get_iosurface_id(
+        res_handle: u32,
+        iosurface_id: *mut u32,
+    ) -> ::std::os::raw::c_int;
+}
 unsafe extern "C" {
     pub fn virgl_renderer_resource_export_blob(
         res_id: u32,
