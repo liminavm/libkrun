@@ -752,6 +752,15 @@ impl VirtioGpu {
             // limina tier-2: an IOSurface-backed SET_SCANOUT_BLOB scanout is presented zero-copy
             // (venus already rendered into the IOSurface) — no alloc_frame, no readback.
             #[cfg(target_os = "macos")]
+            {
+                let dbg_ios = self
+                    .scanouts
+                    .get(scanout_id as usize)
+                    .and_then(|s| s.as_ref())
+                    .and_then(|s| s.iosurface_id);
+                log::info!("[FLUSHDBG] flush res={resource_id} scanout={scanout_id} iosurface_id={dbg_ios:?}");
+            }
+            #[cfg(target_os = "macos")]
             if let Some(iosurface_id) = self
                 .scanouts
                 .get(scanout_id as usize)
@@ -840,6 +849,18 @@ impl VirtioGpu {
             .get(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
         let format = resource.format.unwrap_or(ResourceFormat::BGRA);
+        // The guest kernel creates ALL dumb buffers as XRGB (virtgpu_gem.c hardcodes
+        // DRM_FORMAT_HOST_XRGB8888), but cursor images carry real alpha in those X bytes —
+        // virtio-gpu treats cursor data as ARGB regardless (QEMU does the same). Promote the
+        // X formats to their alpha-carrying counterparts so the overlay keeps the transparent
+        // surround instead of compositing an opaque black rectangle around the cursor.
+        let format = match format {
+            ResourceFormat::BGRX => ResourceFormat::BGRA,
+            ResourceFormat::XRGB => ResourceFormat::ARGB,
+            ResourceFormat::RGBX => ResourceFormat::RGBA,
+            ResourceFormat::XBGR => ResourceFormat::ABGR,
+            f => f,
+        };
         // Clone the (tiny, ~64x64) cursor pixels so we don't hold a borrow of `self` across the
         // &mut self backend call.
         let Some(pixels) = self.sw2d.get(&resource_id).map(|sw| sw.host.clone()) else {
