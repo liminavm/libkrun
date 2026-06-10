@@ -1034,11 +1034,15 @@ impl VirtioGpu {
         context_init: u32,
         context_name: Option<&str>,
     ) -> VirtioGpuResult {
-        self.rutabaga.as_mut().ok_or(ErrUnspec)?.create_context(
-            ctx_id,
-            context_init,
-            context_name,
-        )?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .create_context(ctx_id, context_init, context_name)
+            .map_err(|e| {
+                warn!("CTX_CREATE failed ctx={ctx_id} init={context_init:#x} name={context_name:?}: {e}");
+                e
+            })?;
+        info!("CTX_CREATE ctx={ctx_id} init={context_init:#x} name={context_name:?}");
         Ok(OkNoData)
     }
 
@@ -1047,7 +1051,12 @@ impl VirtioGpu {
         self.rutabaga
             .as_mut()
             .ok_or(ErrUnspec)?
-            .destroy_context(ctx_id)?;
+            .destroy_context(ctx_id)
+            .map_err(|e| {
+                warn!("CTX_DESTROY failed ctx={ctx_id}: {e}");
+                e
+            })?;
+        info!("CTX_DESTROY ctx={ctx_id}");
         Ok(OkNoData)
     }
 
@@ -1056,7 +1065,11 @@ impl VirtioGpu {
         self.rutabaga
             .as_mut()
             .ok_or(ErrUnspec)?
-            .context_attach_resource(ctx_id, resource_id)?;
+            .context_attach_resource(ctx_id, resource_id)
+            .map_err(|e| {
+                warn!("CTX_ATTACH_RESOURCE failed ctx={ctx_id} res={resource_id}: {e}");
+                e
+            })?;
         Ok(OkNoData)
     }
 
@@ -1065,7 +1078,11 @@ impl VirtioGpu {
         self.rutabaga
             .as_mut()
             .ok_or(ErrUnspec)?
-            .context_detach_resource(ctx_id, resource_id)?;
+            .context_detach_resource(ctx_id, resource_id)
+            .map_err(|e| {
+                warn!("CTX_DETACH_RESOURCE failed ctx={ctx_id} res={resource_id}: {e}");
+                e
+            })?;
         Ok(OkNoData)
     }
 

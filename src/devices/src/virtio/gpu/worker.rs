@@ -454,7 +454,10 @@ impl Worker {
                 let mut gpu_response = match resp {
                     Ok(gpu_response) => gpu_response,
                     Err(gpu_response) => {
-                        debug!("{gpu_cmd:?} -> {gpu_response:?}");
+                        // limina: error responses are load-bearing diagnostics (the guest sees
+                        // RESP_ERR and degrades silently — e.g. Firefox WebGL EGL_CREATE
+                        // failures); keep them visible at default log level.
+                        warn!("{gpu_cmd:?} -> {gpu_response:?}");
                         gpu_response
                     }
                 };
