@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -193,19 +193,40 @@ struct PresentFenceState {
     /// Cookies parked by the currently-executing flush command (consumed by the
     /// flush's trailing FLAG_FENCE, cleared on every flush).
     flush_parked_cookies: Vec<u64>,
-    /// Held guest fences, each waiting for its flush's cookies to present.
+    /// Held guest fences, each waiting for its flush's cookies to present (+latch).
     guest_holds: Vec<GuestFlushHold>,
-    /// Completes held fences after the latch delay (clone of the rutabaga fence
-    /// handler — it owns the desc-retirement bookkeeping).
+    /// Completes held fences after a delay (clone of the rutabaga fence handler —
+    /// it owns the desc-retirement bookkeeping). With shown acks this is only the
+    /// safety fallback; completion is idempotent.
     latch_tx: std::sync::mpsc::Sender<(std::time::Instant, RutabagaFence)>,
-    /// Present -> guest-visible-completion delay: covers the supervisor's display
-    /// timer tick (<=16.7ms) plus Core Animation's latch (<=16.7ms).
+    /// Present -> guest-visible-completion delay when there is NO ack channel:
+    /// covers the supervisor's display timer tick plus Core Animation's latch.
     latch_delay: std::time::Duration,
+
+    /// #8 leg 2 — supervisor "shown <id>" acks (the truthful CA latch boundary).
+    /// True when the ack reader thread is running; holds then complete on acks
+    /// (with `latch_tx` as a generous fallback) instead of the open-loop delay.
+    ack_active: bool,
+    /// Surface ids acked by the supervisor (reader thread -> worker via `event`).
+    shown: Arc<Mutex<Vec<u32>>>,
+    /// Presented-but-not-yet-acked frames in apply order: (iosurface_id, cookie).
+    /// An ack for id X confirms every entry up to and including the first X —
+    /// frames applied before X are certainly off glass once X latched.
+    awaiting_shown: std::collections::VecDeque<(u32, u64)>,
+    /// Completes ack-confirmed holds immediately (same handler the latch thread uses).
+    guest_fence_handler: RutabagaFenceHandler,
 }
 
 struct GuestFlushHold {
     fence: RutabagaFence,
-    cookies: std::collections::BTreeSet<u64>,
+    /// Cookies whose frames haven't presented yet.
+    unpresented: std::collections::BTreeSet<u64>,
+    /// Cookies presented but not yet latch-confirmed (ack or no-ack policy).
+    unconfirmed: std::collections::BTreeSet<u64>,
+    /// Safety fallback deadline (ack mode), set once all frames presented:
+    /// completion is idempotent, so the fallback and the ack path may both fire.
+    /// Past the deadline the hold is dropped (the latch thread completed it).
+    fallback_at: Option<std::time::Instant>,
 }
 
 struct ParkedFlush {
@@ -508,6 +529,47 @@ impl VirtioGpu {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(35);
+            // #8 leg 2: read the supervisor's "shown <id>" acks off the control
+            // socketpair (rendezvous'd via env by limina-vmm main). The display backend
+            // only ever writes that fd; the supervisor's acks are the only inbound
+            // bytes. The reader wakes the worker through the same present eventfd.
+            let shown: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let ack_active = if let Some(fd) = std::env::var("LIMINA_SHOWN_ACK_FD")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .filter(|fd| *fd >= 0)
+            {
+                let dup = unsafe { libc::dup(fd) };
+                if dup >= 0 {
+                    let shown = shown.clone();
+                    let wake = present_event.try_clone().expect("eventfd clone");
+                    std::thread::Builder::new()
+                        .name("gpu shown-ack".into())
+                        .spawn(move || {
+                            use std::io::BufRead;
+                            // SAFETY: we own `dup`.
+                            let file = unsafe { std::fs::File::from_raw_fd(dup) };
+                            for line in std::io::BufReader::new(file).lines() {
+                                let Ok(line) = line else { break };
+                                let mut parts = line.split_whitespace();
+                                if parts.next() == Some("shown") {
+                                    if let Some(id) =
+                                        parts.next().and_then(|s| s.parse::<u32>().ok())
+                                    {
+                                        shown.lock().unwrap().push(id);
+                                        let _ = wake.write(1);
+                                    }
+                                }
+                            }
+                            debug!("gpu shown-ack reader: channel closed");
+                        })
+                        .is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             PresentFenceState {
                 retired: present_retired,
                 event: present_event,
@@ -517,6 +579,10 @@ impl VirtioGpu {
                 guest_holds: Vec::new(),
                 latch_tx,
                 latch_delay: std::time::Duration::from_millis(latch_ms),
+                ack_active,
+                shown,
+                awaiting_shown: std::collections::VecDeque::new(),
+                guest_fence_handler: fence_handler.clone(),
             }
         });
 
@@ -1012,30 +1078,73 @@ impl VirtioGpu {
         // after the swap re-raises the event rather than getting lost.
         let _ = pf.event.read();
         let cookies = std::mem::take(&mut *pf.retired.lock().unwrap());
+        let shown_ids = std::mem::take(&mut *pf.shown.lock().unwrap());
         let mut hits: Vec<(u32, u32, Rect)> = Vec::new();
         for cookie in &cookies {
             if let Some(p) = pf.parked.remove(cookie) {
                 hits.push((p.scanout_id, p.iosurface_id, p.rect));
+                // limina (#8 half 2): the frame presents below (this same thread, before
+                // anything sleeps). With acks: confirmation comes from the supervisor's
+                // "shown"; without: presenting IS the confirmation (the open-loop latch
+                // delay supplies the margin).
+                for hold in pf.guest_holds.iter_mut() {
+                    hold.unpresented.remove(cookie);
+                    if !pf.ack_active {
+                        hold.unconfirmed.remove(cookie);
+                    }
+                }
+                if pf.ack_active {
+                    pf.awaiting_shown.push_back((p.iosurface_id, *cookie));
+                }
             }
         }
-        // limina (#8 half 2): release guest flush-fence holds whose frames have all
-        // retired; the latch thread completes them after the latch delay (present is
-        // about to happen below, on this same thread, before any sleep elapses).
-        for cookie in &cookies {
-            for hold in pf.guest_holds.iter_mut() {
-                hold.cookies.remove(cookie);
+        // Ack path: a shown(X) confirms every awaited frame up to and including the
+        // first X — anything applied before X is off glass once X latched.
+        for id in &shown_ids {
+            if !pf.awaiting_shown.iter().any(|(i, _)| i == id) {
+                continue; // ack for a frame we didn't park (2D path, toggle transitions)
+            }
+            while let Some((i, cookie)) = pf.awaiting_shown.pop_front() {
+                for hold in pf.guest_holds.iter_mut() {
+                    hold.unconfirmed.remove(&cookie);
+                }
+                if i == *id {
+                    break;
+                }
             }
         }
-        let deadline = std::time::Instant::now() + pf.latch_delay;
+        // Complete / arm holds. Completion is idempotent (watermark max + desc scan),
+        // so the ack path and the fallback may both fire harmlessly.
+        let now = std::time::Instant::now();
         let holds = std::mem::take(&mut pf.guest_holds);
-        for hold in holds {
-            if hold.cookies.is_empty() {
-                if let Err(e) = pf.latch_tx.send((deadline, hold.fence)) {
+        for mut hold in holds {
+            if hold.unconfirmed.is_empty() {
+                if pf.ack_active {
+                    // Acked = latched: complete immediately.
+                    pf.guest_fence_handler.call(hold.fence);
+                } else if let Err(e) = pf.latch_tx.send((now + pf.latch_delay, hold.fence)) {
                     error!("latch thread gone: {e}");
                 }
-            } else {
-                pf.guest_holds.push(hold);
+                continue;
             }
+            match hold.fallback_at {
+                // Fallback elapsed with acks still missing: the latch thread already
+                // completed the fence — drop the hold (lost-ack cleanup).
+                Some(t) if now > t => continue,
+                Some(_) => {}
+                None => {
+                    if pf.ack_active && hold.unpresented.is_empty() {
+                        // All frames presented, acks outstanding: arm the safety
+                        // fallback in case an ack is lost (gen collapse, dropped write).
+                        let fallback = now + std::time::Duration::from_millis(150);
+                        hold.fallback_at = Some(fallback);
+                        if let Err(e) = pf.latch_tx.send((fallback, hold.fence)) {
+                            error!("latch thread gone: {e}");
+                        }
+                    }
+                }
+            }
+            pf.guest_holds.push(hold);
         }
         for (scanout_id, iosurface_id, rect) in hits {
             // Rate-limited oracle: proves the fence-accurate path is live (a silent
@@ -1363,9 +1472,12 @@ impl VirtioGpu {
             if let Some(pf) = self.present_fence.as_mut() {
                 if !pf.flush_parked_cookies.is_empty() {
                     let cookies = std::mem::take(&mut pf.flush_parked_cookies);
+                    let set: std::collections::BTreeSet<u64> = cookies.into_iter().collect();
                     pf.guest_holds.push(GuestFlushHold {
                         fence: rutabaga_fence,
-                        cookies: cookies.into_iter().collect(),
+                        unpresented: set.clone(),
+                        unconfirmed: set,
+                        fallback_at: None,
                     });
                     return Ok(OkNoData);
                 }
