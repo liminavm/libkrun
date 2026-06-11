@@ -182,6 +182,30 @@ struct PresentFenceState {
     next_cookie: u64,
     /// cookie -> parked flush, bounded by in-flight fences (every cookie retires).
     parked: BTreeMap<u64, ParkedFlush>,
+
+    /// limina (#8 half 2) — guest flush-fence holds. The patched guest kernel fences
+    /// blob-scanout RESOURCE_FLUSH and dma_fence_wait()s it before completing the
+    /// commit (whose fake flip event paces mutter). We hold the flush's virtio
+    /// fence descriptor until the parked frame has been shown AND the compositor
+    /// latch window passed, then retire it via the regular fence handler — giving
+    /// the guest honest flip pacing and race-free buffer reuse.
+    ///
+    /// Cookies parked by the currently-executing flush command (consumed by the
+    /// flush's trailing FLAG_FENCE, cleared on every flush).
+    flush_parked_cookies: Vec<u64>,
+    /// Held guest fences, each waiting for its flush's cookies to present.
+    guest_holds: Vec<GuestFlushHold>,
+    /// Completes held fences after the latch delay (clone of the rutabaga fence
+    /// handler — it owns the desc-retirement bookkeeping).
+    latch_tx: std::sync::mpsc::Sender<(std::time::Instant, RutabagaFence)>,
+    /// Present -> guest-visible-completion delay: covers the supervisor's display
+    /// timer tick (<=16.7ms) plus Core Animation's latch (<=16.7ms).
+    latch_delay: std::time::Duration,
+}
+
+struct GuestFlushHold {
+    fence: RutabagaFence,
+    cookies: std::collections::BTreeSet<u64>,
 }
 
 struct ParkedFlush {
@@ -345,16 +369,10 @@ impl VirtioGpu {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn create_rutabaga(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
-        interrupt: InterruptTransport,
-        fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
         export_table: Option<ExportTable>,
-        present_retired: Arc<Mutex<Vec<u64>>>,
-        present_event: utils::eventfd::EventFd,
+        fence: RutabagaFenceHandler,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
             Ok(dir) => dir,
@@ -409,14 +427,6 @@ impl VirtioGpu {
             builder
         };
 
-        let fence = Self::create_fence_handler(
-            mem,
-            queue_ctl.clone(),
-            fence_state.clone(),
-            interrupt,
-            present_retired,
-            present_event,
-        );
         match builder.clone().build(fence.clone(), None) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -441,10 +451,19 @@ impl VirtioGpu {
         let fence_state = Arc::new(Mutex::new(Default::default()));
 
         // limina (#8): present-fence plumbing — built up front because the fence handler
-        // (created inside create_rutabaga) needs its endpoints.
+        // needs its endpoints.
         let present_retired: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let present_event = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK)
             .expect("failed to create present-fence eventfd");
+
+        let fence_handler = Self::create_fence_handler(
+            mem.clone(),
+            queue_ctl.clone(),
+            fence_state.clone(),
+            interrupt.clone(),
+            present_retired.clone(),
+            present_event.try_clone().expect("eventfd clone"),
+        );
 
         // limina software-2D-only mode: skip renderer init entirely (no virglrenderer/Metal).
         // Coexist mode (software_2d == false): try the (Venus) renderer for 3D while the
@@ -456,16 +475,8 @@ impl VirtioGpu {
         let rutabaga = if software_2d {
             None
         } else {
-            match Self::create_rutabaga(
-                mem.clone(),
-                queue_ctl.clone(),
-                interrupt.clone(),
-                fence_state.clone(),
-                virgl_flags,
-                export_table.clone(),
-                present_retired.clone(),
-                present_event.try_clone().expect("eventfd clone"),
-            ) {
+            match Self::create_rutabaga(virgl_flags, export_table.clone(), fence_handler.clone())
+            {
                 Some(rutabaga) => Some(rutabaga),
                 None => {
                     warn!("virtio-gpu: renderer init failed; degrading to software-2D (no 3D)");
@@ -474,11 +485,39 @@ impl VirtioGpu {
             }
         };
 
-        let present_fence = rutabaga.as_ref().map(|_| PresentFenceState {
-            retired: present_retired,
-            event: present_event,
-            next_cookie: 1,
-            parked: BTreeMap::new(),
+        // limina (#8 half 2): the latch thread completes held guest flush fences a fixed
+        // delay after their frames presented (supervisor tick + CA latch); completion
+        // goes through the regular fence handler, which owns desc retirement.
+        let present_fence = rutabaga.as_ref().map(|_| {
+            let (latch_tx, latch_rx) =
+                std::sync::mpsc::channel::<(std::time::Instant, RutabagaFence)>();
+            let latch_handler = fence_handler.clone();
+            std::thread::Builder::new()
+                .name("gpu latch".into())
+                .spawn(move || {
+                    while let Ok((deadline, fence)) = latch_rx.recv() {
+                        let now = std::time::Instant::now();
+                        if deadline > now {
+                            std::thread::sleep(deadline - now);
+                        }
+                        latch_handler.call(fence);
+                    }
+                })
+                .expect("failed to spawn gpu latch thread");
+            let latch_ms = std::env::var("LIMINA_FENCE_LATCH_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(35);
+            PresentFenceState {
+                retired: present_retired,
+                event: present_event,
+                next_cookie: 1,
+                parked: BTreeMap::new(),
+                flush_parked_cookies: Vec::new(),
+                guest_holds: Vec::new(),
+                latch_tx,
+                latch_delay: std::time::Duration::from_millis(latch_ms),
+            }
         });
 
         let display_backend = display_backend
@@ -820,6 +859,11 @@ impl VirtioGpu {
 
     /// If the resource is the scanout resource, flush it to the display.
     pub fn flush_resource(&mut self, resource_id: u32, rect: Rect) -> VirtioGpuResult {
+        // limina (#8 half 2): the parked-cookie list is per flush command — it feeds the
+        // flush's own trailing FLAG_FENCE and must never leak into a later command.
+        if let Some(pf) = self.present_fence.as_mut() {
+            pf.flush_parked_cookies.clear();
+        }
         if resource_id == 0 {
             return Ok(OkNoData);
         }
@@ -941,6 +985,8 @@ impl VirtioGpu {
                 rect: *rect,
             },
         );
+        // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
+        pf.flush_parked_cookies.push(cookie);
 
         let fence = RutabagaFence {
             flags: RUTABAGA_FLAG_FENCE | RUTABAGA_FLAG_INFO_RING_IDX,
@@ -967,9 +1013,28 @@ impl VirtioGpu {
         let _ = pf.event.read();
         let cookies = std::mem::take(&mut *pf.retired.lock().unwrap());
         let mut hits: Vec<(u32, u32, Rect)> = Vec::new();
-        for cookie in cookies {
-            if let Some(p) = pf.parked.remove(&cookie) {
+        for cookie in &cookies {
+            if let Some(p) = pf.parked.remove(cookie) {
                 hits.push((p.scanout_id, p.iosurface_id, p.rect));
+            }
+        }
+        // limina (#8 half 2): release guest flush-fence holds whose frames have all
+        // retired; the latch thread completes them after the latch delay (present is
+        // about to happen below, on this same thread, before any sleep elapses).
+        for cookie in &cookies {
+            for hold in pf.guest_holds.iter_mut() {
+                hold.cookies.remove(cookie);
+            }
+        }
+        let deadline = std::time::Instant::now() + pf.latch_delay;
+        let holds = std::mem::take(&mut pf.guest_holds);
+        for hold in holds {
+            if hold.cookies.is_empty() {
+                if let Err(e) = pf.latch_tx.send((deadline, hold.fence)) {
+                    error!("latch thread gone: {e}");
+                }
+            } else {
+                pf.guest_holds.push(hold);
             }
         }
         for (scanout_id, iosurface_id, rect) in hits {
@@ -1279,8 +1344,37 @@ impl VirtioGpu {
     }
 
     /// Creates a fence with the RutabagaFence that can be used to determine when the previous
-    /// command completed.
-    pub fn create_fence(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
+    /// command completed. `is_flush` marks the fence as trailing a RESOURCE_FLUSH —
+    /// the only command whose fence may be held for fence-accurate presents.
+    pub fn create_fence(
+        &mut self,
+        rutabaga_fence: RutabagaFence,
+        is_flush: bool,
+    ) -> VirtioGpuResult {
+        // limina (#8 half 2): a fenced flush whose frames were parked — hold the guest
+        // fence until those frames have presented + the latch delay. The descriptor
+        // parks in process_fence (watermark untouched); the latch thread retires it
+        // through the regular fence handler. The patched guest kernel's
+        // dma_fence_wait on this fence is what holds the commit (and the fake flip
+        // event), pacing mutter honestly and keeping the buffer unwritten while CA
+        // still samples it.
+        let context_ring = rutabaga_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0;
+        if is_flush && !context_ring {
+            if let Some(pf) = self.present_fence.as_mut() {
+                if !pf.flush_parked_cookies.is_empty() {
+                    let cookies = std::mem::take(&mut pf.flush_parked_cookies);
+                    pf.guest_holds.push(GuestFlushHold {
+                        fence: rutabaga_fence,
+                        cookies: cookies.into_iter().collect(),
+                    });
+                    return Ok(OkNoData);
+                }
+            }
+        }
+        self.create_fence_inner(rutabaga_fence)
+    }
+
+    fn create_fence_inner(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
         // Route the fence by ring. Software-2D (Global-ring) commands finish synchronously
         // before their response is encoded, so the fence is already signaled by the time we
         // get here: record it as completed up-front and let process_fence() retire the
