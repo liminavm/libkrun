@@ -483,7 +483,7 @@ impl Worker {
                     let mut ctx_id = 0;
                     let mut flags = 0;
                     let mut ring_idx = 0;
-                    if let Some(_cmd) = gpu_cmd {
+                    if let Some(cmd) = gpu_cmd {
                         let ctrl_hdr = ctrl_hdr.unwrap();
                         if ctrl_hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
                             flags = ctrl_hdr.flags;
@@ -497,7 +497,10 @@ impl Worker {
                                 ctx_id,
                                 ring_idx,
                             };
-                            gpu_response = match virtio_gpu.create_fence(fence) {
+                            // limina (#8 half 2): only a flush's fence may be held for
+                            // fence-accurate presents.
+                            let is_flush = matches!(cmd, GpuCommand::ResourceFlush(_));
+                            gpu_response = match virtio_gpu.create_fence(fence, is_flush) {
                                 Ok(_) => gpu_response,
                                 Err(fence_resp) => {
                                     warn!("create_fence {fence_id} -> {fence_resp:?}");
