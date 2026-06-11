@@ -115,6 +115,9 @@ impl Worker {
         let control_ev_fd = self.control_evt.as_raw_fd();
         let cursor_ev_fd = self.cursor_evt.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
+        // limina (#8): retired present fences wake this fd; -1 (never matched) when
+        // the renderer is absent.
+        let present_ev_fd = virtio_gpu.present_event_fd().unwrap_or(-1);
 
         let mut epoll = Epoll::new().unwrap();
         let _ = epoll.ctl(
@@ -132,6 +135,13 @@ impl Worker {
             stop_ev_fd,
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
+        if present_ev_fd >= 0 {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                present_ev_fd,
+                &EpollEvent::new(EventSet::IN, present_ev_fd as u64),
+            );
+        }
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
@@ -170,6 +180,10 @@ impl Worker {
                             error!("Error signaling cursor queue: {e:?}");
                         }
                     }
+                }
+                // limina (#8): present fences retired — show their parked frames.
+                if present_ev_fd >= 0 && source == present_ev_fd {
+                    virtio_gpu.process_retired_presents();
                 }
             }
         }
