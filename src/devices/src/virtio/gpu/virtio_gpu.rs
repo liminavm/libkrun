@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
-#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,7 +30,8 @@ use rutabaga_gfx::{
     RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
 };
 use rutabaga_gfx::{
-    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
+    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_FLAG_FENCE, RUTABAGA_FLAG_INFO_RING_IDX,
+    RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
     Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec,
     Transfer3D,
 };
@@ -136,6 +136,9 @@ struct VirtioGpuResource {
     size: u64, // only for blob resources
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
+    /// limina (#8): the context that created this resource (blob resources only;
+    /// 0 = none). A scanout flush injects its present fence on this context.
+    ctx_id: u32,
 }
 
 impl VirtioGpuResource {
@@ -157,9 +160,40 @@ impl VirtioGpuResource {
             format,
             shmem_offset: None,
             rutabaga_external_mapping: false,
+            ctx_id: 0,
         }
     }
 }
+
+/// limina fence-accurate presents (#8/#31): state for deferring zero-copy scanout
+/// presents until the guest's GPU work completes. A flush parks the frame here and
+/// injects a fence on the context's reserved present ring (vkr ring 63); the fence
+/// handler pushes the retired cookie + kicks `event`; the worker drains it on its
+/// epoll and presents. Parked frames are keyed by cookie and EVERY one presents on
+/// its own retirement (retirement is in flush order per context, so presents stay
+/// chronological — merely latency-shifted). Never drop a parked frame in favor of
+/// a newer one: if GPU latency exceeds the flip interval, dropping would starve
+/// the display forever.
+struct PresentFenceState {
+    /// Cookies retired by the fence handler (vkr sync threads) awaiting present.
+    retired: Arc<Mutex<Vec<u64>>>,
+    /// Wakes the worker epoll when `retired` gains entries.
+    event: utils::eventfd::EventFd,
+    next_cookie: u64,
+    /// cookie -> parked flush, bounded by in-flight fences (every cookie retires).
+    parked: BTreeMap<u64, ParkedFlush>,
+}
+
+struct ParkedFlush {
+    scanout_id: u32,
+    iosurface_id: u32,
+    rect: Rect,
+}
+
+/// The reserved vkr fence ring for present fences (mirrors VKR_LIMINA_PRESENT_RING in
+/// our virglrenderer fork). Guest fences never use it — a guest process would need
+/// 63 concurrent VkQueues.
+const LIMINA_PRESENT_RING: u8 = 63;
 
 pub struct VirtioGpuScanout {
     resource_id: u32,
@@ -231,6 +265,8 @@ pub struct VirtioGpu {
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackendInstance,
+    /// limina (#8): present-fence state; `None` when the renderer is absent.
+    present_fence: Option<PresentFenceState>,
 }
 
 impl VirtioGpu {
@@ -239,12 +275,31 @@ impl VirtioGpu {
         queue_ctl: Arc<Mutex<VirtQueue>>,
         fence_state: Arc<Mutex<FenceState>>,
         interrupt: InterruptTransport,
+        present_retired: Arc<Mutex<Vec<u64>>>,
+        present_event: utils::eventfd::EventFd,
     ) -> RutabagaFenceHandler {
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
             debug!(
                 "XXX - fence called: id={}, ring_idx={}",
                 completed_fence.fence_id, completed_fence.ring_idx
             );
+
+            // limina (#8): a fence on the reserved present ring is host-injected — it
+            // carries a parked-present cookie, not a guest fence id. Hand it to the
+            // worker thread (which owns the display backend) and stay clear of the
+            // guest fence bookkeeping below.
+            if completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0
+                && completed_fence.ring_idx == LIMINA_PRESENT_RING
+            {
+                present_retired
+                    .lock()
+                    .unwrap()
+                    .push(completed_fence.fence_id);
+                if let Err(e) = present_event.write(1) {
+                    error!("present fence eventfd write failed: {e}");
+                }
+                return;
+            }
 
             let mut queue = queue_ctl.lock().unwrap();
             let mut fence_state = fence_state.lock().unwrap();
@@ -290,6 +345,7 @@ impl VirtioGpu {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_rutabaga(
         mem: GuestMemoryMmap,
         queue_ctl: Arc<Mutex<VirtQueue>>,
@@ -297,6 +353,8 @@ impl VirtioGpu {
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
         export_table: Option<ExportTable>,
+        present_retired: Arc<Mutex<Vec<u64>>>,
+        present_event: utils::eventfd::EventFd,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
             Ok(dir) => dir,
@@ -351,8 +409,14 @@ impl VirtioGpu {
             builder
         };
 
-        let fence =
-            Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
+        let fence = Self::create_fence_handler(
+            mem,
+            queue_ctl.clone(),
+            fence_state.clone(),
+            interrupt,
+            present_retired,
+            present_event,
+        );
         match builder.clone().build(fence.clone(), None) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -376,6 +440,12 @@ impl VirtioGpu {
     ) -> Self {
         let fence_state = Arc::new(Mutex::new(Default::default()));
 
+        // limina (#8): present-fence plumbing — built up front because the fence handler
+        // (created inside create_rutabaga) needs its endpoints.
+        let present_retired: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let present_event = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK)
+            .expect("failed to create present-fence eventfd");
+
         // limina software-2D-only mode: skip renderer init entirely (no virglrenderer/Metal).
         // Coexist mode (software_2d == false): try the (Venus) renderer for 3D while the
         // software-2D path keeps serving 2D/scanout. If the renderer fails to init, degrade
@@ -393,6 +463,8 @@ impl VirtioGpu {
                 fence_state.clone(),
                 virgl_flags,
                 export_table.clone(),
+                present_retired.clone(),
+                present_event.try_clone().expect("eventfd clone"),
             ) {
                 Some(rutabaga) => Some(rutabaga),
                 None => {
@@ -401,6 +473,13 @@ impl VirtioGpu {
                 }
             }
         };
+
+        let present_fence = rutabaga.as_ref().map(|_| PresentFenceState {
+            retired: present_retired,
+            event: present_event,
+            next_cookie: 1,
+            parked: BTreeMap::new(),
+        });
 
         let display_backend = display_backend
             .create_instance()
@@ -416,6 +495,7 @@ impl VirtioGpu {
             display_backend,
             #[cfg(target_os = "macos")]
             map_sender,
+            present_fence,
         }
     }
 
@@ -687,7 +767,8 @@ impl VirtioGpu {
             .and_then(|r| r.iosurface_id(resource_id).ok())
             .filter(|&id| id != 0);
         if let Some(id) = iosurface_id {
-            log::info!(
+            // Per-flip (mutter alternates swapchain buffers every frame) — debug, not info.
+            log::debug!(
                 "SET_SCANOUT_BLOB scanout={scanout_id} res={resource_id} -> IOSurface {id} (zero-copy)"
             );
         } else {
@@ -752,13 +833,13 @@ impl VirtioGpu {
             // limina tier-2: an IOSurface-backed SET_SCANOUT_BLOB scanout is presented zero-copy
             // (venus already rendered into the IOSurface) — no alloc_frame, no readback.
             #[cfg(target_os = "macos")]
-            {
+            if log::log_enabled!(log::Level::Debug) {
                 let dbg_ios = self
                     .scanouts
                     .get(scanout_id as usize)
                     .and_then(|s| s.as_ref())
                     .and_then(|s| s.iosurface_id);
-                log::info!("[FLUSHDBG] flush res={resource_id} scanout={scanout_id} iosurface_id={dbg_ios:?}");
+                log::debug!("[FLUSHDBG] flush res={resource_id} scanout={scanout_id} iosurface_id={dbg_ios:?}");
             }
             #[cfg(target_os = "macos")]
             if let Some(iosurface_id) = self
@@ -767,6 +848,13 @@ impl VirtioGpu {
                 .and_then(|s| s.as_ref())
                 .and_then(|s| s.iosurface_id)
             {
+                // limina (#8): fence-accurate present — park the frame and inject a
+                // present fence on the rendering context; the worker presents when it
+                // retires (true GPU completion). Falls through to the immediate
+                // present if parking isn't possible.
+                if self.try_park_present(scanout_id, iosurface_id, &rect, resource.ctx_id) {
+                    continue;
+                }
                 match self
                     .display_backend
                     .present_surface(scanout_id, iosurface_id, Some(&rect))
@@ -814,6 +902,96 @@ impl VirtioGpu {
         }
 
         Ok(OkNoData)
+    }
+
+    /// limina (#8): true when fence-accurate presents are armed (env for the whole
+    /// run, marker file for live A/B within a session).
+    fn fence_present_enabled() -> bool {
+        std::env::var_os("LIMINA_FENCE_PRESENT").is_some()
+            || std::fs::metadata("/tmp/limina-fence-present").is_ok()
+    }
+
+    /// limina (#8): park a zero-copy scanout flush and inject a present fence on the
+    /// rendering context's reserved ring. Returns false when the frame must be
+    /// presented immediately instead (knob off, no renderer, unknown context, or
+    /// the injection failed).
+    #[cfg(target_os = "macos")]
+    fn try_park_present(
+        &mut self,
+        scanout_id: u32,
+        iosurface_id: u32,
+        rect: &Rect,
+        ctx_id: u32,
+    ) -> bool {
+        if ctx_id == 0 || !Self::fence_present_enabled() {
+            return false;
+        }
+        let (Some(pf), Some(rutabaga)) = (self.present_fence.as_mut(), self.rutabaga.as_mut())
+        else {
+            return false;
+        };
+
+        let cookie = pf.next_cookie;
+        pf.next_cookie += 1;
+        pf.parked.insert(
+            cookie,
+            ParkedFlush {
+                scanout_id,
+                iosurface_id,
+                rect: *rect,
+            },
+        );
+
+        let fence = RutabagaFence {
+            flags: RUTABAGA_FLAG_FENCE | RUTABAGA_FLAG_INFO_RING_IDX,
+            fence_id: cookie,
+            ctx_id,
+            ring_idx: LIMINA_PRESENT_RING,
+        };
+        if let Err(e) = rutabaga.create_fence(fence) {
+            warn!("present fence injection failed (ctx {ctx_id}): {e}; presenting now");
+            self.present_fence.as_mut().unwrap().parked.remove(&cookie);
+            return false;
+        }
+        true
+    }
+
+    /// limina (#8): drain retired present-fence cookies and present their parked
+    /// frames. Runs on the worker thread (epoll on the present eventfd).
+    pub fn process_retired_presents(&mut self) {
+        let Some(pf) = self.present_fence.as_mut() else {
+            return;
+        };
+        // Drain the eventfd (level cleared) before the cookies so a cookie pushed
+        // after the swap re-raises the event rather than getting lost.
+        let _ = pf.event.read();
+        let cookies = std::mem::take(&mut *pf.retired.lock().unwrap());
+        let mut hits: Vec<(u32, u32, Rect)> = Vec::new();
+        for cookie in cookies {
+            if let Some(p) = pf.parked.remove(&cookie) {
+                hits.push((p.scanout_id, p.iosurface_id, p.rect));
+            }
+        }
+        for (scanout_id, iosurface_id, rect) in hits {
+            // Rate-limited oracle: proves the fence-accurate path is live (a silent
+            // fallback to immediate presents would otherwise look identical).
+            static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 512 == 0 {
+                log::info!("[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})");
+            }
+            if let Err(e) =
+                self.display_backend
+                    .present_surface(scanout_id, iosurface_id, Some(&rect))
+            {
+                error!("deferred present_surface failed for scanout {scanout_id}: {e}");
+            }
+        }
+    }
+
+    /// limina (#8): the eventfd the worker should poll for retired present fences.
+    pub fn present_event_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.present_fence.as_ref().map(|pf| pf.event.as_raw_fd())
     }
 
     /// limina: render the guest hardware cursor as a host overlay (`VIRTIO_GPU_CMD_UPDATE_CURSOR`).
@@ -1175,7 +1353,11 @@ impl VirtioGpu {
                 None,
             )?;
 
-        let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
+        let mut resource =
+            VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
+        // limina (#8): remember the rendering context so a scanout flush of this blob
+        // can inject its present fence there.
+        resource.ctx_id = ctx_id;
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
