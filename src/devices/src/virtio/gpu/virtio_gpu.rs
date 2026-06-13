@@ -320,12 +320,26 @@ pub struct VirtioGpu {
     present_fence: Option<PresentFenceState>,
 }
 
+/// The per-activation transport the fence handler retires guest fences into.
+///
+/// limina (renderer-singleton fix): `virgl_renderer_init` is a process-global, init-once,
+/// thread-bound singleton, so the `Rutabaga`/renderer (and the fence handler registered into
+/// it) must outlive any single device activation. But the control queue, guest memory, and
+/// interrupt are recreated on every `activate()` (driver rebind, EFI→kernel hand-off, reboot).
+/// So the long-lived fence handler reaches them indirectly through a shared cell the worker
+/// swaps on each activate and clears on reset; `None` means the device is currently inactive
+/// (a fence that completes in that window has nothing to retire into). See `worker.rs`.
+#[derive(Clone)]
+pub(crate) struct GpuActivation {
+    pub(crate) mem: GuestMemoryMmap,
+    pub(crate) control_queue: Arc<Mutex<VirtQueue>>,
+    pub(crate) interrupt: InterruptTransport,
+}
+
 impl VirtioGpu {
     fn create_fence_handler(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
+        active: Arc<Mutex<Option<GpuActivation>>>,
         fence_state: Arc<Mutex<FenceState>>,
-        interrupt: InterruptTransport,
         present_retired: Arc<Mutex<Vec<u64>>>,
         present_event: utils::eventfd::EventFd,
     ) -> RutabagaFenceHandler {
@@ -352,7 +366,19 @@ impl VirtioGpu {
                 return;
             }
 
-            let mut queue = queue_ctl.lock().unwrap();
+            // Retire the guest fence into the *current* activation's queue. If the device is
+            // inactive (between reset and re-activate), there's nothing to retire into — drop
+            // it (the descriptors it would have retired were cleared by `reset_session`).
+            let Some(GpuActivation {
+                mem,
+                control_queue,
+                interrupt,
+            }) = active.lock().unwrap().clone()
+            else {
+                return;
+            };
+
+            let mut queue = control_queue.lock().unwrap();
             let mut fence_state = fence_state.lock().unwrap();
             let mut i = 0;
 
@@ -465,9 +491,7 @@ impl VirtioGpu {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
-        interrupt: InterruptTransport,
+        active: Arc<Mutex<Option<GpuActivation>>>,
         virgl_flags: u32,
         software_2d: bool,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
@@ -483,11 +507,12 @@ impl VirtioGpu {
         let present_event = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK)
             .expect("failed to create present-fence eventfd");
 
+        // limina (renderer-singleton fix): the handler is registered into the process-global
+        // renderer once and lives as long as it does, so it reaches the per-activation queue/
+        // mem/interrupt through `active` rather than capturing them directly.
         let fence_handler = Self::create_fence_handler(
-            mem.clone(),
-            queue_ctl.clone(),
+            active,
             fence_state.clone(),
-            interrupt.clone(),
             present_retired.clone(),
             present_event.try_clone().expect("eventfd clone"),
         );
@@ -502,8 +527,7 @@ impl VirtioGpu {
         let rutabaga = if software_2d {
             None
         } else {
-            match Self::create_rutabaga(virgl_flags, export_table.clone(), fence_handler.clone())
-            {
+            match Self::create_rutabaga(virgl_flags, export_table.clone(), fence_handler.clone()) {
                 Some(rutabaga) => Some(rutabaga),
                 None => {
                     warn!("virtio-gpu: renderer init failed; degrading to software-2D (no 3D)");
@@ -607,6 +631,43 @@ impl VirtioGpu {
             #[cfg(target_os = "macos")]
             map_sender,
             present_fence,
+        }
+    }
+
+    /// limina (renderer-singleton fix): reset the per-VM-session bookkeeping on a device reset,
+    /// while **keeping** the process-global renderer (`rutabaga`), the display backend, and the
+    /// present-fence infrastructure alive. The guest re-initializes virtio-gpu from scratch
+    /// (driver rebind, EFI→kernel hand-off, reboot), so our resource/scanout maps must start
+    /// empty; critically, any in-flight fence descriptors index into the now-freed control
+    /// queue and MUST NOT be retired into the next activation's queue. (Resources the guest
+    /// owned in the renderer are released by its own CTX_DESTROY/RESOURCE_UNREF before the
+    /// reset; a guest that resets dirty is a separate, narrower concern.)
+    pub fn reset_session(&mut self) {
+        self.resources.clear();
+        self.sw2d.clear();
+        self.scanouts = Default::default();
+        // Dirty-reset hardening: a guest that crashed (or a firmware→kernel hand-off) never sent
+        // CTX_DESTROY/RESOURCE_UNREF, so its contexts/resources survive in the process-global
+        // renderer and collide with the re-initialized guest's reused ids — InvalidContextId /
+        // InvalidResourceId, which cascade-crashes the recovering session's GPU clients. Drop that
+        // leaked per-session renderer state so the next session starts clean. (A *clean* reset
+        // already emptied these via the guest's own teardown, so this is a no-op there.)
+        if let Some(rutabaga) = self.rutabaga.as_mut() {
+            rutabaga.reset_session_state();
+        }
+        {
+            let mut fs = self.fence_state.lock().unwrap();
+            fs.descs.clear();
+            fs.completed_fences.clear();
+        }
+        if let Some(pf) = self.present_fence.as_mut() {
+            // Drop parked frames and held flush fences: their cookies/descriptors belong to the
+            // freed queue. Keep the retired/event/latch/ack plumbing (tied to the renderer).
+            pf.parked.clear();
+            pf.flush_parked_cookies.clear();
+            pf.guest_holds.clear();
+            pf.awaiting_shown.clear();
+            pf.retired.lock().unwrap().clear();
         }
     }
 
@@ -1917,15 +1978,24 @@ mod test {
         // park the descriptor with no handler to ever wake it.
         {
             let st = fence_state.lock().unwrap();
-            let completed = *st.completed_fences.get(&VirtioGpuRing::Global).unwrap_or(&0);
-            assert!(fence.fence_id > completed, "precondition: fence not yet complete");
+            let completed = *st
+                .completed_fences
+                .get(&VirtioGpuRing::Global)
+                .unwrap_or(&0);
+            assert!(
+                fence.fence_id > completed,
+                "precondition: fence not yet complete"
+            );
         }
 
         mark_fence_completed_sync(&fence_state, &fence);
 
         // After: the watermark covers the fence, so process_fence() retires it now.
         let st = fence_state.lock().unwrap();
-        let completed = *st.completed_fences.get(&VirtioGpuRing::Global).unwrap_or(&0);
+        let completed = *st
+            .completed_fences
+            .get(&VirtioGpuRing::Global)
+            .unwrap_or(&0);
         assert!(
             fence.fence_id <= completed,
             "software-2D fence must be marked completed synchronously"
