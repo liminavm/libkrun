@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REBOOT};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
@@ -411,6 +411,10 @@ impl Vcpu {
                     info!("vCPU {vcpuid} received shutdown signal");
                     Ok(VcpuEmulation::Stopped)
                 }
+                VcpuExit::Reset => {
+                    info!("vCPU {vcpuid} received reboot (PSCI SYSTEM_RESET)");
+                    Ok(VcpuEmulation::Rebooted)
+                }
                 VcpuExit::SystemRegister => {
                     debug!("vCPU {vcpuid} accessed a system register");
                     Ok(VcpuEmulation::Handled)
@@ -482,9 +486,16 @@ impl Vcpu {
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
                 }
-                // The guest was rebooted or halted.
+                // The guest halted / powered off (PSCI SYSTEM_OFF).
                 Ok(VcpuEmulation::Stopped) => {
                     self.exit(FC_EXIT_CODE_OK);
+                    break;
+                }
+                // The guest asked to reboot (PSCI SYSTEM_RESET). libkrun is single-shot, so we
+                // still tear the worker down — but with a distinct exit code so the supervisor
+                // can relaunch us (a fresh boot) instead of treating it as a clean power-off.
+                Ok(VcpuEmulation::Rebooted) => {
+                    self.exit(FC_EXIT_CODE_REBOOT);
                     break;
                 }
                 // Emulation errors lead to vCPU exit.
@@ -639,6 +650,7 @@ enum VcpuEmulation {
     Handled,
     Interrupted,
     Stopped,
+    Rebooted,
     WaitForEvent,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
