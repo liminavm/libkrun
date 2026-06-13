@@ -1013,6 +1013,32 @@ impl Rutabaga {
         Ok(())
     }
 
+    /// limina (dirty-reset hardening): drop ALL live contexts and resources without tearing down
+    /// the process-global renderer/components or capset state. On a *dirty* virtio-gpu device
+    /// reset — a guest compositor that crashed mid-teardown (the reset to device-status 0 races
+    /// the in-flight `CTX_DESTROY`s and they never drain), or a firmware→kernel hand-off — the
+    /// guest's contexts/resources survive in this init-once singleton renderer. The re-initialized
+    /// guest then re-creates contexts/resources with the same ids it re-assigns from zero, which
+    /// collide with the leaked ids: `create_context` / `resource_create_*` hit their
+    /// `contains_key` guards and fail (`InvalidContextId` / `InvalidResourceId`), cascade-crashing
+    /// the recovering session's GPU clients. Clearing here lets the next session start as clean as
+    /// a fresh boot. Must run on the renderer's own thread-bound thread — `reset_session` does.
+    /// (On a *clean* reset both maps are already empty, so this is a no-op.)
+    pub fn reset_session_state(&mut self) {
+        // Contexts first — the field drop order is contexts-before-resources, and a context may
+        // reference attached resources. `destroy_context` is just a map removal (the GPU-side
+        // context tears down in the `Box<dyn RutabagaContext>` Drop), so `clear()` is identical to
+        // destroying every context.
+        self.contexts.clear();
+        // Resources need the component notified too (`unref_resource` removes from the map AND
+        // calls `component.unref_resource`); a bare `clear()` would leak the renderer-side
+        // resource. Snapshot the ids first to avoid borrowing `self.resources` while we mutate it.
+        let resource_ids: Vec<u32> = self.resources.keys().copied().collect();
+        for resource_id in resource_ids {
+            let _ = self.unref_resource(resource_id);
+        }
+    }
+
     /// Attaches the resource given by `resource_id` to the context given by `ctx_id`.
     pub fn context_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> RutabagaResult<()> {
         // In limina's coexist GPU mode the 2D scanout resources (the boot framebuffer, fbcon)
