@@ -602,11 +602,14 @@ impl Vcpu {
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
                 }
+                // The guest asked to reboot (PSCI SYSTEM_RESET). libkrun is single-shot, so we
+                // still tear the worker down, and the VMM picks an exit code the supervisor can
+                // tell apart from a clean power-off (`DEFAULT_RESET_EXIT_CODE`).
                 Ok(VcpuEmulation::Reset) => {
                     self.exit(VcpuResponse::Reset);
                     break;
                 }
-                // The guest was halted.
+                // The guest halted / powered off (PSCI SYSTEM_OFF).
                 Ok(VcpuEmulation::Stopped) => {
                     self.exit(VcpuResponse::Exited(FC_EXIT_CODE_OK));
                     break;
