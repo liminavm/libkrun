@@ -1,4 +1,6 @@
 use std::io::Write;
+use std::sync::mpsc::Sender as CmdSender;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 #[cfg(target_os = "macos")]
@@ -13,7 +15,8 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
-use super::worker::Worker;
+use super::virtio_gpu::GpuActivation;
+use super::worker::{Worker, WorkerCmd};
 use crate::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
@@ -52,9 +55,13 @@ pub struct Gpu {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
-    /// Handle to the running worker thread, present only while activated.
+    /// The long-lived gpu worker thread. Spawned once (on first `activate()`) and kept across
+    /// resets — it owns the process-global, thread-bound renderer for the whole VMM lifetime.
+    /// Joined on `Drop`. See [`WorkerCmd`].
     worker_thread: Option<JoinHandle<()>>,
-    /// Signals the worker to exit so it can be joined on reset/re-activation.
+    /// Sends activate/deactivate/shutdown commands to the worker; `None` until first activate.
+    worker_tx: Option<CmdSender<WorkerCmd>>,
+    /// Wakes the worker's inner epoll loop when a command is queued (reset / Drop).
     worker_stopfd: EventFd,
 }
 
@@ -83,6 +90,7 @@ impl Gpu {
             displays,
             display_backend,
             worker_thread: None,
+            worker_tx: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?,
         })
     }
@@ -217,11 +225,6 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        if self.worker_thread.is_some() {
-            // reset() must have joined the previous worker before re-activation.
-            panic!("virtio_gpu: worker thread already exists");
-        }
-
         let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
@@ -230,27 +233,53 @@ impl VirtioDevice for Gpu {
             ActivateError::BadActivate
         })?;
 
-        let shm_region = match self.shm_region.as_ref() {
-            Some(s) => s.clone(),
-            None => panic!("virtio_gpu: missing SHM region"),
+        // Spawn the worker ONCE, on the first activation. It owns the process-global,
+        // thread-bound renderer for the whole VMM lifetime; later activations (driver rebind,
+        // EFI→kernel hand-off, reboot) reuse the same thread+renderer and just rebind transport.
+        // This is the renderer-singleton fix: `virgl_renderer_init` can't be re-run, so we must
+        // never drop+recreate the renderer on reset.
+        let tx = match &self.worker_tx {
+            Some(tx) => tx,
+            None => {
+                let shm_region = match self.shm_region.as_ref() {
+                    Some(s) => s.clone(),
+                    None => panic!("virtio_gpu: missing SHM region"),
+                };
+                let (tx, rx) = std::sync::mpsc::channel();
+                let active: Arc<Mutex<Option<GpuActivation>>> = Arc::new(Mutex::new(None));
+                let worker = Worker::new(
+                    shm_region,
+                    self.virgl_flags,
+                    self.software_2d,
+                    self.worker_stopfd.try_clone().unwrap(),
+                    rx,
+                    active,
+                    #[cfg(target_os = "macos")]
+                    self.map_sender.clone(),
+                    self.export_table.take(),
+                    self.displays.clone(),
+                    self.display_backend,
+                );
+                self.worker_thread = Some(worker.run());
+                self.worker_tx = Some(tx);
+                self.worker_tx.as_ref().unwrap()
+            }
         };
 
-        let worker = Worker::new(
-            control_q,
-            cursor_q,
-            mem.clone(),
-            interrupt.clone(),
-            shm_region,
-            self.virgl_flags,
-            self.software_2d,
-            self.worker_stopfd.try_clone().unwrap(),
-            #[cfg(target_os = "macos")]
-            self.map_sender.clone(),
-            self.export_table.take(),
-            self.displays.clone(),
-            self.display_backend,
-        );
-        self.worker_thread = Some(worker.run());
+        // Bind this activation's transport. The worker is in its outer recv() (first activate)
+        // or just deactivated, so a plain send wakes it — no stop_fd kick needed here.
+        if tx
+            .send(WorkerCmd::Activate {
+                mem: mem.clone(),
+                control_q,
+                cursor_q,
+                interrupt: interrupt.clone(),
+            })
+            .is_err()
+        {
+            error!("virtio_gpu: worker thread is gone; cannot activate");
+            return Err(ActivateError::BadActivate);
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 
@@ -262,15 +291,14 @@ impl VirtioDevice for Gpu {
     }
 
     fn reset(&mut self) -> bool {
-        // Stop and join the worker so a stale thread doesn't keep running on the old queue
-        // when the guest re-initializes the device (firmware -> kernel hand-off, driver
-        // rebind, reboot). Returning true lets the transport recreate the queues and a later
-        // activate() spawn a fresh worker.
-        if let Some(worker) = self.worker_thread.take() {
+        // Tell the worker to stop servicing the (about-to-be-freed) queues and drop this
+        // session's bookkeeping, WITHOUT tearing down the renderer — so the guest's re-init
+        // (firmware→kernel hand-off, driver rebind, reboot) gets a fresh device backed by the
+        // same long-lived renderer instead of a failed second `virgl_renderer_init`. The
+        // stop_fd kick wakes the worker's inner epoll loop to pick up the queued command.
+        if let Some(tx) = &self.worker_tx {
+            let _ = tx.send(WorkerCmd::Deactivate);
             let _ = self.worker_stopfd.write(1);
-            if let Err(e) = worker.join() {
-                error!("error waiting for gpu worker thread: {e:?}");
-            }
         }
         self.device_state = DeviceState::Inactive;
         true
@@ -279,6 +307,23 @@ impl VirtioDevice for Gpu {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         debug!("virtio_gpu: GET_shm_region");
         self.shm_region.as_ref()
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        // Reap the long-lived worker thread (it isn't joined on reset anymore). Closing the
+        // command channel would also end it, but the explicit Shutdown + stop_fd kick wakes it
+        // promptly whether it's parked in recv() or its inner epoll loop.
+        if let Some(tx) = self.worker_tx.take() {
+            let _ = tx.send(WorkerCmd::Shutdown);
+            let _ = self.worker_stopfd.write(1);
+        }
+        if let Some(worker) = self.worker_thread.take() {
+            if let Err(e) = worker.join() {
+                error!("error waiting for gpu worker thread: {e:?}");
+            }
+        }
     }
 }
 
@@ -356,12 +401,15 @@ mod tests {
         .unwrap()
     }
 
-    /// Re-activating virtio-gpu (firmware -> kernel hand-off, driver rebind, reboot) must not
-    /// leave the previous worker thread running on the stale queue. `reset()` must stop+join
-    /// the worker and return true so a fresh `activate()` can spawn a new one. If the stop
-    /// signal were broken, `reset()`'s `join()` would hang and this test would time out.
+    /// The renderer-singleton fix: `virgl_renderer_init` can't be re-run, so the worker (which
+    /// owns the renderer) must be spawned ONCE and **persist** across resets — `activate()`/
+    /// `reset()` just bind/unbind the transport. This asserts that lifecycle: the worker thread
+    /// is created on first activate, survives a reset (not joined), and re-activates without a
+    /// second spawn; `Drop` then joins it cleanly (a deadlock there would hang this test).
+    /// (Runs with `software_2d=true` → no real renderer, so it exercises the thread/transport
+    /// lifecycle, not the renderer reuse itself — that's `venus_reset.rs`.)
     #[test]
-    fn test_reset_stops_worker_and_allows_reactivation() {
+    fn test_worker_persists_across_reset() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let intc =
             InterruptTransport::new(DummyIrqChip::new().into(), "gpu-test".to_string()).unwrap();
@@ -373,7 +421,7 @@ mod tests {
             size: 0,
         });
 
-        // Activate -> a worker thread is running.
+        // First activate -> the single worker thread is spawned.
         gpu.activate(
             mem.clone(),
             intc.clone(),
@@ -382,18 +430,19 @@ mod tests {
         .unwrap();
         assert!(gpu.is_activated());
         assert!(gpu.worker_thread.is_some());
+        assert!(gpu.worker_tx.is_some());
 
-        // Reset -> worker stopped+joined, device inactive (join() hangs if stop is broken).
+        // Reset -> device inactive, but the worker thread PERSISTS (renderer must outlive it).
         assert!(gpu.reset());
         assert!(!gpu.is_activated());
-        assert!(gpu.worker_thread.is_none());
+        assert!(gpu.worker_thread.is_some(), "worker must survive reset");
 
-        // Re-activate -> a fresh worker, no "already exists" panic.
+        // Re-activate -> reuses the same worker (no second spawn, no panic).
         gpu.activate(mem, intc, vec![dummy_device_queue(), dummy_device_queue()])
             .unwrap();
         assert!(gpu.is_activated());
 
-        // Clean up the second worker.
-        assert!(gpu.reset());
+        // Drop joins the worker (Shutdown + stop_fd kick); a broken teardown would hang here.
+        drop(gpu);
     }
 }
