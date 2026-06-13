@@ -18,7 +18,7 @@ use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
-use super::virtio_gpu::VirtioGpu;
+use super::virtio_gpu::{GpuActivation, VirtioGpu};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
@@ -27,19 +27,42 @@ use crate::virtio::{InterruptTransport, VirtioShmRegion};
 use krun_display::DisplayBackend;
 use krun_display::Rect;
 
+/// Commands the device sends to the long-lived worker thread.
+///
+/// limina (renderer-singleton fix): `virgl_renderer_init` is a process-global, init-once,
+/// thread-bound singleton, so the worker (which owns the `Rutabaga`/renderer) must live for the
+/// whole VMM process and stay on one thread. `activate()`/`reset()` no longer spawn/join it —
+/// they message it to bind/unbind the per-activation transport (the control/cursor queues, guest
+/// memory, and interrupt, which are recreated on every activation).
+pub enum WorkerCmd {
+    /// (Re)bind the transport and start servicing the queues.
+    Activate {
+        mem: GuestMemoryMmap,
+        control_q: DeviceQueue,
+        cursor_q: DeviceQueue,
+        interrupt: InterruptTransport,
+    },
+    /// Stop servicing and release the transport, but keep the renderer alive (device reset).
+    Deactivate,
+    /// Tear the worker down (device drop / VMM teardown).
+    Shutdown,
+}
+
+/// How the inner service loop ended.
+enum InnerExit {
+    Deactivate,
+    Shutdown,
+}
+
 pub struct Worker {
-    control_evt: EventFd,
-    /// Signalled by the device on reset so the worker exits its epoll loop and the
-    /// thread can be joined (otherwise a stale worker keeps running across re-activation).
+    /// Wakes the inner epoll loop when a [`WorkerCmd`] is waiting on `cmd_rx` (the queue fds
+    /// epoll can't observe the channel). Persistent across activations.
     stop_fd: EventFd,
-    control_queue: Arc<Mutex<VirtQueue>>,
-    /// limina: the cursor queue — serviced so the guest uses its hardware cursor plane (and
-    /// stops compositing the cursor into the scanout). Cursor commands become host overlay
-    /// updates via the display backend.
-    cursor_evt: EventFd,
-    cursor_queue: Arc<Mutex<VirtQueue>>,
-    mem: GuestMemoryMmap,
-    interrupt: InterruptTransport,
+    /// Activation/teardown commands from the device.
+    cmd_rx: std::sync::mpsc::Receiver<WorkerCmd>,
+    /// The current activation's transport, shared with the renderer's fence handler (which is
+    /// registered once and outlives any activation). `None` while inactive.
+    active: Arc<Mutex<Option<GpuActivation>>>,
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
     /// limina: serve only the software-2D scanout path; don't init virglrenderer/rutabaga.
@@ -54,32 +77,21 @@ pub struct Worker {
 impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        control_q: DeviceQueue,
-        cursor_q: DeviceQueue,
-        mem: GuestMemoryMmap,
-        interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
         software_2d: bool,
         stop_fd: EventFd,
+        cmd_rx: std::sync::mpsc::Receiver<WorkerCmd>,
+        active: Arc<Mutex<Option<GpuActivation>>>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
     ) -> Self {
-        // Clone the eventfd so we own a file descriptor we can register with epoll. It stays
-        // non-blocking; epoll does the waiting and we drain the counter after a readable event.
-        let control_evt = control_q.event.try_clone().unwrap();
-        let cursor_evt = cursor_q.event.try_clone().unwrap();
-
         Self {
-            control_evt,
             stop_fd,
-            control_queue: Arc::new(Mutex::new(control_q.queue)),
-            cursor_evt,
-            cursor_queue: Arc::new(Mutex::new(cursor_q.queue)),
-            mem,
-            interrupt,
+            cmd_rx,
+            active,
             shm_region,
             virgl_flags,
             software_2d,
@@ -98,11 +110,13 @@ impl Worker {
             .unwrap()
     }
 
+    /// The worker thread body: build the renderer ONCE (it's a process-global, thread-bound
+    /// singleton), then loop activating/deactivating as the device binds/unbinds transport.
     fn work(mut self) {
+        // The renderer + fence handler are created once and live for the whole process. The
+        // fence handler reaches the current activation's queue/mem/interrupt through `active`.
         let mut virtio_gpu = VirtioGpu::new(
-            self.mem.clone(),
-            self.control_queue.clone(),
-            self.interrupt.clone(),
+            self.active.clone(),
             self.virgl_flags,
             self.software_2d,
             #[cfg(target_os = "macos")]
@@ -112,13 +126,77 @@ impl Worker {
             self.display_backend,
         );
 
-        let control_ev_fd = self.control_evt.as_raw_fd();
-        let cursor_ev_fd = self.cursor_evt.as_raw_fd();
+        loop {
+            // Inactive: block on the next command from the device.
+            let (mem, control_q, cursor_q, interrupt) = match self.cmd_rx.recv() {
+                Ok(WorkerCmd::Activate {
+                    mem,
+                    control_q,
+                    cursor_q,
+                    interrupt,
+                }) => (mem, control_q, cursor_q, interrupt),
+                // A Deactivate while already inactive is a no-op; Shutdown / closed channel ends.
+                Ok(WorkerCmd::Deactivate) => continue,
+                Ok(WorkerCmd::Shutdown) | Err(_) => return,
+            };
+
+            // Own each activation's queue eventfds + queues; publish the transport so the
+            // long-lived fence handler retires guest fences into THIS activation's queue.
+            let control_evt = control_q.event.try_clone().unwrap();
+            let cursor_evt = cursor_q.event.try_clone().unwrap();
+            let control_queue = Arc::new(Mutex::new(control_q.queue));
+            let cursor_queue = Arc::new(Mutex::new(cursor_q.queue));
+            *self.active.lock().unwrap() = Some(GpuActivation {
+                mem: mem.clone(),
+                control_queue: control_queue.clone(),
+                interrupt: interrupt.clone(),
+            });
+
+            let exit = self.service(
+                &mut virtio_gpu,
+                &mem,
+                &control_evt,
+                &control_queue,
+                &cursor_evt,
+                &cursor_queue,
+                &interrupt,
+            );
+
+            // Unbind the transport and drop this session's resource/scanout/fence bookkeeping
+            // (its descriptors index the now-freed queue) — but keep the renderer alive.
+            *self.active.lock().unwrap() = None;
+            virtio_gpu.reset_session();
+
+            match exit {
+                InnerExit::Deactivate => continue,
+                InnerExit::Shutdown => return,
+            }
+        }
+    }
+
+    /// Service the bound transport's queues until the device deactivates or shuts down.
+    #[allow(clippy::too_many_arguments)]
+    fn service(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        mem: &GuestMemoryMmap,
+        control_evt: &EventFd,
+        control_queue: &Arc<Mutex<VirtQueue>>,
+        cursor_evt: &EventFd,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        interrupt: &InterruptTransport,
+    ) -> InnerExit {
+        let control_ev_fd = control_evt.as_raw_fd();
+        let cursor_ev_fd = cursor_evt.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
         // limina (#8): retired present fences wake this fd; -1 (never matched) when
         // the renderer is absent.
         let present_ev_fd = virtio_gpu.present_event_fd().unwrap_or(-1);
 
+        // A stop signal left over from a Deactivate that arrived while we were inactive (the
+        // outer loop consumed the command but not the kick) just produces one spurious wake
+        // here, handled by the `TryRecvError::Empty` branch below — no entry drain needed (and
+        // draining here could eat a Deactivate kick that races this activation).
         let mut epoll = Epoll::new().unwrap();
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -155,28 +233,38 @@ impl Worker {
             for event in &epoll_events[0..ev_cnt] {
                 let source = event.fd();
                 if source == stop_ev_fd {
-                    // Device reset: drain and exit so the thread can be joined.
+                    // A command awaits (the queue fds can't observe the channel). Drain the
+                    // wake and act on it.
                     let _ = self.stop_fd.read();
-                    return;
+                    match self.cmd_rx.try_recv() {
+                        Ok(WorkerCmd::Deactivate) => return InnerExit::Deactivate,
+                        Ok(WorkerCmd::Shutdown) => return InnerExit::Shutdown,
+                        // An Activate while already active shouldn't happen (the lifecycle is
+                        // activate→reset→activate); ignore it. Empty = spurious wake.
+                        Ok(WorkerCmd::Activate { .. }) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return InnerExit::Shutdown
+                        }
+                    }
                 }
                 if source == control_ev_fd {
-                    if let Err(e) = self.control_evt.read() {
+                    if let Err(e) = control_evt.read() {
                         error!("Failed to read control_evt: {e:?}");
                         continue;
                     }
-                    if self.process_queue(&mut virtio_gpu, &self.control_queue.clone()) {
-                        if let Err(e) = self.interrupt.try_signal_used_queue() {
+                    if self.process_queue(virtio_gpu, control_queue, mem) {
+                        if let Err(e) = interrupt.try_signal_used_queue() {
                             error!("Error signaling queue: {e:?}");
                         }
                     }
                 }
                 if source == cursor_ev_fd {
-                    if let Err(e) = self.cursor_evt.read() {
+                    if let Err(e) = cursor_evt.read() {
                         error!("Failed to read cursor_evt: {e:?}");
                         continue;
                     }
-                    if self.process_cursor_queue(&mut virtio_gpu) {
-                        if let Err(e) = self.interrupt.try_signal_used_queue() {
+                    if self.process_cursor_queue(virtio_gpu, cursor_queue, mem) {
+                        if let Err(e) = interrupt.try_signal_used_queue() {
                             error!("Error signaling cursor queue: {e:?}");
                         }
                     }
@@ -436,9 +524,10 @@ impl Worker {
         &mut self,
         virtio_gpu: &mut VirtioGpu,
         control_queue: &Arc<Mutex<VirtQueue>>,
+        mem: &GuestMemoryMmap,
     ) -> bool {
         let mut used_any = false;
-        let mem = self.mem.clone();
+        let mem = mem.clone();
 
         loop {
             let head = control_queue.lock().unwrap().pop(&mem);
@@ -551,10 +640,15 @@ impl Worker {
     /// host overlay update. Draining it is what lets the guest use its hardware cursor plane;
     /// an unserviced cursor queue makes the guest fall back to compositing the cursor into the
     /// scanout (or stall once the ring fills).
-    fn process_cursor_queue(&mut self, virtio_gpu: &mut VirtioGpu) -> bool {
+    fn process_cursor_queue(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        mem: &GuestMemoryMmap,
+    ) -> bool {
         let mut used_any = false;
-        let mem = self.mem.clone();
-        let cursor_queue = self.cursor_queue.clone();
+        let mem = mem.clone();
+        let cursor_queue = cursor_queue.clone();
 
         loop {
             let head = cursor_queue.lock().unwrap().pop(&mem);
