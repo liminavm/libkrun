@@ -1366,14 +1366,41 @@ impl VirtioGpu {
     ///    2) To the host resource's attached iovecs
     ///
     /// Can also be used to invalidate caches.
+    ///
+    /// limina: this is the virgl/vrend copy-model readback path (`TRANSFER_FROM_HOST_3D`).
+    /// venus (zero-copy, host-visible blobs) never needs it, so upstream left it a `panic!` —
+    /// but a stock 4 KiB guest on the coexist device drives vrend, and any GL readback
+    /// (`glReadPixels`, `glxinfo`, WebGL) issues `TRANSFER_FROM_HOST_3D`. Panicking here killed
+    /// the GPU worker thread and wedged the whole guest (every later command blocks on a fence
+    /// that never completes). Delegate to rutabaga like `transfer_write` does, and never panic.
     pub fn transfer_read(
         &mut self,
-        _ctx_id: u32,
-        _resource_id: u32,
-        _transfer: Transfer3D,
-        _buf: Option<VolatileSlice>,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
+        buf: Option<VolatileSlice>,
     ) -> VirtioGpuResult {
-        panic!("virtio_gpu: transfer_read unimplemented");
+        // limina software 2D: the guest backing already mirrors our host buffer (we copy it on
+        // write/flush), so a host->guest readback is a no-op for these resources.
+        if self.sw2d.contains_key(&resource_id) {
+            return Ok(OkNoData);
+        }
+        // The common `TRANSFER_FROM_HOST_3D` path passes `buf = None`: rutabaga copies from the
+        // host resource into the resource's attached guest iovecs. When a destination slice is
+        // given instead, hand it to rutabaga as an `IoSliceMut`.
+        // SAFETY: `s` is a writable guest-memory slice the descriptor chain keeps valid for the
+        // duration of this command; `IoSliceMut` only borrows it (same pattern as line ~62/968).
+        let mut dst = buf.map(|s| unsafe {
+            IoSliceMut::new(std::slice::from_raw_parts_mut(
+                s.ptr_guard_mut().as_ptr(),
+                s.len(),
+            ))
+        });
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .transfer_read(ctx_id, resource_id, transfer, dst.take())?;
+        Ok(OkNoData)
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
