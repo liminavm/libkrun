@@ -1387,8 +1387,17 @@ impl VirtioGpu {
         resource_id: u32,
         transfer: Transfer3D,
     ) -> VirtioGpuResult {
-        self.rutabaga
-            .transfer_read(ctx_id, resource_id, transfer, None)?;
+        // limina software 2D: the guest backing already mirrors our host buffer (we copy it on
+        // write/flush), so a host->guest readback is a no-op for these resources.
+        if self.sw2d.contains_key(&resource_id) {
+            return Ok(OkNoData);
+        }
+        self.rutabaga.as_mut().ok_or(ErrUnspec)?.transfer_read(
+            ctx_id,
+            resource_id,
+            transfer,
+            None,
+        )?;
         Ok(OkNoData)
     }
 
