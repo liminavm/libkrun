@@ -452,6 +452,30 @@ impl VirtioGpu {
         })
     }
 
+    /// The rutabaga capsets our renderer actually backs for this `virgl_flags` set.
+    ///
+    /// Upstream passes `capset_mask = 0` to `RutabagaBuilder`, which registers ALL nine
+    /// capsets regardless of the renderer config; the guest then enumerates and probes
+    /// capsets we can't serve (e.g. a virgl GL context under `NO_VIRGL`, rejected with a
+    /// harmless-but-noisy EINVAL). Advertise only what these flags support: venus, plus
+    /// virgl/virgl2 when GL is enabled. The device's `num_capsets` config field is the
+    /// pop-count of this mask, so the guest enumerates exactly the real set.
+    pub(crate) fn capset_mask_from_virgl_flags(virgl_flags: u32) -> u64 {
+        // Mirror of the `VirglRendererFlags` bit layout in rutabaga_utils.rs.
+        const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+
+        let mut mask = 0u64;
+        if virgl_flags & VIRGLRENDERER_VENUS != 0 {
+            mask |= 1u64 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
+        }
+        if virgl_flags & VIRGLRENDERER_NO_VIRGL == 0 {
+            mask |= 1u64 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
+            mask |= 1u64 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
+        }
+        mask
+    }
+
     pub fn create_rutabaga(
         virgl_flags: u32,
         export_table: Option<ExportTable>,
@@ -501,7 +525,7 @@ impl VirtioGpu {
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::VirglRenderer,
             virgl_flags,
-            0,
+            Self::capset_mask_from_virgl_flags(virgl_flags),
         )
         .set_rutabaga_channels(rutabaga_channels_opt);
         let builder = if let Some(export_table) = export_table {
