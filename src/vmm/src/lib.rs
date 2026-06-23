@@ -231,6 +231,10 @@ pub struct Vmm {
     paused: bool,
     #[cfg(target_os = "macos")]
     paused_at: u64,
+    /// limina: a handle for pushing runtime display resizes into the live virtio-gpu device,
+    /// captured when the GPU device is attached. `None` if no display/GPU is configured.
+    #[cfg(feature = "gpu")]
+    gpu_resize_handle: Option<devices::virtio::DisplayResizeHandle>,
 }
 
 /// Out-of-band request to the running VM's event loop.
@@ -242,6 +246,19 @@ pub enum VmCtl {
 }
 
 impl Vmm {
+    /// limina: the runtime display-resize handle for the live virtio-gpu (if a GPU is
+    /// attached). limina-vmm uses it to apply window-resize requests to the guest.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_resize_handle(&self) -> Option<devices::virtio::DisplayResizeHandle> {
+        self.gpu_resize_handle.clone()
+    }
+
+    /// limina: record the GPU resize handle at attach time (see [`Self::gpu_resize_handle`]).
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu_resize_handle(&mut self, handle: devices::virtio::DisplayResizeHandle) {
+        self.gpu_resize_handle = Some(handle);
+    }
+
     /// Gets the the specified bus device.
     pub fn get_bus_device(
         &self,
