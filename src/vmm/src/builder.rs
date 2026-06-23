@@ -1013,6 +1013,8 @@ pub fn build_microvm(
         paused: false,
         #[cfg(target_os = "macos")]
         paused_at: 0,
+        #[cfg(feature = "gpu")]
+        gpu_resize_handle: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -2782,6 +2784,10 @@ fn attach_gpu_device(
     if let Some(export_table) = export_table.take() {
         gpu.lock().unwrap().set_export_table(export_table);
     }
+
+    // limina: capture the runtime display-resize handle before the device is moved into the
+    // bus, so limina-vmm can apply window-resize requests to the live device.
+    vmm.set_gpu_resize_handle(gpu.lock().unwrap().display_resize_handle());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc, gpu).map_err(RegisterGpuDevice)?;
