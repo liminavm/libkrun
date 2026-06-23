@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -21,7 +22,9 @@ use super::protocol::{
 use super::virtio_gpu::{GpuActivation, VirtioGpu};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
-use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
+use crate::virtio::gpu::protocol::{
+    VIRTIO_GPU_EVENT_DISPLAY, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+};
 use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 use krun_display::DisplayBackend;
@@ -72,6 +75,13 @@ pub struct Worker {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    /// limina runtime resize: config-space `events_read`, shared with the device. The worker
+    /// sets VIRTIO_GPU_EVENT_DISPLAY here before raising a config-change; the guest clears it.
+    events_read: Arc<AtomicU32>,
+    /// Wakes the service loop's epoll when a resize is pending (shared with the device + handle).
+    resize_evt: Arc<EventFd>,
+    /// The pending resize `(display_id, width, height)`, taken on a `resize_evt` wake.
+    resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
 }
 
 impl Worker {
@@ -87,6 +97,9 @@ impl Worker {
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
+        events_read: Arc<AtomicU32>,
+        resize_evt: Arc<EventFd>,
+        resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
     ) -> Self {
         Self {
             stop_fd,
@@ -100,6 +113,9 @@ impl Worker {
             export_table,
             displays,
             display_backend,
+            events_read,
+            resize_evt,
+            resize_pending,
         }
     }
 
@@ -189,6 +205,8 @@ impl Worker {
         let control_ev_fd = control_evt.as_raw_fd();
         let cursor_ev_fd = cursor_evt.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
+        // limina runtime resize: the host (limina-vmm) kicks this fd to push a new display size.
+        let resize_ev_fd = self.resize_evt.as_raw_fd();
         // limina (#8): retired present fences wake this fd; -1 (never matched) when
         // the renderer is absent.
         let present_ev_fd = virtio_gpu.present_event_fd().unwrap_or(-1);
@@ -212,6 +230,11 @@ impl Worker {
             ControlOperation::Add,
             stop_ev_fd,
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            resize_ev_fd,
+            &EpollEvent::new(EventSet::IN, resize_ev_fd as u64),
         );
         if present_ev_fd >= 0 {
             let _ = epoll.ctl(
@@ -266,6 +289,22 @@ impl Worker {
                     if self.process_cursor_queue(virtio_gpu, cursor_queue, mem) {
                         if let Err(e) = interrupt.try_signal_used_queue() {
                             error!("Error signaling cursor queue: {e:?}");
+                        }
+                    }
+                }
+                // limina runtime resize: the host pushed a new display size. Apply it to the
+                // scanout's preferred mode, set the config-space display-event bit, and raise a
+                // virtio-gpu config-change interrupt so the guest re-reads GET_DISPLAY_INFO and
+                // re-modesets (the backend reallocates on the resulting SET_SCANOUT geometry).
+                if source == resize_ev_fd {
+                    let _ = self.resize_evt.read();
+                    let pending = self.resize_pending.lock().unwrap().take();
+                    if let Some((id, w, h)) = pending {
+                        virtio_gpu.set_display_size(id, w, h);
+                        self.events_read
+                            .fetch_or(VIRTIO_GPU_EVENT_DISPLAY, Ordering::SeqCst);
+                        if let Err(e) = interrupt.try_signal_config_change() {
+                            error!("display resize: failed to signal config change: {e:?}");
                         }
                     }
                 }
