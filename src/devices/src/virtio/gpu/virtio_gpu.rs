@@ -1046,6 +1046,18 @@ impl VirtioGpu {
                 let n = buffer.len().min(sw.host.len());
                 buffer[..n].copy_from_slice(&sw.host[..n]);
             } else if let Some(rutabaga) = self.rutabaga.as_mut() {
+                // limina DIAG (flicker hunt): tunable pre-readback delay. `echo N >
+                // /tmp/limina-readback-delay` sleeps N ms before transfer_read, giving the
+                // host GPU time to finish rendering this buffer. If the incomplete-frame
+                // rate collapses with N>0, the flicker is a readback-vs-render race (the
+                // readback path lacks the #8 fence-accurate present the zero-copy path has).
+                if let Ok(s) = std::fs::read_to_string("/tmp/limina-readback-delay") {
+                    if let Ok(ms) = s.trim().parse::<u64>() {
+                        if ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
+                    }
+                }
                 if let Err(e) = Self::read_2d_resource(rutabaga, resource, buffer) {
                     log::error!(
                         "Failed to read resource {resource_id} for scanout {scanout_id}: {e}"
@@ -1055,6 +1067,39 @@ impl VirtioGpu {
             } else {
                 // No software-2D buffer and no renderer: nothing to present.
                 return Err(ErrUnspec);
+            }
+            // limina DIAG (flicker hunt): characterise every readback present. Pins whether the
+            // flicker is multi-buffer divergence (resource_id cycles, hash differs per buffer),
+            // a large damage rect overwriting good canvas, or a stride mismatch (dims != scanout).
+            // FNV-1a over a sparse sample of the staging readback — cheap, but reveals content
+            // oscillation: same res with two alternating hashes = the guest re-renders it stale.
+            {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                let n = buffer.len();
+                let mut i = 0usize;
+                while i < n {
+                    h = (h ^ buffer[i] as u64).wrapping_mul(0x0100_0000_01b3);
+                    i += 1021;
+                }
+                log::info!(
+                    "[FLUSH2] res={resource_id} scan={scanout_id} rect=({},{},{},{}) dims={}x{} hash={h:016x}",
+                    rect.x, rect.y, rect.width, rect.height, resource.width, resource.height
+                );
+            }
+            // limina DIAG (`touch /tmp/limina-dump-staging`): dump the RAW readback (staging,
+            // BGRA, full frame) BEFORE any swizzle/canvas/ring, so we can run the duplicate-row
+            // detector directly on it. Answers: is the tear already in the readback (guest
+            // delivered a torn buffer) or introduced downstream (host present path)?
+            if resource.width == 1280
+                && resource.height == 800
+                && std::fs::metadata("/tmp/limina-dump-staging").is_ok()
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SEQ: AtomicU32 = AtomicU32::new(0);
+                let n = SEQ.fetch_add(1, Ordering::Relaxed);
+                if n < 80 {
+                    let _ = std::fs::write(format!("/tmp/limina-staging-{n:03}.raw"), &buffer[..]);
+                }
             }
             self.display_backend
                 .present_frame(scanout_id, frame_id, Some(&rect))?
@@ -1340,6 +1385,21 @@ impl VirtioGpu {
             .ok_or(ErrInvalidScanoutId)?;
 
         Ok(OkEdid(display.edid_bytes()))
+    }
+
+    /// limina runtime resize: update a scanout's preferred mode (host window resize). The EDID
+    /// regenerates from these dimensions on the next `GET_EDID` (for the `Generated` case). The
+    /// caller (worker) raises a config-change interrupt so the guest re-reads `display_info()`
+    /// and re-modesets to the new `width`×`height`. See `docs/design/runtime-display-resize.md`.
+    pub fn set_display_size(&mut self, display_id: u32, width: u32, height: u32) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => {
+                debug!("set_display_size: scanout {display_id} -> {width}x{height}");
+                d.width = width;
+                d.height = height;
+            }
+            None => error!("set_display_size: invalid display id {display_id}"),
+        }
     }
 
     /// Copies data to host resource from the attached iovecs. Can also be used to flush caches.
