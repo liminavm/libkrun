@@ -249,6 +249,11 @@ const LIMINA_PRESENT_RING: u8 = 63;
 
 pub struct VirtioGpuScanout {
     resource_id: u32,
+    /// limina: the SET_SCANOUT rect dimensions — the visible region the guest scans out, and
+    /// the size of the host staging buffer (`configure_scanout` is called with these). The
+    /// backing *resource* can be LARGER (mutter pads its framebuffer, e.g. a 1000×708 mode
+    /// backed by a 1024×768 resource), so the 2D readback must extract this rect at the
+    /// resource's own stride — a flat copy shears. See `flush_resource`.
     width: u32,
     height: u32,
     /// limina tier-2: if `Some`, this scanout's resource is backed by a global IOSurface
@@ -299,6 +304,29 @@ impl Sw2dResource {
             }
             off += n;
         }
+    }
+}
+
+/// limina: copy the top-left rect of a (possibly wider) source framebuffer into a tightly-strided
+/// destination, row by row — de-shearing a padded resource. The guest's scanout *resource* can be
+/// wider than the visible scanout rect (mutter pads its framebuffer, e.g. a 1000×708 mode backed by
+/// a 1024×768 resource); the host staging buffer is `dst_stride`-wide, so a flat byte copy would
+/// drift every row by `(src_stride − dst_stride)` px. When the strides match (the common case) this
+/// is a single flat copy. `src_stride >= dst_stride` is expected; rows that would read/write out of
+/// bounds are skipped. See `flush_resource`.
+fn blit_scanout_rect(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, rows: usize) {
+    if src_stride == dst_stride {
+        let n = dst.len().min(src.len());
+        dst[..n].copy_from_slice(&src[..n]);
+        return;
+    }
+    for y in 0..rows {
+        let s = y * src_stride;
+        let d = y * dst_stride;
+        if s + dst_stride > src.len() || d + dst_stride > dst.len() {
+            break;
+        }
+        dst[d..d + dst_stride].copy_from_slice(&src[s..s + dst_stride]);
     }
 }
 
@@ -968,18 +996,23 @@ impl VirtioGpu {
     fn read_2d_resource(
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
-        scanout: &VirtioGpuScanout,
+        width: u32,
+        height: u32,
         output: &mut [u8],
     ) -> RutabagaResult<()> {
+        // limina: read the top-left `width`×`height` rect (the scanout's visible region) into a
+        // TIGHTLY packed `width*4`-stride output — the host staging buffer. The backing resource
+        // may be wider (mutter pads its framebuffer), but the box read extracts just the rect, so
+        // the output never shears regardless of the resource's own stride.
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: scanout.width.min(resource.width),
-            h: scanout.height.min(resource.height),
+            w: width.min(resource.width),
+            h: height.min(resource.height),
             d: 1,
             level: 0,
-            stride: scanout.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: width * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
@@ -1045,16 +1078,28 @@ impl VirtioGpu {
                 }
             }
 
-            let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize) else {
-                continue;
-            };
+            // limina: the scanout's visible rect = the staging-buffer size (`configure_scanout`
+            // was called with it). The backing resource may be LARGER — mutter pads its
+            // framebuffer (e.g. a 1000×708 mode backed by a 1024×768 resource) — so we must
+            // extract this rect at the resource's own stride. A flat copy shears every row by
+            // (resource.width − scan_w) px. Falls back to the resource dims if unknown.
+            let (scan_w, scan_h) = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .map(|s| (s.width, s.height))
+                .filter(|&(w, h)| w != 0 && h != 0)
+                .unwrap_or((resource.width, resource.height));
+            let bpp = ResourceFormat::BYTES_PER_PIXEL;
+            let dst_stride = scan_w as usize * bpp;
+            let src_stride = resource.width as usize * bpp;
+
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
             let mut read_failed = false;
             // limina software 2D: the pixels already live in the host buffer; copy them out.
             // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
             if let Some(sw) = self.sw2d.get(&resource_id) {
-                let n = buffer.len().min(sw.host.len());
-                buffer[..n].copy_from_slice(&sw.host[..n]);
+                blit_scanout_rect(buffer, dst_stride, &sw.host, src_stride, scan_h as usize);
             } else if let Some(rutabaga) = self.rutabaga.as_mut() {
                 // limina DIAG (flicker hunt): tunable pre-readback delay. `echo N >
                 // /tmp/limina-readback-delay` sleeps N ms before transfer_read, giving the
@@ -1068,7 +1113,7 @@ impl VirtioGpu {
                         }
                     }
                 }
-                if let Err(e) = Self::read_2d_resource(rutabaga, resource, scanout, buffer) {
+                if let Err(e) = Self::read_2d_resource(rutabaga, resource, scan_w, scan_h, buffer) {
                     log::error!(
                         "Failed to read resource {resource_id} for scanout {scanout_id}: {e}"
                     );
@@ -2041,6 +2086,48 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
 
+    // limina: a window-resize to a non-stride-aligned width gives a scanout whose visible rect is
+    // narrower than the guest's (padded) framebuffer resource (e.g. a 1000-wide mode backed by a
+    // 1024-wide resource). The 2D present must extract the rect at the *resource's* stride; a flat
+    // copy shears every row. This guards `blit_scanout_rect` against that regression (the real bug:
+    // a resized GNOME desktop rendered as diagonal stripes, pixel-confirmed 2026-06-23).
+    #[test]
+    fn blit_scanout_rect_de_shears_padded_resource() {
+        use super::blit_scanout_rect;
+        // 4px-wide visible scanout from a 6px-wide padded resource, 3 rows. Tag each pixel's first
+        // byte with row*10 + col so a shear (wrong row offset) is detectable.
+        let (src_w, dst_w, rows) = (6usize, 4usize, 3usize);
+        let (src_stride, dst_stride) = (src_w * 4, dst_w * 4);
+        let mut src = vec![0u8; src_stride * rows];
+        for y in 0..rows {
+            for x in 0..src_w {
+                src[y * src_stride + x * 4] = (y * 10 + x) as u8;
+            }
+        }
+        let mut dst = vec![0u8; dst_stride * rows];
+        blit_scanout_rect(&mut dst, dst_stride, &src, src_stride, rows);
+        // Each dst row must hold exactly the top-left dst_w pixels of the matching src row.
+        for y in 0..rows {
+            for x in 0..dst_w {
+                assert_eq!(
+                    dst[y * dst_stride + x * 4],
+                    (y * 10 + x) as u8,
+                    "sheared at row {y} col {x}"
+                );
+            }
+        }
+    }
+
+    // The matching-stride fast path (resource width == scanout width) is a plain flat copy.
+    #[test]
+    fn blit_scanout_rect_flat_copies_when_strides_match() {
+        use super::blit_scanout_rect;
+        let src: Vec<u8> = (0..(4 * 4 * 2) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        blit_scanout_rect(&mut dst, 4 * 4, &src, 4 * 4, 2);
+        assert_eq!(dst, src);
+    }
+
     // Software-2D mode (rutabaga == None) has no async fence handler. A fence the
     // guest requests on a 2D command must be retired synchronously, otherwise the
     // response is parked forever and the guest hangs (observed: GTK4/nautilus on
@@ -2147,7 +2234,7 @@ mod test {
 
     #[test]
     fn test_read_2d_resource_larger_than_scanout() {
-        use super::{VirtioGpu, VirtioGpuResource, VirtioGpuScanout};
+        use super::{VirtioGpu, VirtioGpuResource};
         use rutabaga_gfx::{
             RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
             RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler, RutabagaIovec,
@@ -2190,13 +2277,8 @@ mod test {
             .unwrap();
 
         let resource = VirtioGpuResource::new(1, width, height, None, 0);
-        let scanout = VirtioGpuScanout {
-            resource_id: 1,
-            width: 2,
-            height: 2,
-        };
         let mut frame = [0u8; 2 * 2 * 4];
-        VirtioGpu::read_2d_resource(&mut rutabaga, resource, &scanout, &mut frame).unwrap();
+        VirtioGpu::read_2d_resource(&mut rutabaga, resource, 2, 2, &mut frame).unwrap();
 
         let row = |y: usize| &guest[y * 4 * 4..][..2 * 4];
         assert_eq!(frame[..2 * 4], *row(0));
