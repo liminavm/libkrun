@@ -437,7 +437,14 @@ impl Vcpu {
                     Ok(VcpuEmulation::WaitForEventTimeout(duration))
                 }
             },
-            Err(e) => panic!("Error running HVF vCPU: {e:?}"),
+            // A vCPU run error is no longer fatal to the worker process: log it and report an
+            // emulation error so the run loop tears the VM down cleanly (FC_EXIT_CODE_GENERIC_ERROR)
+            // instead of `panic!`ing. A stock guest that trips an unmodeled trap then degrades to a
+            // clean stop the supervisor can report, not a crashed VMM.
+            Err(e) => {
+                error!("vCPU {vcpuid}: unrecoverable run error: {e}; stopping the VM");
+                Err(Error::VcpuRun)
+            }
         }
     }
 
