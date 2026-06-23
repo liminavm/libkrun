@@ -259,8 +259,18 @@ impl VirtioDevice for Gpu {
             events_read: self.events_read.load(Ordering::SeqCst),
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            // No renderer in software-2D-only mode → no capsets to advertise.
-            num_capsets: if self.software_2d { 0 } else { 5 },
+            // No renderer in software-2D-only mode → no capsets to advertise. Otherwise
+            // advertise exactly the capsets our renderer backs for these flags (venus-only
+            // under NO_VIRGL), so the guest doesn't enumerate and probe capsets we can't
+            // serve. This is the pop-count of the same mask create_rutabaga() passes to the
+            // builder — derived from virgl_flags, so it's stable before the renderer exists
+            // (the guest reads this config field during device probe, pre-activate).
+            num_capsets: if self.software_2d {
+                0
+            } else {
+                super::virtio_gpu::VirtioGpu::capset_mask_from_virgl_flags(self.virgl_flags)
+                    .count_ones()
+            },
         };
 
         let config_slice = config.as_slice();
