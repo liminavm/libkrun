@@ -25,7 +25,7 @@ use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
-use log::debug;
+use log::{debug, error, warn};
 
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
@@ -101,6 +101,12 @@ const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
 const EC_DATAABORT: u64 = 0x24;
 const EC_AA64_BKPT: u64 = 0x3c;
 
+/// PSCI standard return: the requested function is not implemented (Arm DEN 0022, value -1).
+/// A 64-bit -1 also reads as -1 in the 32-bit (w0) calling convention, so it's correct for both
+/// SMC32 and SMC64 callers. Returned for any PSCI/SMC function we don't model, so a guest that
+/// probes an optional function (e.g. PSCI_FEATURES) keeps running instead of crashing the VMM.
+const PSCI_RET_NOT_SUPPORTED: u64 = -1i64 as u64;
+
 #[derive(Debug)]
 pub enum Error {
     EnableEL2,
@@ -108,6 +114,10 @@ pub enum Error {
     MemoryMap,
     MemoryUnmap,
     NestedCheck,
+    /// The guest reached a vCPU state we can't emulate (unknown exit reason, exception class, or
+    /// system register). Not fatal to the VMM: the run loop logs it and stops the VM cleanly
+    /// instead of `panic!`ing the worker process. The specifics are logged at the trap site.
+    Unhandled,
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -130,6 +140,7 @@ impl Display for Error {
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
+            Unhandled => write!(f, "Unhandled guest vCPU state (see log); stopping the VM"),
             NestedCheck => write!(
                 f,
                 "Nested virtualization was requested but it's not support in this system"
@@ -580,7 +591,15 @@ impl HvfVcpu<'_> {
                 self.write_reg(hv_reg_t_HV_REG_X0, 0)?;
                 Ok(VcpuExit::CpuOn(mpidr, entry, context_id))
             }
-            val => panic!("Unexpected val={val}")
+            val => {
+                // An unmodeled PSCI/SMC function. Standard PSCI behaviour is to return
+                // NOT_SUPPORTED rather than fault — a stock guest probing an optional function
+                // (PSCI_FEATURES, CPU_OFF, AFFINITY_INFO, SYSTEM_RESET2, …) then degrades
+                // gracefully instead of taking the whole VMM down.
+                warn!("unhandled PSCI/SMC function 0x{val:x}; returning NOT_SUPPORTED");
+                self.write_reg(hv_reg_t_HV_REG_X0, PSCI_RET_NOT_SUPPORTED)?;
+                Ok(VcpuExit::PsciHandled)
+            }
         }
     }
 
@@ -595,10 +614,13 @@ impl HvfVcpu<'_> {
                 2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
                 4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
                 8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                _ => panic!(
-                    "unsupported mmio pa={} len={}",
-                    mmio_read.addr, mmio_read.len
-                ),
+                _ => {
+                    error!(
+                        "unsupported MMIO read size: pa=0x{:x} len={}; stopping the VM",
+                        mmio_read.addr, mmio_read.len
+                    );
+                    return Err(Error::Unhandled);
+                }
             };
 
             self.write_reg(mmio_read.srt, val)?;
@@ -628,12 +650,13 @@ impl HvfVcpu<'_> {
             HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
             _ => {
                 let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
-                panic!(
-                    "unexpected exit reason: vcpuid={} 0x{:x} at pc=0x{:x}",
+                error!(
+                    "unexpected HVF exit reason: vcpuid={} 0x{:x} at pc=0x{:x}; stopping the VM",
                     self.id(),
                     self.vcpu_exit.reason,
                     pc
                 );
+                return Err(Error::Unhandled);
             }
         }
 
@@ -675,7 +698,10 @@ impl HvfVcpu<'_> {
                         2 => self.mmio_buf[0..2].copy_from_slice(&(val as u16).to_le_bytes()),
                         4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
                         8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
-                        _ => panic!("unsupported mmio len={len}"),
+                        _ => {
+                            error!("unsupported MMIO write size: len={len}; stopping the VM");
+                            return Err(Error::Unhandled);
+                        }
                     };
 
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
@@ -713,12 +739,15 @@ impl HvfVcpu<'_> {
                             self.write_reg(rt, val)?;
                             Ok(VcpuExit::SystemRegister)
                         }
-                        None => panic!(
-                            "UNKNOWN rt={}, reg={} name={}",
-                            rt,
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        ),
+                        None => {
+                            error!(
+                                "unhandled system-register read: rt={} reg={} name={}; stopping the VM",
+                                rt,
+                                reg,
+                                sys_reg_name(reg).unwrap_or("unknown sysreg")
+                            );
+                            Err(Error::Unhandled)
+                        }
                     }
                 } else {
                     assert!(rt < 32);
@@ -729,11 +758,12 @@ impl HvfVcpu<'_> {
                     if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
                         Ok(VcpuExit::SystemRegister)
                     } else {
-                        panic!(
-                            "unexpected write: {} name={}",
+                        error!(
+                            "unhandled system-register write: reg={} name={}; stopping the VM",
                             reg,
                             sys_reg_name(reg).unwrap_or("unknown sysreg")
                         );
+                        Err(Error::Unhandled)
                     }
                 }
             }
@@ -768,7 +798,13 @@ impl HvfVcpu<'_> {
                 self.pending_advance_pc = true;
                 self.handle_psci_request()
             }
-            _ => panic!("unexpected exception: 0x{ec:x}"),
+            _ => {
+                let pc = self.read_reg(hv_reg_t_HV_REG_PC).unwrap_or(0);
+                error!(
+                    "unhandled exception class EC=0x{ec:x} syndrome=0x{syndrome:x} at pc=0x{pc:x}; stopping the VM"
+                );
+                Err(Error::Unhandled)
+            }
         }
     }
 }
