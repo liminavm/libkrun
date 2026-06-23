@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender as CmdSender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -42,6 +43,46 @@ const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
     [QueueConfig::new(QUEUE_SIZE); defs::NUM_QUEUES];
 
+/// limina: a cloneable, thread-safe handle that lets the host push a runtime display resize
+/// into the live GPU device after boot, from any thread (the supervisor's window-resize gesture
+/// funnels here via limina-vmm). Mechanism only — *policy* (when, and to what size) lives in
+/// limina. Obtained from [`Gpu::display_resize_handle`] before boot and held by limina-vmm.
+///
+/// A `request` stores the new dimensions and kicks the GPU worker's eventfd; the worker applies
+/// it to `displays[id]`, sets the config-space display-event bit, and raises a virtio-gpu
+/// config-change interrupt so the guest re-reads `GET_DISPLAY_INFO` and re-modesets. See
+/// `docs/design/runtime-display-resize.md`.
+#[derive(Clone)]
+pub struct DisplayResizeHandle {
+    /// Wakes the GPU worker's epoll loop; shared (same eventfd object) with the worker.
+    resize_evt: Arc<EventFd>,
+    /// The latest pending request `(display_id, width, height)`; the worker takes it on wake.
+    pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    /// Number of scanouts, for validating `display_id` host-side.
+    num_displays: usize,
+}
+
+impl DisplayResizeHandle {
+    /// Request the guest reflow scanout `display_id` to `width`×`height`. Stores the request
+    /// (coalescing with any not-yet-applied one) and kicks the GPU worker. Returns `false`
+    /// (logged) if `display_id` is out of range or the worker can't be woken.
+    pub fn request(&self, display_id: u32, width: u32, height: u32) -> bool {
+        if display_id as usize >= self.num_displays {
+            error!(
+                "display resize: invalid display id {display_id} (have {})",
+                self.num_displays
+            );
+            return false;
+        }
+        *self.pending.lock().unwrap() = Some((display_id, width, height));
+        if let Err(e) = self.resize_evt.write(1) {
+            error!("display resize: failed to kick gpu worker: {e}");
+            return false;
+        }
+        true
+    }
+}
+
 pub struct Gpu {
     pub(crate) avail_features: u64,
     pub(crate) acked_features: u64,
@@ -63,6 +104,15 @@ pub struct Gpu {
     worker_tx: Option<CmdSender<WorkerCmd>>,
     /// Wakes the worker's inner epoll loop when a command is queued (reset / Drop).
     worker_stopfd: EventFd,
+    /// limina runtime display resize (see [`DisplayResizeHandle`]). The config-space
+    /// `events_read` field, shared with the worker (which sets the display-event bit) and read
+    /// by the guest via [`Self::read_config`]; cleared by the guest's `events_clear` write.
+    events_read: Arc<AtomicU32>,
+    /// Wakes the worker to apply a pending resize; cloned into the worker and the handle.
+    resize_evt: Arc<EventFd>,
+    /// The latest pending resize `(display_id, width, height)`; set by the handle, taken by
+    /// the worker.
+    resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
 }
 
 impl Gpu {
@@ -92,11 +142,24 @@ impl Gpu {
             worker_thread: None,
             worker_tx: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?,
+            events_read: Arc::new(AtomicU32::new(0)),
+            resize_evt: Arc::new(EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?),
+            resize_pending: Arc::new(Mutex::new(None)),
         })
     }
 
     pub fn id(&self) -> &str {
         defs::GPU_DEV_ID
+    }
+
+    /// limina: a handle for pushing runtime display resizes into this live device. Grab it
+    /// before boot and hold it host-side (limina-vmm); see [`DisplayResizeHandle`].
+    pub fn display_resize_handle(&self) -> DisplayResizeHandle {
+        DisplayResizeHandle {
+            resize_evt: self.resize_evt.clone(),
+            pending: self.resize_pending.clone(),
+            num_displays: self.displays.len(),
+        }
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
@@ -191,7 +254,9 @@ impl VirtioDevice for Gpu {
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config = virtio_gpu_config {
-            events_read: 0,
+            // limina: the guest reads this after a config-change interrupt; a set
+            // VIRTIO_GPU_EVENT_DISPLAY bit tells it to re-fetch GET_DISPLAY_INFO (runtime resize).
+            events_read: self.events_read.load(Ordering::SeqCst),
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
             // No renderer in software-2D-only mode → no capsets to advertise.
@@ -212,6 +277,14 @@ impl VirtioDevice for Gpu {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        // limina: the driver acks display events by writing the bits-to-clear into the
+        // `events_clear` field (offset 4 in virtio_gpu_config); clear them from `events_read`.
+        const EVENTS_CLEAR_OFFSET: u64 = 4;
+        if offset == EVENTS_CLEAR_OFFSET && data.len() == 4 {
+            let clear = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            self.events_read.fetch_and(!clear, Ordering::SeqCst);
+            return;
+        }
         warn!(
             "gpu: guest driver attempted to write device config (offset={:x}, len={:x})",
             offset,
@@ -259,6 +332,9 @@ impl VirtioDevice for Gpu {
                     self.export_table.take(),
                     self.displays.clone(),
                     self.display_backend,
+                    self.events_read.clone(),
+                    self.resize_evt.clone(),
+                    self.resize_pending.clone(),
                 );
                 self.worker_thread = Some(worker.run());
                 self.worker_tx = Some(tx);
