@@ -1119,11 +1119,38 @@ impl VirtioGpu {
             let dst_stride = scan_w as usize * bpp;
             let src_stride = resource.width as usize * bpp;
 
+            // limina: an IOSurface-backed (venus zero-copy) scanout whose present_surface fell
+            // through to readback — i.e. a display sink with no zero-copy path, the headless
+            // capture sink. venus blobs have no CPU transfer_read, so read the presented
+            // IOSurface's shared storage directly instead of read_2d_resource (which EINVALs).
+            #[cfg(target_os = "macos")]
+            let scan_iosurface_id = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .and_then(|s| s.iosurface_id);
+            #[cfg(not(target_os = "macos"))]
+            let scan_iosurface_id: Option<u32> = None;
+
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
             // limina software 2D: the pixels already live in the host buffer; copy them out.
             // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
             if let Some(sw) = self.sw2d.get(&resource_id) {
                 blit_scanout_rect(buffer, dst_stride, &sw.host, src_stride, scan_h as usize);
+            } else if let Some(iosurface_id) = scan_iosurface_id {
+                match self.rutabaga.as_ref() {
+                    Some(rutabaga) => {
+                        if let Err(e) =
+                            rutabaga.read_iosurface(resource_id, buffer, dst_stride as u32, scan_h)
+                        {
+                            log::error!(
+                                "Failed to read IOSurface {iosurface_id} for scanout {scanout_id} (res {resource_id}): {e}"
+                            );
+                            return Err(ErrUnspec);
+                        }
+                    }
+                    None => return Err(ErrUnspec),
+                }
             } else if let Some(rutabaga) = self.rutabaga.as_mut() {
                 // limina DIAG (flicker hunt): tunable pre-readback delay. `echo N >
                 // /tmp/limina-readback-delay` sleeps N ms before transfer_read, giving the
