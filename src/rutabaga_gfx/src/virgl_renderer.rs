@@ -603,6 +603,28 @@ impl RutabagaComponent for VirglRenderer {
         ret_to_res(ret)
     }
 
+    // limina: read a venus/virgl scanout's presented IOSurface (shared-storage, CPU-readable)
+    // into `dst`. Venus zero-copy blobs have no CPU transfer_read, so this is the only way the
+    // headless capture display sink can recover the frame.
+    #[cfg(target_os = "macos")]
+    fn read_iosurface(
+        &self,
+        resource_id: u32,
+        dst: &mut [u8],
+        dst_stride: u32,
+        height: u32,
+    ) -> RutabagaResult<()> {
+        let ret = unsafe {
+            virgl_renderer_resource_read_iosurface(
+                resource_id,
+                dst.as_mut_ptr() as *mut std::os::raw::c_void,
+                dst_stride,
+                height,
+            )
+        };
+        ret_to_res(ret)
+    }
+
     fn transfer_read(
         &self,
         ctx_id: u32,
