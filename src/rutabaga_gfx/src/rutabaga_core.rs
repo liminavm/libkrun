@@ -168,6 +168,20 @@ pub trait RutabagaComponent {
         Ok(())
     }
 
+    /// limina: copy a scanout resource's presented IOSurface into `dst` (top-down BGRA,
+    /// `dst_stride` bytes/row, `height` rows). Only the virgl/venus component implements it;
+    /// it lets the headless capture display sink read frames that have no CPU transfer_read
+    /// (venus zero-copy blobs only exist in the IOSurface's shared storage).
+    fn read_iosurface(
+        &self,
+        _resource_id: u32,
+        _dst: &mut [u8],
+        _dst_stride: u32,
+        _height: u32,
+    ) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// Implementations must flush the given resource to the display.
     fn resource_flush(&self, _resource_id: &mut RutabagaResource) -> RutabagaResult<()> {
         Err(RutabagaError::Unsupported)
@@ -907,6 +921,25 @@ impl Rutabaga {
         resource
             .iosurface_id
             .ok_or(RutabagaError::SpecViolation("not IOSurface-backed"))
+    }
+
+    /// limina: copy a scanout resource's presented IOSurface into `dst` (top-down BGRA,
+    /// `dst_stride` bytes/row, `height` rows). Dispatches to the component — only virgl/venus
+    /// implements it. The headless capture display sink uses this because venus zero-copy blobs
+    /// have no CPU transfer_read; the frame only lives in the IOSurface's shared storage.
+    pub fn read_iosurface(
+        &self,
+        resource_id: u32,
+        dst: &mut [u8],
+        dst_stride: u32,
+        height: u32,
+    ) -> RutabagaResult<()> {
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+
+        component.read_iosurface(resource_id, dst, dst_stride, height)
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device
