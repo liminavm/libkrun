@@ -23,6 +23,11 @@ macro_rules! into_rust_result {
         match $expr {
             $($pat $(if $pat_guard)? => $pat_expr,)+
             -1 => Err(DisplayBackendError::InternalError),
+            // -2 = KRUN_DISPLAY_ERR_METHOD_UNSUPPORTED. Without this arm a backend that returns
+            // MethodNotSupported (e.g. the headless capture sink, which has no zero-copy
+            // present_surface) falls through to the catch-all and is misreported as InternalError,
+            // so callers that branch on MethodNotSupported to take a readback fallback never do.
+            -2 => Err(DisplayBackendError::MethodNotSupported),
             -3 => Err(DisplayBackendError::InvalidScanoutId),
             -4 => Err(DisplayBackendError::InvalidParam),
             code @ i32::MIN.. => {
