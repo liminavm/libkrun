@@ -55,6 +55,11 @@ impl FreePageReclaim {
         self.reclaimer.is_some() && reclaimable(range.guest_addr, range.len)
     }
 
+    /// Whether reports go to the VMM to be replaced ([`FreePageReportingMode::Replace`]).
+    pub(super) fn replaces(&self) -> bool {
+        self.reclaimer.is_some()
+    }
+
     /// Whether another report can be taken from the queue.
     pub(super) fn can_take_report(&self) -> bool {
         self.reclaimer
