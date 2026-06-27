@@ -235,6 +235,10 @@ pub struct Vmm {
     /// captured when the GPU device is attached. `None` if no display/GPU is configured.
     #[cfg(feature = "gpu")]
     gpu_resize_handle: Option<devices::virtio::DisplayResizeHandle>,
+
+    /// limina: a handle for pushing balloon targets into the live virtio-balloon device, captured
+    /// when the balloon is attached. `None` if no balloon (e.g. the `tee` build).
+    balloon_control_handle: Option<devices::virtio::BalloonControlHandle>,
 }
 
 /// Out-of-band request to the running VM's event loop.
@@ -257,6 +261,18 @@ impl Vmm {
     #[cfg(feature = "gpu")]
     pub fn set_gpu_resize_handle(&mut self, handle: devices::virtio::DisplayResizeHandle) {
         self.gpu_resize_handle = Some(handle);
+    }
+
+    /// limina: the balloon control handle for the live virtio-balloon (if attached). limina-vmm
+    /// uses it to drive the dynamic-memory target (M6) and read back `actual`.
+    pub fn balloon_control_handle(&self) -> Option<devices::virtio::BalloonControlHandle> {
+        self.balloon_control_handle.clone()
+    }
+
+    /// limina: record the balloon control handle at attach time (see
+    /// [`Self::balloon_control_handle`]).
+    pub fn set_balloon_control_handle(&mut self, handle: devices::virtio::BalloonControlHandle) {
+        self.balloon_control_handle = Some(handle);
     }
 
     /// Gets the the specified bus device.

@@ -1015,6 +1015,7 @@ pub fn build_microvm(
         paused_at: 0,
         #[cfg(feature = "gpu")]
         gpu_resize_handle: None,
+        balloon_control_handle: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -2654,6 +2655,10 @@ fn attach_balloon_device(
     event_manager
         .add_subscriber(balloon.clone())
         .map_err(RegisterEvent)?;
+
+    // limina: capture the balloon control handle before the device is moved into the bus, so
+    // limina-vmm can drive the dynamic-memory target on the live device (M6).
+    vmm.set_balloon_control_handle(balloon.lock().unwrap().balloon_control_handle());
 
     let id = String::from(balloon.lock().unwrap().id());
 

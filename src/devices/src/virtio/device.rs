@@ -56,6 +56,17 @@ impl DeviceState {
             Self::Activated(_, interrupt) => interrupt.signal_used_queue(),
         }
     }
+
+    /// Raise a config-change interrupt so the guest re-reads device config (e.g. the balloon
+    /// `num_pages` target). Mirrors [`Self::signal_used_queue`].
+    pub fn signal_config_change(&self) {
+        match self {
+            Self::Inactive => {
+                warn!("DeviceState::signal_config_change() called, but device is not activated")
+            }
+            Self::Activated(_, interrupt) => interrupt.signal_config_change(),
+        }
+    }
 }
 
 impl DeviceState {
