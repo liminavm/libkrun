@@ -700,6 +700,15 @@ impl VirtioGpu {
         self.resources.clear();
         self.sw2d.clear();
         self.scanouts = Default::default();
+        // Dirty-reset hardening: a guest that crashed (or a firmware→kernel hand-off) never sent
+        // CTX_DESTROY/RESOURCE_UNREF, so its contexts/resources survive in the process-global
+        // renderer and collide with the re-initialized guest's reused ids — InvalidContextId /
+        // InvalidResourceId, which cascade-crashes the recovering session's GPU clients. Drop that
+        // leaked per-session renderer state so the next session starts clean. (A *clean* reset
+        // already emptied these via the guest's own teardown, so this is a no-op there.)
+        if let Some(rutabaga) = self.rutabaga.as_mut() {
+            rutabaga.reset_session_state();
+        }
         {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
