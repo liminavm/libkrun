@@ -1196,7 +1196,7 @@ impl VirtioGpu {
                     h = (h ^ buffer[i] as u64).wrapping_mul(0x0100_0000_01b3);
                     i += 1021;
                 }
-                log::info!(
+                log::trace!(
                     "[FLUSH2] res={resource_id} scan={scanout_id} rect=({},{},{},{}) dims={}x{} hash={h:016x}",
                     rect.x, rect.y, rect.width, rect.height, resource.width, resource.height
                 );
@@ -1385,7 +1385,7 @@ impl VirtioGpu {
             static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n % 512 == 0 {
-                log::info!("[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})");
+                log::trace!("[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})");
             }
             if let Err(e) =
                 self.display_backend
