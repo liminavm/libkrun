@@ -258,6 +258,14 @@ impl VirtioDevice for Input {
                 }
             }
         }
+        // Return to the inactive state so a later activate() runs again. Without this the
+        // device stays Activated and the transport's `if !is_activated() { activate() }`
+        // (mmio.rs) skips re-activation, leaving the guest with no input worker. This is
+        // the same line block/console reset() carry; input was missing it. It matters
+        // whenever the device is driven twice — e.g. the EDK2 VirtioKeyboardDxe binds the
+        // virtio keyboard for GRUB, resets it on ExitBootServices, then the guest kernel
+        // re-initializes it; without the reset the guest received zero input events.
+        self.device_state = DeviceState::Inactive;
         true
     }
 }
