@@ -118,7 +118,10 @@ impl InputWorker {
         let mut events = vec![EpollEvent::default(); 16];
 
         'event_loop: loop {
-            let num_events = match epoll.wait(events.len(), 1000, &mut events) {
+            // -1 = block indefinitely. Every fd (backend ready, event/status queues, stop) is
+            // registered above and shutdown rides the stop_fd (QUIT), so the old 1000 ms timeout
+            // did no work on expiry — it was a pure ~1 Hz idle wakeup.
+            let num_events = match epoll.wait(events.len(), -1, &mut events) {
                 Ok(n) => n,
                 Err(e) => {
                     error!("Epoll wait failed: {:?}", e);
