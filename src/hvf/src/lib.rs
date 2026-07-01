@@ -790,7 +790,12 @@ impl HvfVcpu<'_> {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
 
-                let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
+                // Multiply before dividing (in u128 to avoid overflow on far-future deadlines):
+                // dividing 1e9/cntfrq first truncates (24 MHz -> 41 ns/tick instead of 41.67), so
+                // every WFI-timeout ran ~1.6% short, the vCPU woke early, the guest re-WFI'd, and a
+                // single guest timer deadline cost two host wakeups.
+                let timeout_ns = ((cval - now) as u128 * 1_000_000_000) / self.cntfrq as u128;
+                let timeout = Duration::from_nanos(timeout_ns.min(u64::MAX as u128) as u64);
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_AA64_HVC => self.handle_psci_request(),
