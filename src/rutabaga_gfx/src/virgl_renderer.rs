@@ -563,6 +563,12 @@ impl RutabagaComponent for VirglRenderer {
         // The resource is safe to unreference destroy because no user of these bindings can still
         // be holding a reference.
         unsafe {
+            // limina (macOS): create_blob eagerly maps every mappable blob via map_ptr() (the
+            // host pointer feeds hv_vm_map), and virglrenderer's destroy path does not munmap a
+            // live mapping — balance it here. Harmless -EINVAL when the resource was never
+            // mapped; the #28 borrowed-driver-pointer case returns early without munmapping.
+            #[cfg(target_os = "macos")]
+            virgl_renderer_resource_unmap(resource_id);
             virgl_renderer_resource_unref(resource_id);
         }
     }
