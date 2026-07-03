@@ -1026,6 +1026,10 @@ pub fn build_microvm(
     #[cfg(not(feature = "tee"))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
     #[cfg(not(feature = "tee"))]
+    if let Some(provider) = vm_resources.battery_provider.clone() {
+        attach_i2c_battery_device(&mut vmm, event_manager, intc.clone(), provider)?;
+    }
+    #[cfg(not(feature = "tee"))]
     {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
         {
@@ -2704,6 +2708,32 @@ fn attach_rng_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
+
+    Ok(())
+}
+
+/// limina: virtio-i2c with the emulated SBS smart battery mirroring the host
+/// battery (see devices::virtio::i2c). Attached only when the VMM supplies a
+/// state provider — battery-less hosts simply don't get the device.
+#[cfg(not(feature = "tee"))]
+fn attach_i2c_battery_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    provider: devices::virtio::BatteryProvider,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let i2c = Arc::new(Mutex::new(devices::virtio::I2c::new(provider).unwrap()));
+
+    event_manager
+        .add_subscriber(i2c.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(i2c.lock().unwrap().id());
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, id, intc.clone(), i2c).map_err(RegisterRngDevice)?;
 
     Ok(())
 }
