@@ -29,6 +29,32 @@ use log::{debug, error, warn};
 
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
+    fn getpagesize() -> i32;
+}
+
+/// The HOST page size (16 KiB on Apple Silicon). hv_vm_map/hv_vm_unmap operate at this
+/// granularity and reject any size that is not a multiple of it with HV_BAD_ARGUMENT.
+fn host_page_size() -> u64 {
+    static PAGE: LazyLock<u64> = LazyLock::new(|| unsafe { getpagesize() } as u64);
+    *PAGE
+}
+
+/// Round `size` up to the host page granule.
+///
+/// Guests whose page size is smaller than the host's (a stock 4 KiB Linux guest on a
+/// 16 KiB Apple Silicon host) produce mappings sized at *their* granularity — e.g. a
+/// 0x21000-byte virtio-gpu blob (33 × 4 KiB, size%16k=4096) — which hv_vm_map/hv_vm_unmap
+/// reject outright. Rounding the size up is safe:
+/// - Host side: mmap'ed regions always occupy whole host pages, so the bytes between the
+///   requested end and the end of its last host page belong to the same host mapping.
+/// - Guest side: a rounded range can only overlap a neighboring mapping whose own start is
+///   NOT host-page-aligned — and any map/unmap of such a neighbor is itself rejected by HVF
+///   before it can touch the first mapping's pages.
+/// Map and unmap must round identically or a successful rounded map would leak its tail
+/// page at unmap time.
+fn round_up_to_host_page(size: u64) -> u64 {
+    let page = host_page_size();
+    size.div_ceil(page).saturating_mul(page)
 }
 
 const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
@@ -282,6 +308,9 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
+        // A 4 KiB guest can request sub-host-page sizes (see round_up_to_host_page);
+        // the addresses are NOT rounded — a misaligned address is a real caller bug.
+        let size = round_up_to_host_page(size);
         let ret = unsafe {
             hv_vm_map(
                 host_start_addr as *mut core::ffi::c_void,
@@ -309,6 +338,9 @@ impl HvfVm {
     }
 
     pub fn unmap_memory(&self, guest_start_addr: u64, size: u64) -> Result<(), Error> {
+        // Mirror map_memory's rounding exactly, or a rounded map's tail page would survive
+        // its unmap.
+        let size = round_up_to_host_page(size);
         let ret = unsafe { hv_vm_unmap(guest_start_addr, size.try_into().unwrap()) };
         if ret != HV_SUCCESS {
             Err(Error::MemoryUnmap)
@@ -811,5 +843,31 @@ impl HvfVcpu<'_> {
                 Err(Error::Unhandled)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_page_size, round_up_to_host_page};
+
+    // The blob-map alignment guard: hv_vm_map/hv_vm_unmap take sizes at host page
+    // granularity only, so the wrappers must round sub-granule sizes up (and by exactly
+    // the same amount on both map and unmap). See round_up_to_host_page.
+    #[test]
+    fn sizes_round_up_to_the_host_page_granule() {
+        let page = host_page_size();
+        assert!(page.is_power_of_two() && page >= 4096);
+
+        assert_eq!(round_up_to_host_page(0), 0);
+        assert_eq!(round_up_to_host_page(1), page);
+        assert_eq!(round_up_to_host_page(page), page);
+        assert_eq!(round_up_to_host_page(page + 1), 2 * page);
+
+        // The signature from the wild: a 4 KiB guest's 0x21000-byte blob on a 16 KiB host.
+        let odd = 0x21000u64;
+        let rounded = round_up_to_host_page(odd);
+        assert!(rounded >= odd);
+        assert_eq!(rounded % page, 0);
+        assert!(rounded - odd < page);
     }
 }
