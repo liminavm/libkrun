@@ -25,6 +25,8 @@ pub mod file_traits;
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(not(feature = "tee"))]
+pub mod i2c;
 #[cfg(feature = "input")]
 pub mod input;
 pub mod linux_errno;
@@ -48,6 +50,8 @@ pub use self::device::*;
 pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
+#[cfg(not(feature = "tee"))]
+pub use self::i2c::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;

@@ -246,6 +246,11 @@ pub struct VmResources {
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
     /// Enable the embedded dhcp client in init.c
     pub dhcp_client: bool,
+    /// limina: host battery mirror — when set, a virtio-i2c adapter with an
+    /// emulated SBS smart battery is attached, answering register reads from
+    /// this callback (see devices::virtio::i2c).
+    #[cfg(not(feature = "tee"))]
+    pub battery_provider: Option<devices::virtio::BatteryProvider>,
 }
 
 impl VmResources {
