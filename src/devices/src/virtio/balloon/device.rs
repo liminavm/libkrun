@@ -292,8 +292,16 @@ impl Balloon {
             // "complete" a host page whose sub-page is live again -> corruption.
             let mut coalescer = ReclaimCoalescer::new(host_page);
             for desc in head.into_iter() {
-                let host_addr = mem.get_host_address(desc.addr).unwrap() as usize;
-                coalescer.add(host_addr, desc.len as usize);
+                // desc.addr is guest-reported; a bad/out-of-range FRQ entry must skip, not
+                // panic the worker (a guest-triggerable DoS otherwise).
+                let Ok(host_addr) = mem.get_host_address(desc.addr) else {
+                    warn!(
+                        "balloon: FRQ descriptor addr {:#x} outside guest memory; skipping",
+                        desc.addr.0
+                    );
+                    continue;
+                };
+                coalescer.add(host_addr as usize, desc.len as usize);
             }
             // madvise BEFORE add_used: page_reporting keeps these pages isolated from the guest
             // allocator until the descriptor is marked used, which closes the reallocation window.
