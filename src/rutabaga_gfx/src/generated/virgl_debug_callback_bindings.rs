@@ -73,3 +73,29 @@ pub type virgl_debug_callback_type = ::std::option::Option<
 unsafe extern "C" {
     pub fn virgl_set_debug_callback(cb: virgl_debug_callback_type) -> virgl_debug_callback_type;
 }
+
+/* Level-aware logging API (virglrenderer.h "new API"): unlike the legacy
+ * debug callback it carries the severity, letting the VMM route virgl ERROR
+ * lines (e.g. venus ring poisoning) to a level production logging records. */
+pub const VIRGL_LOG_LEVEL_DEBUG: u32 = 0;
+pub const VIRGL_LOG_LEVEL_INFO: u32 = 1;
+pub const VIRGL_LOG_LEVEL_WARNING: u32 = 2;
+pub const VIRGL_LOG_LEVEL_ERROR: u32 = 3;
+
+pub type virgl_log_callback_type = ::std::option::Option<
+    unsafe extern "C" fn(
+        log_level: u32,
+        message: *const ::std::os::raw::c_char,
+        user_data: *mut ::std::os::raw::c_void,
+    ),
+>;
+pub type virgl_free_data_callback_type =
+    ::std::option::Option<unsafe extern "C" fn(user_data: *mut ::std::os::raw::c_void)>;
+
+unsafe extern "C" {
+    pub fn virgl_set_log_callback(
+        cb: virgl_log_callback_type,
+        user_data: *mut ::std::os::raw::c_void,
+        free_data_cb: virgl_free_data_callback_type,
+    );
+}
