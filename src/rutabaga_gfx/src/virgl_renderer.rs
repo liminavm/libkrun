@@ -25,6 +25,7 @@ use std::sync::atomic::Ordering;
 
 use log::debug;
 use log::error;
+use log::info;
 use log::warn;
 
 use crate::generated::virgl_debug_callback_bindings::*;
@@ -159,6 +160,29 @@ impl Drop for VirglRendererContext {
     }
 }
 
+/// Level-aware virgl log sink (virgl_set_log_callback). Unlike the legacy
+/// va_list callback this receives the severity, so virgl/vkr ERROR lines —
+/// e.g. "ring FATAL set at ..." when a venus context is poisoned — surface at
+/// a level production deployments (default `warn`) actually record.
+extern "C" fn log_callback(
+    log_level: u32,
+    message: *const ::std::os::raw::c_char,
+    _user_data: *mut ::std::os::raw::c_void,
+) {
+    if message.is_null() {
+        return;
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy();
+    let msg = msg.trim_end();
+    match log_level {
+        VIRGL_LOG_LEVEL_ERROR => error!("virgl: {msg}"),
+        VIRGL_LOG_LEVEL_WARNING => warn!("virgl: {msg}"),
+        VIRGL_LOG_LEVEL_INFO => info!("virgl: {msg}"),
+        _ => debug!("virgl: {msg}"),
+    }
+}
+
+#[allow(dead_code)] // superseded by the level-aware log_callback below; kept for reference
 extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: stdio::va_list) {
     const BUF_LEN: usize = 256;
     let mut v = [b' '; BUF_LEN];
@@ -312,7 +336,7 @@ impl VirglRenderer {
             return Err(RutabagaError::AlreadyInUse);
         }
 
-        unsafe { virgl_set_debug_callback(Some(debug_callback)) };
+        unsafe { virgl_set_log_callback(Some(log_callback), null_mut(), None) };
 
         // Cookie is intentionally never freed because virglrenderer never gets uninitialized.
         // Otherwise, Resource and Context would become invalid because their lifetime is not tied
