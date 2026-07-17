@@ -250,6 +250,11 @@ pub struct VmResources {
     /// audio. A plain bool so callers need no `snd`-feature cfg; the builder only
     /// acts on it when built with the `snd` feature (see devices::virtio::snd).
     pub snd: bool,
+    /// limina: advertise the mic-capture input stream on the virtio-snd device.
+    /// Opt-in and default-off for privacy (unlike playback); only meaningful when
+    /// `snd` is also set. Enabling it lets the guest capture the host microphone
+    /// (and triggers the macOS mic TCC prompt on first PREPARE).
+    pub snd_capture: bool,
     /// limina: host battery mirror — when set, a virtio-i2c adapter with an
     /// emulated SBS smart battery is attached, answering register reads from
     /// this callback (see devices::virtio::i2c).
