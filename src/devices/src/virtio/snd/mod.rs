@@ -13,6 +13,8 @@
 //! B replaces the null sink with a CoreAudio output unit driven from a dedicated
 //! worker thread, with tx-completion pacing.
 
+#[cfg(target_os = "macos")]
+mod audio_macos;
 mod device;
 mod event_handler;
 mod protocol;
