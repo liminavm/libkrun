@@ -246,6 +246,10 @@ pub struct VmResources {
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
     /// Enable the embedded dhcp client in init.c
     pub dhcp_client: bool,
+    /// limina: attach the native virtio-snd device (device ID 25) driving host
+    /// audio. A plain bool so callers need no `snd`-feature cfg; the builder only
+    /// acts on it when built with the `snd` feature (see devices::virtio::snd).
+    pub snd: bool,
     /// limina: host battery mirror — when set, a virtio-i2c adapter with an
     /// emulated SBS smart battery is attached, answering register reads from
     /// this callback (see devices::virtio::i2c).
