@@ -38,6 +38,11 @@ impl Snd {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn handle_completion_event(&mut self) {
+        self.reap_completions();
+    }
+
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
         debug!("snd: activate event");
         if let Err(e) = self.activate_evt.read() {
@@ -63,6 +68,22 @@ impl Snd {
                 });
         }
 
+        // The CoreAudio render callback kicks this fd when it consumes frames; the
+        // reaper then completes the tx descriptors those frames belong to.
+        #[cfg(target_os = "macos")]
+        {
+            let fd = self.completion_evt_fd();
+            event_manager
+                .register(
+                    fd,
+                    EpollEvent::new(EventSet::IN, fd as u64),
+                    self_subscriber.clone(),
+                )
+                .unwrap_or_else(|e| {
+                    error!("snd: failed to register completion evt with event manager: {e:?}");
+                });
+        }
+
         event_manager
             .unregister(self.activate_evt.as_raw_fd())
             .unwrap_or_else(|e| {
@@ -78,6 +99,11 @@ impl Subscriber for Snd {
         if source == activate_evt {
             self.handle_activate_event(event_manager);
         } else if self.is_activated() {
+            #[cfg(target_os = "macos")]
+            if source == self.completion_evt_fd() {
+                self.handle_completion_event();
+                return;
+            }
             if source == self.queue_event(CONTROL_INDEX).as_raw_fd() {
                 self.handle_control_event(event);
             } else if source == self.queue_event(TX_INDEX).as_raw_fd() {
