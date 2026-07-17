@@ -1029,6 +1029,10 @@ pub fn build_microvm(
     if let Some(provider) = vm_resources.battery_provider.clone() {
         attach_i2c_battery_device(&mut vmm, event_manager, intc.clone(), provider)?;
     }
+    #[cfg(feature = "snd")]
+    if vm_resources.snd {
+        attach_snd_device(&mut vmm, event_manager, intc.clone())?;
+    }
     #[cfg(not(feature = "tee"))]
     {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -2734,6 +2738,31 @@ fn attach_i2c_battery_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), i2c).map_err(RegisterRngDevice)?;
+
+    Ok(())
+}
+
+/// limina: native virtio-snd device (device ID 25) driving host audio. Attached when
+/// `VmResources::snd` is set; the guest's stock virtio_snd driver binds it and exposes
+/// an ALSA card (see devices::virtio::snd). Works on macOS (in-VMM, no vhost-user).
+#[cfg(feature = "snd")]
+fn attach_snd_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let snd = Arc::new(Mutex::new(devices::virtio::Snd::new().unwrap()));
+
+    event_manager
+        .add_subscriber(snd.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(snd.lock().unwrap().id());
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, id, intc.clone(), snd).map_err(RegisterRngDevice)?;
 
     Ok(())
 }
