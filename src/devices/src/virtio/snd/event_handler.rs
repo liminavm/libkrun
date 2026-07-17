@@ -6,7 +6,7 @@ use std::os::unix::io::AsRawFd;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::defs::{CONTROL_INDEX, TX_INDEX};
+use super::defs::{CONTROL_INDEX, RX_INDEX, TX_INDEX};
 use super::device::Snd;
 use crate::virtio::device::VirtioDevice;
 
@@ -39,8 +39,26 @@ impl Snd {
     }
 
     #[cfg(target_os = "macos")]
+    fn handle_rx_event(&mut self, event: &EpollEvent) {
+        if event.event_set() != EventSet::IN {
+            warn!("snd: rx queue unexpected event {:?}", event.event_set());
+            return;
+        }
+        if let Err(e) = self.queue_event(RX_INDEX).read() {
+            error!("snd: failed to read rx queue event: {e:?}");
+        } else {
+            self.process_rx();
+        }
+    }
+
+    // The shared completion fd is kicked by both the playback (consumed frames) and
+    // capture (produced frames) callbacks: reap tx completions and drain the mic ring.
+    #[cfg(target_os = "macos")]
     fn handle_completion_event(&mut self) {
         self.reap_completions();
+        if self.capture_enabled {
+            self.process_rx();
+        }
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
@@ -55,7 +73,12 @@ impl Snd {
             .subscriber(self.activate_evt.as_raw_fd())
             .unwrap();
 
-        for idx in [CONTROL_INDEX, TX_INDEX] {
+        // Playback (control+tx) always; capture (rx) only when the mic is enabled.
+        let mut queues = vec![CONTROL_INDEX, TX_INDEX];
+        if self.capture_enabled {
+            queues.push(RX_INDEX);
+        }
+        for idx in queues {
             let fd = self.queue_event(idx).as_raw_fd();
             event_manager
                 .register(
@@ -109,6 +132,11 @@ impl Subscriber for Snd {
             } else if source == self.queue_event(TX_INDEX).as_raw_fd() {
                 self.handle_tx_event(event);
             } else {
+                #[cfg(target_os = "macos")]
+                if self.capture_enabled && source == self.queue_event(RX_INDEX).as_raw_fd() {
+                    self.handle_rx_event(event);
+                    return;
+                }
                 warn!("snd: unexpected event on fd {source:?}");
             }
         } else {

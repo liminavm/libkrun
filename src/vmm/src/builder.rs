@@ -1031,7 +1031,12 @@ pub fn build_microvm(
     }
     #[cfg(feature = "snd")]
     if vm_resources.snd {
-        attach_snd_device(&mut vmm, event_manager, intc.clone())?;
+        attach_snd_device(
+            &mut vmm,
+            event_manager,
+            intc.clone(),
+            vm_resources.snd_capture,
+        )?;
     }
     #[cfg(not(feature = "tee"))]
     {
@@ -2750,10 +2755,13 @@ fn attach_snd_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    capture_enabled: bool,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let snd = Arc::new(Mutex::new(devices::virtio::Snd::new().unwrap()));
+    let snd = Arc::new(Mutex::new(
+        devices::virtio::Snd::new(capture_enabled).unwrap(),
+    ));
 
     event_manager
         .add_subscriber(snd.clone())
