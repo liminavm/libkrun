@@ -2040,7 +2040,7 @@ fn attach_legacy_devices(
     }
 
     mmio_device_manager
-        .register_mmio_rtc(vm, intc.clone())
+        .register_mmio_rtc(vm, intc.clone(), event_manager)
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 

@@ -181,17 +181,33 @@ impl MMIODeviceManager {
 
     #[cfg(target_arch = "aarch64")]
     /// Register a MMIO RTC device.
-    pub fn register_mmio_rtc(&mut self, _vm: &Vm, _intc: IrqChip) -> Result<()> {
+    pub fn register_mmio_rtc(
+        &mut self,
+        _vm: &Vm,
+        intc: IrqChip,
+        event_manager: &mut EventManager,
+    ) -> Result<()> {
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
-        // Attaching the RTC device.
+        // Attaching the RTC device. Wire its alarm interrupt to the GIC and subscribe to its timer
+        // eventfd (mirroring the GPIO device) so a programmed match actually raises an SPI — the
+        // mechanism a guest needs to wake from suspend-to-idle via `rtcwake`.
         let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
-        let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
+        let rtc = Arc::new(Mutex::new(devices::legacy::RTC::new(
+            rtc_evt.try_clone().map_err(Error::EventFd)?,
+        )));
+
+        event_manager.add_subscriber(rtc.clone()).unwrap();
+        {
+            let mut rtc = rtc.lock().unwrap();
+            rtc.set_intc(intc);
+            rtc.set_irq_line(self.irq);
+        }
 
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .insert(rtc, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
 
         let ret = self.mmio_base;
