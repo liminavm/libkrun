@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
@@ -20,6 +21,7 @@ use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
@@ -108,6 +110,12 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    // Per-activation thread stop signals, so a device reset (suspend/resume) tears the current
+    // activation's threads down before the device is re-activated with a fresh queue — otherwise a
+    // stale timesync/muxer thread keeps writing into the recreated guest RX ring. Fire-and-forget:
+    // signalled in `deactivate`, each thread self-exits (see timesync/muxer_thread/reaper).
+    timesync_stop: Option<Arc<AtomicBool>>,
+    muxer_stop: Option<EventFd>,
 }
 
 impl VsockMuxer {
@@ -129,6 +137,8 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            timesync_stop: None,
+            muxer_stop: None,
         }
     }
 
@@ -144,12 +154,24 @@ impl VsockMuxer {
 
         #[cfg(target_os = "macos")]
         {
-            let timesync =
-                TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
+            let stop = Arc::new(AtomicBool::new(false));
+            let timesync = TimesyncThread::new(
+                self.cid,
+                mem.clone(),
+                queue.clone(),
+                interrupt.clone(),
+                stop.clone(),
+            );
             timesync.run();
+            self.timesync_stop = Some(stop);
         }
 
         let (sender, receiver) = unbounded();
+
+        // Stop eventfd for the muxer thread: `deactivate` writes it to wake the thread out of its
+        // blocking epoll and exit. We keep the write end here; the thread registers the read fd.
+        let muxer_stop = EventFd::new(EFD_NONBLOCK).unwrap();
+        let stop_fd = muxer_stop.as_raw_fd();
 
         let thread = MuxerThread::new(
             self.cid,
@@ -161,12 +183,49 @@ impl VsockMuxer {
             interrupt.clone(),
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
+            stop_fd,
         );
         thread.run();
+        self.muxer_stop = Some(muxer_stop);
 
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
         reaper.run();
+    }
+
+    /// Tear down the current activation's worker threads on a device reset (suspend/resume), before
+    /// the device is re-activated with a fresh queue. Without this, a stale timesync/muxer thread
+    /// from the previous activation keeps writing used-ring entries into the guest RX ring that the
+    /// resumed driver has recreated (freed + reallocated) → silent guest-memory corruption, plus a
+    /// leaked thread trio per suspend cycle.
+    ///
+    /// Fire-and-forget by design: this runs on the vCPU MMIO thread inside `set_device_status(0)`
+    /// while the guest is suspending, so it must not block on `join`. Each thread checks its stop
+    /// signal before any queue access and self-exits; because reset (status 0) precedes re-activate
+    /// (DRIVER_OK), the old threads are gone — or harmlessly winding down without touching the
+    /// queue — before the next activation spawns new ones.
+    pub(crate) fn deactivate(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(stop) = self.timesync_stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+        // Wake the muxer thread but keep the eventfd ALIVE: the thread reads the fd asynchronously,
+        // so dropping it here could close the fd (and cancel the kqueue event) before the thread
+        // sees it. The next `activate` replaces `muxer_stop`, dropping this one only once the old
+        // thread has long since woken and exited.
+        if let Some(stop_evt) = &self.muxer_stop {
+            let _ = stop_evt.write(1);
+        }
+        // Dropping the muxer's sender + the exiting muxer thread's sender disconnects the reaper,
+        // which then stops instead of busy-looping.
+        self.reaper_sender = None;
+        // Drop stale host-side proxy state (open connections/listeners) so their fds don't leak
+        // across the cycle and a re-activate starts from a clean slate; likewise the pending RX.
+        self.proxy_map.write().unwrap().clear();
+        *self.rxq.lock().unwrap() = MuxerRxQ::new();
+        self.queue = None;
+        self.mem = None;
+        self.interrupt = None;
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
