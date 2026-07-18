@@ -331,6 +331,12 @@ impl MmioTransport {
     #[allow(unused_assignments)]
     fn set_device_status(&mut self, status: u32) {
         use device_status::*;
+        debug!(
+            "device {} status transition 0x{:x} -> 0x{:x}",
+            self.locked_device().device_name(),
+            self.device_status,
+            status
+        );
         // match changed bits
         match !self.device_status & status {
             ACKNOWLEDGE if self.device_status == INIT => {
