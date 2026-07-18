@@ -178,6 +178,42 @@ pub struct VcpuConfig {
 // Using this for easier explicit type-casting to help IDEs interpret the code.
 type VcpuCell = Cell<Option<*const Vcpu>>;
 
+/// One-shot barrier that holds every restoring vCPU thread after it has created its HVF vCPU
+/// (so MPIDR is set) but *before* it restores its register file, until the main thread has
+/// restored the VM-wide in-kernel GIC (M9 restore). The ordering is load-bearing: `hv_gic_set_state`
+/// requires the vCPUs to already exist with their MPIDRs, and each vCPU's per-CPU-interface (ICC)
+/// registers — restored inside [`HvfVcpu::restore_state`] on the vCPU's own thread — must be applied
+/// *after* the distributor/redistributor state, or interrupts won't deliver post-restore. Opened once.
+pub struct RestoreGate {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Default for RestoreGate {
+    fn default() -> Self {
+        Self {
+            open: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+impl RestoreGate {
+    /// Block until [`open`](Self::open) is called (returns immediately if already open).
+    pub fn wait(&self) {
+        let mut opened = self.open.lock().unwrap();
+        while !*opened {
+            opened = self.cv.wait(opened).unwrap();
+        }
+    }
+
+    /// Release every waiting vCPU. Called once, after the GIC has been restored.
+    pub fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     id: u8,
@@ -202,6 +238,14 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+
+    /// M9 restore: this vCPU's saved architectural state. When `Some`, `run` restores it (via
+    /// [`HvfVcpu::restore_state`]) instead of calling `set_initial_state`, and skips the PSCI
+    /// `CPU_ON` boot-wait (a restored guest already onlined its secondaries and never re-sends it).
+    restore_state: Option<VcpuState>,
+    /// M9 restore: the shared gate this vCPU waits on (after creating its HVF vCPU, before
+    /// restoring) until the main thread has restored the in-kernel GIC. `None` on a fresh boot.
+    restore_gate: Option<Arc<RestoreGate>>,
 }
 
 impl Vcpu {
@@ -295,12 +339,22 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            restore_state: None,
+            restore_gate: None,
         })
     }
 
     /// Returns the cpu index as seen by the guest OS.
     pub fn cpu_index(&self) -> u8 {
         self.id
+    }
+
+    /// M9 restore: hand this vCPU its saved state and the shared GIC-restore gate. `run` will then
+    /// wait on the gate (until the GIC is restored) and `restore_state` instead of a fresh boot.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_restore(&mut self, state: VcpuState, gate: Arc<RestoreGate>) {
+        self.restore_state = Some(state);
+        self.restore_gate = Some(gate);
     }
 
     /// Gets the MPIDR register value.
@@ -463,15 +517,36 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+        if let Some(state) = self.restore_state.take() {
+            // M9 restore: the HVF vCPU now exists with its MPIDR set (a precondition for
+            // `hv_gic_set_state`). Wait on the shared gate until the main thread has restored the
+            // in-kernel GIC, then restore this vCPU's register file (which restores its ICC regs on
+            // this thread, after the distributor/redistributor). We do NOT wait on the PSCI
+            // `CPU_ON` boot channel — a restored guest already onlined its secondaries and never
+            // re-sends it, so a secondary would otherwise park here forever.
+            if let Some(gate) = self.restore_gate.take() {
+                gate.wait();
+            }
+            hvf_vcpu
+                .restore_state(&state)
+                .unwrap_or_else(|e| panic!("Can't restore HVF vCPU {hvf_vcpuid} state: {e}"));
+            // The fresh worker has loaded this vCPU's saved register file into a live HVF vCPU
+            // (behind the already-restored in-kernel GIC); it will resume executing at exactly the
+            // guest PC captured at snapshot time. Emitting the PC makes the resume observable to an
+            // operator (and to the M9.1 acceptance test) without needing the guest to reach any
+            // device — device state is not restored until M9.2.
+            info!("vCPU {hvf_vcpuid} resumed from snapshot at pc={:#x}", state.pc);
         } else {
-            self.boot_entry_addr
-        };
+            let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
+                boot_receiver.recv().unwrap()
+            } else {
+                self.boot_entry_addr
+            };
 
-        hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+            hvf_vcpu
+                .set_initial_state(entry_addr, self.fdt_addr)
+                .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        }
 
         loop {
             // An out-of-band pause request breaks the vCPU out of HVF via

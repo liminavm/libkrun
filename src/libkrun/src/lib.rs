@@ -2970,6 +2970,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         sender,
+        None, // the C API has no snapshot-restore path (limina's worker drives M9)
     ) {
         Ok(vmm) => vmm,
         Err(e) => {
