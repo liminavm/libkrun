@@ -5,7 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::Error as DeviceError;
-use crate::virtio::net::Result;
+use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
@@ -13,13 +13,15 @@ use crate::virtio::{
     TYPE_NET, VirtioDevice,
 };
 
-use super::backend::{ReadError, WriteError};
-use super::worker::NetWorker;
+use super::backend::{NetBackend, ReadError, WriteError};
+use super::worker::{connect_backend, NetWorker};
 
 use std::cmp;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::thread::JoinHandle;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
@@ -79,6 +81,17 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+
+    // Suspend/resume: the running worker's handle + the eventfd that stops it, so `reset` (the
+    // virtio reset the guest issues on resume) can tear the old worker down cleanly before the
+    // device is re-activated with fresh queues. The join handle yields the backend connection back
+    // so it survives the reset (see [`Net::reset`] and `worker::connect_backend`).
+    worker_thread: Option<JoinHandle<Box<dyn NetBackend + Send>>>,
+    worker_stopfd: EventFd,
+    // The gateway connection (e.g. gvproxy socket), preserved across suspend/resume. `Some` while
+    // the device is inactive/idle; taken by `activate` (moved into the worker) and handed back by
+    // `reset`. Lazily opened on first activate.
+    backend: Option<Box<dyn NetBackend + Send>>,
 }
 
 impl Net {
@@ -109,6 +122,10 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+
+            worker_thread: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?,
+            backend: None,
         })
     }
 
@@ -181,30 +198,62 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
-        match NetWorker::new(
-            rx_q,
-            tx_q,
-            interrupt.clone(),
-            mem.clone(),
-            self.acked_features,
-            self.cfg_backend.clone(),
-        ) {
-            Ok(worker) => {
-                worker.run();
-                self.device_state = DeviceState::Activated(mem, interrupt);
-                Ok(())
-            }
+        let stop_fd = match self.worker_stopfd.try_clone() {
+            Ok(fd) => fd,
             Err(err) => {
                 error!(
-                    "Error activating virtio-net ({}) backend: {err:?}",
+                    "Cannot clone virtio-net ({}) stop eventfd: {err:?}",
                     self.id()
                 );
-                Err(ActivateError::BadActivate)
+                return Err(ActivateError::BadActivate);
             }
-        }
+        };
+
+        // Reuse the existing gateway connection across a suspend/resume cycle; open it only the
+        // first time (or if a previous worker failed to hand it back).
+        let backend = match self.backend.take() {
+            Some(backend) => backend,
+            None => match connect_backend(self.cfg_backend.clone(), self.acked_features) {
+                Ok(backend) => backend,
+                Err(err) => {
+                    error!(
+                        "Error connecting virtio-net ({}) backend: {err:?}",
+                        self.id()
+                    );
+                    return Err(ActivateError::BadActivate);
+                }
+            },
+        };
+
+        let worker = NetWorker::new(rx_q, tx_q, interrupt.clone(), mem.clone(), backend, stop_fd);
+        self.worker_thread = Some(worker.run());
+        self.device_state = DeviceState::Activated(mem, interrupt);
+        Ok(())
     }
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    /// Deactivate on the virtio reset the guest issues when re-initialising the device — notably
+    /// on resume from suspend-to-idle. Stop the worker thread (so a fresh `activate` doesn't race a
+    /// stale one on the same queues) and go Inactive; the transport then recreates the queues and
+    /// re-activates. Returning `false` here (the trait default) would leave the transport marking
+    /// the device FAILED, so the guest's re-init writes get dropped and networking never comes back.
+    fn reset(&mut self) -> bool {
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            match worker.join() {
+                // Preserve the gateway connection so the next activate reuses it (don't reconnect,
+                // which would drop gvproxy).
+                Ok(backend) => self.backend = Some(backend),
+                Err(e) => error!(
+                    "error waiting for virtio-net ({}) worker thread: {e:?}",
+                    self.id()
+                ),
+            }
+        }
+        self.device_state = DeviceState::Inactive;
+        true
     }
 }
