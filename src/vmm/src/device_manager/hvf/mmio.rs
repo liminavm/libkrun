@@ -234,11 +234,13 @@ impl MMIODeviceManager {
         intc: IrqChip,
         event_manager: &mut EventManager,
         shutdown_efd: EventFd,
+        suspend_efd: EventFd,
     ) -> Result<()> {
         // Attaching the GPIO device.
         let gpio_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let gpio = Arc::new(Mutex::new(devices::legacy::Gpio::new(
             shutdown_efd,
+            suspend_efd,
             gpio_evt.try_clone().map_err(Error::EventFd)?,
         )));
 
