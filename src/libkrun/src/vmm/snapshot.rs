@@ -102,6 +102,7 @@ fn encode_vcpu(v: &mut Vec<u8>, s: &VcpuState) {
     put_u64_slice(v, &s.sysregs);
     put_u64_slice(v, &s.icc);
     put_u64(v, s.vtimer_offset);
+    v.push(s.vtimer_masked as u8);
     v.push(s.pending_irq as u8);
     v.push(s.pending_fiq as u8);
 }
@@ -188,6 +189,7 @@ fn decode_vcpu(r: &mut Reader) -> io::Result<VcpuState> {
     let sysregs = decode_u64_vec(r)?;
     let icc = decode_u64_vec(r)?;
     let vtimer_offset = r.u64()?;
+    let vtimer_masked = r.u8()? != 0;
     let pending_irq = r.u8()? != 0;
     let pending_fiq = r.u8()? != 0;
     Ok(VcpuState {
@@ -200,6 +202,7 @@ fn decode_vcpu(r: &mut Reader) -> io::Result<VcpuState> {
         sysregs,
         icc,
         vtimer_offset,
+        vtimer_masked,
         pending_irq,
         pending_fiq,
     })
@@ -257,6 +260,7 @@ mod tests {
             sysregs: (0..113).map(|i| seed * 1000 + i).collect(),
             icc: (0..9).map(|i| seed * 10 + i).collect(),
             vtimer_offset: seed + 500,
+            vtimer_masked: seed % 2 == 1,
             pending_irq: seed % 2 == 0,
             pending_fiq: seed % 3 == 0,
         }
