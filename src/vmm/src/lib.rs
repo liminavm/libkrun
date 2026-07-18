@@ -452,8 +452,18 @@ impl Vmm {
     pub fn save_snapshot(&mut self, path: &std::path::Path) -> Result<()> {
         let vcpus = self.snapshot_vcpus()?;
         let gic = hvf::save_gic_state().map_err(|_| Error::Snapshot)?;
+        let gpio = self
+            .mmio_device_manager
+            .gpio
+            .as_ref()
+            .map(|g| g.lock().unwrap().save_state());
         let ram = self.dump_ram();
-        let snap = snapshot::Snapshot { vcpus, gic, ram };
+        let snap = snapshot::Snapshot {
+            vcpus,
+            gic,
+            gpio,
+            ram,
+        };
         snapshot::write(path, &snap).map_err(Error::SnapshotIo)?;
         info!(
             "snapshot written: {} vCPUs, {}-byte GIC, {} RAM regions -> {}",
@@ -463,6 +473,16 @@ impl Vmm {
             path.display()
         );
         Ok(())
+    }
+
+    /// M9 restore: apply a saved PL061 register file to the fresh GPIO device before the guest
+    /// resumes, so the wake injected on resume demuxes (`GPIOMIS = istate & im`) and the guest's
+    /// `pl061_resume` sees the register state it left. No-op if the VM has no GPIO device.
+    #[cfg(target_os = "macos")]
+    pub fn restore_gpio_state(&self, gpio: &devices::legacy::GpioState) {
+        if let Some(g) = &self.mmio_device_manager.gpio {
+            g.lock().unwrap().restore_state(gpio);
+        }
     }
 
     /// Copy out the guest RAM regions for a snapshot, skipping everything at or above the SHM
