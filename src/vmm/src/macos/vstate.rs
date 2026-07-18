@@ -20,7 +20,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{HvfVcpu, HvfVm, VcpuExit, VcpuState, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -477,8 +477,13 @@ impl Vcpu {
             // An out-of-band pause request breaks the vCPU out of HVF via
             // `vcpu_request_exit` (-> Canceled), so we observe it here between
             // guest runs and freeze on this thread, where the HvfVcpu lives.
-            if let Ok(VcpuEvent::Pause) = self.event_receiver.try_recv() {
-                self.pause_and_park(&hvf_vcpu);
+            // A `Snapshot` saves this vCPU's state on its own thread (HVF register
+            // affinity) and then parks the same way.
+            match self.event_receiver.try_recv() {
+                Ok(VcpuEvent::Pause) => self.pause_and_park(&hvf_vcpu),
+                Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(&mut hvf_vcpu, reply),
+                // A stale `Resume` with no matching pause, or an empty channel.
+                Ok(VcpuEvent::Resume(_)) | Err(_) => {}
             }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
@@ -546,6 +551,39 @@ impl Vcpu {
         }
     }
 
+    /// Snapshot this vCPU (M9): save its full architectural state on this thread, send it back,
+    /// then park until `Resume` (or the process tears down). Called from the top of the run loop,
+    /// a clean boundary between `hv_vcpu_run` calls, so the captured register file is consistent.
+    fn handle_snapshot(&mut self, hvf_vcpu: &mut HvfVcpu, reply: Sender<Box<VcpuState>>) {
+        match hvf_vcpu.save_state() {
+            Ok(state) => {
+                // If the collector is gone the whole snapshot is being aborted; just park.
+                let _ = reply.send(Box::new(state));
+            }
+            Err(e) => {
+                error!("vCPU {} snapshot save failed: {e}", hvf_vcpu.id());
+                // Dropping `reply` without sending signals the collector that this vCPU failed.
+            }
+        }
+        loop {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Resume(paused_ticks)) => {
+                    hvf_vcpu
+                        .advance_vtimer_offset(paused_ticks)
+                        .unwrap_or_else(|e| {
+                            panic!("vCPU {} vtimer advance failed: {e:?}", self.id)
+                        });
+                    self.response_sender
+                        .send(VcpuResponse::Resumed)
+                        .expect("failed to report vcpu Resumed");
+                    return;
+                }
+                Ok(_) => {}       // redundant Pause/Snapshot while parked; ignore
+                Err(_) => return, // event channel dropped: process tearing down
+            }
+        }
+    }
+
     fn wait_for_resume(&mut self) {}
 
     /// Freeze this vCPU in response to a `Pause` event and block until `Resume`,
@@ -602,6 +640,10 @@ pub enum VcpuEvent {
     /// (the wall-clock time the VM spent paused). The coordinator sends the
     /// same value to every vCPU so their counters stay synchronized.
     Resume(u64),
+    /// Snapshot this vCPU's full architectural state and send it back over the channel, then
+    /// park (as for `Pause`) until `Resume`. The save runs on the vCPU's own thread because HVF
+    /// binds register access there. Used by the M9 snapshot path.
+    Snapshot(Sender<Box<VcpuState>>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
