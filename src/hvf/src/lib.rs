@@ -206,6 +206,36 @@ pub trait Vcpus {
     fn handle_sysreg_write(&self, vcpuid: u64, reg: u32, val: u64) -> bool;
 }
 
+/// Save the in-kernel GICv3 **distributor + redistributor** state (VM-wide) as an opaque,
+/// versioned blob (Apple's binary-plist format). The per-vCPU CPU-interface (ICC) registers are
+/// deliberately NOT included — Apple's `hv_gic_state` omits them — so they're captured per-vCPU
+/// in [`VcpuState`]. Call while all vCPUs are quiesced (M9 snapshot).
+pub fn save_gic_state() -> Result<Vec<u8>, Error> {
+    let state = unsafe { hv_gic_state_create() };
+    if state.is_null() {
+        return Err(Error::VcpuSnapshot);
+    }
+    let mut size: usize = 0;
+    if unsafe { hv_gic_state_get_size(state, &mut size) } != HV_SUCCESS {
+        return Err(Error::VcpuSnapshot);
+    }
+    let mut buf = vec![0u8; size];
+    if unsafe { hv_gic_state_get_data(state, buf.as_mut_ptr() as *mut _) } != HV_SUCCESS {
+        return Err(Error::VcpuSnapshot);
+    }
+    Ok(buf)
+}
+
+/// Restore the in-kernel GICv3 distributor + redistributor state from a [`save_gic_state`] blob.
+/// Must run after the GIC is (re-)created and before the vCPUs run (the per-vCPU ICC state is
+/// then restored on each vCPU thread by [`HvfVcpu::restore_state`]).
+pub fn restore_gic_state(data: &[u8]) -> Result<(), Error> {
+    if unsafe { hv_gic_set_state(data.as_ptr() as *const _, data.len()) } != HV_SUCCESS {
+        return Err(Error::VcpuSnapshot);
+    }
+    Ok(())
+}
+
 pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
     let mut vcpu: u64 = vcpuid;
     let ret = unsafe { hv_vcpus_exit(&mut vcpu, 1) };
@@ -397,10 +427,27 @@ pub struct VcpuState {
     pub q: [u128; 32],
     /// Values for [`SNAPSHOT_SYS_REGS`], in that order.
     pub sysregs: Vec<u64>,
+    /// Values for the per-vCPU GIC CPU-interface registers [`SNAPSHOT_ICC_REGS`], in that order.
+    /// Not covered by the VM-wide GIC blob, but needed or interrupts won't deliver after restore.
+    pub icc: Vec<u64>,
     pub vtimer_offset: u64,
     pub pending_irq: bool,
     pub pending_fiq: bool,
 }
+
+/// The per-vCPU GIC CPU-interface (`ICC_*_EL1`) registers captured in a [`VcpuState`], in
+/// save/restore order. These are the settable interface registers (priority mask, binary points,
+/// active-priority, control, SRE, group enables); `ICC_RPR_EL1` is read-only (running priority)
+/// and `ICC_SRE_EL2` is EL2, so both are excluded. Restoring these is what keeps interrupts
+/// deliverable after resume — the VM-wide `hv_gic_state` blob does not carry them.
+#[rustfmt::skip]
+static SNAPSHOT_ICC_REGS: &[hv_gic_icc_reg_t] = &[
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_PMR_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN1_EL1,
+];
 
 /// The EL1/EL0 system registers captured in a [`VcpuState`], in save/restore order. Excludes the
 /// EL2 (nested-only) registers and `CNTHP_*` (they read `HV_UNSUPPORTED` without nested virt),
@@ -724,6 +771,25 @@ impl HvfVcpu<'_> {
         }
     }
 
+    fn read_icc_reg(&self, reg: hv_gic_icc_reg_t) -> Result<u64, Error> {
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_gic_get_icc_reg(self.vcpuid, reg, &mut val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(val)
+        }
+    }
+
+    fn write_icc_reg(&self, reg: hv_gic_icc_reg_t, val: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_gic_set_icc_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(())
+        }
+    }
+
     fn read_pending_interrupt(&self, ty: hv_interrupt_type_t) -> Result<bool, Error> {
         let mut pending = false;
         let ret = unsafe { hv_vcpu_get_pending_interrupt(self.vcpuid, ty, &mut pending) };
@@ -778,6 +844,10 @@ impl HvfVcpu<'_> {
         for &reg in SNAPSHOT_SYS_REGS {
             sysregs.push(self.read_sys_reg(reg)?);
         }
+        let mut icc = Vec::with_capacity(SNAPSHOT_ICC_REGS.len());
+        for &reg in SNAPSHOT_ICC_REGS {
+            icc.push(self.read_icc_reg(reg)?);
+        }
 
         Ok(VcpuState {
             x,
@@ -787,6 +857,7 @@ impl HvfVcpu<'_> {
             fpsr: self.read_reg(hv_reg_t_HV_REG_FPSR)?,
             q,
             sysregs,
+            icc,
             vtimer_offset: self.read_vtimer_offset()?,
             pending_irq: self
                 .read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
@@ -801,11 +872,18 @@ impl HvfVcpu<'_> {
     /// order otherwise follows the round-trip spike (sysregs, then GP/PC/PSTATE/SIMD, then the
     /// vtimer offset and pending lines).
     pub fn restore_state(&mut self, state: &VcpuState) -> Result<(), Error> {
-        if state.sysregs.len() != SNAPSHOT_SYS_REGS.len() {
+        if state.sysregs.len() != SNAPSHOT_SYS_REGS.len()
+            || state.icc.len() != SNAPSHOT_ICC_REGS.len()
+        {
             return Err(Error::VcpuSnapshot);
         }
         for (&reg, &val) in SNAPSHOT_SYS_REGS.iter().zip(state.sysregs.iter()) {
             self.write_sys_reg(reg, val)?;
+        }
+        // GIC CPU-interface (ICC) regs — needed for interrupt delivery post-restore. The VM-wide
+        // GIC blob (restore_gic_state) must already be in place before this runs.
+        for (&reg, &val) in SNAPSHOT_ICC_REGS.iter().zip(state.icc.iter()) {
+            self.write_icc_reg(reg, val)?;
         }
         for (i, &val) in state.x.iter().enumerate() {
             self.write_reg(hv_reg_t_HV_REG_X0 + i as u32, val)?;

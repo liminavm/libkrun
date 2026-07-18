@@ -500,6 +500,10 @@ mod tests {
             virtio_consoles: Vec::new(),
             kernel_console: None,
             dhcp_client: false,
+            snd: false,
+            snd_capture: false,
+            #[cfg(not(feature = "tee"))]
+            battery_provider: None,
         }
     }
 
