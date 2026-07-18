@@ -223,6 +223,15 @@ impl MmioTransport {
         self.interrupt.event()
     }
 
+    /// The current virtio device-status register (`ACKNOWLEDGE|DRIVER|FEATURES_OK|DRIVER_OK`
+    /// bits). limina M9.2 reads this at snapshot time: a quiesced (s2idle-suspended) device has
+    /// been reset by its driver's `.suspend` callback, so status returns to `INIT` (0). virtio-gpu
+    /// is the known exception (no PM ops, stays `DRIVER_OK`). Used by the quiesce oracle / the
+    /// INIT-invariant assert on the host-side snapshot path.
+    pub fn device_status(&self) -> u32 {
+        self.device_status
+    }
+
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
         self.device.lock().expect("Poisoned device lock")
     }
