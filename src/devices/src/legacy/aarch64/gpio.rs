@@ -68,6 +68,23 @@ impl fmt::Display for Error {
 
 type Result<T> = result::Result<T, Error>;
 
+/// The PL061 register file, for M9 snapshot save/restore. The GPIO registers are the one piece of
+/// device state that does NOT ride the guest RAM snapshot; restoring them into a fresh device
+/// before the guest resumes is what lets the injected wake demux correctly (`GPIOMIS = istate & im`
+/// — a fresh device's `im=0` would swallow the wake) and lets the guest's `pl061_resume` see the
+/// register state it left. ~32 bytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpioState {
+    pub data: u32,
+    pub dir: u32,
+    pub isense: u32,
+    pub ibe: u32,
+    pub iev: u32,
+    pub im: u32,
+    pub istate: u32,
+    pub afsel: u32,
+}
+
 /// A GPIO device following the PL061 specification.
 pub struct Gpio {
     // Data Register
@@ -126,6 +143,33 @@ impl Gpio {
 
     pub fn set_intc(&mut self, intc: IrqChip) {
         self.intc = Some(intc);
+    }
+
+    /// Capture the PL061 register file for a snapshot (M9 save).
+    pub fn save_state(&self) -> GpioState {
+        GpioState {
+            data: self.data,
+            dir: self.dir,
+            isense: self.isense,
+            ibe: self.ibe,
+            iev: self.iev,
+            im: self.im,
+            istate: self.istate,
+            afsel: self.afsel,
+        }
+    }
+
+    /// Restore the PL061 register file from a snapshot (M9 restore), before the guest resumes — so
+    /// the injected wake demuxes (`GPIOMIS = istate & im`) and `pl061_resume` sees its own state.
+    pub fn restore_state(&mut self, s: &GpioState) {
+        self.data = s.data;
+        self.dir = s.dir;
+        self.isense = s.isense;
+        self.ibe = s.ibe;
+        self.iev = s.iev;
+        self.im = s.im;
+        self.istate = s.istate;
+        self.afsel = s.afsel;
     }
 
     pub fn set_irq_line(&mut self, irq: u32) {

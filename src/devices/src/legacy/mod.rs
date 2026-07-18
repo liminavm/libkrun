@@ -54,7 +54,7 @@ pub use self::cmos::Cmos;
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
 #[cfg(target_arch = "aarch64")]
-pub use self::gpio::Gpio;
+pub use self::gpio::{Gpio, GpioState};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]
