@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-use devices::DeviceType;
+use devices::{BusDevice, DeviceType};
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
 use kernel::cmdline as kernel_cmdline;
@@ -299,6 +299,46 @@ impl MMIODeviceManager {
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
+    }
+
+    /// Gets the specified device.
+    pub fn get_device(
+        &self,
+        device_type: DeviceType,
+        device_id: &str,
+    ) -> Option<&Mutex<dyn BusDevice>> {
+        if let Some(dev_info) = self
+            .id_to_dev_info
+            .get(&(device_type, device_id.to_string()))
+            && let Some((_, device)) = self.bus.get_device(dev_info.addr)
+        {
+            return Some(device);
+        }
+        None
+    }
+
+    /// limina M9.2: snapshot every virtio-mmio device as `(virtio type id, id, device_status)`.
+    /// The quiesce oracle / INIT-invariant assert reads this at suspend time. A device quiesced by
+    /// its driver's s2idle `.suspend` callback has been reset to `INIT` (0); virtio-gpu is the known
+    /// exception (no PM ops → stays `DRIVER_OK`). Only virtio-mmio transports are inspected (the
+    /// legacy PL0xx devices carry no virtio status).
+    pub fn virtio_statuses(&self) -> Vec<(u32, String, u32)> {
+        use devices::virtio::MmioTransport;
+        let mut out = Vec::new();
+        for (dtype, id) in self.id_to_dev_info.keys() {
+            if let DeviceType::Virtio(type_id) = *dtype {
+                if let Some(dev) = self.get_device(*dtype, id) {
+                    let guard = dev.lock().unwrap();
+                    // Deref to `&dyn BusDevice` so `as_any` dispatches via the supertrait vtable
+                    // (not the blanket `impl<T: Any> AsAny for T` on the non-'static MutexGuard).
+                    let dev_ref: &dyn BusDevice = &*guard;
+                    if let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() {
+                        out.push((type_id, id.clone(), mmio.device_status()));
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
