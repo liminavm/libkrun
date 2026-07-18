@@ -384,8 +384,15 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
     let rtc_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
     #[cfg(target_os = "linux")]
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_LEVEL_HI]);
+    // macOS/HVF: the in-kernel GIC's `set_irq` only asserts a one-shot pulse (no de-assert path),
+    // so declare the alarm SPI edge-triggered (like the GPIO device) — the guest gets one edge per
+    // fired alarm and clears it via RTCICR, with no risk of a held-high level re-firing.
     #[cfg(target_os = "macos")]
-    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq() - 32, IRQ_TYPE_LEVEL_HI]);
+    let irq = generate_prop32(&[
+        GIC_FDT_IRQ_TYPE_SPI,
+        dev_info.irq() - 32,
+        IRQ_TYPE_EDGE_RISING,
+    ]);
     let rtc_node = fdt.begin_node(&format!("rtc@{:x}", dev_info.addr()))?;
     fdt.property("compatible", compatible)?;
     fdt.property("reg", &rtc_reg_prop)?;
