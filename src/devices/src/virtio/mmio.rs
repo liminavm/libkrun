@@ -239,8 +239,9 @@ impl MmioTransport {
             self.with_queue_mut(f);
         } else {
             warn!(
-                "update virtio queue in invalid state 0x{:x}",
-                self.state.device_status
+                "update virtio queue in invalid state 0x{:x} (device {})",
+                self.state.device_status,
+                self.locked_device().device_name()
             );
         }
     }

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time;
@@ -18,6 +19,10 @@ pub struct TimesyncThread {
     mem: GuestMemoryMmap,
     queue_mutex: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
+    // Set true by `VsockMuxer::deactivate` on a device reset (suspend/resume). Checked before every
+    // wake/queue-write so a stale timesync thread from a previous activation never writes into the
+    // now-recreated (freed/reallocated) guest RX ring. Fire-and-forget: the thread self-exits.
+    stop: Arc<AtomicBool>,
 }
 
 impl TimesyncThread {
@@ -26,12 +31,14 @@ impl TimesyncThread {
         mem: GuestMemoryMmap,
         queue_mutex: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
+        stop: Arc<AtomicBool>,
     ) -> Self {
         Self {
             cid,
             mem,
             queue_mutex,
             interrupt,
+            stop,
         }
     }
 
@@ -62,6 +69,10 @@ impl TimesyncThread {
         let mut last_update = 0u64;
         let mut last_awake = utils::time::get_time(utils::time::ClockType::Real);
         loop {
+            // Bail before touching the queue if this activation has been torn down (device reset).
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
             let now = utils::time::get_time(utils::time::ClockType::Real);
             /*
              * We send a time sync packet if we slept for 3 times more

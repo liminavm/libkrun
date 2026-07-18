@@ -261,6 +261,10 @@ impl VirtioTransportState {
                     debug!("reset device while it's still in active state");
                 }
                 if device_activated && !self.locked_device().reset() {
+                    warn!(
+                        "device {} does not support reset; marking FAILED",
+                        self.locked_device().device_name()
+                    );
                     self.device_status |= FAILED;
                 }
 
