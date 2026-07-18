@@ -198,6 +198,11 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
+        // Drain any leftover stop signal before arming a new worker: if a previous worker panicked
+        // (instead of exiting via `reset`) it never read the pipe, and a residual byte would make
+        // the new worker see its stop event immediately and exit — a silently dead NIC. Nonblocking.
+        let _ = self.worker_stopfd.read();
+
         let stop_fd = match self.worker_stopfd.try_clone() {
             Ok(fd) => fd,
             Err(err) => {

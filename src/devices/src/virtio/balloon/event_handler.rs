@@ -205,6 +205,11 @@ impl Subscriber for Balloon {
                 _ => warn!("Unexpected balloon event received: {source:?}"),
             }
         } else {
+            // Drain the fd: these eventfds are level-triggered, so a spurious event while the
+            // device is inactive (e.g. the host balloon policy kicking `target_evt`, or a stale
+            // queue kick, across a suspend/resume) would otherwise re-fire every loop iteration and
+            // busy-spin the worker's event loop at 100% CPU for the whole suspended interval.
+            crate::virtio::drain_eventfd(source);
             warn!("balloon: The device is not yet activated. Spurious event received: {source:?}");
         }
     }
