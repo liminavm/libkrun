@@ -16,7 +16,10 @@ use hvf::VcpuState;
 
 const MAGIC: &[u8; 8] = b"LIMINAS1";
 // v2 adds the legacy-device (PL061 GPIO) register section after the GIC blob (M9.2 restore wake).
-const VERSION: u32 = 2;
+// v3 widens every byte-section length prefix from u32 to u64: a guest-RAM region can be ≥ 4 GiB, and
+// a u32 length silently truncated it (4 GiB → 0), so restore wrote back an empty region and the guest
+// resumed into blank RAM. See `put_bytes`/`Reader::bytes`.
+const VERSION: u32 = 3;
 
 /// One guest-RAM region: its guest-physical base and raw bytes.
 pub struct RamRegion {
@@ -83,7 +86,8 @@ fn put_u128(v: &mut Vec<u8>, x: u128) {
     v.extend_from_slice(&x.to_le_bytes());
 }
 fn put_bytes(v: &mut Vec<u8>, b: &[u8]) {
-    put_u32(v, b.len() as u32);
+    // u64, not u32: a guest-RAM region routinely exceeds 4 GiB and a u32 length truncated it to 0.
+    put_u64(v, b.len() as u64);
     v.extend_from_slice(b);
 }
 fn put_u64_slice(v: &mut Vec<u8>, s: &[u64]) {
@@ -176,7 +180,7 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
     fn bytes(&mut self) -> io::Result<Vec<u8>> {
-        let n = self.u32()? as usize;
+        let n = self.u64()? as usize;
         Ok(self.take(n)?.to_vec())
     }
 }
@@ -347,6 +351,24 @@ mod tests {
         assert_eq!(got.ram.len(), 2);
         assert_eq!(got.ram[0].gpa, 0x4000_0000);
         assert_eq!(got.ram[1].data, snap.ram[1].data);
+    }
+
+    #[test]
+    fn byte_section_length_is_u64_not_u32() {
+        // Regression (M9.3 floor spike): a guest-RAM region ≥ 4 GiB has a length that does not fit
+        // in a u32. The old encoder wrote `len as u32`, truncating a 4 GiB region's length to 0 while
+        // still appending all 4 GiB of data — so the CRC matched, `write` "succeeded", and the file
+        // was ~4 GiB, but on restore `bytes()` read length 0 and returned an EMPTY region. The guest
+        // resumed into blank RAM and stalled. The length prefix MUST be a 64-bit value.
+        let mut v = Vec::new();
+        put_bytes(&mut v, &[0xABu8; 5]);
+        assert_eq!(v.len(), 8 + 5, "byte-section length must be a 64-bit prefix");
+        assert_eq!(&v[..8], &5u64.to_le_bytes(), "length encoded little-endian u64");
+        // And a length that would overflow u32 must survive the u64 round-trip in the header.
+        let mut h = Vec::new();
+        put_u64(&mut h, 0x1_0000_0000u64); // exactly 4 GiB — the value a u32 truncates to 0
+        let mut r = Reader { buf: &h, pos: 0 };
+        assert_eq!(r.u64().unwrap(), 0x1_0000_0000u64);
     }
 
     #[test]
