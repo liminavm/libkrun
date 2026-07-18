@@ -30,6 +30,9 @@ mod linux;
 use crate::linux::vstate;
 #[cfg(target_os = "macos")]
 mod macos;
+/// M9 VM snapshot file format + (de)serialization (macOS).
+#[cfg(target_os = "macos")]
+pub mod snapshot;
 mod terminal;
 pub mod worker;
 
@@ -136,6 +139,10 @@ pub enum Error {
     VcpuResume,
     /// vCPU pause failed (a vCPU did not report `Paused` in time). Used by the M9 snapshot path.
     VcpuPause,
+    /// A snapshot save/restore step failed (GIC blob, or serialization). Used by M9.
+    Snapshot,
+    /// A snapshot file read/write failed.
+    SnapshotIo(std::io::Error),
     /// Cannot spawn a new Vcpu thread.
     VcpuSpawn(std::io::Error),
     /// Vm error.
@@ -173,6 +180,8 @@ impl Display for Error {
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             VcpuResume => write!(f, "vCPUs resume failed."),
             VcpuPause => write!(f, "vCPUs pause failed."),
+            Snapshot => write!(f, "VM snapshot save/restore failed."),
+            SnapshotIo(e) => write!(f, "VM snapshot file I/O failed: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
             VmmObserverInit(e) => write!(
@@ -423,14 +432,62 @@ impl Vmm {
         }
         self.vcpu_list.kick_all();
         let mut states = Vec::with_capacity(receivers.len());
-        for rx in receivers {
+        for (i, rx) in receivers.into_iter().enumerate() {
             match rx.recv_timeout(Duration::from_millis(5000)) {
                 Ok(state) => states.push(*state),
                 // Timeout, or a vCPU dropped its reply channel because its save failed.
-                _ => return Err(Error::VcpuPause),
+                Err(e) => {
+                    warn!("snapshot: vCPU {i} did not report its state ({e:?})");
+                    return Err(Error::VcpuPause);
+                }
             }
         }
         Ok(states)
+    }
+
+    /// Take a full host-side VM snapshot (M9): quiesce + capture every vCPU, the VM-wide GIC
+    /// blob, and guest RAM (skipping the GPU/fs SHM window), then serialize it all to `path`.
+    /// On return the vCPUs are parked; the caller tears the worker down (exit "snapshotted").
+    #[cfg(target_os = "macos")]
+    pub fn save_snapshot(&mut self, path: &std::path::Path) -> Result<()> {
+        let vcpus = self.snapshot_vcpus()?;
+        let gic = hvf::save_gic_state().map_err(|_| Error::Snapshot)?;
+        let ram = self.dump_ram();
+        let snap = snapshot::Snapshot { vcpus, gic, ram };
+        snapshot::write(path, &snap).map_err(Error::SnapshotIo)?;
+        info!(
+            "snapshot written: {} vCPUs, {}-byte GIC, {} RAM regions -> {}",
+            snap.vcpus.len(),
+            snap.gic.len(),
+            snap.ram.len(),
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Copy out the guest RAM regions for a snapshot, skipping everything at or above the SHM
+    /// window base (the GPU/fs host-shared regions, which are re-established by the guest on
+    /// resume, not carried in the snapshot).
+    #[cfg(target_os = "macos")]
+    fn dump_ram(&self) -> Vec<snapshot::RamRegion> {
+        use vm_memory::{Address, Bytes, GuestMemory, GuestMemoryRegion};
+        let shm_start = self.arch_memory_info.shm_start_addr;
+        let mut regions = Vec::new();
+        for region in self.guest_memory.iter() {
+            let gpa = region.start_addr().raw_value();
+            if gpa >= shm_start {
+                continue; // GPU/fs SHM window — not part of the RAM snapshot
+            }
+            let len = region.len() as usize;
+            let mut data = vec![0u8; len];
+            // Read straight out of the mapped region; this is the same memory HVF runs on.
+            if let Err(e) = self.guest_memory.read_slice(&mut data, region.start_addr()) {
+                error!("snapshot: reading RAM region at 0x{gpa:x} failed: {e:?}; skipping");
+                continue;
+            }
+            regions.push(snapshot::RamRegion { gpa, data });
+        }
+        regions
     }
 
     /// Configures the system for boot.
