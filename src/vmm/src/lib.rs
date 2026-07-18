@@ -347,6 +347,20 @@ impl Vmm {
         Ok(())
     }
 
+    /// Resume vCPUs that were parked by [`Self::pause_vcpus`] or [`Self::snapshot_vcpus`] (M9 abort
+    /// path), so a failed snapshot can put the guest back into execution instead of leaving it
+    /// wedged. Rides [`Vmm::resume`], which advances the vtimer offset by the parked time and
+    /// waits for each vCPU's `Resumed` ack.
+    ///
+    /// This is deliberately **separate** from the no-op [`Self::resume_vcpus`] that `start_vcpus`
+    /// calls on every boot: on macOS the vCPUs self-start (via the boot channel / direct run) and are
+    /// never `Pause`-parked at boot, so a `Resume` there is swallowed with no reply — waiting for
+    /// `Resumed` would hang cold boot. Only call this when the vCPUs are actually parked.
+    #[cfg(target_os = "macos")]
+    pub fn resume_parked_vcpus(&mut self) -> Result<()> {
+        self.resume().map_err(|_| Error::VcpuResume)
+    }
+
     /// Sender for live [`VmCtl`] requests. The event loop runs [`Vmm::pause`] /
     /// [`Vmm::resume`] in response.
     #[cfg(target_os = "macos")]
@@ -422,6 +436,10 @@ impl Vmm {
     /// ready for the caller to serialize the GIC and guest RAM alongside these states.
     #[cfg(target_os = "macos")]
     pub fn snapshot_vcpus(&mut self) -> Result<Vec<VcpuState>> {
+        // Participate in the live-pause bookkeeping: the vCPUs park just like
+        // [`Vmm::pause`]'s, so [`Vmm::resume`] (via `resume_parked_vcpus`) must
+        // see the VM as paused and advance the vtimers by the parked time.
+        self.paused_at = unsafe { hvf::mach_absolute_time() };
         let mut receivers = Vec::with_capacity(self.vcpus_handles.len());
         for handle in self.vcpus_handles.iter() {
             let (tx, rx) = crossbeam_channel::unbounded();
@@ -442,6 +460,7 @@ impl Vmm {
                 }
             }
         }
+        self.paused = true;
         Ok(states)
     }
 
