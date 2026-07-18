@@ -84,6 +84,9 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// Handle to the live PL061 GPIO device (M9 snapshot save/restore of its register file, and
+    /// wake injection). `None` until `register_mmio_gpio` runs (macOS/aarch64 only).
+    pub gpio: Option<Arc<Mutex<devices::legacy::Gpio>>>,
 }
 
 impl MMIODeviceManager {
@@ -99,6 +102,7 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            gpio: None,
         }
     }
 
@@ -259,6 +263,10 @@ impl MMIODeviceManager {
             gpio.set_intc(intc);
             gpio.set_irq_line(self.irq);
         }
+
+        // Keep a typed handle for M9 snapshot save/restore of the register file + wake injection,
+        // before the Arc is coerced to `dyn BusDevice` and moved into the bus.
+        self.gpio = Some(gpio.clone());
 
         self.bus
             .insert(gpio, self.mmio_base, MMIO_LEN)
