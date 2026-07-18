@@ -584,6 +584,7 @@ pub fn build_microvm(
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _suspend_efd: Option<EventFd>,
+    _restart_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     restore_from: Option<PathBuf>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
@@ -964,6 +965,7 @@ pub fn build_microvm(
             event_manager,
             _shutdown_efd,
             _suspend_efd,
+            _restart_efd,
         )?;
     }
 
@@ -2039,6 +2041,7 @@ fn attach_legacy_devices(
     event_manager: &mut EventManager,
     shutdown_efd: Option<EventFd>,
     suspend_efd: Option<EventFd>,
+    restart_efd: Option<EventFd>,
 ) -> Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2057,18 +2060,29 @@ fn attach_legacy_devices(
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 
-    // The GPIO device carries both the poweroff and the suspend button. We synthesize a
-    // suspend eventfd when the caller didn't supply one so the button always exists (the
-    // guest side is harmless if never pulsed); the poweroff eventfd stays required.
+    // The GPIO device carries the poweroff, suspend, and restart buttons. We synthesize the
+    // suspend/restart eventfds when the caller didn't supply them so the buttons always exist
+    // (the guest side is harmless if never pulsed); the poweroff eventfd stays required.
     if let Some(shutdown_efd) = shutdown_efd {
-        let suspend_efd = match suspend_efd {
-            Some(efd) => efd,
-            None => EventFd::new(utils::eventfd::EFD_NONBLOCK)
-                .map_err(Error::EventFd)
-                .map_err(StartMicrovmError::Internal)?,
+        let or_new = |efd: Option<EventFd>| -> Result<EventFd, StartMicrovmError> {
+            match efd {
+                Some(efd) => Ok(efd),
+                None => EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                    .map_err(Error::EventFd)
+                    .map_err(StartMicrovmError::Internal),
+            }
         };
+        let suspend_efd = or_new(suspend_efd)?;
+        let restart_efd = or_new(restart_efd)?;
         mmio_device_manager
-            .register_mmio_gpio(vm, intc.clone(), event_manager, shutdown_efd, suspend_efd)
+            .register_mmio_gpio(
+                vm,
+                intc.clone(),
+                event_manager,
+                shutdown_efd,
+                suspend_efd,
+                restart_efd,
+            )
             .map_err(Error::RegisterMMIODevice)
             .map_err(StartMicrovmError::Internal)?;
     }

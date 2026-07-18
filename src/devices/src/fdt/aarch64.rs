@@ -29,6 +29,10 @@ const SIZE_CELLS: u32 = 0x2;
 
 // System restart
 const KEY_RESTART: u32 = 0x198;
+// Linux input code for the power key. systemd-logind maps KEY_POWER to HandlePowerKey
+// (default: poweroff), so pulsing this line asks a stock guest to power off gracefully —
+// the host-driven shutdown path (the shutdown eventfd).
+const KEY_POWER: u32 = 116;
 // Linux input code for the "sleep"/suspend key. systemd-logind maps KEY_SLEEP to its
 // HandleSuspendKey action (default: suspend), so pulsing this line makes a stock guest
 // enter suspend-to-idle with no guest agent (M9 freeze trigger, stock tier).
@@ -438,9 +442,11 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property_string("compatible", "gpio-keys")?;
     fdt.property_u32("#size-cells", 0)?;
     fdt.property_u32("#address-cells", 1)?;
+    // Poweroff button (KEY_POWER on GPIO line 3) — the host pulses it to ask the guest to
+    // power off gracefully (the shutdown eventfd → logind HandlePowerKey → poweroff).
     let gpio_keys_poweroff_node = fdt.begin_node("button@1")?;
     fdt.property_string("label", "GPIO Key Poweroff")?;
-    fdt.property_u32("linux,code", KEY_RESTART)?;
+    fdt.property_u32("linux,code", KEY_POWER)?;
     let gpios = [GPIO_PHANDLE, 3, 0];
     fdt.property_array_u32("gpios", &gpios)?;
     fdt.end_node(gpio_keys_poweroff_node)?;
@@ -452,6 +458,14 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     let suspend_gpios = [GPIO_PHANDLE, 4, 0];
     fdt.property_array_u32("gpios", &suspend_gpios)?;
     fdt.end_node(gpio_keys_suspend_node)?;
+    // Restart button (KEY_RESTART on GPIO line 5) — the host pulses it to ask the guest to
+    // reboot gracefully (the restart eventfd → logind HandleRebootKey → reboot → relaunch).
+    let gpio_keys_restart_node = fdt.begin_node("button@3")?;
+    fdt.property_string("label", "GPIO Key Restart")?;
+    fdt.property_u32("linux,code", KEY_RESTART)?;
+    let restart_gpios = [GPIO_PHANDLE, 5, 0];
+    fdt.property_array_u32("gpios", &restart_gpios)?;
+    fdt.end_node(gpio_keys_restart_node)?;
     fdt.end_node(gpio_keys_node)?;
 
     Ok(())

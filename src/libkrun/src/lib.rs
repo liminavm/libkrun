@@ -2970,6 +2970,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         None, // the C API has no suspend-button trigger yet (limina's worker drives M9)
+        None, // the C API has no restart-button trigger yet (limina's worker drives M9)
         sender,
         None, // the C API has no snapshot-restore path (limina's worker drives M9)
     ) {
