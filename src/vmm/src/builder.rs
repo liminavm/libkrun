@@ -18,7 +18,6 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
-#[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
@@ -585,7 +584,12 @@ pub fn build_microvm(
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
+    restore_from: Option<PathBuf>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    // M9 suspend/resume is macOS/HVF-only; other targets never restore.
+    #[cfg(not(target_os = "macos"))]
+    let _ = &restore_from;
+
     let payload = choose_payload(vm_resources)?;
 
     let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
@@ -1156,6 +1160,40 @@ pub fn build_microvm(
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     load_cmdline(&vmm)?;
 
+    // M9 restore: read + validate the snapshot, hand each vCPU its saved state and the shared
+    // GIC-restore gate, and stash the RAM/GIC for the two steps below (RAM overwrite after
+    // `configure_system`, GIC restore after `start_vcpus`). `vcpus` is consumed and rebuilt so it
+    // stays immutable on the fresh-boot path. `restore_release` is `None` for a normal boot.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    let (vcpus, restore_release): (
+        Vec<Vcpu>,
+        Option<(
+            Vec<crate::snapshot::RamRegion>,
+            Vec<u8>,
+            Arc<crate::vstate::RestoreGate>,
+        )>,
+    ) = if let Some(ref path) = restore_from {
+        let snap = crate::snapshot::read(path)
+            .map_err(|e| StartMicrovmError::Internal(crate::Error::SnapshotIo(e)))?;
+        if snap.vcpus.len() != vcpus.len() {
+            // Snapshot vCPU count must match this boot's --cpus, or the register state is nonsense.
+            return Err(StartMicrovmError::Internal(crate::Error::Snapshot));
+        }
+        let gate = Arc::new(crate::vstate::RestoreGate::default());
+        let vcpus = vcpus
+            .into_iter()
+            .zip(snap.vcpus)
+            .map(|(mut v, st)| {
+                v.set_restore(st, gate.clone());
+                v
+            })
+            .collect();
+        (vcpus, Some((snap.ram, snap.gic, gate)))
+    } else {
+        (vcpus, None)
+    };
+
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
@@ -1164,6 +1202,20 @@ pub fn build_microvm(
         payload_config.pvh,
     )
     .map_err(StartMicrovmError::Internal)?;
+
+    // M9 restore: overwrite guest RAM from the snapshot AFTER `configure_system` has written the
+    // fresh FDT. The snapshot RAM already holds the guest's own FDT and full memory image as of
+    // suspend and is authoritative — the guest resumes mid-execution from its saved PC and never
+    // re-reads the FDT. (The GPU/fs SHM window was excluded at save time and is re-established by
+    // the guest, per Strategy A; it is not overwritten here.)
+    #[cfg(target_os = "macos")]
+    if let Some((ram, _, _)) = &restore_release {
+        for region in ram {
+            vmm.guest_memory()
+                .write_slice(&region.data, GuestAddress(region.gpa))
+                .map_err(|_| StartMicrovmError::Internal(crate::Error::Snapshot))?;
+        }
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1201,6 +1253,18 @@ pub fn build_microvm(
 
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+
+    // M9 restore: `start_vcpus` returns only once every vCPU has created its HVF vCPU (its
+    // per-vCPU TLS-init handshake fires right after `HvfVcpu::new`, which sets MPIDR) — so all
+    // MPIDRs are set and each restoring vCPU is now parked on the gate. Restore the VM-wide
+    // in-kernel GIC (distributor + redistributor), then open the gate so each vCPU restores its
+    // own register file (including its ICC/CPU-interface regs, on its own thread) and runs.
+    #[cfg(target_os = "macos")]
+    if let Some((_, gic, gate)) = &restore_release {
+        hvf::restore_gic_state(gic)
+            .map_err(|_| StartMicrovmError::Internal(crate::Error::Snapshot))?;
+        gate.open();
+    }
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface

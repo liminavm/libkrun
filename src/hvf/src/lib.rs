@@ -431,6 +431,11 @@ pub struct VcpuState {
     /// Not covered by the VM-wide GIC blob, but needed or interrupts won't deliver after restore.
     pub icc: Vec<u64>,
     pub vtimer_offset: u64,
+    /// Whether HVF's virtual-timer IRQ was masked at snapshot (`hv_vcpu_get_vtimer_mask`). libkrun
+    /// masks it after a `VTIMER_ACTIVATED` exit until the guest EOIs, so a fresh vCPU's default
+    /// (unmasked) can desync the mask dance and wedge the guest waiting on an IRQ that never
+    /// re-fires — the mask must be restored alongside the offset (the round-trip spike does this).
+    pub vtimer_masked: bool,
     pub pending_irq: bool,
     pub pending_fiq: bool,
 }
@@ -771,6 +776,16 @@ impl HvfVcpu<'_> {
         }
     }
 
+    fn read_vtimer_mask(&self) -> Result<bool, Error> {
+        let mut masked = false;
+        let ret = unsafe { hv_vcpu_get_vtimer_mask(self.vcpuid, &mut masked) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(masked)
+        }
+    }
+
     fn read_icc_reg(&self, reg: hv_gic_icc_reg_t) -> Result<u64, Error> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_gic_get_icc_reg(self.vcpuid, reg, &mut val) };
@@ -859,6 +874,7 @@ impl HvfVcpu<'_> {
             sysregs,
             icc,
             vtimer_offset: self.read_vtimer_offset()?,
+            vtimer_masked: self.read_vtimer_mask()?,
             pending_irq: self
                 .read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
             pending_fiq: self
@@ -877,13 +893,15 @@ impl HvfVcpu<'_> {
         {
             return Err(Error::VcpuSnapshot);
         }
-        for (&reg, &val) in SNAPSHOT_SYS_REGS.iter().zip(state.sysregs.iter()) {
-            self.write_sys_reg(reg, val)?;
-        }
-        // GIC CPU-interface (ICC) regs — needed for interrupt delivery post-restore. The VM-wide
-        // GIC blob (restore_gic_state) must already be in place before this runs.
+        // Order follows the round-trip spike: GIC CPU-interface (ICC) regs first (the VM-wide GIC
+        // blob is already restored by the caller), then the EL1/EL0 sysregs, then GP/PC/PSTATE/SIMD,
+        // then the vtimer offset + mask and the pending lines. ICC before sysregs matters: a stale
+        // sysreg view must not sit atop a half-restored CPU interface.
         for (&reg, &val) in SNAPSHOT_ICC_REGS.iter().zip(state.icc.iter()) {
             self.write_icc_reg(reg, val)?;
+        }
+        for (&reg, &val) in SNAPSHOT_SYS_REGS.iter().zip(state.sysregs.iter()) {
+            self.write_sys_reg(reg, val)?;
         }
         for (i, &val) in state.x.iter().enumerate() {
             self.write_reg(hv_reg_t_HV_REG_X0 + i as u32, val)?;
@@ -896,6 +914,10 @@ impl HvfVcpu<'_> {
             self.write_simd(hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, val)?;
         }
         self.write_vtimer_offset(state.vtimer_offset)?;
+        // Restore HVF's vtimer mask (and mirror it into our worker-side tracking) — without it a
+        // guest snapshotted mid-timer waits forever on an IRQ that never re-fires.
+        vcpu_set_vtimer_mask(self.vcpuid, state.vtimer_masked)?;
+        self.vtimer_masked = state.vtimer_masked;
         vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
         vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
         Ok(())
