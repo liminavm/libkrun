@@ -236,6 +236,7 @@ impl MMIODeviceManager {
         shutdown_efd: EventFd,
         suspend_efd: EventFd,
         restart_efd: EventFd,
+        wake_efd: EventFd,
     ) -> Result<()> {
         // Attaching the GPIO device.
         let gpio_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
@@ -243,6 +244,7 @@ impl MMIODeviceManager {
             shutdown_efd,
             suspend_efd,
             restart_efd,
+            wake_efd,
             gpio_evt.try_clone().map_err(Error::EventFd)?,
         )));
 
