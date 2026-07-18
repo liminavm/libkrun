@@ -570,6 +570,19 @@ impl VirtioDevice for Balloon {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    /// Deactivate on the virtio reset the guest issues when re-initialising the device — notably on
+    /// resume from suspend-to-idle. Returning `false` here (the trait default) leaves the transport
+    /// marking the device FAILED (`device_status 0x8f`), so the guest's re-init writes get dropped
+    /// and the balloon never comes back. Unlike net/block there's no dedicated worker to stop: the
+    /// balloon runs under the shared EventManager and its queue eventfds are stable across a
+    /// transport reset (the transport reuses `queue_evts`), so they stay registered and route to a
+    /// fresh `activate`. We keep the inflate bookkeeping intact — the guest RAM (and thus which host
+    /// pages are still ballooned) survives s2idle, so re-madvising nothing is correct.
+    fn reset(&mut self) -> bool {
+        self.device_state = DeviceState::Inactive;
+        true
+    }
 }
 
 #[cfg(test)]
