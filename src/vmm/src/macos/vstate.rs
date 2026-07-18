@@ -222,6 +222,13 @@ pub struct Vcpu {
     boot_senders: Option<HashMap<u64, Sender<u64>>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
+    /// limina M9.3 floor-spike oracle: base of the GPU/fs host-shared SHM window. A guest MMIO exit
+    /// at or above this is a touch into a region the *fresh restore worker* has no `hv_vm_map` for
+    /// (venus ring / `VkDeviceMemory` HOST3D blobs live here and are SKIPPED by `dump_ram`) — the
+    /// unambiguous "GPU state gone on restore" fault. 0 = unset (no flagging).
+    shm_start: u64,
+    /// One-shot latch so the SHM-window fault is logged loudly once per vCPU, not per (flooding) access.
+    shm_fault_logged: bool,
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
     exit_evt: EventFd,
 
@@ -331,6 +338,8 @@ impl Vcpu {
             boot_senders: None,
             fdt_addr: 0,
             mmio_bus: None,
+            shm_start: 0,
+            shm_fault_logged: false,
             exit_evt,
             mpidr: id as u64,
             event_receiver,
@@ -360,6 +369,32 @@ impl Vcpu {
     /// Gets the MPIDR register value.
     pub fn get_mpidr(&self) -> u64 {
         self.mpidr
+    }
+
+    /// limina M9.3: tell this vCPU the SHM-window base so an MMIO exit into it (a fresh-worker
+    /// restore touching unmapped GPU/venus blob memory) is flagged as the "GPU gone on restore" fault.
+    pub fn set_shm_start(&mut self, shm_start: u64) {
+        self.shm_start = shm_start;
+    }
+
+    /// limina M9.3 floor-spike oracle. An MMIO exit at/above `shm_start` means the guest touched the
+    /// GPU/fs host-shared window — which is `hv_vm_map`'d in a live worker (so it never traps there),
+    /// but UNMAPPED in a fresh `--restore` worker until the guest re-establishes its blobs. venus'
+    /// ring + every mappable `VkDeviceMemory` are HOST3D blobs in this window and are SKIPPED by
+    /// `dump_ram`, so this exit is the unambiguous signature of "GPU/venus state is gone on restore."
+    /// Logged loudly once per vCPU (the access would otherwise flood).
+    fn flag_shm_window_fault(&mut self, vcpuid: u64, addr: u64, write: bool) {
+        if self.shm_start != 0 && addr >= self.shm_start && !self.shm_fault_logged {
+            self.shm_fault_logged = true;
+            warn!(
+                "M9.3 SHM-WINDOW FAULT: vCPU {vcpuid} MMIO {} 0x{addr:x} (>= shm_start 0x{:x}) — the \
+                 guest touched GPU/venus blob memory the fresh restore worker has no mapping for \
+                 (offset +0x{:x} into the window). This is the 'GPU state gone on restore' fault.",
+                if write { "write" } else { "read" },
+                self.shm_start,
+                addr - self.shm_start,
+            );
+        }
     }
 
     /// Sets a MMIO bus for this vcpu.
@@ -441,6 +476,7 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioRead(addr, data) => {
+                    self.flag_shm_window_fault(vcpuid, addr, false);
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         debug!("vCPU {vcpuid} MMIO read 0x{addr:x}");
                         mmio_bus.read(vcpuid, addr, data);
@@ -448,6 +484,7 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    self.flag_shm_window_fault(vcpuid, addr, true);
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(vcpuid, addr, data);
                     }

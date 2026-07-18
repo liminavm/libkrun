@@ -311,6 +311,11 @@ impl Vmm {
 
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+            // limina M9.3 floor-spike oracle: flag guest touches into the GPU/fs SHM window (unmapped
+            // on a fresh --restore worker). No-op cost in steady state (the window is hv_vm_map'd, so
+            // it never traps there); only fires after a GPU-bearing restore.
+            #[cfg(target_os = "macos")]
+            vcpu.set_shm_start(self.arch_memory_info.shm_start_addr);
 
             self.vcpus_handles
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
