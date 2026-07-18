@@ -11,10 +11,12 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use devices::legacy::GpioState;
 use hvf::VcpuState;
 
 const MAGIC: &[u8; 8] = b"LIMINAS1";
-const VERSION: u32 = 1;
+// v2 adds the legacy-device (PL061 GPIO) register section after the GIC blob (M9.2 restore wake).
+const VERSION: u32 = 2;
 
 /// One guest-RAM region: its guest-physical base and raw bytes.
 pub struct RamRegion {
@@ -28,6 +30,9 @@ pub struct Snapshot {
     pub vcpus: Vec<VcpuState>,
     /// The VM-wide in-kernel GICv3 distributor/redistributor blob.
     pub gic: Vec<u8>,
+    /// The PL061 GPIO register file, if the VM has a GPIO device. Restored before the guest resumes
+    /// so the injected wake demuxes (M9.2). `None` when there is no GPIO device (non-macOS/aarch64).
+    pub gpio: Option<GpioState>,
     /// Guest RAM regions (SHM window excluded by the caller).
     pub ram: Vec<RamRegion>,
 }
@@ -117,6 +122,18 @@ pub fn write(path: &Path, snap: &Snapshot) -> io::Result<()> {
         encode_vcpu(&mut v, s);
     }
     put_bytes(&mut v, &snap.gic);
+    // Legacy-device (PL061 GPIO) register section: a presence byte, then the 8 registers.
+    match &snap.gpio {
+        Some(g) => {
+            v.push(1);
+            for x in [
+                g.data, g.dir, g.isense, g.ibe, g.iev, g.im, g.istate, g.afsel,
+            ] {
+                put_u32(&mut v, x);
+            }
+        }
+        None => v.push(0),
+    }
     put_u32(&mut v, snap.ram.len() as u32);
     for r in &snap.ram {
         put_u64(&mut v, r.gpa);
@@ -235,6 +252,20 @@ pub fn read(path: &Path) -> io::Result<Snapshot> {
         vcpus.push(decode_vcpu(&mut r)?);
     }
     let gic = r.bytes()?;
+    let gpio = match r.u8()? {
+        0 => None,
+        1 => Some(GpioState {
+            data: r.u32()?,
+            dir: r.u32()?,
+            isense: r.u32()?,
+            ibe: r.u32()?,
+            iev: r.u32()?,
+            im: r.u32()?,
+            istate: r.u32()?,
+            afsel: r.u32()?,
+        }),
+        _ => return Err(corrupt("bad gpio presence byte")),
+    };
     let ram_count = r.u32()? as usize;
     let mut ram = Vec::with_capacity(ram_count);
     for _ in 0..ram_count {
@@ -242,7 +273,12 @@ pub fn read(path: &Path) -> io::Result<Snapshot> {
         let data = r.bytes()?;
         ram.push(RamRegion { gpa, data });
     }
-    Ok(Snapshot { vcpus, gic, ram })
+    Ok(Snapshot {
+        vcpus,
+        gic,
+        gpio,
+        ram,
+    })
 }
 
 #[cfg(test)]
@@ -271,6 +307,16 @@ mod tests {
         let snap = Snapshot {
             vcpus: vec![sample_vcpu(1), sample_vcpu(2)],
             gic: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x11],
+            gpio: Some(GpioState {
+                data: 0x40,
+                dir: 0x1,
+                isense: 0x2,
+                ibe: 0x3,
+                iev: 0x4,
+                im: 0x78,
+                istate: 0x40,
+                afsel: 0x5,
+            }),
             ram: vec![
                 RamRegion {
                     gpa: 0x4000_0000,
@@ -294,6 +340,10 @@ mod tests {
         assert_eq!(got.vcpus[1].icc, snap.vcpus[1].icc);
         assert_eq!(got.vcpus[0].pending_irq, snap.vcpus[0].pending_irq);
         assert_eq!(got.gic, snap.gic);
+        let gpio = got.gpio.expect("gpio present");
+        assert_eq!(gpio.im, 0x78);
+        assert_eq!(gpio.istate, 0x40);
+        assert_eq!(gpio.data, 0x40);
         assert_eq!(got.ram.len(), 2);
         assert_eq!(got.ram[0].gpa, 0x4000_0000);
         assert_eq!(got.ram[1].data, snap.ram[1].data);
@@ -304,6 +354,7 @@ mod tests {
         let snap = Snapshot {
             vcpus: vec![sample_vcpu(9)],
             gic: vec![1, 2, 3],
+            gpio: None,
             ram: vec![],
         };
         let path =

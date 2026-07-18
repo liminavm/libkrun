@@ -1546,6 +1546,7 @@ pub fn build_microvm(
         Option<(
             Vec<crate::vmm::snapshot::RamRegion>,
             Vec<u8>,
+            Option<devices::legacy::GpioState>,
             Arc<crate::vmm::vstate::RestoreGate>,
         )>,
     ) = if let Some(ref path) = restore_from {
@@ -1556,6 +1557,7 @@ pub fn build_microvm(
             return Err(StartMicrovmError::Internal(crate::vmm::Error::Snapshot));
         }
         let gate = Arc::new(crate::vmm::vstate::RestoreGate::default());
+        let gpio = snap.gpio;
         let vcpus = vcpus
             .into_iter()
             .zip(snap.vcpus)
@@ -1564,7 +1566,7 @@ pub fn build_microvm(
                 v
             })
             .collect();
-        (vcpus, Some((snap.ram, snap.gic, gate)))
+        (vcpus, Some((snap.ram, snap.gic, gpio, gate)))
     } else {
         (vcpus, None)
     };
@@ -1588,7 +1590,7 @@ pub fn build_microvm(
     // re-reads the FDT. (The GPU/fs SHM window was excluded at save time and is re-established by
     // the guest, per Strategy A; it is not overwritten here.)
     #[cfg(target_os = "macos")]
-    if let Some((ram, _, _)) = &restore_release {
+    if let Some((ram, _, _, _)) = &restore_release {
         for region in ram {
             vmm.guest_memory()
                 .write_slice(&region.data, GuestAddress(region.gpa))
@@ -1639,9 +1641,14 @@ pub fn build_microvm(
     // in-kernel GIC (distributor + redistributor), then open the gate so each vCPU restores its
     // own register file (including its ICC/CPU-interface regs, on its own thread) and runs.
     #[cfg(target_os = "macos")]
-    if let Some((_, gic, gate)) = &restore_release {
+    if let Some((_, gic, gpio, gate)) = &restore_release {
         hvf::restore_gic_state(gic)
             .map_err(|_| StartMicrovmError::Internal(crate::vmm::Error::Snapshot))?;
+        // Restore the PL061 register file into the fresh GPIO device before releasing the vCPUs, so
+        // the wake injected after resume demuxes correctly (GPIOMIS = istate & im).
+        if let Some(gpio) = gpio {
+            vmm.restore_gpio_state(gpio);
+        }
         gate.open();
     }
 
