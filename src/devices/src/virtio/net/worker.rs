@@ -16,6 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
@@ -25,6 +26,9 @@ pub struct NetWorker {
 
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
+    // Signalled by `Net::reset` (suspend/resume): the worker drains it, drops out of its epoll
+    // loop, and exits so the device can be re-activated with fresh queues.
+    stop_fd: EventFd,
 
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
@@ -36,47 +40,58 @@ pub struct NetWorker {
     tx_has_deferred_frame: bool,
 }
 
+/// Open the network backend from its config. Kept separate from [`NetWorker`] so the backend
+/// connection (e.g. the gvproxy unixgram socket) is created once by the [`Net`] device and
+/// **preserved across suspend/resume** — the worker borrows it and hands it back on reset, instead
+/// of tearing the gateway connection down and reconnecting (which would drop gvproxy).
+pub(crate) fn connect_backend(
+    cfg_backend: VirtioNetBackend,
+    vnet_features: u64,
+) -> Result<Box<dyn NetBackend + Send>, ConnectError> {
+    let _ = vnet_features; // only the Tap backend (Linux) uses it
+    Ok(match cfg_backend {
+        VirtioNetBackend::UnixstreamFd(fd) => {
+            // SAFETY: we need to trust that the library user has configured
+            // the backend with a healthy file descriptor.
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            Box::new(Unixstream::new(owned_fd)) as Box<dyn NetBackend + Send>
+        }
+        VirtioNetBackend::UnixstreamPath(path) => {
+            Box::new(Unixstream::open(path)?) as Box<dyn NetBackend + Send>
+        }
+        VirtioNetBackend::UnixgramFd(fd) => {
+            // SAFETY: we need to trust that the library user has configured
+            // the backend with a healthy file descriptor.
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
+        }
+        VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
+            Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
+        }
+        #[cfg(target_os = "linux")]
+        VirtioNetBackend::Tap(tap_name) => {
+            Box::new(Tap::new(tap_name, vnet_features)?) as Box<dyn NetBackend + Send>
+        }
+    })
+}
+
 impl NetWorker {
     pub fn new(
         rx_q: DeviceQueue,
         tx_q: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
-        _vnet_features: u64,
-        cfg_backend: VirtioNetBackend,
-    ) -> Result<Self, ConnectError> {
-        let backend = match cfg_backend {
-            VirtioNetBackend::UnixstreamFd(fd) => {
-                // SAFETY: we need to trust that the library user has configured
-                // the backend with a healthy file descriptor.
-                let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixstream::new(owned_fd)) as Box<dyn NetBackend + Send>
-            }
-            VirtioNetBackend::UnixstreamPath(path) => {
-                Box::new(Unixstream::open(path)?) as Box<dyn NetBackend + Send>
-            }
-            VirtioNetBackend::UnixgramFd(fd) => {
-                // SAFETY: we need to trust that the library user has configured
-                // the backend with a healthy file descriptor.
-                let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
-            }
-            VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
-                Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
-            }
-            #[cfg(target_os = "linux")]
-            VirtioNetBackend::Tap(tap_name) => {
-                Box::new(Tap::new(tap_name, _vnet_features)?) as Box<dyn NetBackend + Send>
-            }
-        };
-
-        Ok(Self {
+        backend: Box<dyn NetBackend + Send>,
+        stop_fd: EventFd,
+    ) -> Self {
+        Self {
             rx_q,
             tx_q,
 
             mem,
             backend,
             interrupt,
+            stop_fd,
 
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
@@ -86,26 +101,34 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
-        })
+        }
     }
 
-    pub fn run(self) {
+    /// Run the worker on its own thread. The join handle yields the backend back when the worker
+    /// stops (on reset), so the device can reuse the same gateway connection on re-activate.
+    pub fn run(self) -> thread::JoinHandle<Box<dyn NetBackend + Send>> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> Box<dyn NetBackend + Send> {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_ev_fd = self.stop_fd.as_raw_fd();
 
         let mut epoll = Epoll::new().unwrap();
 
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_ev_fd,
+            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
         let _ = epoll.ctl(
             ControlOperation::Add,
             virtq_rx_ev_fd,
@@ -126,13 +149,19 @@ impl NetWorker {
         );
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-        loop {
+        'poll: loop {
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
+                            EventSet::IN if source == stop_ev_fd => {
+                                // Reset/suspend: drain the signal and exit so the device can be
+                                // cleanly re-activated (new queues) on resume.
+                                let _ = self.stop_fd.read();
+                                break 'poll;
+                            }
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }
@@ -186,6 +215,10 @@ impl NetWorker {
                 }
             }
         }
+
+        // The poll loop broke on `stop_fd` (reset): hand the backend connection back so the device
+        // can reuse it when the guest re-activates the NIC on resume, instead of reconnecting.
+        self.backend
     }
 
     pub(crate) fn process_rx_queue_event(&mut self) {
