@@ -275,8 +275,9 @@ impl MmioTransport {
             self.with_queue_mut(f);
         } else {
             warn!(
-                "update virtio queue in invalid state 0x{:x}",
-                self.device_status
+                "update virtio queue in invalid state 0x{:x} (device {})",
+                self.device_status,
+                self.locked_device().device_name()
             );
         }
     }
@@ -354,6 +355,10 @@ impl MmioTransport {
             }
             _ if status == 0 => {
                 if self.locked_device().is_activated() && !self.locked_device().reset() {
+                    warn!(
+                        "device {} does not support reset; marking FAILED",
+                        self.locked_device().device_name()
+                    );
                     self.device_status |= FAILED;
                 }
 

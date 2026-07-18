@@ -276,4 +276,17 @@ impl VirtioDevice for Vsock {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    /// Deactivate on the virtio reset the guest issues when re-initialising the device — notably on
+    /// resume from suspend-to-idle. Returning `false` here (the trait default) leaves the transport
+    /// marking the device FAILED (`device_status 0x8f`), so the guest's re-init writes get dropped
+    /// and vsock (the limina control plane) never comes back. Like the balloon, vsock runs under the
+    /// shared EventManager with queue eventfds that are stable across a transport reset, so they stay
+    /// registered and route to a fresh `activate` (which recreates the queues and re-`activate`s the
+    /// muxer). Host-side connections are torn down by the guest's reset and re-established after
+    /// resume, so we don't preserve muxer state.
+    fn reset(&mut self) -> bool {
+        self.device_state = DeviceState::Inactive;
+        true
+    }
 }
