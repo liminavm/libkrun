@@ -254,6 +254,12 @@ impl MmioTransport {
     /// a device status bit. If the driver sets the FAILED bit, the driver MUST later reset
     /// the device before attempting to re-initialize.
     fn set_device_status(&mut self, status: u32) {
+        debug!(
+            "device {} status transition 0x{:x} -> 0x{:x}",
+            self.locked_device().device_name(),
+            self.state.device_status,
+            status
+        );
         if self
             .state
             .set_device_status(status, self.device_interrupt.clone(), true)
