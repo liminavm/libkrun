@@ -46,7 +46,6 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
@@ -57,7 +56,6 @@ use crate::vmm::device_manager::mmio::MMIODeviceManager;
     any(target_os = "linux", target_os = "windows")
 ))]
 use crate::vmm::device_manager::pci::PciHostManager;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
 #[cfg(not(target_os = "windows"))]
 use crate::vmm::vstate::Vm;
@@ -137,6 +135,8 @@ pub enum Error {
     VcpuHandle(vstate::Error),
     /// vCPU resume failed.
     VcpuResume,
+    /// vCPU pause failed (a vCPU did not report `Paused` in time). Used by the M9 snapshot path.
+    VcpuPause,
     /// Vm error.
     Vm(vstate::Error),
 }
@@ -162,6 +162,7 @@ impl Display for Error {
             VcpuReply(e) => write!(f, "Cannot receive vCPU reply: {e}"),
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             VcpuResume => write!(f, "vCPUs resume failed."),
+            VcpuPause => write!(f, "vCPUs pause failed."),
             Vm(e) => write!(f, "Vm error: {e}"),
         }
     }
@@ -230,6 +231,11 @@ pub struct Vmm {
     /// limina: a handle for pushing balloon targets into the live virtio-balloon device, captured
     /// when the balloon is attached. `None` if no balloon (e.g. the `tee` build).
     balloon_control_handle: Option<devices::virtio::BalloonControlHandle>,
+
+    /// limina (M9 snapshot/suspend): the shared vCPU list, used to kick every vCPU out to the
+    /// top of its run loop so it notices a snapshot `Pause`. See [`Self::pause_vcpus`].
+    #[cfg(target_os = "macos")]
+    vcpu_list: std::sync::Arc<devices::legacy::VcpuList>,
 }
 
 #[cfg(target_os = "linux")]
@@ -476,6 +482,16 @@ impl Vmm {
                     .map_err(Error::VcpuReply)
             })
             .collect()
+    }
+
+    /// Quiesce all vCPUs for a snapshot (M9): park every vCPU at a clean
+    /// inter-`hv_vcpu_run` boundary so register/GIC state can be serialized
+    /// consistently. Upstream's live-pause machinery ([`Vmm::pause`]) parks at
+    /// exactly that boundary (busy vCPUs via `vcpu_request_exit`, WFE-parked
+    /// ones via the event channel their wait selects on), so M9 rides it.
+    #[cfg(target_os = "macos")]
+    pub fn pause_vcpus(&mut self) -> Result<()> {
+        self.pause().map_err(|_| Error::VcpuPause)
     }
 
     /// Configures the system for boot.
