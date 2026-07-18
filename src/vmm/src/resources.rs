@@ -260,6 +260,11 @@ pub struct VmResources {
     /// this callback (see devices::virtio::i2c).
     #[cfg(not(feature = "tee"))]
     pub battery_provider: Option<devices::virtio::BatteryProvider>,
+    /// limina: advertise `VIRTIO_BALLOON_F_REPORTING` (FRQ fast-reclaim) to the guest. **Default
+    /// false**: a Linux guest with page-reporting enabled use-after-frees the reporting virtqueue on
+    /// suspend-to-idle (upstream `virtballoon_freeze` bug) and wedges. Enable only for enhanced-tier
+    /// guests carrying the kernel fix. See `devices::virtio::Balloon::new`.
+    pub balloon_free_page_reporting: bool,
 }
 
 impl VmResources {
@@ -502,6 +507,7 @@ mod tests {
             dhcp_client: false,
             snd: false,
             snd_capture: false,
+            balloon_free_page_reporting: false,
             #[cfg(not(feature = "tee"))]
             battery_provider: None,
         }
