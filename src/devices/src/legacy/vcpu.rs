@@ -56,6 +56,28 @@ impl PerCPUInterruptControllerState {
         false
     }
 
+    /// Force this vCPU out to the top of its run loop so it notices a pending
+    /// [`VcpuEvent`](crate) (e.g. a snapshot Pause). Mirrors [`Self::set_irq_common`]'s wake
+    /// path but injects **no** interrupt: a WFE/WFI-parked vCPU (blocked in
+    /// `wait_for_event`'s channel `recv`) is woken via its wfe channel, while a running one is
+    /// kicked out of `hv_vcpu_run` with `hv_vcpus_exit`. Harmless if the vCPU is already at the
+    /// loop top: the spurious wakeup just re-evaluates `should_wait`.
+    fn kick(&mut self) {
+        match self.status {
+            VcpuStatus::Waiting => {
+                self.wfe_sender
+                    .as_mut()
+                    .unwrap()
+                    .send(self.vcpuid as u32)
+                    .unwrap();
+                self.status = VcpuStatus::Running;
+            }
+            VcpuStatus::Running => {
+                vcpu_request_exit(self.vcpuid).unwrap();
+            }
+        }
+    }
+
     fn has_pending_irq(&self) -> bool {
         !self.pending_irqs.is_empty()
     }
@@ -109,6 +131,15 @@ impl VcpuList {
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
         assert!(vcpuid < self.cpu_count);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
+    }
+
+    /// Kick every vCPU out to the top of its run loop so each notices a pending
+    /// [`VcpuEvent`](crate) — used by the snapshot path to quiesce all vCPUs (M9). See
+    /// [`PerCPUInterruptControllerState::kick`].
+    pub fn kick_all(&self) {
+        for vcpu in &self.vcpus {
+            vcpu.lock().unwrap().kick();
+        }
     }
 }
 
