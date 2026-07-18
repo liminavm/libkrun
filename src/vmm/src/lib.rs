@@ -468,7 +468,37 @@ impl Vmm {
     /// blob, and guest RAM (skipping the GPU/fs SHM window), then serialize it all to `path`.
     /// On return the vCPUs are parked; the caller tears the worker down (exit "snapshotted").
     #[cfg(target_os = "macos")]
+    /// limina M9.2 quiesce oracle: the virtio-mmio devices whose driver has NOT reset them to `INIT`
+    /// (`device_status != 0`), i.e. the devices still holding un-drained queues. Empirically (see
+    /// `spikes/m9-freeze-trigger/observe-quiesce-status.sh`) an s2idle-suspended guest drives every
+    /// device to `0x0` via its `.suspend` callback, so a non-empty result means the guest has NOT
+    /// fully quiesced and the snapshot would capture a mid-flight machine (→ M9.1 wedge on restore).
+    /// **virtio-gpu (type 16) is excepted** — it has no s2idle PM ops (stays `DRIVER_OK` with live
+    /// queues across suspend), so M9.2 is headless-scoped and the GPU is not a quiesce holdout.
+    /// Returns `(virtio type id, device id, device_status)` for each holdout.
+    #[cfg(target_os = "macos")]
+    pub fn quiesce_holdouts(&self) -> Vec<(u32, String, u32)> {
+        const VIRTIO_ID_GPU: u32 = 16;
+        self.mmio_device_manager
+            .virtio_statuses()
+            .into_iter()
+            .filter(|(type_id, _, status)| *type_id != VIRTIO_ID_GPU && *status != 0)
+            .collect()
+    }
+
+    /// True once every virtio-mmio device (except virtio-gpu) has quiesced to `INIT`. See
+    /// [`quiesce_holdouts`](Self::quiesce_holdouts).
+    #[cfg(target_os = "macos")]
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesce_holdouts().is_empty()
+    }
+
     pub fn save_snapshot(&mut self, path: &std::path::Path) -> Result<()> {
+        // limina M9.2: log every virtio-mmio device's status at snapshot time — the ground truth for
+        // the quiesce oracle, and a durable record of what the captured machine's devices looked like.
+        for (type_id, id, status) in self.mmio_device_manager.virtio_statuses() {
+            info!("snapshot: virtio device type={type_id} id={id} device_status=0x{status:x}");
+        }
         let vcpus = self.snapshot_vcpus()?;
         let gic = hvf::save_gic_state().map_err(|_| Error::Snapshot)?;
         let gpio = self

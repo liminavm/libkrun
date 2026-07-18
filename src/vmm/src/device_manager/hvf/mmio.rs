@@ -328,6 +328,31 @@ impl MMIODeviceManager {
         }
         None
     }
+
+    /// limina M9.2: snapshot every virtio-mmio device as `(virtio type id, id, device_status)`.
+    /// The quiesce oracle / INIT-invariant assert reads this at suspend time. A device quiesced by
+    /// its driver's s2idle `.suspend` callback has been reset to `INIT` (0); virtio-gpu is the known
+    /// exception (no PM ops → stays `DRIVER_OK`). Only virtio-mmio transports are inspected (the
+    /// legacy PL0xx devices carry no virtio status).
+    pub fn virtio_statuses(&self) -> Vec<(u32, String, u32)> {
+        use devices::virtio::MmioTransport;
+        use devices::BusDevice;
+        let mut out = Vec::new();
+        for (dtype, id) in self.id_to_dev_info.keys() {
+            if let DeviceType::Virtio(type_id) = *dtype {
+                if let Some(dev) = self.get_device(*dtype, id) {
+                    let guard = dev.lock().unwrap();
+                    // Deref to `&dyn BusDevice` so `as_any` dispatches via the supertrait vtable
+                    // (not the blanket `impl<T: Any> AsAny for T` on the non-'static MutexGuard).
+                    let dev_ref: &dyn BusDevice = &*guard;
+                    if let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() {
+                        out.push((type_id, id.clone(), mmio.device_status()));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
