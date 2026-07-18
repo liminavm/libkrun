@@ -442,6 +442,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         None,
         sender.clone(),
         device_manager,
+        None,
     )
     .map_err(|e| VmmError::BootError(format!("{e:?}")))?;
 
