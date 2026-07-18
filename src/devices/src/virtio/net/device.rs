@@ -296,6 +296,12 @@ impl VirtioDevice for Net {
                 },
             };
 
+            let reused = self.backend.is_none(); // took Some above -> reused if we didn't reconnect
+            debug!(
+                "virtio-net ({}): activate; reused_preserved_backend={}",
+                self.id(),
+                reused
+            );
             let worker = NetWorker::new(rx_q, tx_q, interrupt.clone(), mem.clone(), backend, stop_fd);
             self.worker_thread = Some(worker.run());
             self.device_state = DeviceState::Activated(mem, interrupt);
@@ -324,6 +330,7 @@ impl VirtioDevice for Net {
         }
         #[cfg(not(windows))]
         {
+            debug!("virtio-net ({}): reset (suspend/resume)", self.id());
             if let Some(worker) = self.worker_thread.take() {
                 let _ = self.worker_stopfd.write(1);
                 match worker.join() {
