@@ -154,6 +154,8 @@ pub enum Error {
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
+    /// A vCPU snapshot save/restore FFI call (SIMD, vtimer offset, or pending interrupt) failed.
+    VcpuSnapshot,
     VmCreate,
 }
 
@@ -184,6 +186,7 @@ impl Display for Error {
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            VcpuSnapshot => write!(f, "Error saving/restoring HVF vCPU snapshot state"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
         }
     }
@@ -375,6 +378,95 @@ struct MmioRead {
     len: usize,
     srt: u32,
 }
+
+/// A full snapshot of one vCPU's architectural state (M9 suspend/resume). Everything HVF
+/// exposes that a resumed guest needs: the general-purpose registers + PC + PSTATE, the SIMD/FP
+/// bank, the EL1/EL0 system-register set ([`SNAPSHOT_SYS_REGS`], values in the same order), the
+/// virtual-timer offset, and the pending interrupt lines. Transient HVF-internal software state
+/// (a pending WFx PC advance, a half-serviced MMIO read) is folded into the real register file
+/// by [`HvfVcpu::save_state`] before capture, so nothing here is renderer-/emulator-internal.
+#[derive(Clone)]
+pub struct VcpuState {
+    /// X0..X30.
+    pub x: [u64; 31],
+    pub pc: u64,
+    pub cpsr: u64,
+    pub fpcr: u64,
+    pub fpsr: u64,
+    /// V0..V31 (128-bit SIMD/FP registers).
+    pub q: [u128; 32],
+    /// Values for [`SNAPSHOT_SYS_REGS`], in that order.
+    pub sysregs: Vec<u64>,
+    pub vtimer_offset: u64,
+    pub pending_irq: bool,
+    pub pending_fiq: bool,
+}
+
+/// The EL1/EL0 system registers captured in a [`VcpuState`], in save/restore order. Excludes the
+/// EL2 (nested-only) registers and `CNTHP_*` (they read `HV_UNSUPPORTED` without nested virt),
+/// the derived `CNTP_TVAL_EL0` (a view of `CNTP_CVAL_EL0` — restoring both would double-apply),
+/// and `MPIDR_EL1`/`MIDR_EL1` (set at vCPU creation). Every entry is proven to round-trip on a
+/// fresh HVF vCPU by `spikes/m9-hvf-state-roundtrip` (get + set, no rejections).
+#[rustfmt::skip]
+static SNAPSHOT_SYS_REGS: &[hv_sys_reg_t] = &[
+    hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1, hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1, hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1, hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1, hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1, hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1, hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1, hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1, hv_sys_reg_t_HV_SYS_REG_CNTP_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CVAL_EL0, hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0, hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1, hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR0_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR10_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR11_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR12_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR13_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR14_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR15_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR2_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR4_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR6_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR7_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR8_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBCR9_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR0_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR10_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR11_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR12_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR13_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR14_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR15_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR2_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR4_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR6_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR7_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR8_EL1, hv_sys_reg_t_HV_SYS_REG_DBGBVR9_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR0_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR10_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR11_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR12_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR13_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR14_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR15_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR2_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR4_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR6_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR7_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR8_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWCR9_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR0_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR10_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR11_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR12_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR13_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR14_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR15_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR2_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR4_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR6_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR7_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR8_EL1, hv_sys_reg_t_HV_SYS_REG_DBGWVR9_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1, hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1, hv_sys_reg_t_HV_SYS_REG_ID_AA64DFR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ID_AA64DFR1_EL1, hv_sys_reg_t_HV_SYS_REG_ID_AA64ISAR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ID_AA64ISAR1_EL1, hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR1_EL1, hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR2_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1, hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1, hv_sys_reg_t_HV_SYS_REG_MDCCINT_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1, hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1, hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL0, hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1, hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0, hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1, hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+];
 
 pub struct HvfVcpu<'a> {
     vcpuid: hv_vcpu_t,
@@ -580,6 +672,154 @@ impl HvfVcpu<'_> {
             return Err(Error::VcpuSetRegister);
         }
         self.vtimer_offset.set(offset);
+        Ok(())
+    }
+
+    /// Set an EL1/EL0 system register — the counterpart to the private [`Self::read_sys_reg`],
+    /// used by the M9 snapshot restore path (there was no generic setter before).
+    pub fn write_sys_reg(&self, reg: u16, val: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_sys_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSetSystemRegister(reg, val))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_simd(&self, reg: hv_simd_fp_reg_t) -> Result<u128, Error> {
+        let mut val: hv_simd_fp_uchar16_t = 0;
+        let ret = unsafe { hv_vcpu_get_simd_fp_reg(self.vcpuid, reg, &mut val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(val)
+        }
+    }
+
+    fn write_simd(&self, reg: hv_simd_fp_reg_t, val: u128) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_simd_fp_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_vtimer_offset(&self) -> Result<u64, Error> {
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(val)
+        }
+    }
+
+    fn write_vtimer_offset(&self, val: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_pending_interrupt(&self, ty: hv_interrupt_type_t) -> Result<bool, Error> {
+        let mut pending = false;
+        let ret = unsafe { hv_vcpu_get_pending_interrupt(self.vcpuid, ty, &mut pending) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(pending)
+        }
+    }
+
+    /// Fold this vCPU's transient software state into the real HVF register file before a
+    /// snapshot: apply a half-serviced MMIO read to its destination register, then the pending
+    /// WFx PC advance. Mirrors the top of [`Self::run`] (which normally applies these on the
+    /// next entry). After this the register file is fully consistent, so a [`VcpuState`]
+    /// captures everything and a restore needs to carry no HVF-internal software flags.
+    fn flush_pending_state(&mut self) -> Result<(), Error> {
+        if let Some(mmio_read) = self.pending_mmio_read.take() {
+            if mmio_read.srt < 31 {
+                let val = match mmio_read.len {
+                    1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
+                    2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
+                    4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
+                    8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
+                    _ => return Err(Error::Unhandled),
+                };
+                self.write_reg(mmio_read.srt, val)?;
+            }
+        }
+        if self.pending_advance_pc {
+            let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
+            self.write_reg(hv_reg_t_HV_REG_PC, pc + 4)?;
+            self.pending_advance_pc = false;
+        }
+        Ok(())
+    }
+
+    /// Capture this vCPU's full architectural state for an M9 snapshot. **Must run on the vCPU's
+    /// own thread** — HVF binds `hv_vcpu_*` register access to the creating thread. Transient
+    /// software state is folded into the register file first ([`Self::flush_pending_state`]).
+    pub fn save_state(&mut self) -> Result<VcpuState, Error> {
+        self.flush_pending_state()?;
+
+        let mut x = [0u64; 31];
+        for (i, slot) in x.iter_mut().enumerate() {
+            *slot = self.read_reg(hv_reg_t_HV_REG_X0 + i as u32)?;
+        }
+        let mut q = [0u128; 32];
+        for (i, slot) in q.iter_mut().enumerate() {
+            *slot = self.read_simd(hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32)?;
+        }
+        let mut sysregs = Vec::with_capacity(SNAPSHOT_SYS_REGS.len());
+        for &reg in SNAPSHOT_SYS_REGS {
+            sysregs.push(self.read_sys_reg(reg)?);
+        }
+
+        Ok(VcpuState {
+            x,
+            pc: self.read_reg(hv_reg_t_HV_REG_PC)?,
+            cpsr: self.read_reg(hv_reg_t_HV_REG_CPSR)?,
+            fpcr: self.read_reg(hv_reg_t_HV_REG_FPCR)?,
+            fpsr: self.read_reg(hv_reg_t_HV_REG_FPSR)?,
+            q,
+            sysregs,
+            vtimer_offset: self.read_vtimer_offset()?,
+            pending_irq: self
+                .read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
+            pending_fiq: self
+                .read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
+        })
+    }
+
+    /// Restore a vCPU from a [`VcpuState`] — the resume-path counterpart to
+    /// [`Self::set_initial_state`]. Runs on the vCPU's own thread, before its run loop. MPIDR is
+    /// already set at creation and the VM-wide GIC blob is restored by the caller beforehand;
+    /// order otherwise follows the round-trip spike (sysregs, then GP/PC/PSTATE/SIMD, then the
+    /// vtimer offset and pending lines).
+    pub fn restore_state(&mut self, state: &VcpuState) -> Result<(), Error> {
+        if state.sysregs.len() != SNAPSHOT_SYS_REGS.len() {
+            return Err(Error::VcpuSnapshot);
+        }
+        for (&reg, &val) in SNAPSHOT_SYS_REGS.iter().zip(state.sysregs.iter()) {
+            self.write_sys_reg(reg, val)?;
+        }
+        for (i, &val) in state.x.iter().enumerate() {
+            self.write_reg(hv_reg_t_HV_REG_X0 + i as u32, val)?;
+        }
+        self.write_reg(hv_reg_t_HV_REG_PC, state.pc)?;
+        self.write_reg(hv_reg_t_HV_REG_CPSR, state.cpsr)?;
+        self.write_reg(hv_reg_t_HV_REG_FPCR, state.fpcr)?;
+        self.write_reg(hv_reg_t_HV_REG_FPSR, state.fpsr)?;
+        for (i, &val) in state.q.iter().enumerate() {
+            self.write_simd(hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, val)?;
+        }
+        self.write_vtimer_offset(state.vtimer_offset)?;
+        vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
+        vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
         Ok(())
     }
 

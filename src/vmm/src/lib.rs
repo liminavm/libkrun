@@ -48,6 +48,8 @@ use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
+#[cfg(target_os = "macos")]
+use hvf::VcpuState;
 
 use arch::{ArchMemoryInfo, InitrdConfig};
 #[cfg(target_os = "macos")]
@@ -402,6 +404,33 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn pause_vcpus(&mut self) -> Result<()> {
         self.pause().map_err(|_| Error::VcpuPause)
+    }
+
+    /// Snapshot every vCPU's architectural state (M9): hand each a per-vCPU reply channel via a
+    /// `Snapshot` event, kick them all to the top of their run loops, and collect the states in
+    /// vCPU-index order. Each vCPU saves on its own thread (HVF register affinity) and then
+    /// parks, so on return the machine is quiesced exactly as after [`Self::pause_vcpus`] —
+    /// ready for the caller to serialize the GIC and guest RAM alongside these states.
+    #[cfg(target_os = "macos")]
+    pub fn snapshot_vcpus(&mut self) -> Result<Vec<VcpuState>> {
+        let mut receivers = Vec::with_capacity(self.vcpus_handles.len());
+        for handle in self.vcpus_handles.iter() {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            handle
+                .send_event(VcpuEvent::Snapshot(tx))
+                .map_err(Error::VcpuEvent)?;
+            receivers.push(rx);
+        }
+        self.vcpu_list.kick_all();
+        let mut states = Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            match rx.recv_timeout(Duration::from_millis(5000)) {
+                Ok(state) => states.push(*state),
+                // Timeout, or a vCPU dropped its reply channel because its save failed.
+                _ => return Err(Error::VcpuPause),
+            }
+        }
+        Ok(states)
     }
 
     /// Configures the system for boot.
