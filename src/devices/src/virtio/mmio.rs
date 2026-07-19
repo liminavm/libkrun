@@ -63,6 +63,20 @@ pub struct MmioTransport {
     // live `Queue`s move into the device worker (after which `self.queues` is `None`). This lets
     // `transport_state()` report the queue GPAs for a snapshot of an already-activated device.
     activated_queue_regs: Vec<QueueRegs>,
+    // limina M9.3 diagnostics (LIMINA_MMIO_TRACE=1): log every salient transport register write
+    // (status / queue geometry — NOT the per-notification firehose) at warn with the device name.
+    // Answers "did the guest re-program this device's queues on s2idle thaw?" by direct observation.
+    mmio_trace: bool,
+    trace_name: String,
+    // limina M9.3 (no-PM-ops s2idle leniency): did the driver write any queue-geometry register
+    // (QueueNum/Ready/Desc/Avail/Used) since the last reset? A driver whose virtio_driver has no
+    // .freeze/.restore ops resumes from s2idle via the bus fallback (virtio.c
+    // virtio_device_restore_priv): reset → features → DRIVER_OK, with NO queue re-programming —
+    // virtio-gpu is the one such driver in practice (verified absent through v7.1.2). Reset wipes
+    // our queue registers, so that sequence would activate the device on dead queues and every
+    // guest command would wait forever (the M9.3 restore wedge, and equally an in-place s2idle).
+    // When this is false at DRIVER_OK, `activate()` re-arms from `activated_queue_regs`.
+    queues_programmed: bool,
 }
 
 /// A virtqueue's negotiated register file (guest-physical ring addresses + size/ready), as the driver
@@ -216,6 +230,7 @@ impl MmioTransport {
             .device_name()
             .to_string();
         let debug_log_target = format!("{}[{device_name}]", module_path!());
+        let mmio_trace = std::env::var("LIMINA_MMIO_TRACE").map(|v| v == "1") == Ok(true);
         let state = VirtioTransportState::new(mem, device)
             .map_err(CreateMmioTransportError::CreateInterruptEventFd)?;
         let interrupt = MmioInterrupt::new(intc, debug_log_target)?;
@@ -227,7 +242,18 @@ impl MmioTransport {
             device_interrupt,
             shm_region_select: 0,
             activated_queue_regs: Vec::new(),
+            mmio_trace,
+            trace_name: device_name,
+            queues_programmed: false,
         })
+    }
+
+    /// limina M9.3 restore: seed the previous-activation queue register file on a FRESH transport
+    /// from the snapshot's captured transport state. The guest re-negotiates the device itself on
+    /// s2idle thaw, but a driver with no PM ops (virtio-gpu) never re-programs its queues — the
+    /// seeded file is what `activate()`'s no-queues-programmed re-arm then falls back to.
+    pub fn seed_queue_regs(&mut self, regs: Vec<QueueRegs>) {
+        self.activated_queue_regs = regs;
     }
 
     /// Set the irq line for the device.
@@ -274,6 +300,9 @@ impl MmioTransport {
 
     fn update_queue_field<F: FnOnce(&mut Queue)>(&mut self, f: F) {
         if self.check_device_status(device_status::FEATURES_OK, device_status::FAILED) {
+            // limina M9.3: any queue-geometry write marks this negotiation cycle as having
+            // programmed queues — the no-PM-ops resume re-arm must then stay out of the way.
+            self.queues_programmed = true;
             // FIXME: check if activated!
             self.with_queue_mut(f);
         } else {
@@ -285,10 +314,84 @@ impl MmioTransport {
         }
     }
 
+    /// limina M9.3 (no-PM-ops s2idle leniency): the driver reached DRIVER_OK without programming
+    /// any queue this negotiation cycle (bus-fallback resume, see `queues_programmed`). Re-arm the
+    /// transport queues from the previous activation's register file — the rings still live in
+    /// guest RAM (in-place resume) or restored RAM (snapshot restore, where the file was seeded
+    /// from the capture). Ring cursors resume at used.idx as read from RAM: everything the device
+    /// completed stays completed, and any entries the guest queued past that are (re)processed.
+    /// A queue that fails validation is left un-ready (logged) — no worse than the dead queue the
+    /// spec-faithful behavior would have produced.
+    fn rearm_queues_from_stash(&mut self) {
+        use vm_memory::Bytes;
+        let mem = self.state.mem().clone();
+        let regs = self.activated_queue_regs.clone();
+        let Some(queues) = self.state.queues.as_mut() else {
+            return;
+        };
+        if queues.len() != regs.len() {
+            warn!(
+                "{}: queue re-arm skipped: stash has {} queue(s), transport {}",
+                self.trace_name,
+                regs.len(),
+                queues.len()
+            );
+            return;
+        }
+        for (i, (q, r)) in queues.iter_mut().zip(regs.iter()).enumerate() {
+            if !r.ready {
+                continue;
+            }
+            q.size = r.size;
+            q.ready = true;
+            q.desc_table = GuestAddress(r.desc);
+            q.avail_ring = GuestAddress(r.avail);
+            q.used_ring = GuestAddress(r.used);
+            // used.idx is the u16 at used_ring + 2 (after the flags field).
+            let used_idx = match mem.read_obj::<u16>(GuestAddress(r.used + 2)) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "{}: queue {i} re-arm: used.idx read failed ({e:?}); leaving queue un-ready",
+                        self.trace_name
+                    );
+                    q.ready = false;
+                    continue;
+                }
+            };
+            q.next_avail = std::num::Wrapping(used_idx);
+            q.next_used = std::num::Wrapping(used_idx);
+            if !q.is_valid(&mem) {
+                warn!(
+                    "{}: queue {i} re-arm: ring invalid against guest memory; leaving queue un-ready",
+                    self.trace_name
+                );
+                q.ready = false;
+            }
+        }
+        warn!(
+            "{}: DRIVER_OK with no queues programmed this cycle (no-PM-ops driver resume); \
+             re-armed queue register file from the previous activation",
+            self.trace_name
+        );
+    }
+
     /// Activates the device through the shared transport state, first stashing the negotiated
     /// queue register file (M9.3 snapshot) so `transport_state()` can report the queue GPAs of an
     /// already-activated device after the live `Queue`s have moved into the device worker.
     fn activate(&mut self) {
+        // limina M9.3: bus-fallback resume detection — see `rearm_queues_from_stash`.
+        if !self.queues_programmed
+            && self
+                .state
+                .queues
+                .as_ref()
+                .is_some_and(|qs| qs.iter().all(|q| !q.ready))
+            && self.activated_queue_regs.iter().any(|r| r.ready)
+        {
+            self.rearm_queues_from_stash();
+        }
+
         let Some(queues) = self.state.queues.as_ref() else {
             return;
         };
@@ -342,6 +445,10 @@ impl MmioTransport {
             .set_device_status(status, self.device_interrupt.clone(), false)
         {
             self.interrupt.reset_status();
+            // limina M9.3: a new negotiation cycle begins; `activated_queue_regs` deliberately
+            // SURVIVES the reset — it is the fallback for a no-PM-ops driver's bus-fallback resume
+            // (reset → features → DRIVER_OK with no queue writes), see `rearm_queues_from_stash`.
+            self.queues_programmed = false;
         }
         if !had_driver_ok
             && self.check_device_status(device_status::DRIVER_OK, 0)
@@ -428,6 +535,31 @@ impl BusDevice for MmioTransport {
         match offset {
             0x00..=0xff if data.len() == 4 => {
                 let v = byte_order::read_le_u32(data);
+                // limina M9.3 diagnostics: trace the negotiation-relevant writes (skip the
+                // per-notification 0x50 and interrupt-ack 0x64 firehoses).
+                if self.mmio_trace && offset != 0x50 && offset != 0x64 {
+                    let reg = match offset {
+                        0x14 => "DeviceFeaturesSel",
+                        0x20 => "DriverFeatures",
+                        0x24 => "DriverFeaturesSel",
+                        0x30 => "QueueSel",
+                        0x38 => "QueueNum",
+                        0x44 => "QueueReady",
+                        0x70 => "Status",
+                        0x80 => "QueueDescLow",
+                        0x84 => "QueueDescHigh",
+                        0x90 => "QueueAvailLow",
+                        0x94 => "QueueAvailHigh",
+                        0xa0 => "QueueUsedLow",
+                        0xa4 => "QueueUsedHigh",
+                        0xac => "SHMSel",
+                        _ => "?",
+                    };
+                    warn!(
+                        "[MMIOTRACE] {} write 0x{offset:02x} {reg} = 0x{v:x} (qsel={})",
+                        self.trace_name, self.state.queue_select
+                    );
+                }
                 match offset {
                     0x14 => self.state.features_select = v,
                     0x20 => {
