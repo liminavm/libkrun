@@ -1270,6 +1270,8 @@ pub fn build_microvm(
         paused_at: 0,
         #[cfg(feature = "gpu")]
         gpu_resize_handle: None,
+        #[cfg(feature = "gpu")]
+        gpu_device: None,
         balloon_control_handle: None,
         #[cfg(target_os = "macos")]
         vcpu_list: vcpu_list.clone(),
@@ -1357,6 +1359,7 @@ pub fn build_microvm(
             Vec<u8>,
             Option<devices::legacy::GpioState>,
             Vec<crate::vmm::snapshot::DeviceTransportState>,
+            Option<Vec<u8>>,
             Arc<crate::vmm::vstate::RestoreGate>,
         )>,
     ) = if let Some(ref path) = restore_from {
@@ -1392,7 +1395,10 @@ pub fn build_microvm(
                 v
             })
             .collect();
-        (vcpus, Some((snap.ram, snap.gic, gpio, snap.devices, gate)))
+        (
+            vcpus,
+            Some((snap.ram, snap.gic, gpio, snap.devices, snap.gpu, gate)),
+        )
     } else {
         (vcpus, None)
     };
@@ -1414,7 +1420,7 @@ pub fn build_microvm(
     // re-reads the FDT. (The GPU/fs SHM window was excluded at save time and is re-established by
     // the guest, per Strategy A; it is not overwritten here.)
     #[cfg(target_os = "macos")]
-    if let Some((ram, _, _, _, _)) = &restore_release {
+    if let Some((ram, _, _, _, _, _)) = &restore_release {
         for region in ram {
             vmm.guest_memory()
                 .write_slice(&region.data, GuestAddress(region.gpa))
@@ -1465,7 +1471,7 @@ pub fn build_microvm(
     // in-kernel GIC (distributor + redistributor), then open the gate so each vCPU restores its
     // own register file (including its ICC/CPU-interface regs, on its own thread) and runs.
     #[cfg(target_os = "macos")]
-    if let Some((_, gic, gpio, devices, gate)) = &restore_release {
+    if let Some((_, gic, gpio, devices, gpu, gate)) = &restore_release {
         hvf::restore_gic_state(gic)
             .map_err(|_| StartMicrovmError::Internal(crate::vmm::Error::Snapshot))?;
         // Restore the PL061 register file into the fresh GPIO device before releasing the vCPUs, so
@@ -1489,6 +1495,22 @@ pub fn build_microvm(
                     StartMicrovmError::Internal(crate::vmm::Error::Snapshot)
                 })?;
         }
+        // M9.3 venus snapshot-replay: stage the v5 GPU section on the device. The worker
+        // replays it at the guest thaw's re-activation — after the thaw reset (whose
+        // `reset_session` would wipe an earlier replay) and before the first queue command,
+        // whose venus state it re-creates. A failed replay is logged by the worker and the
+        // guest gets the fresh-renderer behavior (session restart), never a wedge.
+        #[cfg(feature = "gpu")]
+        if let Some(data) = gpu {
+            if vmm.restore_gpu(data.clone()) {
+                info!(
+                    "restore: staged {}-byte GPU re-creation payload for replay on thaw",
+                    data.len()
+                );
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = gpu;
         gate.open();
     }
 

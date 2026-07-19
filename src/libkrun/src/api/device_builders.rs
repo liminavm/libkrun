@@ -1792,6 +1792,9 @@ impl<'a> AttachDevice<'a> for GpuDevice {
         ctx.vmm
             .set_gpu_resize_handle(inner.lock().unwrap().display_resize_handle());
 
+        // limina M9.3: keep a handle to the device for GPU snapshot/replay round-trips.
+        ctx.vmm.set_gpu_device(inner.clone());
+
         let id = inner.lock().unwrap().id().to_string();
         ctx.register(&id, inner)
     }
