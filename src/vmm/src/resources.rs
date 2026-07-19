@@ -507,6 +507,7 @@ mod tests {
             dhcp_client: false,
             snd: false,
             snd_capture: false,
+            balloon_free_page_reporting: false,
             #[cfg(not(feature = "tee"))]
             battery_provider: None,
         }
