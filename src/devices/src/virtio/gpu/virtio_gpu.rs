@@ -832,6 +832,7 @@ impl VirtioGpu {
             ops: Vec::new(),
             vkr_journals: Vec::new(),
             blob_contents: Vec::new(),
+            memory_contents: Vec::new(),
         };
 
         let mut ctxs: Vec<u32> = Vec::new();
@@ -857,7 +858,36 @@ impl VirtioGpu {
             {
                 Some(bytes) => payload.vkr_journals.push((ctx_id, bytes)),
                 // Normal for non-venus contexts (the kernel's ctx 1, virgl contexts).
-                None => debug!("gpu snapshot: no vkr journal for ctx {ctx_id}"),
+                None => {
+                    debug!("gpu snapshot: no vkr journal for ctx {ctx_id}");
+                    continue;
+                }
+            }
+            // P2: every capturable VkDeviceMemory's raw bytes. The census excludes
+            // map_ptr-exported blobs (the mapped-blob loop below captures those) and
+            // imports (they alias another storage); what remains — textures, render
+            // targets, non-staging buffers — lives only in host heaps.
+            let Some(census) = self
+                .rutabaga
+                .as_ref()
+                .and_then(|r| r.limina_memory_census(ctx_id))
+            else {
+                warn!("gpu snapshot: memory census failed for venus ctx {ctx_id}");
+                continue;
+            };
+            for (mem_id, size) in census {
+                let mut bytes = vec![0u8; size as usize];
+                if self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_memory_read(ctx_id, mem_id, &mut bytes))
+                {
+                    payload.memory_contents.push((ctx_id, mem_id, bytes));
+                } else {
+                    warn!(
+                        "gpu snapshot: content read failed for ctx {ctx_id} mem {mem_id} ({size} bytes)"
+                    );
+                }
             }
         }
 
@@ -868,11 +898,18 @@ impl VirtioGpu {
             }
         }
 
+        let content_bytes: usize = payload
+            .memory_contents
+            .iter()
+            .map(|(_, _, b)| b.len())
+            .sum();
         info!(
-            "gpu snapshot: {} ops, {} vkr journals, {} blob contents",
+            "gpu snapshot: {} ops, {} vkr journals, {} blob contents, {} memory contents ({} MiB)",
             payload.ops.len(),
             payload.vkr_journals.len(),
-            payload.blob_contents.len()
+            payload.blob_contents.len(),
+            payload.memory_contents.len(),
+            content_bytes >> 20
         );
         Some(payload.to_bytes())
     }
@@ -898,9 +935,10 @@ impl VirtioGpu {
             return false;
         };
         let GpuSnapshotPayload {
-            ops,
+            mut ops,
             vkr_journals,
             blob_contents,
+            memory_contents,
         } = payload;
 
         let mut wire: HashMap<u32, (Vec<super::journal::VkrWireEntry>, usize)> = HashMap::new();
@@ -975,7 +1013,17 @@ impl VirtioGpu {
             };
         }
 
-        for entry in &ops {
+        for entry in &mut ops {
+            // GENERATION REBASE (the 2nd-resume disk of the journal): a CreateBlob's
+            // vkr_seq fence is meaningful only against the wire journal that recorded it.
+            // The fresh context re-records the replayed wire commands from seq 1, so the
+            // fence must be rewritten to the NEW journal's watermark at the exact point
+            // its old fence was satisfied — otherwise the next generation's merge is
+            // cross-epoch garbage (the first old fence, ~1M, drains the entire new wire
+            // journal, and every later import replays before its exporter blob exists:
+            // the observed fd_type=-999 cascade + KK descriptor assert). Set in the
+            // CreateBlob arm below; carrying it as a local keeps entry.op's borrow short.
+            let mut rebased_fence: Option<u64> = None;
             match &entry.op {
                 GpuJournalOp::CtxCreate {
                     ctx_id,
@@ -1045,6 +1093,13 @@ impl VirtioGpu {
                         .iter()
                         .map(|(a, l)| (GuestAddress(*a), *l))
                         .collect();
+                    // Rebase the fence into the new journal's epoch (see the loop head):
+                    // journal_vkr_seq is the new journal's last-assigned seq — everything
+                    // this fence fed has just re-recorded, so this IS the old fence's
+                    // position translated. Venus contexts only (others have no journal).
+                    if wire.contains_key(ctx_id) {
+                        rebased_fence = Some(self.journal_vkr_seq(*ctx_id));
+                    }
                     if self
                         .resource_create_blob(*ctx_id, *resource_id, create, vecs, mem)
                         .is_err()
@@ -1095,12 +1150,37 @@ impl VirtioGpu {
                     }
                 }
             }
+            if let Some(fence) = rebased_fence {
+                entry.vkr_seq = fence;
+            }
         }
 
-        // Drain each context's remaining wire entries, then start the rings.
+        // Drain each context's remaining wire entries, restore its device-memory
+        // contents (the allocs exist now, and the rings — which consume parked
+        // commands the moment they start — haven't started yet), then start the
+        // rings. A failed content write is recoverable in the same sense as a
+        // dropped stale wire entry: the memory whose alloc replay was dropped is
+        // garbage-if-accessed either way.
         let ctxs: Vec<u32> = wire.keys().copied().collect();
+        let mut content_failed = 0u32;
         for ctx_id in ctxs {
             replay_wire_upto!(ctx_id, u64::MAX);
+            for (mem_ctx, mem_id, bytes) in &memory_contents {
+                if *mem_ctx != ctx_id {
+                    continue;
+                }
+                if !self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_memory_write(ctx_id, *mem_id, bytes))
+                {
+                    content_failed += 1;
+                    debug!(
+                        "gpu restore: content write failed for ctx {ctx_id} mem {mem_id} ({} bytes)",
+                        bytes.len()
+                    );
+                }
+            }
             if !self
                 .rutabaga
                 .as_ref()
@@ -1109,6 +1189,13 @@ impl VirtioGpu {
                 error!("gpu restore: replay_end {ctx_id} failed");
                 op_failed += 1;
             }
+        }
+        if content_failed > 0 {
+            warn!(
+                "gpu restore: {content_failed} of {} memory-content writes failed (allocs \
+                 whose replay was dropped — garbage-if-accessed before and after)",
+                memory_contents.len()
+            );
         }
 
         if op_failed > 0 {
