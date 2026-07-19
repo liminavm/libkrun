@@ -91,6 +91,29 @@ pub trait RutabagaComponent {
     /// called on the renderer thread.
     fn limina_dump_state(&self) {}
 
+    /// limina M9.3 P1 snapshot-replay hooks (virglrenderer implements them; every
+    /// other component returns the do-nothing defaults). All renderer-thread-only.
+    fn limina_journal_export(&self, _ctx_id: u32) -> Option<Vec<u8>> {
+        None
+    }
+    fn limina_journal_unpin(&self, _ctx_id: u32, _key: u64) {}
+
+    fn limina_journal_seq(&self, _ctx_id: u32) -> u64 {
+        0
+    }
+    fn limina_replay_begin(&self, _ctx_id: u32) -> bool {
+        false
+    }
+    fn limina_replay_submit(&self, _ctx_id: u32, _cmd: &mut [u8]) -> bool {
+        false
+    }
+    fn limina_replay_ring_cmd(&self, _ctx_id: u32, _ring_id: u64, _cmd: &mut [u8]) -> bool {
+        false
+    }
+    fn limina_replay_end(&self, _ctx_id: u32) -> bool {
+        false
+    }
+
     /// Implementations must create a fence that represents the completion of prior work.  This is
     /// required for synchronization with the guest kernel.
     fn create_fence(&mut self, _fence: RutabagaFence) -> RutabagaResult<()> {
@@ -595,6 +618,51 @@ impl Rutabaga {
         if let Some(component) = self.components.get(&self.default_component) {
             component.limina_dump_state();
         }
+    }
+
+    /// limina M9.3 P1: snapshot-replay passthroughs to the default component
+    /// (virglrenderer). Renderer-thread-only, like the dump above.
+    pub fn limina_journal_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
+        self.components
+            .get(&self.default_component)
+            .and_then(|c| c.limina_journal_export(ctx_id))
+    }
+
+    pub fn limina_journal_unpin(&self, ctx_id: u32, key: u64) {
+        if let Some(c) = self.components.get(&self.default_component) {
+            c.limina_journal_unpin(ctx_id, key);
+        }
+    }
+
+    pub fn limina_journal_seq(&self, ctx_id: u32) -> u64 {
+        self.components
+            .get(&self.default_component)
+            .map(|c| c.limina_journal_seq(ctx_id))
+            .unwrap_or(0)
+    }
+
+    pub fn limina_replay_begin(&self, ctx_id: u32) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_replay_begin(ctx_id))
+    }
+
+    pub fn limina_replay_submit(&self, ctx_id: u32, cmd: &mut [u8]) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_replay_submit(ctx_id, cmd))
+    }
+
+    pub fn limina_replay_ring_cmd(&self, ctx_id: u32, ring_id: u64, cmd: &mut [u8]) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_replay_ring_cmd(ctx_id, ring_id, cmd))
+    }
+
+    pub fn limina_replay_end(&self, ctx_id: u32) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_replay_end(ctx_id))
     }
 
     /// Creates a fence with the given `fence`.

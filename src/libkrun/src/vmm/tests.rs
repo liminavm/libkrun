@@ -91,6 +91,8 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         balloon_control_handle: None,
         #[cfg(target_os = "macos")]
         vcpu_list: Arc::new(devices::legacy::VcpuList::new(1)),
+        #[cfg(feature = "gpu")]
+        gpu_device: None,
     };
 
     match control {
