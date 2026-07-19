@@ -833,6 +833,7 @@ impl VirtioGpu {
             vkr_journals: Vec::new(),
             blob_contents: Vec::new(),
             memory_contents: Vec::new(),
+            sync_states: Vec::new(),
         };
 
         let mut ctxs: Vec<u32> = Vec::new();
@@ -862,6 +863,16 @@ impl VirtioGpu {
                     debug!("gpu snapshot: no vkr journal for ctx {ctx_id}");
                     continue;
                 }
+            }
+            // P2.1: fence status + timeline semaphore counter values (opaque vkr
+            // blob) for the restore-time sync fast-forward.
+            match self
+                .rutabaga
+                .as_ref()
+                .and_then(|r| r.limina_sync_export(ctx_id))
+            {
+                Some(bytes) => payload.sync_states.push((ctx_id, bytes)),
+                None => warn!("gpu snapshot: sync export failed for venus ctx {ctx_id}"),
             }
             // P2: every capturable VkDeviceMemory's raw bytes. The census excludes
             // map_ptr-exported blobs (the mapped-blob loop below captures those) and
@@ -935,6 +946,7 @@ impl VirtioGpu {
             vkr_journals,
             blob_contents,
             memory_contents,
+            sync_states,
         } = payload;
 
         let mut wire: HashMap<u32, (Vec<super::journal::VkrWireEntry>, usize)> = HashMap::new();
@@ -1155,6 +1167,19 @@ impl VirtioGpu {
                         "gpu restore: content write failed for ctx {ctx_id} mem {mem_id} ({} bytes)",
                         bytes.len()
                     );
+                }
+            }
+            // P2.1: fast-forward the context's sync objects (fences, timeline +
+            // binary semaphores) to their retired pre-suspend state BEFORE the
+            // rings start — a started ring may immediately consume a guest wait
+            // rooted in the pre-suspend epoch (the mutter WSI-semaphore wedge).
+            if let Some((_, blob)) = sync_states.iter().find(|(c, _)| *c == ctx_id) {
+                if !self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_sync_restore(ctx_id, blob))
+                {
+                    warn!("gpu restore: sync fast-forward failed for ctx {ctx_id}");
                 }
             }
             if !self
