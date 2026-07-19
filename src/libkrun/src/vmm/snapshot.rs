@@ -240,7 +240,10 @@ fn corrupt(what: &str) -> io::Error {
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
         let end = self.pos.checked_add(n).ok_or_else(|| corrupt("overflow"))?;
-        let s = self.buf.get(self.pos..end).ok_or_else(|| corrupt("truncated"))?;
+        let s = self
+            .buf
+            .get(self.pos..end)
+            .ok_or_else(|| corrupt("truncated"))?;
         self.pos = end;
         Ok(s)
     }
@@ -503,7 +506,8 @@ mod tests {
                 },
             ],
         };
-        let path = std::env::temp_dir().join(format!("limina-snap-test-{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("limina-snap-test-{}.bin", std::process::id()));
         write(&path, &snap).expect("write");
         let got = read(&path).expect("read");
         let _ = fs::remove_file(&path);
@@ -562,8 +566,16 @@ mod tests {
         // resumed into blank RAM and stalled. The length prefix MUST be a 64-bit value.
         let mut v = Vec::new();
         put_bytes(&mut v, &[0xABu8; 5]);
-        assert_eq!(v.len(), 8 + 5, "byte-section length must be a 64-bit prefix");
-        assert_eq!(&v[..8], &5u64.to_le_bytes(), "length encoded little-endian u64");
+        assert_eq!(
+            v.len(),
+            8 + 5,
+            "byte-section length must be a 64-bit prefix"
+        );
+        assert_eq!(
+            &v[..8],
+            &5u64.to_le_bytes(),
+            "length encoded little-endian u64"
+        );
         // And a length that would overflow u32 must survive the u64 round-trip in the header.
         let mut h = Vec::new();
         put_u64(&mut h, 0x1_0000_0000u64); // exactly 4 GiB — the value a u32 truncates to 0
@@ -588,7 +600,9 @@ mod tests {
         let mut raw = fs::read(&path).unwrap();
         raw[12] ^= 0xff;
         fs::write(&path, &raw).unwrap();
-        let err = read(&path).err().expect("corrupted snapshot must be rejected");
+        let err = read(&path)
+            .err()
+            .expect("corrupted snapshot must be rejected");
         let _ = fs::remove_file(&path);
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
