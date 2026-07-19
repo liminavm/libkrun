@@ -19,12 +19,58 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // v3 widens every byte-section length prefix from u32 to u64: a guest-RAM region can be ≥ 4 GiB, and
 // a u32 length silently truncated it (4 GiB → 0), so restore wrote back an empty region and the guest
 // resumed into blank RAM. See `put_bytes`/`Reader::bytes`.
-const VERSION: u32 = 3;
+// v4 adds (a) a memory-layout identity header (fail closed if the restore worker's RAM/SHM layout
+// differs from the captured one — else the restored PTEs/device mappings silently diverge) and (b) a
+// per-device virtio-transport section (M9.3): devices the guest left `DRIVER_OK` across suspend (the
+// GPU, which has no s2idle PM ops so it never resets/re-negotiates) need their transport re-activated
+// on restore, or the fresh worker's device stays in INIT with dead queues and the guest wedges.
+const VERSION: u32 = 4;
 
 /// One guest-RAM region: its guest-physical base and raw bytes.
 pub struct RamRegion {
     pub gpa: u64,
     pub data: Vec<u8>,
+}
+
+/// Memory-layout identity of the captured VM. Restore fails closed unless the fresh worker computes an
+/// identical layout — the guest's page tables and the device SHM-window mappings are baked into the
+/// snapshotted RAM at these exact addresses, so a mismatch (e.g. a different `--ram-mib`) is silent
+/// corruption, not a migration.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LayoutInfo {
+    pub ram_start: u64,
+    pub ram_last: u64,
+    pub shm_start: u64,
+    pub firmware: bool,
+}
+
+/// One virtqueue's negotiated register file, as the driver programmed it (guest-physical ring
+/// addresses + size/ready). `next_avail`/`next_used` are deliberately NOT carried: after the
+/// capture-time drain they equal `avail.idx == used.idx` in guest RAM, and the restore path derives
+/// them from the restored rings (which also self-enforces the drain contract).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct QueueRegs {
+    pub size: u16,
+    pub ready: bool,
+    pub desc: u64,
+    pub avail: u64,
+    pub used: u64,
+}
+
+/// A virtio-mmio device's transport state, captured for every transport still `device_status != 0` at
+/// quiesce (today exactly virtio-gpu). Restore replays this as real negotiation writes, ending in the
+/// genuine `DRIVER_OK`-triggered activation. `type_id`/`mmio_base`/`irq` are identity: restore fails
+/// closed if the fresh worker registered the device differently.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DeviceTransportState {
+    pub type_id: u32,
+    pub mmio_base: u64,
+    pub irq: u32,
+    pub device_status: u32,
+    pub acked_features: u64,
+    pub config_generation: u32,
+    pub isr: u32,
+    pub queues: Vec<QueueRegs>,
 }
 
 /// The full deserialized contents of a snapshot file.
@@ -36,6 +82,10 @@ pub struct Snapshot {
     /// The PL061 GPIO register file, if the VM has a GPIO device. Restored before the guest resumes
     /// so the injected wake demuxes (M9.2). `None` when there is no GPIO device (non-macOS/aarch64).
     pub gpio: Option<GpioState>,
+    /// Memory-layout identity — checked against the restore worker's layout, fail-closed.
+    pub layout: LayoutInfo,
+    /// Per-device virtio-transport state for devices left `DRIVER_OK` across suspend (M9.3).
+    pub devices: Vec<DeviceTransportState>,
     /// Guest RAM regions (SHM window excluded by the caller).
     pub ram: Vec<RamRegion>,
 }
@@ -76,6 +126,9 @@ fn crc32(data: &[u8]) -> u32 {
 
 // --- encode ---------------------------------------------------------------------------------
 
+fn put_u16(v: &mut Vec<u8>, x: u16) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
 fn put_u32(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_le_bytes());
 }
@@ -138,6 +191,30 @@ pub fn write(path: &Path, snap: &Snapshot) -> io::Result<()> {
         }
         None => v.push(0),
     }
+    // v4 memory-layout identity header.
+    put_u64(&mut v, snap.layout.ram_start);
+    put_u64(&mut v, snap.layout.ram_last);
+    put_u64(&mut v, snap.layout.shm_start);
+    v.push(snap.layout.firmware as u8);
+    // v4 per-device virtio-transport section.
+    put_u32(&mut v, snap.devices.len() as u32);
+    for d in &snap.devices {
+        put_u32(&mut v, d.type_id);
+        put_u64(&mut v, d.mmio_base);
+        put_u32(&mut v, d.irq);
+        put_u32(&mut v, d.device_status);
+        put_u64(&mut v, d.acked_features);
+        put_u32(&mut v, d.config_generation);
+        put_u32(&mut v, d.isr);
+        put_u32(&mut v, d.queues.len() as u32);
+        for q in &d.queues {
+            put_u16(&mut v, q.size);
+            v.push(q.ready as u8);
+            put_u64(&mut v, q.desc);
+            put_u64(&mut v, q.avail);
+            put_u64(&mut v, q.used);
+        }
+    }
     put_u32(&mut v, snap.ram.len() as u32);
     for r in &snap.ram {
         put_u64(&mut v, r.gpa);
@@ -166,6 +243,9 @@ impl<'a> Reader<'a> {
         let s = self.buf.get(self.pos..end).ok_or_else(|| corrupt("truncated"))?;
         self.pos = end;
         Ok(s)
+    }
+    fn u16(&mut self) -> io::Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
     fn u32(&mut self) -> io::Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -270,6 +350,56 @@ pub fn read(path: &Path) -> io::Result<Snapshot> {
         }),
         _ => return Err(corrupt("bad gpio presence byte")),
     };
+    // v4 memory-layout identity header.
+    let layout = LayoutInfo {
+        ram_start: r.u64()?,
+        ram_last: r.u64()?,
+        shm_start: r.u64()?,
+        firmware: match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(corrupt("bad layout firmware byte")),
+        },
+    };
+    // v4 per-device virtio-transport section.
+    let dev_count = r.u32()? as usize;
+    let mut devices = Vec::with_capacity(dev_count);
+    for _ in 0..dev_count {
+        let type_id = r.u32()?;
+        let mmio_base = r.u64()?;
+        let irq = r.u32()?;
+        let device_status = r.u32()?;
+        let acked_features = r.u64()?;
+        let config_generation = r.u32()?;
+        let isr = r.u32()?;
+        let q_count = r.u32()? as usize;
+        let mut queues = Vec::with_capacity(q_count);
+        for _ in 0..q_count {
+            let size = r.u16()?;
+            let ready = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(corrupt("bad queue ready byte")),
+            };
+            queues.push(QueueRegs {
+                size,
+                ready,
+                desc: r.u64()?,
+                avail: r.u64()?,
+                used: r.u64()?,
+            });
+        }
+        devices.push(DeviceTransportState {
+            type_id,
+            mmio_base,
+            irq,
+            device_status,
+            acked_features,
+            config_generation,
+            isr,
+            queues,
+        });
+    }
     let ram_count = r.u32()? as usize;
     let mut ram = Vec::with_capacity(ram_count);
     for _ in 0..ram_count {
@@ -281,6 +411,8 @@ pub fn read(path: &Path) -> io::Result<Snapshot> {
         vcpus,
         gic,
         gpio,
+        layout,
+        devices,
         ram,
     })
 }
@@ -306,6 +438,43 @@ mod tests {
         }
     }
 
+    fn sample_layout() -> LayoutInfo {
+        LayoutInfo {
+            ram_start: 0x4000_0000,
+            ram_last: 0x1_4000_0000,
+            shm_start: 0x1_8000_0000,
+            firmware: true,
+        }
+    }
+
+    fn sample_gpu_device() -> DeviceTransportState {
+        DeviceTransportState {
+            type_id: 16, // virtio-gpu
+            mmio_base: 0x0a00_8000,
+            irq: 47,
+            device_status: 0xf,
+            acked_features: 0x1_0000_012b,
+            config_generation: 3,
+            isr: 0,
+            queues: vec![
+                QueueRegs {
+                    size: 64,
+                    ready: true,
+                    desc: 0x1_2340_0000,
+                    avail: 0x1_2340_0400,
+                    used: 0x1_2340_0800,
+                },
+                QueueRegs {
+                    size: 16,
+                    ready: true,
+                    desc: 0x1_2350_0000,
+                    avail: 0x1_2350_0100,
+                    used: 0x1_2350_0200,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn snapshot_file_round_trips() {
         let snap = Snapshot {
@@ -321,6 +490,8 @@ mod tests {
                 istate: 0x40,
                 afsel: 0x5,
             }),
+            layout: sample_layout(),
+            devices: vec![sample_gpu_device()],
             ram: vec![
                 RamRegion {
                     gpa: 0x4000_0000,
@@ -348,9 +519,38 @@ mod tests {
         assert_eq!(gpio.im, 0x78);
         assert_eq!(gpio.istate, 0x40);
         assert_eq!(gpio.data, 0x40);
+        // v4: layout identity + device-transport section round-trip byte-for-byte.
+        assert_eq!(got.layout, snap.layout);
+        assert_eq!(got.devices, snap.devices);
+        assert_eq!(got.devices[0].queues[0].avail, 0x1_2340_0400);
         assert_eq!(got.ram.len(), 2);
         assert_eq!(got.ram[0].gpa, 0x4000_0000);
         assert_eq!(got.ram[1].data, snap.ram[1].data);
+    }
+
+    #[test]
+    fn v4_device_transport_section_survives_no_devices() {
+        // The common case (no sticky device) must encode an empty section and read back empty — not
+        // desync the stream. Also pins the layout header round-trip in isolation.
+        let snap = Snapshot {
+            vcpus: vec![sample_vcpu(3)],
+            gic: vec![1, 2, 3, 4],
+            gpio: None,
+            layout: sample_layout(),
+            devices: vec![],
+            ram: vec![RamRegion {
+                gpa: 0x4000_0000,
+                data: vec![9u8; 64],
+            }],
+        };
+        let path =
+            std::env::temp_dir().join(format!("limina-snap-v4-empty-{}.bin", std::process::id()));
+        write(&path, &snap).expect("write");
+        let got = read(&path).expect("read");
+        let _ = fs::remove_file(&path);
+        assert!(got.devices.is_empty());
+        assert_eq!(got.layout, sample_layout());
+        assert_eq!(got.ram[0].data, vec![9u8; 64]);
     }
 
     #[test]
@@ -377,6 +577,8 @@ mod tests {
             vcpus: vec![sample_vcpu(9)],
             gic: vec![1, 2, 3],
             gpio: None,
+            layout: sample_layout(),
+            devices: vec![],
             ram: vec![],
         };
         let path =

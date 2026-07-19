@@ -511,11 +511,23 @@ impl Vmm {
             .gpio
             .as_ref()
             .map(|g| g.lock().unwrap().save_state());
+        let layout = snapshot::LayoutInfo {
+            ram_start: self.arch_memory_info.ram_start_addr,
+            ram_last: self.arch_memory_info.ram_last_addr,
+            shm_start: self.arch_memory_info.shm_start_addr,
+            // EFI boot places RAM at 0x4000_0000 (1 GiB); a direct kernel boot at 0x8000_0000 (2 GiB).
+            firmware: self.arch_memory_info.ram_start_addr == 0x4000_0000,
+        };
+        // M9.3 device-transport capture is wired in a following step; empty for now (no regression:
+        // a snapshot with no sticky devices behaves exactly as v3 did on restore).
+        let devices = Vec::new();
         let ram = self.dump_ram();
         let snap = snapshot::Snapshot {
             vcpus,
             gic,
             gpio,
+            layout,
+            devices,
             ram,
         };
         snapshot::write(path, &snap).map_err(Error::SnapshotIo)?;
