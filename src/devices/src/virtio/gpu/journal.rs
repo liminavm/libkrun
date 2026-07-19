@@ -317,9 +317,11 @@ impl GpuJournal {
 
 const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
 // v2 (M9.3 P2): + memory_contents — every capturable VkDeviceMemory's raw bytes
-// (not just guest-mapped blobs). Snapshots are single-use against their exact
-// post-suspend disk, so no cross-version parse compatibility is kept.
-const PAYLOAD_VERSION: u32 = 2;
+// (not just guest-mapped blobs). v3 (P2.1): + sync_states — per-context opaque
+// vkr sync blobs (fence status + timeline counter values) for the restore-time
+// sync fast-forward. Snapshots are single-use against their exact post-suspend
+// disk, so no cross-version parse compatibility is kept.
+const PAYLOAD_VERSION: u32 = 3;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -359,6 +361,10 @@ pub struct GpuSnapshotPayload {
     /// render targets, non-staging buffers — invisible to both the guest-RAM
     /// dump and the mapped-blob capture above.
     pub memory_contents: Vec<(u32, u64, Vec<u8>)>,
+    /// per venus context: opaque vkr sync-state blob (fence signaled status +
+    /// timeline semaphore counter values) applied by the restore-time sync
+    /// fast-forward — see vkr_renderer_sync_export/restore in the fork.
+    pub sync_states: Vec<(u32, Vec<u8>)>,
 }
 
 impl GpuSnapshotPayload {
@@ -460,6 +466,13 @@ impl GpuSnapshotPayload {
             buf.extend_from_slice(bytes);
         }
 
+        put_u32(&mut buf, self.sync_states.len() as u32);
+        for (ctx_id, bytes) in &self.sync_states {
+            put_u32(&mut buf, *ctx_id);
+            put_u64(&mut buf, bytes.len() as u64);
+            buf.extend_from_slice(bytes);
+        }
+
         buf
     }
 
@@ -556,6 +569,13 @@ impl GpuSnapshotPayload {
             payload
                 .memory_contents
                 .push((ctx_id, mem_id, c.take(len)?.to_vec()));
+        }
+
+        let nsyncs = c.u32()?;
+        for _ in 0..nsyncs {
+            let ctx_id = c.u32()?;
+            let len = c.u64()? as usize;
+            payload.sync_states.push((ctx_id, c.take(len)?.to_vec()));
         }
 
         Some(payload)
@@ -668,6 +688,7 @@ mod tests {
             vkr_journals: vec![(3, vec![0xaa; 24])],
             blob_contents: vec![(7, vec![0x5a; 64])],
             memory_contents: vec![(3, 21, vec![0xc3; 48])],
+            sync_states: vec![(3, vec![0x11; 16])],
         };
         let bytes = payload.to_bytes();
         let got = GpuSnapshotPayload::from_bytes(&bytes).expect("parse");
@@ -695,6 +716,7 @@ mod tests {
         assert_eq!(got.vkr_journals, vec![(3, vec![0xaa; 24])]);
         assert_eq!(got.blob_contents, vec![(7, vec![0x5a; 64])]);
         assert_eq!(got.memory_contents, vec![(3, 21, vec![0xc3; 48])]);
+        assert_eq!(got.sync_states, vec![(3, vec![0x11; 16])]);
     }
 
     #[test]
