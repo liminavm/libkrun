@@ -40,6 +40,7 @@ use rutabaga_gfx::{
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
+use super::journal::GpuJournal;
 use super::trace::GpuTraceStats;
 use super::{GpuError, Result};
 use crate::display::DisplayInfo;
@@ -393,6 +394,9 @@ pub struct VirtioGpu {
     present_fence: Option<PresentFenceState>,
     /// limina M9.3: counted GPU health probes (stale-ctx submissions, fence ledger).
     trace: Arc<GpuTraceStats>,
+    /// limina M9.3 P0: the rutabaga-layer half of the snapshot-replay journal
+    /// (the vkr wire half lives in virglrenderer). Worker-thread-only.
+    journal: GpuJournal,
 }
 
 /// The per-activation transport the fence handler retires guest fences into.
@@ -729,6 +733,8 @@ impl VirtioGpu {
             .create_instance()
             .expect("Failed to create display backend instance!");
 
+        let journal = GpuJournal::new(trace.clone());
+
         Self {
             rutabaga,
             resources: Default::default(),
@@ -741,6 +747,7 @@ impl VirtioGpu {
             map_sender,
             present_fence,
             trace,
+            journal,
         }
     }
 
@@ -748,6 +755,15 @@ impl VirtioGpu {
     /// sites and the fence handler, read by the tick reporter).
     pub fn trace(&self) -> &Arc<GpuTraceStats> {
         &self.trace
+    }
+
+    /// limina M9.3 P0: the rutabaga-layer snapshot-replay journal (worker thread only).
+    pub fn journal_mut(&mut self) -> &mut GpuJournal {
+        &mut self.journal
+    }
+
+    pub fn journal(&self) -> &GpuJournal {
+        &self.journal
     }
 
     /// limina M9.3: dump the renderer's live context table (serviced on the worker

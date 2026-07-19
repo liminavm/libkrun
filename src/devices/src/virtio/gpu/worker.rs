@@ -341,7 +341,13 @@ impl Worker {
                     info.height,
                 )
             }
-            GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
+            GpuCommand::ResourceUnref(info) => {
+                let r = virtio_gpu.unref_resource(info.resource_id);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().resource_unref(info.resource_id);
+                }
+                r
+            }
             GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
                 info.scanout_id,
                 info.resource_id,
@@ -403,14 +409,44 @@ impl Worker {
 
             GpuCommand::CtxCreate(info) => {
                 let context_name: Option<String> = String::from_utf8(info.debug_name.to_vec()).ok();
-                virtio_gpu.create_context(hdr.ctx_id, info.context_init, context_name.as_deref())
+                let r = virtio_gpu.create_context(
+                    hdr.ctx_id,
+                    info.context_init,
+                    context_name.as_deref(),
+                );
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().ctx_create(
+                        hdr.ctx_id,
+                        info.context_init,
+                        context_name,
+                    );
+                }
+                r
             }
-            GpuCommand::CtxDestroy(_info) => virtio_gpu.destroy_context(hdr.ctx_id),
+            GpuCommand::CtxDestroy(_info) => {
+                let r = virtio_gpu.destroy_context(hdr.ctx_id);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().ctx_destroy(hdr.ctx_id);
+                }
+                r
+            }
             GpuCommand::CtxAttachResource(info) => {
-                virtio_gpu.context_attach_resource(hdr.ctx_id, info.resource_id)
+                let r = virtio_gpu.context_attach_resource(hdr.ctx_id, info.resource_id);
+                if r.is_ok() {
+                    virtio_gpu
+                        .journal_mut()
+                        .ctx_attach_resource(hdr.ctx_id, info.resource_id);
+                }
+                r
             }
             GpuCommand::CtxDetachResource(info) => {
-                virtio_gpu.context_detach_resource(hdr.ctx_id, info.resource_id)
+                let r = virtio_gpu.context_detach_resource(hdr.ctx_id, info.resource_id);
+                if r.is_ok() {
+                    virtio_gpu
+                        .journal_mut()
+                        .ctx_detach_resource(hdr.ctx_id, info.resource_id);
+                }
+                r
             }
             GpuCommand::ResourceCreate3d(info) => {
                 let resource_id = info.resource_id;
@@ -524,25 +560,48 @@ impl Worker {
                     }
                 }
 
-                virtio_gpu.resource_create_blob(
+                let backing: Vec<(u64, usize)> = vecs.iter().map(|(a, l)| (a.0, *l)).collect();
+                let r = virtio_gpu.resource_create_blob(
                     ctx_id,
                     resource_id,
                     resource_create_blob,
                     vecs,
                     mem,
-                )
+                );
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().create_blob(
+                        ctx_id,
+                        resource_id,
+                        info.blob_mem,
+                        info.blob_flags,
+                        info.blob_id,
+                        info.size,
+                        backing,
+                    );
+                }
+                r
             }
             GpuCommand::SetScanoutBlob(info) => {
                 // limina tier-2 (macOS): present an IOSurface-backed blob scanout zero-copy.
                 #[cfg(target_os = "macos")]
                 {
-                    virtio_gpu.set_scanout_blob(
+                    let r = virtio_gpu.set_scanout_blob(
                         info.scanout_id,
                         info.resource_id,
                         info.width,
                         info.height,
                         info.format,
-                    )
+                    );
+                    if r.is_ok() {
+                        virtio_gpu.journal_mut().set_scanout_blob(
+                            info.scanout_id,
+                            info.resource_id,
+                            info.width,
+                            info.height,
+                            info.format,
+                        );
+                    }
+                    r
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -553,11 +612,19 @@ impl Worker {
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
                 let offset = info.offset;
-                virtio_gpu.resource_map_blob(resource_id, &self.shm_region, offset)
+                let r = virtio_gpu.resource_map_blob(resource_id, &self.shm_region, offset);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().map_blob(resource_id, offset);
+                }
+                r
             }
             GpuCommand::ResourceUnmapBlob(info) => {
                 let resource_id = info.resource_id;
-                virtio_gpu.resource_unmap_blob(resource_id, &self.shm_region)
+                let r = virtio_gpu.resource_unmap_blob(resource_id, &self.shm_region);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().unmap_blob(resource_id);
+                }
+                r
             }
         }
     }
@@ -581,6 +648,7 @@ impl Worker {
             .dump_requested
             .swap(false, Ordering::Relaxed)
         {
+            virtio_gpu.journal().dump();
             virtio_gpu.dump_renderer_state();
         }
 
