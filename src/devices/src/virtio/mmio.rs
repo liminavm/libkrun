@@ -59,6 +59,35 @@ pub struct MmioTransport {
     shm_region_select: u32,
     interrupt: MmioInterrupt,
     device_interrupt: InterruptTransport,
+    // M9.3 snapshot: the negotiated per-queue register file, stashed at `activate()` just before the
+    // live `Queue`s move into the device worker (after which `self.queues` is `None`). This lets
+    // `transport_state()` report the queue GPAs for a snapshot of an already-activated device.
+    activated_queue_regs: Vec<QueueRegs>,
+}
+
+/// A virtqueue's negotiated register file (guest-physical ring addresses + size/ready), as the driver
+/// programmed it. Stashed at activation so a snapshot of an activated device can report its queue GPAs
+/// (used by the save-side drain, and carried in the snapshot for diagnostics). `next_avail`/`next_used`
+/// are not here — they ride the guest RAM snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct QueueRegs {
+    pub size: u16,
+    pub ready: bool,
+    pub desc: u64,
+    pub avail: u64,
+    pub used: u64,
+}
+
+/// Transport-level state a snapshot captures for a device that is DRIVER_OK at snapshot time (M9.3).
+/// Captured for diagnostics + the save-side drain (queue GPAs) + a future feature-drift fail-closed
+/// check. NOT replayed on restore: the guest re-negotiates every virtio device itself on s2idle thaw
+/// (`virtio_device_restore`), so a restore-side negotiation replay is redundant and was removed.
+pub struct TransportState {
+    pub device_status: u32,
+    pub acked_features: u64,
+    pub config_generation: u32,
+    pub isr: u32,
+    pub queues: Vec<QueueRegs>,
 }
 
 struct MmioInterruptInner {
@@ -197,6 +226,7 @@ impl MmioTransport {
             interrupt,
             device_interrupt,
             shm_region_select: 0,
+            activated_queue_regs: Vec::new(),
         })
     }
 
@@ -255,6 +285,41 @@ impl MmioTransport {
         }
     }
 
+    /// Activates the device through the shared transport state, first stashing the negotiated
+    /// queue register file (M9.3 snapshot) so `transport_state()` can report the queue GPAs of an
+    /// already-activated device after the live `Queue`s have moved into the device worker.
+    fn activate(&mut self) {
+        let Some(queues) = self.state.queues.as_ref() else {
+            return;
+        };
+
+        self.activated_queue_regs = queues
+            .iter()
+            .map(|q| QueueRegs {
+                size: q.size,
+                ready: q.ready,
+                desc: q.desc_table.0,
+                avail: q.avail_ring.0,
+                used: q.used_ring.0,
+            })
+            .collect();
+
+        self.state.activate(self.device_interrupt.clone());
+    }
+
+    /// M9.3 snapshot: the transport state a restore needs to re-activate this device. Meaningful for
+    /// an activated device (the queue register file was stashed at `activate()`); reports the current
+    /// status/features/ISR plus that stashed per-queue register file.
+    pub fn transport_state(&self) -> TransportState {
+        TransportState {
+            device_status: self.state.device_status,
+            acked_features: self.locked_device().acked_features(),
+            config_generation: self.state.config_generation,
+            isr: self.interrupt.status() as u32,
+            queues: self.activated_queue_regs.clone(),
+        }
+    }
+
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
     /// Please refer to VirtIO Spec 1.0, section 2.1.1 and 3.1.1.
     ///
@@ -269,11 +334,20 @@ impl MmioTransport {
             self.state.device_status,
             status
         );
+        let had_driver_ok = self.check_device_status(device_status::DRIVER_OK, 0);
+        // The shared state machine doesn't activate the device here: `activate()` does, so that
+        // the MMIO-only bookkeeping around activation (the M9.3 queue register stash) runs.
         if self
             .state
-            .set_device_status(status, self.device_interrupt.clone(), true)
+            .set_device_status(status, self.device_interrupt.clone(), false)
         {
             self.interrupt.reset_status();
+        }
+        if !had_driver_ok
+            && self.check_device_status(device_status::DRIVER_OK, 0)
+            && !self.locked_device().is_activated()
+        {
+            self.activate();
         }
     }
 }
