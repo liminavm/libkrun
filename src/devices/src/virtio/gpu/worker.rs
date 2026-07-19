@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -93,6 +93,9 @@ pub struct Worker {
     /// fallback: reset → features → DRIVER_OK), so replay must run AFTER that reset's
     /// `reset_session` and before any queue command — i.e. exactly at activation.
     pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+    /// limina M9.3: flipped true (+ notify) once the staged replay finished; the device's
+    /// `activate` blocks the guest's DRIVER_OK on it (see `Gpu::restore_done`).
+    restore_done: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Worker {
@@ -112,6 +115,7 @@ impl Worker {
         resize_evt: Arc<EventFd>,
         resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
         pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+        restore_done: Arc<(Mutex<bool>, Condvar)>,
     ) -> Self {
         Self {
             stop_fd,
@@ -129,6 +133,7 @@ impl Worker {
             resize_evt,
             resize_pending,
             pending_restore,
+            restore_done,
         }
     }
 
@@ -190,8 +195,11 @@ impl Worker {
 
             // limina M9.3: a staged GPU snapshot payload replays NOW — after the thaw
             // reset's `reset_session` (which would have wiped it) and before the first
-            // queue command (whose venus state it re-creates). The guest kernel is still
-            // mid-thaw at DRIVER_OK, so userspace can't touch mapped blobs yet.
+            // queue command (whose venus state it re-creates). The guest's DRIVER_OK write
+            // is BLOCKED on `restore_done` for the duration (see `Gpu::activate`), keeping
+            // the thaw — and with it guest userspace — frozen until the blob mappings are
+            // re-established; without that hold, mesa's first post-thaw writes raced the
+            // replay and landed in unmapped shmem (run-14 ring FATAL).
             let staged = self.pending_restore.lock().unwrap().take();
             if let Some(data) = staged {
                 if self.gpu_restore(&mut virtio_gpu, &data, &mem) {
@@ -199,6 +207,9 @@ impl Worker {
                 } else {
                     warn!("gpu worker: staged snapshot replay failed; guest session will restart");
                 }
+                let (done_lock, done_cv) = &*self.restore_done;
+                *done_lock.lock().unwrap() = true;
+                done_cv.notify_all();
             }
 
             let exit = self.service(

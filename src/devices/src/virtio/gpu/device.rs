@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender as CmdSender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 #[cfg(target_os = "macos")]
@@ -116,6 +116,13 @@ pub struct Gpu {
     /// limina M9.3: a staged GPU snapshot payload, set by the restore path and replayed by
     /// the worker on the next activation (after the guest thaw's device reset).
     pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+    /// limina M9.3: `false` while a staged replay is pending, flipped back by the worker
+    /// once the replay finished. `activate` blocks the guest's DRIVER_OK on it so guest
+    /// userspace (still frozen during dpm_resume) can't touch blob shmem before the replay
+    /// re-established the mappings — mesa's post-thaw writes would land in limbo and the
+    /// first live `vkExecuteCommandStreamsMESA` would decode stale bytes (garbage) and
+    /// FATAL the ring.
+    restore_done: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Gpu {
@@ -149,6 +156,7 @@ impl Gpu {
             resize_evt: Arc::new(EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?),
             resize_pending: Arc::new(Mutex::new(None)),
             pending_restore: Arc::new(Mutex::new(None)),
+            restore_done: Arc::new((Mutex::new(true), Condvar::new())),
         })
     }
 
@@ -259,6 +267,7 @@ impl Gpu {
                 self.resize_evt.clone(),
                 self.resize_pending.clone(),
                 self.pending_restore.clone(),
+                self.restore_done.clone(),
             );
             self.worker_thread = Some(worker.run());
             self.worker_tx = Some(tx);
@@ -284,6 +293,7 @@ impl Gpu {
     /// serviced by a VMM thread that only starts after `build_microvm` returns.
     pub fn restore_gpu(&mut self, data: Vec<u8>) {
         *self.pending_restore.lock().unwrap() = Some(data);
+        *self.restore_done.0.lock().unwrap() = false;
     }
 }
 
@@ -400,6 +410,39 @@ impl VirtioDevice for Gpu {
         }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
+
+        // limina M9.3: if a snapshot replay is staged, hold the guest here (this is the
+        // vCPU thread servicing the thaw's DRIVER_OK write, while guest userspace is still
+        // frozen) until the worker finishes replaying. Otherwise the resumed guest races
+        // the replay: mesa writes command-stream bytes through blob mappings the replay
+        // hasn't re-established yet, the bytes are lost, and the first live ring submission
+        // decodes garbage → ring FATAL → compositor abort. The VMM worker thread that
+        // services the replay's GpuAddMapping messages doesn't need this thread or the
+        // device lock, so waiting here is deadlock-free.
+        let (done_lock, done_cv) = &*self.restore_done;
+        let mut done = done_lock.lock().unwrap();
+        if !*done {
+            info!("virtio_gpu: holding DRIVER_OK for the staged snapshot replay");
+            let start = std::time::Instant::now();
+            while !*done {
+                let (guard, timeout) = done_cv
+                    .wait_timeout(done, std::time::Duration::from_secs(120))
+                    .unwrap();
+                done = guard;
+                if timeout.timed_out() && !*done {
+                    error!(
+                        "virtio_gpu: staged snapshot replay did not finish within 120s; \
+                         releasing DRIVER_OK (the session will likely be lost)"
+                    );
+                    break;
+                }
+            }
+            info!(
+                "virtio_gpu: released DRIVER_OK after {:?} (replay {})",
+                start.elapsed(),
+                if *done { "complete" } else { "TIMED OUT" }
+            );
+        }
 
         Ok(())
     }
