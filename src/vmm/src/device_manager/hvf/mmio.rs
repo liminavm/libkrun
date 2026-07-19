@@ -353,6 +353,100 @@ impl MMIODeviceManager {
         }
         out
     }
+
+    /// limina M9.3: capture the transport state of every virtio-mmio device the guest left
+    /// `device_status != 0` at quiesce (today exactly virtio-gpu — it has no s2idle PM ops so it never
+    /// resets/re-negotiates, unlike every other device which the guest reset to INIT). Those are the
+    /// only devices that need transport restore; a reset device re-drives its own `DRIVER_OK` on resume
+    /// and the fresh worker activates it then. Identity (type_id/mmio base/irq) is carried so restore
+    /// can fail closed on a layout mismatch.
+    pub fn capture_transport_states(&self) -> Vec<crate::snapshot::DeviceTransportState> {
+        use crate::snapshot::{DeviceTransportState, QueueRegs};
+        use devices::virtio::MmioTransport;
+        use devices::BusDevice;
+        let mut out = Vec::new();
+        for ((dtype, id), dev_info) in self.id_to_dev_info.iter() {
+            let DeviceType::Virtio(type_id) = *dtype else {
+                continue;
+            };
+            let Some(dev) = self.get_device(*dtype, id) else {
+                continue;
+            };
+            let guard = dev.lock().unwrap();
+            let dev_ref: &dyn BusDevice = &*guard;
+            let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() else {
+                continue;
+            };
+            if mmio.device_status() == 0 {
+                continue; // reset device — re-negotiated by the guest on resume, nothing to carry
+            }
+            let ts = mmio.transport_state();
+            out.push(DeviceTransportState {
+                type_id,
+                mmio_base: dev_info.addr,
+                irq: dev_info.irq,
+                device_status: ts.device_status,
+                acked_features: ts.acked_features,
+                config_generation: ts.config_generation,
+                isr: ts.isr,
+                queues: ts
+                    .queues
+                    .into_iter()
+                    .map(|q| QueueRegs {
+                        size: q.size,
+                        ready: q.ready,
+                        desc: q.desc,
+                        avail: q.avail,
+                        used: q.used,
+                    })
+                    .collect(),
+            });
+        }
+        out
+    }
+
+    /// limina M9.3: validate + log the captured device transports on restore. We do NOT replay the
+    /// negotiation: the guest re-negotiates every virtio device ITSELF on s2idle thaw
+    /// (`virtio_device_restore` resets + re-drives DRIVER_OK for each; the fresh worker's `activate()`
+    /// fires from the guest's own writes). A device is captured only because it was DRIVER_OK at
+    /// snapshot time — for the virtio-gpu that's just because it has no driver PM ops, so it's the sole
+    /// device left non-INIT; it is still re-negotiated on thaw like the rest (RED-first + R4 verified,
+    /// 2026-07-18). So this pass only (a) fails closed on layout drift — a captured device missing at
+    /// its snapshot base/irq means the restore worker's device topology diverged, which would silently
+    /// corrupt guest driver state — and (b) logs the captured transport for diagnostics.
+    ///
+    /// TODO(feature-drift, Fable): the one way the guest's self-revival can go wrong is a features_ok
+    /// mismatch when a newer limina restores an older snapshot offering different device features. Add
+    /// a fail-closed compare of `st.acked_features` against the fresh device's offered feature set here.
+    pub fn validate_transport_states(
+        &self,
+        states: &[crate::snapshot::DeviceTransportState],
+    ) -> std::result::Result<(), String> {
+        for st in states {
+            // Locate the device by identity: same virtio type at the same mmio base + irq.
+            let matched = self.id_to_dev_info.iter().any(|((dtype, _), info)| {
+                matches!(*dtype, DeviceType::Virtio(t) if t == st.type_id)
+                    && info.addr == st.mmio_base
+                    && info.irq == st.irq
+            });
+            if !matched {
+                return Err(format!(
+                    "restore: no virtio device type={} @0x{:x} irq={} (layout drift)",
+                    st.type_id, st.mmio_base, st.irq
+                ));
+            }
+            info!(
+                "restore: captured virtio type={} @0x{:x} status=0x{:x} acked_features=0x{:x} {} queue(s) \
+                 (diagnostic only — guest self-renegotiates on thaw)",
+                st.type_id,
+                st.mmio_base,
+                st.device_status,
+                st.acked_features,
+                st.queues.len()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
