@@ -118,6 +118,13 @@ pub trait RutabagaComponent {
     fn limina_memory_census(&self, _ctx_id: u32) -> Option<Vec<(u64, u64)>> {
         None
     }
+    /// limina M9.3 P2.1: sync-object fast-forward (virglrenderer implements).
+    fn limina_sync_export(&self, _ctx_id: u32) -> Option<Vec<u8>> {
+        None
+    }
+    fn limina_sync_restore(&self, _ctx_id: u32, _data: &[u8]) -> bool {
+        false
+    }
     fn limina_memory_read(&self, _ctx_id: u32, _mem_id: u64, _buf: &mut [u8]) -> bool {
         false
     }
@@ -674,6 +681,18 @@ impl Rutabaga {
         self.components
             .get(&self.default_component)
             .is_some_and(|c| c.limina_replay_end(ctx_id))
+    }
+
+    pub fn limina_sync_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
+        self.components
+            .get(&self.default_component)
+            .and_then(|c| c.limina_sync_export(ctx_id))
+    }
+
+    pub fn limina_sync_restore(&self, ctx_id: u32, data: &[u8]) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_sync_restore(ctx_id, data))
     }
 
     pub fn limina_memory_census(&self, ctx_id: u32) -> Option<Vec<(u64, u64)>> {
