@@ -1183,6 +1183,7 @@ pub fn build_microvm(
             Vec<crate::snapshot::RamRegion>,
             Vec<u8>,
             Option<devices::legacy::GpioState>,
+            Vec<crate::snapshot::DeviceTransportState>,
             Arc<crate::vstate::RestoreGate>,
         )>,
     ) = if let Some(ref path) = restore_from {
@@ -1190,6 +1191,22 @@ pub fn build_microvm(
             .map_err(|e| StartMicrovmError::Internal(crate::Error::SnapshotIo(e)))?;
         if snap.vcpus.len() != vcpus.len() {
             // Snapshot vCPU count must match this boot's --cpus, or the register state is nonsense.
+            return Err(StartMicrovmError::Internal(crate::Error::Snapshot));
+        }
+        // M9.3 fail-closed layout identity: the guest's page tables and the device SHM-window mappings
+        // are baked into the snapshotted RAM at these exact addresses, so restoring into a worker with
+        // a different RAM/SHM layout (e.g. a different --ram-mib) is silent corruption, not migration.
+        let expected = crate::snapshot::LayoutInfo {
+            ram_start: vmm.arch_memory_info.ram_start_addr,
+            ram_last: vmm.arch_memory_info.ram_last_addr,
+            shm_start: vmm.arch_memory_info.shm_start_addr,
+            firmware: vmm.arch_memory_info.ram_start_addr == 0x4000_0000,
+        };
+        if snap.layout != expected {
+            error!(
+                "restore: snapshot memory layout {:?} != this worker's {:?} — refusing (fail closed)",
+                snap.layout, expected
+            );
             return Err(StartMicrovmError::Internal(crate::Error::Snapshot));
         }
         let gate = Arc::new(crate::vstate::RestoreGate::default());
@@ -1202,7 +1219,7 @@ pub fn build_microvm(
                 v
             })
             .collect();
-        (vcpus, Some((snap.ram, snap.gic, gpio, gate)))
+        (vcpus, Some((snap.ram, snap.gic, gpio, snap.devices, gate)))
     } else {
         (vcpus, None)
     };
@@ -1222,7 +1239,7 @@ pub fn build_microvm(
     // re-reads the FDT. (The GPU/fs SHM window was excluded at save time and is re-established by
     // the guest, per Strategy A; it is not overwritten here.)
     #[cfg(target_os = "macos")]
-    if let Some((ram, _, _, _)) = &restore_release {
+    if let Some((ram, _, _, _, _)) = &restore_release {
         for region in ram {
             vmm.guest_memory()
                 .write_slice(&region.data, GuestAddress(region.gpa))
@@ -1273,13 +1290,29 @@ pub fn build_microvm(
     // in-kernel GIC (distributor + redistributor), then open the gate so each vCPU restores its
     // own register file (including its ICC/CPU-interface regs, on its own thread) and runs.
     #[cfg(target_os = "macos")]
-    if let Some((_, gic, gpio, gate)) = &restore_release {
+    if let Some((_, gic, gpio, devices, gate)) = &restore_release {
         hvf::restore_gic_state(gic)
             .map_err(|_| StartMicrovmError::Internal(crate::Error::Snapshot))?;
         // Restore the PL061 register file into the fresh GPIO device before releasing the vCPUs, so
         // the wake injected after resume demuxes correctly (GPIOMIS = istate & im).
         if let Some(gpio) = gpio {
             vmm.restore_gpio_state(gpio);
+        }
+        // M9.3: validate + log the captured device transports. We do NOT re-drive them: RED-first +
+        // R4 (2026-07-18) proved the guest re-negotiates every virtio device ITSELF on s2idle thaw
+        // (`virtio_device_restore` resets + re-drives DRIVER_OK; the fresh worker activates from the
+        // guest's own writes), so a restore-side negotiation replay is redundant. The GPU is captured
+        // only because it lacks driver PM ops (the sole device left non-INIT at snapshot) but is still
+        // re-negotiated on thaw. This pass fails closed on device-topology drift and logs for
+        // diagnostics; the real venus-resume wedge is lost HOST-side venus context state, handled by
+        // the retain-and-replay work, not here. Runs before the gate opens.
+        if !devices.is_empty() {
+            vmm.mmio_device_manager
+                .validate_transport_states(devices)
+                .map_err(|e| {
+                    error!("restore: virtio transport validation failed: {e}");
+                    StartMicrovmError::Internal(crate::Error::Snapshot)
+                })?;
         }
         gate.open();
     }

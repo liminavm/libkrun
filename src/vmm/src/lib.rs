@@ -214,7 +214,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Vmm {
     // Guest VM core resources.
     guest_memory: GuestMemoryMmap,
-    arch_memory_info: ArchMemoryInfo,
+    pub(crate) arch_memory_info: ArchMemoryInfo,
 
     kernel_cmdline: KernelCmdline,
 
@@ -505,6 +505,31 @@ impl Vmm {
             info!("snapshot: virtio device type={type_id} id={id} device_status=0x{status:x}");
         }
         let vcpus = self.snapshot_vcpus()?;
+        // M9.3: capture each DRIVER_OK device's transport state — for diagnostics (the per-snapshot
+        // record of which devices were sticky) and the restore-side layout/feature validation. We do
+        // NOT drain the queues: the guest re-negotiates (resets) every virtio device itself on s2idle
+        // thaw (`virtio_device_restore`), which discards in-flight ring state and old fences, so there
+        // is no "completed used entry with no matching completion IRQ" hazard for a restore to hit —
+        // the drain that once guarded that is gone. (A drain also cannot be a general oracle: RX-style
+        // queues sit at avail>used at idle with pre-posted buffers and never reach avail==used.)
+        //
+        // The one thing the drain accidentally provided — quiescing device workers so none writes guest
+        // RAM mid-`dump_ram` (torn dump; loudest as net RX from gvproxy on the raw path) — is a separate
+        // concern tracked in docs/design/m9-suspend-resume.md (worker-quiesce during the dump). It is
+        // narrow on the production s2idle path (the guest froze net/blk/etc. to INIT before we snapshot;
+        // only the GPU worker is live) and pre-dates this change.
+        let devices = self.mmio_device_manager.capture_transport_states();
+        for d in &devices {
+            info!(
+                "snapshot: capturing transport for virtio type={} @0x{:x} status=0x{:x} {} queue(s)",
+                d.type_id,
+                d.mmio_base,
+                d.device_status,
+                d.queues.len()
+            );
+        }
+        // GIC saved after the drain so it carries any line the drain-time completions raised (paired
+        // with the post-drain ISR above).
         let gic = hvf::save_gic_state().map_err(|_| Error::Snapshot)?;
         let gpio = self
             .mmio_device_manager
@@ -515,12 +540,9 @@ impl Vmm {
             ram_start: self.arch_memory_info.ram_start_addr,
             ram_last: self.arch_memory_info.ram_last_addr,
             shm_start: self.arch_memory_info.shm_start_addr,
-            // EFI boot places RAM at 0x4000_0000 (1 GiB); a direct kernel boot at 0x8000_0000 (2 GiB).
-            firmware: self.arch_memory_info.ram_start_addr == 0x4000_0000,
+            firmware: self.arch_memory_info.ram_start_addr
+                == arch::aarch64::layout::DRAM_MEM_START_EFI,
         };
-        // M9.3 device-transport capture is wired in a following step; empty for now (no regression:
-        // a snapshot with no sticky devices behaves exactly as v3 did on restore).
-        let devices = Vec::new();
         let ram = self.dump_ram();
         let snap = snapshot::Snapshot {
             vcpus,
