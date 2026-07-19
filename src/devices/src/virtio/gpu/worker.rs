@@ -264,7 +264,8 @@ impl Worker {
                         Ok(WorkerCmd::Shutdown) => return InnerExit::Shutdown,
                         // An Activate while already active shouldn't happen (the lifecycle is
                         // activate→reset→activate); ignore it. Empty = spurious wake.
-                        Ok(WorkerCmd::Activate { .. }) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Ok(WorkerCmd::Activate { .. })
+                        | Err(std::sync::mpsc::TryRecvError::Empty) => {}
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             return InnerExit::Shutdown
                         }
@@ -467,6 +468,8 @@ impl Worker {
                 virtio_gpu.transfer_read(ctx_id, resource_id, transfer, None)
             }
             GpuCommand::CmdSubmit3d(info) => {
+                // limina M9.3 trace: total submissions, the denominator for unknown_ctx.
+                virtio_gpu.trace().submits.fetch_add(1, Ordering::Relaxed);
                 if reader.available_bytes() != 0 {
                     let num_in_fences = info.num_in_fences as usize;
                     let cmd_size = info.size as usize;
@@ -568,6 +571,19 @@ impl Worker {
         let mut used_any = false;
         let mem = mem.clone();
 
+        // limina M9.3 trace: a renderer state dump was requested (first stale-ctx
+        // event, or a periodic LIMINA_GPU_TRACE_VKR tick). Service it here — this is
+        // the only thread allowed to call into the renderer singleton. Piggybacking
+        // on control-queue activity is fine: the interesting moments (guest submits
+        // into a fresh renderer; a healthy session under measurement) both kick.
+        if virtio_gpu
+            .trace()
+            .dump_requested
+            .swap(false, Ordering::Relaxed)
+        {
+            virtio_gpu.dump_renderer_state();
+        }
+
         loop {
             let head = control_queue.lock().unwrap().pop(&mem);
 
@@ -596,6 +612,9 @@ impl Worker {
                 let mut gpu_response = match resp {
                     Ok(gpu_response) => gpu_response,
                     Err(gpu_response) => {
+                        // limina M9.3 trace: count the error by class (stale ctx /
+                        // unknown resource / other) for the tick reporter.
+                        virtio_gpu.trace().classify_error(&gpu_response);
                         // limina: error responses are load-bearing diagnostics (the guest sees
                         // RESP_ERR and degrades silently — e.g. Firefox WebGL EGL_CREATE
                         // failures); keep them visible at default log level.
