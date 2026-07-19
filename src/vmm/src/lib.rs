@@ -556,8 +556,26 @@ impl Vmm {
                 d.queues.len()
             );
         }
-        // GIC saved after the drain so it carries any line the drain-time completions raised (paired
-        // with the post-drain ISR above).
+        // M9.3 venus snapshot-replay: the GPU worker serializes its re-creation state (rutabaga
+        // journal + venus wire journals + mapped-blob contents). This runs BEFORE the GIC save
+        // and the RAM dump on purpose: the worker first DRAINS in-flight guest fences (the guest
+        // froze mid-frame; a fence whose completion misses the snapshot never signals in the
+        // restored epoch and its waiter wedges — eyeball 2026-07-19), and those drain-time
+        // completions write the used ring (RAM, dumped below) and raise IRQs (GIC, saved below).
+        // vCPUs are parked, so no new fences arrive. None = nothing to replay (software-2D or
+        // stock guest).
+        #[cfg(feature = "gpu")]
+        let gpu = self
+            .gpu_device
+            .as_ref()
+            .and_then(|g| g.lock().unwrap().snapshot_gpu());
+        #[cfg(not(feature = "gpu"))]
+        let gpu: Option<Vec<u8>> = None;
+        if let Some(g) = &gpu {
+            info!("snapshot: GPU re-creation section is {} bytes", g.len());
+        }
+        // GIC saved after the fence drain so it carries any line the drain-time completions
+        // raised.
         let gic = hvf::save_gic_state().map_err(|_| Error::Snapshot)?;
         let gpio = self
             .mmio_device_manager
@@ -571,19 +589,6 @@ impl Vmm {
             firmware: self.arch_memory_info.ram_start_addr
                 == arch::aarch64::layout::DRAM_MEM_START_EFI,
         };
-        // M9.3 venus snapshot-replay: the GPU worker serializes its re-creation state (rutabaga
-        // journal + venus wire journals + mapped-blob contents). vCPUs are parked, so no queue
-        // traffic races the capture. None = nothing to replay (software-2D or stock guest).
-        #[cfg(feature = "gpu")]
-        let gpu = self
-            .gpu_device
-            .as_ref()
-            .and_then(|g| g.lock().unwrap().snapshot_gpu());
-        #[cfg(not(feature = "gpu"))]
-        let gpu: Option<Vec<u8>> = None;
-        if let Some(g) = &gpu {
-            info!("snapshot: GPU re-creation section is {} bytes", g.len());
-        }
         let ram = self.dump_ram();
         let snap = snapshot::Snapshot {
             vcpus,

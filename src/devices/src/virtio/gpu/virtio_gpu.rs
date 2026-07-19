@@ -765,6 +765,18 @@ impl VirtioGpu {
         &self.journal
     }
 
+    /// limina M9.3: the number of outstanding guest fences (requested, not yet retired
+    /// to the used ring), plus a summary for logging. The snapshot path drains these to
+    /// zero before capture: guest waiters hold sync_files backed by them, and a fence
+    /// whose completion misses the snapshot never signals in the restored epoch.
+    pub fn outstanding_fences(&self) -> (usize, String) {
+        let fs = self.fence_state.lock().unwrap();
+        (
+            fs.descs.len(),
+            fs.outstanding_summary(std::time::Instant::now()),
+        )
+    }
+
     /// limina M9.3 P1: the venus wire-journal watermark for `ctx_id`, stamped on
     /// rutabaga journal entries as the cross-layer replay fence.
     pub fn journal_vkr_seq(&self, ctx_id: u32) -> u64 {
@@ -947,14 +959,26 @@ impl VirtioGpu {
                     }
                     // Only venus contexts (the ones with a wire journal) have vkr state to
                     // replay into; the kernel's virgl/none context has nothing host-side.
-                    if wire.contains_key(ctx_id)
-                        && !self
-                            .rutabaga
-                            .as_ref()
-                            .is_some_and(|r| r.limina_replay_begin(*ctx_id))
-                    {
-                        error!("gpu restore: replay_begin {ctx_id} failed");
-                        return false;
+                    // The create is proxied to the (same-process) render-server thread and
+                    // applies asynchronously, so the vkr context may not exist yet — poll.
+                    // Each FFI call takes/releases the renderer lock, letting the server in.
+                    if wire.contains_key(ctx_id) {
+                        let mut began = false;
+                        for _ in 0..2000 {
+                            if self
+                                .rutabaga
+                                .as_ref()
+                                .is_some_and(|r| r.limina_replay_begin(*ctx_id))
+                            {
+                                began = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        if !began {
+                            error!("gpu restore: replay_begin {ctx_id} failed (2s timeout)");
+                            return false;
+                        }
                     }
                 }
                 GpuJournalOp::CreateBlob {

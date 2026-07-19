@@ -170,6 +170,7 @@ impl Worker {
                 // limina M9.3: a snapshot request can arrive while inactive (unlikely — the
                 // production suspend path snapshots with the device DRIVER_OK — but harmless).
                 Ok(WorkerCmd::Snapshot { reply }) => {
+                    Self::drain_fences(&virtio_gpu);
                     let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
                     continue;
                 }
@@ -219,6 +220,34 @@ impl Worker {
                 InnerExit::Deactivate => continue,
                 InnerExit::Shutdown => return,
             }
+        }
+    }
+
+    /// limina M9.3: drain in-flight guest fences before a snapshot capture. The guest
+    /// froze mid-frame and its waiters hold sync_files backed by these fences; a fence
+    /// whose completion misses the snapshot never signals in the restored epoch (eyeball
+    /// 2026-07-19: gnome-shell resumed wedged in `vn_GetSemaphoreFdKHR → poll()`). The
+    /// vCPUs are parked, so no new fences arrive; retirement runs on virglrenderer's
+    /// async fence-callback threads (ASYNC_FENCE_CB), so it proceeds while we poll. The
+    /// used-ring writes land in guest RAM (dumped after this) and the raised IRQs latch
+    /// in the GIC (saved after the GPU capture) — restored waiters see signaled fences.
+    fn drain_fences(virtio_gpu: &VirtioGpu) {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(5);
+        loop {
+            let (n, summary) = virtio_gpu.outstanding_fences();
+            if n == 0 {
+                info!(
+                    "gpu snapshot: fence ledger drained in {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!("gpu snapshot: fence drain TIMED OUT with {n} outstanding: {summary}");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -310,8 +339,10 @@ impl Worker {
                         Ok(WorkerCmd::Deactivate) => return InnerExit::Deactivate,
                         Ok(WorkerCmd::Shutdown) => return InnerExit::Shutdown,
                         // limina M9.3: snapshot with the transport bound (vCPUs quiesced by
-                        // the caller, so the queues are idle).
+                        // the caller, so the queues are idle). Drain in-flight fences first —
+                        // see drain_fences.
                         Ok(WorkerCmd::Snapshot { reply }) => {
+                            Self::drain_fences(virtio_gpu);
                             let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
                         }
                         // An Activate while already active shouldn't happen (the lifecycle is

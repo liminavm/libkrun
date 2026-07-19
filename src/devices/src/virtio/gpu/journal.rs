@@ -676,6 +676,7 @@ mod tests {
         v.extend_from_slice(&1u32.to_le_bytes()); // version
         v.extend_from_slice(&2u32.to_le_bytes()); // count
         v.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
         // entry 1: seq=5, cmd_type=17, klass=1 (CREATE), ring 0, 6 bytes + 2 pad
         v.extend_from_slice(&5u64.to_le_bytes());
         v.extend_from_slice(&17u32.to_le_bytes());
