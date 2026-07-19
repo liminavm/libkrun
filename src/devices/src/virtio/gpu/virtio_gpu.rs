@@ -39,7 +39,7 @@ use rutabaga_gfx::{
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
 
-use super::journal::GpuJournal;
+use super::journal::{GpuJournal, GpuJournalOp};
 use super::trace::GpuTraceStats;
 use super::{GpuError, Result};
 use crate::display::DisplayInfo;
@@ -765,6 +765,347 @@ impl VirtioGpu {
         &self.journal
     }
 
+    /// limina M9.3: the number of outstanding guest fences (requested, not yet retired
+    /// to the used ring), plus a summary for logging. The snapshot path drains these to
+    /// zero before capture: guest waiters hold sync_files backed by them, and a fence
+    /// whose completion misses the snapshot never signals in the restored epoch.
+    pub fn outstanding_fences(&self) -> (usize, String) {
+        let fs = self.fence_state.lock().unwrap();
+        (
+            fs.descs.len(),
+            fs.outstanding_summary(std::time::Instant::now()),
+        )
+    }
+
+    /// limina M9.3 P1: the venus wire-journal watermark for `ctx_id`, stamped on
+    /// rutabaga journal entries as the cross-layer replay fence.
+    pub fn journal_vkr_seq(&self, ctx_id: u32) -> u64 {
+        self.rutabaga
+            .as_ref()
+            .map(|r| r.limina_journal_seq(ctx_id))
+            .unwrap_or(0)
+    }
+
+    /// limina M9.3: release the vkr journal pin a venus blob create took on its
+    /// backing VkDeviceMemory (+ dedicated object). Called at global resource unref.
+    pub fn journal_unpin(&self, ctx_id: u32, blob_id: u64) {
+        if let Some(r) = self.rutabaga.as_ref() {
+            r.limina_journal_unpin(ctx_id, blob_id);
+        }
+    }
+
+    /// limina M9.3 P1: read a mapped blob's bytes through its host mapping (the
+    /// venus vkMapMemory pointer rutabaga resolves). None for unmappable blobs.
+    fn blob_content_read(&mut self, resource_id: u32) -> Option<Vec<u8>> {
+        let size = self.resources.get(&resource_id)?.size as usize;
+        let rutabaga = self.rutabaga.as_mut()?;
+        let ptr = rutabaga.map_ptr(resource_id).ok()?;
+        // Safe: the mapping is alive as long as the resource exists (worker thread
+        // owns both), and `size` is the blob's own size.
+        Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, size) }.to_vec())
+    }
+
+    fn blob_content_write(&mut self, resource_id: u32, bytes: &[u8]) -> bool {
+        let Some(resource) = self.resources.get(&resource_id) else {
+            return false;
+        };
+        let size = (resource.size as usize).min(bytes.len());
+        let Some(rutabaga) = self.rutabaga.as_mut() else {
+            return false;
+        };
+        let Ok(ptr) = rutabaga.map_ptr(resource_id) else {
+            return false;
+        };
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, size) };
+        true
+    }
+
+    /// limina M9.3 P1 snapshot: assemble the GPU section — the rutabaga journal,
+    /// each venus context's vkr wire journal, and every guest-mapped blob's raw
+    /// bytes (host allocations, invisible to the guest-RAM dump). Worker thread.
+    pub fn snapshot_gpu_payload(&mut self) -> Option<Vec<u8>> {
+        if self.rutabaga.is_none() || self.journal.entries().is_empty() {
+            return None;
+        }
+
+        let mut payload = super::journal::GpuSnapshotPayload {
+            ops: Vec::new(),
+            vkr_journals: Vec::new(),
+            blob_contents: Vec::new(),
+        };
+
+        let mut ctxs: Vec<u32> = Vec::new();
+        let mut mapped: Vec<u32> = Vec::new();
+        for e in self.journal.entries() {
+            match &e.op {
+                GpuJournalOp::CtxCreate { ctx_id, .. } => ctxs.push(*ctx_id),
+                GpuJournalOp::MapBlob { resource_id, .. } => mapped.push(*resource_id),
+                _ => {}
+            }
+            payload.ops.push(super::journal::GpuJournalEntry {
+                seq: e.seq,
+                vkr_seq: e.vkr_seq,
+                op: e.op.clone(),
+            });
+        }
+
+        for ctx_id in ctxs {
+            match self
+                .rutabaga
+                .as_ref()
+                .and_then(|r| r.limina_journal_export(ctx_id))
+            {
+                Some(bytes) => payload.vkr_journals.push((ctx_id, bytes)),
+                // Normal for non-venus contexts (the kernel's ctx 1, virgl contexts).
+                None => debug!("gpu snapshot: no vkr journal for ctx {ctx_id}"),
+            }
+        }
+
+        for res_id in mapped {
+            match self.blob_content_read(res_id) {
+                Some(bytes) => payload.blob_contents.push((res_id, bytes)),
+                None => warn!("gpu snapshot: mapped blob {res_id} content unreadable"),
+            }
+        }
+
+        info!(
+            "gpu snapshot: {} ops, {} vkr journals, {} blob contents",
+            payload.ops.len(),
+            payload.vkr_journals.len(),
+            payload.blob_contents.len()
+        );
+        Some(payload.to_bytes())
+    }
+
+    /// limina M9.3 P1 restore: replay the GPU section into the fresh renderer —
+    /// rutabaga ops interleaved with venus wire entries by the recorded vkr_seq
+    /// fences, blob contents restored at their creates (before the ring-creates
+    /// that read them), ring threads started at the end. Worker thread, before
+    /// the guest resumes. Returns false on any replay failure (the session then
+    /// restarts, i.e. today's fresh-renderer behavior — never a wedge).
+    #[cfg(target_os = "macos")]
+    pub fn restore_gpu_payload(
+        &mut self,
+        data: &[u8],
+        shm_region: &VirtioShmRegion,
+        mem: &GuestMemoryMmap,
+    ) -> bool {
+        use super::journal::{parse_vkr_journal, GpuSnapshotPayload, VKR_KLASS_RING_STREAM};
+        use std::collections::HashMap;
+
+        let Some(payload) = GpuSnapshotPayload::from_bytes(data) else {
+            error!("gpu restore: unparseable GPU snapshot section");
+            return false;
+        };
+        let GpuSnapshotPayload {
+            ops,
+            vkr_journals,
+            blob_contents,
+        } = payload;
+
+        let mut wire: HashMap<u32, (Vec<super::journal::VkrWireEntry>, usize)> = HashMap::new();
+        for (ctx_id, bytes) in &vkr_journals {
+            match parse_vkr_journal(bytes) {
+                Some(entries) => {
+                    wire.insert(*ctx_id, (entries, 0));
+                }
+                None => {
+                    error!("gpu restore: unparseable vkr journal for ctx {ctx_id}");
+                    return false;
+                }
+            }
+        }
+        let contents: HashMap<u32, &Vec<u8>> =
+            blob_contents.iter().map(|(id, b)| (*id, b)).collect();
+
+        // Two failure classes: a wire entry can fail RECOVERABLY (a retained command
+        // referencing an object destroyed pre-snapshot — its stale write is dropped, virgl
+        // clears the context FATAL, replay continues), while a structural rutabaga failure
+        // (context/blob/mapping) leaves guest-visible state missing and fails the replay.
+        let mut wire_failed = 0u32;
+        let mut op_failed = 0u32;
+        // Feed ctx's wire entries with seq <= fence (0 = none pending). Ring-stream
+        // entries go to the target ring's decoder; everything else to the context.
+        macro_rules! replay_wire_upto {
+            ($ctx:expr, $fence:expr) => {
+                if let Some((entries, pos)) = wire.get_mut(&$ctx) {
+                    while *pos < entries.len()
+                        && ($fence == u64::MAX || entries[*pos].seq <= $fence)
+                    {
+                        let e = &mut entries[*pos];
+                        let ok = if e.klass == VKR_KLASS_RING_STREAM && e.ring_key != 0 {
+                            self.rutabaga.as_ref().is_some_and(|r| {
+                                r.limina_replay_ring_cmd($ctx, e.ring_key, &mut e.bytes)
+                            })
+                        } else {
+                            self.rutabaga
+                                .as_ref()
+                                .is_some_and(|r| r.limina_replay_submit($ctx, &mut e.bytes))
+                        };
+                        if !ok {
+                            wire_failed += 1;
+                        }
+                        *pos += 1;
+                    }
+                }
+            };
+        }
+
+        for entry in &ops {
+            match &entry.op {
+                GpuJournalOp::CtxCreate {
+                    ctx_id,
+                    context_init,
+                    name,
+                } => {
+                    if self
+                        .create_context(*ctx_id, *context_init, name.as_deref())
+                        .is_err()
+                    {
+                        error!("gpu restore: create_context {ctx_id} failed");
+                        return false;
+                    }
+                    // Only venus contexts (the ones with a wire journal) have vkr state to
+                    // replay into; the kernel's virgl/none context has nothing host-side.
+                    // The create is proxied to the (same-process) render-server thread and
+                    // applies asynchronously, so the vkr context may not exist yet — poll.
+                    // Each FFI call takes/releases the renderer lock, letting the server in.
+                    if wire.contains_key(ctx_id) {
+                        let mut began = false;
+                        for _ in 0..2000 {
+                            if self
+                                .rutabaga
+                                .as_ref()
+                                .is_some_and(|r| r.limina_replay_begin(*ctx_id))
+                            {
+                                began = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        if !began {
+                            error!("gpu restore: replay_begin {ctx_id} failed (2s timeout)");
+                            return false;
+                        }
+                    }
+                }
+                GpuJournalOp::CreateBlob {
+                    ctx_id,
+                    resource_id,
+                    blob_mem,
+                    blob_flags,
+                    blob_id,
+                    size,
+                    backing,
+                } => {
+                    let fed_before = wire.get(ctx_id).map(|(_, p)| *p).unwrap_or(0);
+                    replay_wire_upto!(*ctx_id, entry.vkr_seq);
+                    let fed_after = wire.get(ctx_id).map(|(_, p)| *p).unwrap_or(0);
+                    debug!(
+                        "gpu restore: CREATE_BLOB res {} ctx {} blob_id {} fence {} fed {} wire entries (pos {} of {})",
+                        resource_id,
+                        ctx_id,
+                        blob_id,
+                        entry.vkr_seq,
+                        fed_after - fed_before,
+                        fed_after,
+                        wire.get(ctx_id).map(|(e, _)| e.len()).unwrap_or(0)
+                    );
+                    let create = ResourceCreateBlob {
+                        blob_mem: *blob_mem,
+                        blob_flags: *blob_flags,
+                        blob_id: *blob_id,
+                        size: *size,
+                    };
+                    let vecs: Vec<(GuestAddress, usize)> = backing
+                        .iter()
+                        .map(|(a, l)| (GuestAddress(*a), *l))
+                        .collect();
+                    if self
+                        .resource_create_blob(*ctx_id, *resource_id, create, vecs, mem)
+                        .is_err()
+                    {
+                        error!("gpu restore: CREATE_BLOB res {resource_id} failed");
+                        op_failed += 1;
+                        continue;
+                    }
+                    if let Some(bytes) = contents.get(resource_id) {
+                        if !self.blob_content_write(*resource_id, bytes) {
+                            warn!("gpu restore: content restore for blob {resource_id} failed");
+                        }
+                    }
+                }
+                GpuJournalOp::MapBlob {
+                    resource_id,
+                    offset,
+                } => {
+                    if self
+                        .resource_map_blob(*resource_id, shm_region, *offset)
+                        .is_err()
+                    {
+                        error!("gpu restore: MAP_BLOB res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                GpuJournalOp::CtxAttachResource {
+                    ctx_id,
+                    resource_id,
+                } => {
+                    if self.context_attach_resource(*ctx_id, *resource_id).is_err() {
+                        error!("gpu restore: ATTACH ctx {ctx_id} res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                GpuJournalOp::SetScanoutBlob {
+                    scanout_id,
+                    resource_id,
+                    width,
+                    height,
+                    format,
+                } => {
+                    if self
+                        .set_scanout_blob(*scanout_id, *resource_id, *width, *height, *format)
+                        .is_err()
+                    {
+                        warn!("gpu restore: SET_SCANOUT_BLOB scanout {scanout_id} failed");
+                    }
+                }
+            }
+        }
+
+        // Drain each context's remaining wire entries, then start the rings.
+        let ctxs: Vec<u32> = wire.keys().copied().collect();
+        for ctx_id in ctxs {
+            replay_wire_upto!(ctx_id, u64::MAX);
+            if !self
+                .rutabaga
+                .as_ref()
+                .is_some_and(|r| r.limina_replay_end(ctx_id))
+            {
+                error!("gpu restore: replay_end {ctx_id} failed");
+                op_failed += 1;
+            }
+        }
+
+        if op_failed > 0 {
+            error!(
+                "gpu restore: replay FAILED — {op_failed} structural failures ({wire_failed} wire entries also failed)"
+            );
+            return false;
+        }
+        if wire_failed > 0 {
+            warn!(
+                "gpu restore: replay complete with {wire_failed} dropped wire entries (stale references)"
+            );
+        } else {
+            info!("gpu restore: replay complete (session state re-created)");
+        }
+        // The re-created world is the payload's world (minus dropped stale writes); adopt
+        // its journal so the next suspend records from a warm, accurate baseline.
+        self.journal.restore_entries(ops);
+        true
+    }
+
     /// limina M9.3: dump the renderer's live context table (serviced on the worker
     /// thread, the only thread allowed to call into the renderer singleton).
     pub fn dump_renderer_state(&self) {
@@ -795,6 +1136,9 @@ impl VirtioGpu {
         if let Some(rutabaga) = self.rutabaga.as_mut() {
             rutabaga.reset_session_state();
         }
+        // The re-creation journal describes the session state just dropped; clear it so the
+        // next session's recording (or a pending snapshot replay) starts from empty.
+        self.journal.reset();
         {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
