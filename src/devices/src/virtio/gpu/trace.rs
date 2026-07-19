@@ -44,6 +44,11 @@ pub struct GpuTraceStats {
     /// renderer's context table, then clears it. Only the worker thread may call
     /// into the renderer, so this is a request flag, not a direct call.
     pub dump_requested: AtomicBool,
+    /// M9.3 P0 gpu-journal gauges (absolute, mirrored by GpuJournal::sync_trace;
+    /// the journal itself is worker-thread-only, these make it tick-visible).
+    pub journal_live: AtomicU64,
+    pub journal_recorded: AtomicU64,
+    pub journal_pruned: AtomicU64,
 }
 
 impl GpuTraceStats {
@@ -126,10 +131,14 @@ pub fn maybe_spawn_reporter(stats: Arc<GpuTraceStats>, fence_state: Arc<Mutex<Fe
                     fs.outstanding_summary(Instant::now())
                 };
 
+                let jl = stats.journal_live.load(Ordering::Relaxed);
+                let jr = stats.journal_recorded.load(Ordering::Relaxed);
+                let jp = stats.journal_pruned.load(Ordering::Relaxed);
+
                 warn!(
                     "[GPUTRACE] tick={tick} submits=+{submits} unknown_ctx=+{unknown_ctx} \
                      unknown_res=+{unknown_res} errs=+{errs} fences_req=+{freq} \
-                     fences_ret=+{fret} outstanding={outstanding}"
+                     fences_ret=+{fret} outstanding={outstanding} journal={jl}/{jr}/{jp}"
                 );
 
                 if vkr_ticks && tick % 10 == 0 {
