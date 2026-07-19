@@ -39,6 +39,7 @@ use rutabaga_gfx::{
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
 
+use super::trace::GpuTraceStats;
 use super::{GpuError, Result};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
@@ -78,12 +79,47 @@ struct FenceDescriptor {
     fence_id: u64,
     desc_index: u16,
     len: u32,
+    /// limina M9.3 trace: when the descriptor parked (age of an outstanding fence).
+    created_at: std::time::Instant,
 }
 
 #[derive(Default)]
 pub struct FenceState {
     descs: Vec<FenceDescriptor>,
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
+}
+
+impl FenceState {
+    /// limina M9.3 trace: one-line summary of the outstanding (requested, never
+    /// signaled) fences — count, oldest age, and up to 8 entries with ring + age.
+    /// A post-restore wedge shows here as entries whose ages only ever climb.
+    pub(crate) fn outstanding_summary(&self, now: std::time::Instant) -> String {
+        if self.descs.is_empty() {
+            return "0".to_string();
+        }
+        let mut out = format!("{} [", self.descs.len());
+        for (i, desc) in self.descs.iter().take(8).enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let ring = match desc.ring {
+                VirtioGpuRing::Global => "global".to_string(),
+                VirtioGpuRing::ContextSpecific { ctx_id, ring_idx } => {
+                    format!("ctx{ctx_id}/r{ring_idx}")
+                }
+            };
+            out.push_str(&format!(
+                "{ring}#{}:{}ms",
+                desc.fence_id,
+                now.duration_since(desc.created_at).as_millis()
+            ));
+        }
+        if self.descs.len() > 8 {
+            out.push_str(" …");
+        }
+        out.push(']');
+        out
+    }
 }
 
 /// Mark a fence as already completed without a renderer (software-2D mode).
@@ -313,7 +349,13 @@ impl Sw2dResource {
 /// drift every row by `(src_stride − dst_stride)` px. When the strides match (the common case) this
 /// is a single flat copy. `src_stride >= dst_stride` is expected; rows that would read/write out of
 /// bounds are skipped. See `flush_resource`.
-fn blit_scanout_rect(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, rows: usize) {
+fn blit_scanout_rect(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    rows: usize,
+) {
     if src_stride == dst_stride {
         let n = dst.len().min(src.len());
         dst[..n].copy_from_slice(&src[..n]);
@@ -348,6 +390,8 @@ pub struct VirtioGpu {
     display_backend: DisplayBackendInstance,
     /// limina (#8): present-fence state; `None` when the renderer is absent.
     present_fence: Option<PresentFenceState>,
+    /// limina M9.3: counted GPU health probes (stale-ctx submissions, fence ledger).
+    trace: Arc<GpuTraceStats>,
 }
 
 /// The per-activation transport the fence handler retires guest fences into.
@@ -372,6 +416,7 @@ impl VirtioGpu {
         fence_state: Arc<Mutex<FenceState>>,
         present_retired: Arc<Mutex<Vec<u64>>>,
         present_event: utils::eventfd::EventFd,
+        trace: Arc<GpuTraceStats>,
     ) -> RutabagaFenceHandler {
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
             debug!(
@@ -426,6 +471,9 @@ impl VirtioGpu {
                     && fence_state.descs[i].fence_id <= completed_fence.fence_id
                 {
                     let completed_desc = fence_state.descs.remove(i);
+                    trace
+                        .fences_retired
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     debug!(
                         "XXX - found fence: desc_index={}",
                         completed_desc.desc_index
@@ -553,7 +601,12 @@ impl VirtioGpu {
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend,
     ) -> Self {
-        let fence_state = Arc::new(Mutex::new(Default::default()));
+        let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(Default::default()));
+
+        // limina M9.3: probe counters, shared with the fence handler (retire counts) and
+        // the opt-in tick reporter (LIMINA_GPU_TRACE=1).
+        let trace: Arc<GpuTraceStats> = Arc::new(Default::default());
+        super::trace::maybe_spawn_reporter(trace.clone(), fence_state.clone());
 
         // limina (#8): present-fence plumbing — built up front because the fence handler
         // needs its endpoints.
@@ -569,6 +622,7 @@ impl VirtioGpu {
             fence_state.clone(),
             present_retired.clone(),
             present_event.try_clone().expect("eventfd clone"),
+            trace.clone(),
         );
 
         // limina software-2D-only mode: skip renderer init entirely (no virglrenderer/Metal).
@@ -685,6 +739,22 @@ impl VirtioGpu {
             #[cfg(target_os = "macos")]
             map_sender,
             present_fence,
+            trace,
+        }
+    }
+
+    /// limina M9.3: the probe counters (shared; incremented from the worker's dispatch
+    /// sites and the fence handler, read by the tick reporter).
+    pub fn trace(&self) -> &Arc<GpuTraceStats> {
+        &self.trace
+    }
+
+    /// limina M9.3: dump the renderer's live context table (serviced on the worker
+    /// thread, the only thread allowed to call into the renderer singleton).
+    pub fn dump_renderer_state(&self) {
+        match self.rutabaga.as_ref() {
+            Some(rutabaga) => rutabaga.limina_dump_state(),
+            None => warn!("[GPUTRACE] renderer state dump requested, but no renderer is live"),
         }
     }
 
@@ -1571,10 +1641,12 @@ impl VirtioGpu {
                 s.len(),
             ))
         });
-        self.rutabaga
-            .as_mut()
-            .ok_or(ErrUnspec)?
-            .transfer_read(ctx_id, resource_id, transfer, dst.take())?;
+        self.rutabaga.as_mut().ok_or(ErrUnspec)?.transfer_read(
+            ctx_id,
+            resource_id,
+            transfer,
+            dst.take(),
+        )?;
         Ok(OkNoData)
     }
 
@@ -1735,6 +1807,10 @@ impl VirtioGpu {
         rutabaga_fence: RutabagaFence,
         is_flush: bool,
     ) -> VirtioGpuResult {
+        // limina M9.3 trace: every guest fence request, whatever path it takes below.
+        self.trace
+            .fences_requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // limina (#8 half 2): a fenced flush whose frames were parked — hold the guest
         // fence until those frames have presented + the latch delay. The descriptor
         // parks in process_fence (watermark untouched); the latch thread retires it
@@ -1807,10 +1883,15 @@ impl VirtioGpu {
                 fence_id,
                 desc_index,
                 len,
+                created_at: std::time::Instant::now(),
             });
 
             false
         } else {
+            // Already signaled at creation — retired without ever parking.
+            self.trace
+                .fences_retired
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
     }

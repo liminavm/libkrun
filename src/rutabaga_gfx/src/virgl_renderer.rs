@@ -41,6 +41,13 @@ use crate::rutabaga_utils::*;
 
 type Query = virgl_renderer_export_query;
 
+unsafe extern "C" {
+    // limina M9.3 (virglrenderer patch: venus context-table dump): log the live vkr
+    // context list — per context: rings, object/resource table sizes by type. Only in
+    // our virglrenderer fork; limina builds always link it (see limina-virgl-link-trap).
+    fn virgl_renderer_limina_dump_state();
+}
+
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct VirglRenderer {}
 
@@ -492,6 +499,12 @@ impl RutabagaComponent for VirglRenderer {
 
     fn force_ctx_0(&self) {
         unsafe { virgl_renderer_force_ctx_0() };
+    }
+
+    fn limina_dump_state(&self) {
+        // Safe: no arguments, no return; virglrenderer is initialized for as long as
+        // this component exists, and the caller contract puts us on the renderer thread.
+        unsafe { virgl_renderer_limina_dump_state() };
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
