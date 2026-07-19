@@ -46,6 +46,26 @@ unsafe extern "C" {
     // context list — per context: rings, object/resource table sizes by type. Only in
     // our virglrenderer fork; limina builds always link it (see limina-virgl-link-trap).
     fn virgl_renderer_limina_dump_state();
+
+    // limina M9.3 P1 (virglrenderer patch 0035): venus journal export + replay for
+    // snapshot restore. See virglrenderer.h for the contract (mutable replay buffers,
+    // one journal entry per submit/ring_cmd call, ring threads start at replay_end).
+    fn virgl_renderer_limina_journal_export(
+        ctx_id: u32,
+        out_buf: *mut *mut c_void,
+        out_size: *mut u64,
+    ) -> i32;
+    fn virgl_renderer_limina_journal_seq(ctx_id: u32) -> u64;
+    fn virgl_renderer_limina_journal_unpin(ctx_id: u32, key: u64);
+    fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> i32;
+    fn virgl_renderer_limina_replay_submit(ctx_id: u32, cmd: *mut c_void, size: u32) -> i32;
+    fn virgl_renderer_limina_replay_ring_cmd(
+        ctx_id: u32,
+        ring_id: u64,
+        cmd: *mut c_void,
+        size: u32,
+    ) -> i32;
+    fn virgl_renderer_limina_replay_end(ctx_id: u32) -> i32;
 }
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
@@ -505,6 +525,58 @@ impl RutabagaComponent for VirglRenderer {
         // Safe: no arguments, no return; virglrenderer is initialized for as long as
         // this component exists, and the caller contract puts us on the renderer thread.
         unsafe { virgl_renderer_limina_dump_state() };
+    }
+
+    fn limina_journal_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
+        let mut buf: *mut c_void = std::ptr::null_mut();
+        let mut size: u64 = 0;
+        // Safe: out-params are written only on success; the returned buffer is
+        // malloc'd by virglrenderer and owned by us until the libc::free below.
+        let ret = unsafe { virgl_renderer_limina_journal_export(ctx_id, &mut buf, &mut size) };
+        if ret != 0 || buf.is_null() {
+            return None;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buf as *const u8, size as usize) }.to_vec();
+        unsafe { libc::free(buf) };
+        Some(bytes)
+    }
+
+    fn limina_journal_seq(&self, ctx_id: u32) -> u64 {
+        unsafe { virgl_renderer_limina_journal_seq(ctx_id) }
+    }
+
+    fn limina_journal_unpin(&self, ctx_id: u32, key: u64) {
+        unsafe { virgl_renderer_limina_journal_unpin(ctx_id, key) }
+    }
+
+    fn limina_replay_begin(&self, ctx_id: u32) -> bool {
+        unsafe { virgl_renderer_limina_replay_begin(ctx_id) == 0 }
+    }
+
+    fn limina_replay_submit(&self, ctx_id: u32, cmd: &mut [u8]) -> bool {
+        unsafe {
+            virgl_renderer_limina_replay_submit(
+                ctx_id,
+                cmd.as_mut_ptr() as *mut c_void,
+                cmd.len() as u32,
+            ) == 0
+        }
+    }
+
+    fn limina_replay_ring_cmd(&self, ctx_id: u32, ring_id: u64, cmd: &mut [u8]) -> bool {
+        unsafe {
+            virgl_renderer_limina_replay_ring_cmd(
+                ctx_id,
+                ring_id,
+                cmd.as_mut_ptr() as *mut c_void,
+                cmd.len() as u32,
+            ) == 0
+        }
+    }
+
+    fn limina_replay_end(&self, ctx_id: u32) -> bool {
+        unsafe { virgl_renderer_limina_replay_end(ctx_id) == 0 }
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
