@@ -1,4 +1,5 @@
 mod device;
+mod journal;
 mod protocol;
 mod trace;
 mod virtio_gpu;
