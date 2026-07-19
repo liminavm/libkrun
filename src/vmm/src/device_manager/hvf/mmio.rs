@@ -422,28 +422,54 @@ impl MMIODeviceManager {
         &self,
         states: &[crate::snapshot::DeviceTransportState],
     ) -> std::result::Result<(), String> {
+        use devices::virtio::MmioTransport;
         for st in states {
             // Locate the device by identity: same virtio type at the same mmio base + irq.
-            let matched = self.id_to_dev_info.iter().any(|((dtype, _), info)| {
+            let matched = self.id_to_dev_info.iter().find(|((dtype, _), info)| {
                 matches!(*dtype, DeviceType::Virtio(t) if t == st.type_id)
                     && info.addr == st.mmio_base
                     && info.irq == st.irq
             });
-            if !matched {
+            let Some(((dtype, id), _)) = matched else {
                 return Err(format!(
                     "restore: no virtio device type={} @0x{:x} irq={} (layout drift)",
                     st.type_id, st.mmio_base, st.irq
                 ));
-            }
+            };
             info!(
                 "restore: captured virtio type={} @0x{:x} status=0x{:x} acked_features=0x{:x} {} queue(s) \
-                 (diagnostic only — guest self-renegotiates on thaw)",
+                 (validated; queue regs seeded for the no-PM-ops thaw re-arm)",
                 st.type_id,
                 st.mmio_base,
                 st.device_status,
                 st.acked_features,
                 st.queues.len()
             );
+            // Seed the fresh transport's previous-activation queue register file from the capture.
+            // The guest re-negotiates every device itself on s2idle thaw; a driver WITH PM ops
+            // re-programs its queues and never looks at this. A driver WITHOUT PM ops (virtio-gpu,
+            // verified absent through v7.1.2) resumes via the bus fallback — reset → features →
+            // DRIVER_OK, no queue writes — and the transport re-arms from this seed at activation
+            // (see MmioTransport::rearm_queues_from_stash). Without it, the guest drives DRIVER_OK
+            // onto dead queues and every GPU command waits forever (the M9.3 restore wedge).
+            if let Some(dev) = self.get_device(*dtype, id) {
+                let mut guard = dev.lock().unwrap();
+                let dev_ref: &mut dyn devices::BusDevice = &mut *guard;
+                if let Some(mmio) = dev_ref.as_mut_any().downcast_mut::<MmioTransport>() {
+                    mmio.seed_queue_regs(
+                        st.queues
+                            .iter()
+                            .map(|q| devices::virtio::QueueRegs {
+                                size: q.size,
+                                ready: q.ready,
+                                desc: q.desc,
+                                avail: q.avail,
+                                used: q.used,
+                            })
+                            .collect(),
+                    );
+                }
+            }
         }
         Ok(())
     }
