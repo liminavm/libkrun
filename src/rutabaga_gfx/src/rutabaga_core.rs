@@ -114,6 +114,17 @@ pub trait RutabagaComponent {
         false
     }
 
+    /// limina M9.3 P2: device-memory content capture (virglrenderer implements).
+    fn limina_memory_census(&self, _ctx_id: u32) -> Option<Vec<(u64, u64)>> {
+        None
+    }
+    fn limina_memory_read(&self, _ctx_id: u32, _mem_id: u64, _buf: &mut [u8]) -> bool {
+        false
+    }
+    fn limina_memory_write(&self, _ctx_id: u32, _mem_id: u64, _buf: &[u8]) -> bool {
+        false
+    }
+
     /// Implementations must create a fence that represents the completion of prior work.  This is
     /// required for synchronization with the guest kernel.
     fn create_fence(&mut self, _fence: RutabagaFence) -> RutabagaResult<()> {
@@ -663,6 +674,24 @@ impl Rutabaga {
         self.components
             .get(&self.default_component)
             .is_some_and(|c| c.limina_replay_end(ctx_id))
+    }
+
+    pub fn limina_memory_census(&self, ctx_id: u32) -> Option<Vec<(u64, u64)>> {
+        self.components
+            .get(&self.default_component)
+            .and_then(|c| c.limina_memory_census(ctx_id))
+    }
+
+    pub fn limina_memory_read(&self, ctx_id: u32, mem_id: u64, buf: &mut [u8]) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_memory_read(ctx_id, mem_id, buf))
+    }
+
+    pub fn limina_memory_write(&self, ctx_id: u32, mem_id: u64, buf: &[u8]) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_memory_write(ctx_id, mem_id, buf))
     }
 
     /// Creates a fence with the given `fence`.
