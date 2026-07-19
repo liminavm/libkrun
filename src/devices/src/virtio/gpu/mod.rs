@@ -1,5 +1,6 @@
 mod device;
 mod protocol;
+mod trace;
 mod virtio_gpu;
 mod worker;
 

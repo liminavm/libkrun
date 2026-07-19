@@ -86,6 +86,11 @@ pub trait RutabagaComponent {
     /// Implementations should set their internal context to be the reserved context 0.
     fn force_ctx_0(&self) {}
 
+    /// limina M9.3 diagnostics: implementations may log their live context/resource
+    /// tables (virglrenderer dumps the vkr context list). Default: no-op. Must be
+    /// called on the renderer thread.
+    fn limina_dump_state(&self) {}
+
     /// Implementations must create a fence that represents the completion of prior work.  This is
     /// required for synchronization with the guest kernel.
     fn create_fence(&mut self, _fence: RutabagaFence) -> RutabagaResult<()> {
@@ -568,6 +573,27 @@ impl Rutabaga {
     pub fn force_ctx_0(&self) {
         if let Some(component) = self.components.get(&self.default_component) {
             component.force_ctx_0();
+        }
+    }
+
+    /// limina M9.3 diagnostics: dump the default component's live context/resource
+    /// tables to the log, prefixed with rutabaga's own view (which ctx/resource ids
+    /// the *translation layer* believes exist — a fresh renderer after a snapshot
+    /// restore should show both views empty while the guest submits old ids).
+    /// Must be called on the renderer thread.
+    pub fn limina_dump_state(&self) {
+        let ctx_ids: Vec<u32> = self.contexts.keys().copied().collect();
+        let res_ids: Vec<u32> = self.resources.keys().copied().collect();
+        log::warn!(
+            "[GPUTRACE] rutabaga state: {} contexts {:?}, {} resources (ids {:?}{})",
+            ctx_ids.len(),
+            ctx_ids,
+            res_ids.len(),
+            &res_ids[..res_ids.len().min(32)],
+            if res_ids.len() > 32 { " …" } else { "" }
+        );
+        if let Some(component) = self.components.get(&self.default_component) {
+            component.limina_dump_state();
         }
     }
 
