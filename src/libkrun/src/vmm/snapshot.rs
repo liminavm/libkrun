@@ -24,7 +24,11 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // per-device virtio-transport section (M9.3): devices the guest left `DRIVER_OK` across suspend (the
 // GPU, which has no s2idle PM ops so it never resets/re-negotiates) need their transport re-activated
 // on restore, or the fresh worker's device stays in INIT with dead queues and the guest wedges.
-const VERSION: u32 = 4;
+// v5 adds an optional GPU re-creation section (M9.3 venus snapshot-replay): the rutabaga-layer
+// journal + per-context venus wire journals + mapped-blob contents, serialized by the GPU worker
+// ('LGPU' payload). Replayed into the fresh renderer before the guest resumes so the guest's
+// surviving venus world-view finds its host objects again instead of a dead ring.
+const VERSION: u32 = 5;
 
 /// One guest-RAM region: its guest-physical base and raw bytes.
 pub struct RamRegion {
@@ -86,6 +90,9 @@ pub struct Snapshot {
     pub layout: LayoutInfo,
     /// Per-device virtio-transport state for devices left `DRIVER_OK` across suspend (M9.3).
     pub devices: Vec<DeviceTransportState>,
+    /// v5: the GPU re-creation section ('LGPU' payload from the GPU worker), if the VM had a
+    /// venus renderer with recorded state. `None` = nothing to replay (software-2D / stock guest).
+    pub gpu: Option<Vec<u8>>,
     /// Guest RAM regions (SHM window excluded by the caller).
     pub ram: Vec<RamRegion>,
 }
@@ -214,6 +221,14 @@ pub fn write(path: &Path, snap: &Snapshot) -> io::Result<()> {
             put_u64(&mut v, q.avail);
             put_u64(&mut v, q.used);
         }
+    }
+    // v5 GPU re-creation section: presence byte + bytes.
+    match &snap.gpu {
+        Some(g) => {
+            v.push(1);
+            put_bytes(&mut v, g);
+        }
+        None => v.push(0),
     }
     put_u32(&mut v, snap.ram.len() as u32);
     for r in &snap.ram {
@@ -403,6 +418,12 @@ pub fn read(path: &Path) -> io::Result<Snapshot> {
             queues,
         });
     }
+    // v5 GPU re-creation section.
+    let gpu = match r.u8()? {
+        0 => None,
+        1 => Some(r.bytes()?),
+        _ => return Err(corrupt("bad gpu presence byte")),
+    };
     let ram_count = r.u32()? as usize;
     let mut ram = Vec::with_capacity(ram_count);
     for _ in 0..ram_count {
@@ -416,6 +437,7 @@ pub fn read(path: &Path) -> io::Result<Snapshot> {
         gpio,
         layout,
         devices,
+        gpu,
         ram,
     })
 }
@@ -495,6 +517,7 @@ mod tests {
             }),
             layout: sample_layout(),
             devices: vec![sample_gpu_device()],
+            gpu: None,
             ram: vec![
                 RamRegion {
                     gpa: 0x4000_0000,
@@ -542,6 +565,7 @@ mod tests {
             gpio: None,
             layout: sample_layout(),
             devices: vec![],
+            gpu: None,
             ram: vec![RamRegion {
                 gpa: 0x4000_0000,
                 data: vec![9u8; 64],
@@ -591,6 +615,7 @@ mod tests {
             gpio: None,
             layout: sample_layout(),
             devices: vec![],
+            gpu: None,
             ram: vec![],
         };
         let path =

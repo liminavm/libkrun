@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -49,6 +49,12 @@ pub enum WorkerCmd {
     Deactivate,
     /// Tear the worker down (device drop / VMM teardown).
     Shutdown,
+    /// limina M9.3: serialize the GPU re-creation state (rutabaga journal + venus wire
+    /// journals + mapped-blob contents) for the VMM snapshot. Sent with the vCPUs quiesced,
+    /// so no queue traffic races the capture.
+    Snapshot {
+        reply: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+    },
 }
 
 /// How the inner service loop ended.
@@ -82,6 +88,14 @@ pub struct Worker {
     resize_evt: Arc<EventFd>,
     /// The pending resize `(display_id, width, height)`, taken on a `resize_evt` wake.
     resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    /// limina M9.3: a staged GPU snapshot payload ('LGPU'), taken and replayed on the next
+    /// activation. Staged by the restore path; the guest's thaw resets the device (bus
+    /// fallback: reset → features → DRIVER_OK), so replay must run AFTER that reset's
+    /// `reset_session` and before any queue command — i.e. exactly at activation.
+    pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+    /// limina M9.3: flipped true (+ notify) once the staged replay finished; the device's
+    /// `activate` blocks the guest's DRIVER_OK on it (see `Gpu::restore_done`).
+    restore_done: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Worker {
@@ -100,6 +114,8 @@ impl Worker {
         events_read: Arc<AtomicU32>,
         resize_evt: Arc<EventFd>,
         resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+        pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+        restore_done: Arc<(Mutex<bool>, Condvar)>,
     ) -> Self {
         Self {
             stop_fd,
@@ -116,6 +132,8 @@ impl Worker {
             events_read,
             resize_evt,
             resize_pending,
+            pending_restore,
+            restore_done,
         }
     }
 
@@ -154,6 +172,13 @@ impl Worker {
                 // A Deactivate while already inactive is a no-op; Shutdown / closed channel ends.
                 Ok(WorkerCmd::Deactivate) => continue,
                 Ok(WorkerCmd::Shutdown) | Err(_) => return,
+                // limina M9.3: a snapshot request can arrive while inactive (unlikely — the
+                // production suspend path snapshots with the device DRIVER_OK — but harmless).
+                Ok(WorkerCmd::Snapshot { reply }) => {
+                    Self::drain_fences(&virtio_gpu);
+                    let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
+                    continue;
+                }
             };
 
             // Own each activation's queue eventfds + queues; publish the transport so the
@@ -167,6 +192,25 @@ impl Worker {
                 control_queue: control_queue.clone(),
                 interrupt: interrupt.clone(),
             });
+
+            // limina M9.3: a staged GPU snapshot payload replays NOW — after the thaw
+            // reset's `reset_session` (which would have wiped it) and before the first
+            // queue command (whose venus state it re-creates). The guest's DRIVER_OK write
+            // is BLOCKED on `restore_done` for the duration (see `Gpu::activate`), keeping
+            // the thaw — and with it guest userspace — frozen until the blob mappings are
+            // re-established; without that hold, mesa's first post-thaw writes raced the
+            // replay and landed in unmapped shmem (run-14 ring FATAL).
+            let staged = self.pending_restore.lock().unwrap().take();
+            if let Some(data) = staged {
+                if self.gpu_restore(&mut virtio_gpu, &data, &mem) {
+                    info!("gpu worker: staged snapshot replay complete");
+                } else {
+                    warn!("gpu worker: staged snapshot replay failed; guest session will restart");
+                }
+                let (done_lock, done_cv) = &*self.restore_done;
+                *done_lock.lock().unwrap() = true;
+                done_cv.notify_all();
+            }
 
             let exit = self.service(
                 &mut virtio_gpu,
@@ -187,6 +231,49 @@ impl Worker {
                 InnerExit::Deactivate => continue,
                 InnerExit::Shutdown => return,
             }
+        }
+    }
+
+    /// limina M9.3: drain in-flight guest fences before a snapshot capture. The guest
+    /// froze mid-frame and its waiters hold sync_files backed by these fences; a fence
+    /// whose completion misses the snapshot never signals in the restored epoch (eyeball
+    /// 2026-07-19: gnome-shell resumed wedged in `vn_GetSemaphoreFdKHR → poll()`). The
+    /// vCPUs are parked, so no new fences arrive; retirement runs on virglrenderer's
+    /// async fence-callback threads (ASYNC_FENCE_CB), so it proceeds while we poll. The
+    /// used-ring writes land in guest RAM (dumped after this) and the raised IRQs latch
+    /// in the GIC (saved after the GPU capture) — restored waiters see signaled fences.
+    fn drain_fences(virtio_gpu: &VirtioGpu) {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(5);
+        loop {
+            let (n, summary) = virtio_gpu.outstanding_fences();
+            if n == 0 {
+                info!(
+                    "gpu snapshot: fence ledger drained in {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!("gpu snapshot: fence drain TIMED OUT with {n} outstanding: {summary}");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// limina M9.3: replay a GPU snapshot section into the (fresh) renderer. macOS-only
+    /// mechanism today — the venus/KK stack this exists for; elsewhere report failure so
+    /// the caller falls back to fresh-renderer behavior.
+    fn gpu_restore(&self, virtio_gpu: &mut VirtioGpu, data: &[u8], mem: &GuestMemoryMmap) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            virtio_gpu.restore_gpu_payload(data, &self.shm_region, mem)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (virtio_gpu, data, mem);
+            false
         }
     }
 
@@ -262,6 +349,13 @@ impl Worker {
                     match self.cmd_rx.try_recv() {
                         Ok(WorkerCmd::Deactivate) => return InnerExit::Deactivate,
                         Ok(WorkerCmd::Shutdown) => return InnerExit::Shutdown,
+                        // limina M9.3: snapshot with the transport bound (vCPUs quiesced by
+                        // the caller, so the queues are idle). Drain in-flight fences first —
+                        // see drain_fences.
+                        Ok(WorkerCmd::Snapshot { reply }) => {
+                            Self::drain_fences(virtio_gpu);
+                            let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
+                        }
                         // An Activate while already active shouldn't happen (the lifecycle is
                         // activate→reset→activate); ignore it. Empty = spurious wake.
                         Ok(WorkerCmd::Activate { .. })
@@ -344,7 +438,12 @@ impl Worker {
             GpuCommand::ResourceUnref(info) => {
                 let r = virtio_gpu.unref_resource(info.resource_id);
                 if r.is_ok() {
-                    virtio_gpu.journal_mut().resource_unref(info.resource_id);
+                    let pinned = virtio_gpu.journal_mut().resource_unref(info.resource_id);
+                    // The GLOBAL unref releases the vkr journal pin the blob create
+                    // took on its backing memory (per-ctx detach must not).
+                    if let Some((ctx_id, blob_id)) = pinned {
+                        virtio_gpu.journal_unpin(ctx_id, blob_id);
+                    }
                 }
                 r
             }
@@ -569,6 +668,13 @@ impl Worker {
                     mem,
                 );
                 if r.is_ok() {
+                    // The vkr wire watermark is the cross-layer replay fence: everything the
+                    // blob depends on (its vkAllocateMemory) is at or below this seq.
+                    let vkr_seq = virtio_gpu.journal_vkr_seq(ctx_id);
+                    debug!(
+                        "gpu journal: CREATE_BLOB res {} ctx {} blob_id {} recorded with vkr fence {}",
+                        resource_id, ctx_id, info.blob_id, vkr_seq
+                    );
                     virtio_gpu.journal_mut().create_blob(
                         ctx_id,
                         resource_id,
@@ -577,6 +683,7 @@ impl Worker {
                         info.blob_id,
                         info.size,
                         backing,
+                        vkr_seq,
                     );
                 }
                 r
