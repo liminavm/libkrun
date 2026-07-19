@@ -145,6 +145,10 @@ impl VirtioTransportState {
         self.device.clone()
     }
 
+    pub(crate) fn mem(&self) -> &GuestMemoryMmap {
+        &self.mem
+    }
+
     pub(crate) fn queue_evts(&self) -> &[Arc<EventFd>] {
         &self.queue_evts
     }
