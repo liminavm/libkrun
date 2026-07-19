@@ -438,7 +438,12 @@ impl Worker {
             GpuCommand::ResourceUnref(info) => {
                 let r = virtio_gpu.unref_resource(info.resource_id);
                 if r.is_ok() {
-                    virtio_gpu.journal_mut().resource_unref(info.resource_id);
+                    let pinned = virtio_gpu.journal_mut().resource_unref(info.resource_id);
+                    // The GLOBAL unref releases the vkr journal pin the blob create
+                    // took on its backing memory (per-ctx detach must not).
+                    if let Some((ctx_id, blob_id)) = pinned {
+                        virtio_gpu.journal_unpin(ctx_id, blob_id);
+                    }
                 }
                 r
             }
@@ -666,6 +671,10 @@ impl Worker {
                     // The vkr wire watermark is the cross-layer replay fence: everything the
                     // blob depends on (its vkAllocateMemory) is at or below this seq.
                     let vkr_seq = virtio_gpu.journal_vkr_seq(ctx_id);
+                    debug!(
+                        "gpu journal: CREATE_BLOB res {} ctx {} blob_id {} recorded with vkr fence {}",
+                        resource_id, ctx_id, info.blob_id, vkr_seq
+                    );
                     virtio_gpu.journal_mut().create_blob(
                         ctx_id,
                         resource_id,

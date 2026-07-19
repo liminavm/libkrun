@@ -198,8 +198,25 @@ impl GpuJournal {
     }
 
     /// An unref prunes the blob, its map, its attaches, and any scanout binding
-    /// still pointing at it.
-    pub fn resource_unref(&mut self, resource_id: u32) {
+    /// still pointing at it. Returns the pruned blob's `(ctx_id, blob_id)` when it
+    /// was a venus blob (blob_id != 0) — the caller must release the vkr journal
+    /// pin its create took (the pin lives until this GLOBAL unref, not any
+    /// per-context detach: cross-context shares outlive the exporter's attach).
+    pub fn resource_unref(&mut self, resource_id: u32) -> Option<(u32, u64)> {
+        let mut pinned = None;
+        for e in &self.entries {
+            if let GpuJournalOp::CreateBlob {
+                ctx_id,
+                resource_id: r,
+                blob_id,
+                ..
+            } = &e.op
+            {
+                if *r == resource_id && *blob_id != 0 {
+                    pinned = Some((*ctx_id, *blob_id));
+                }
+            }
+        }
         self.prune(|op| match op {
             GpuJournalOp::CreateBlob { resource_id: r, .. } => *r == resource_id,
             GpuJournalOp::MapBlob { resource_id: r, .. } => *r == resource_id,
@@ -207,6 +224,7 @@ impl GpuJournal {
             GpuJournalOp::SetScanoutBlob { resource_id: r, .. } => *r == resource_id,
             _ => false,
         });
+        pinned
     }
 
     pub fn map_blob(&mut self, resource_id: u32, offset: u64) {

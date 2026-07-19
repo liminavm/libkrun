@@ -56,6 +56,7 @@ unsafe extern "C" {
         out_size: *mut u64,
     ) -> i32;
     fn virgl_renderer_limina_journal_seq(ctx_id: u32) -> u64;
+    fn virgl_renderer_limina_journal_unpin(ctx_id: u32, key: u64);
     fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> i32;
     fn virgl_renderer_limina_replay_submit(ctx_id: u32, cmd: *mut c_void, size: u32) -> i32;
     fn virgl_renderer_limina_replay_ring_cmd(
@@ -543,6 +544,10 @@ impl RutabagaComponent for VirglRenderer {
 
     fn limina_journal_seq(&self, ctx_id: u32) -> u64 {
         unsafe { virgl_renderer_limina_journal_seq(ctx_id) }
+    }
+
+    fn limina_journal_unpin(&self, ctx_id: u32, key: u64) {
+        unsafe { virgl_renderer_limina_journal_unpin(ctx_id, key) }
     }
 
     fn limina_replay_begin(&self, ctx_id: u32) -> bool {

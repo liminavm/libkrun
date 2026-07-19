@@ -786,6 +786,14 @@ impl VirtioGpu {
             .unwrap_or(0)
     }
 
+    /// limina M9.3: release the vkr journal pin a venus blob create took on its
+    /// backing VkDeviceMemory (+ dedicated object). Called at global resource unref.
+    pub fn journal_unpin(&self, ctx_id: u32, blob_id: u64) {
+        if let Some(r) = self.rutabaga.as_ref() {
+            r.limina_journal_unpin(ctx_id, blob_id);
+        }
+    }
+
     /// limina M9.3 P1: read a mapped blob's bytes through its host mapping (the
     /// venus vkMapMemory pointer rutabaga resolves). None for unmappable blobs.
     fn blob_content_read(&mut self, resource_id: u32) -> Option<Vec<u8>> {
@@ -1014,7 +1022,19 @@ impl VirtioGpu {
                     size,
                     backing,
                 } => {
+                    let fed_before = wire.get(ctx_id).map(|(_, p)| *p).unwrap_or(0);
                     replay_wire_upto!(*ctx_id, entry.vkr_seq);
+                    let fed_after = wire.get(ctx_id).map(|(_, p)| *p).unwrap_or(0);
+                    debug!(
+                        "gpu restore: CREATE_BLOB res {} ctx {} blob_id {} fence {} fed {} wire entries (pos {} of {})",
+                        resource_id,
+                        ctx_id,
+                        blob_id,
+                        entry.vkr_seq,
+                        fed_after - fed_before,
+                        fed_after,
+                        wire.get(ctx_id).map(|(e, _)| e.len()).unwrap_or(0)
+                    );
                     let create = ResourceCreateBlob {
                         blob_mem: *blob_mem,
                         blob_flags: *blob_flags,

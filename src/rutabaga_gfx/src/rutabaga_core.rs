@@ -96,6 +96,8 @@ pub trait RutabagaComponent {
     fn limina_journal_export(&self, _ctx_id: u32) -> Option<Vec<u8>> {
         None
     }
+    fn limina_journal_unpin(&self, _ctx_id: u32, _key: u64) {}
+
     fn limina_journal_seq(&self, _ctx_id: u32) -> u64 {
         0
     }
@@ -624,6 +626,12 @@ impl Rutabaga {
         self.components
             .get(&self.default_component)
             .and_then(|c| c.limina_journal_export(ctx_id))
+    }
+
+    pub fn limina_journal_unpin(&self, ctx_id: u32, key: u64) {
+        if let Some(c) = self.components.get(&self.default_component) {
+            c.limina_journal_unpin(ctx_id, key);
+        }
     }
 
     pub fn limina_journal_seq(&self, ctx_id: u32) -> u64 {
