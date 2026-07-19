@@ -71,6 +71,12 @@ unsafe extern "C" {
     // returns a malloc'd (id, size) u64-pair array of the context's capturable
     // VkDeviceMemory objects; read/write copy bytes out of / into the memory's
     // host mapping. See virglrenderer.h for capturable + restore-ordering rules.
+    fn virgl_renderer_limina_sync_export(
+        ctx_id: u32,
+        out_buf: *mut *mut c_void,
+        out_size: *mut u64,
+    ) -> i32;
+    fn virgl_renderer_limina_sync_restore(ctx_id: u32, data: *const c_void, size: u64) -> i32;
     fn virgl_renderer_limina_memory_census(
         ctx_id: u32,
         out_pairs: *mut *mut u64,
@@ -599,6 +605,31 @@ impl RutabagaComponent for VirglRenderer {
 
     fn limina_replay_end(&self, ctx_id: u32) -> bool {
         unsafe { virgl_renderer_limina_replay_end(ctx_id) == 0 }
+    }
+
+    fn limina_sync_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
+        let mut buf: *mut c_void = std::ptr::null_mut();
+        let mut size: u64 = 0;
+        // Safe: out-params written only on success; blob is malloc'd by
+        // virglrenderer, freed below.
+        let ret = unsafe { virgl_renderer_limina_sync_export(ctx_id, &mut buf, &mut size) };
+        if ret != 0 || buf.is_null() {
+            return None;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buf as *const u8, size as usize) }.to_vec();
+        unsafe { libc::free(buf) };
+        Some(bytes)
+    }
+
+    fn limina_sync_restore(&self, ctx_id: u32, data: &[u8]) -> bool {
+        unsafe {
+            virgl_renderer_limina_sync_restore(
+                ctx_id,
+                data.as_ptr() as *const c_void,
+                data.len() as u64,
+            ) == 0
+        }
     }
 
     fn limina_memory_census(&self, ctx_id: u32) -> Option<Vec<(u64, u64)>> {
