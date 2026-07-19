@@ -66,6 +66,28 @@ unsafe extern "C" {
         size: u32,
     ) -> i32;
     fn virgl_renderer_limina_replay_end(ctx_id: u32) -> i32;
+
+    // limina M9.3 P2 (virglrenderer patch: device-memory content capture): census
+    // returns a malloc'd (id, size) u64-pair array of the context's capturable
+    // VkDeviceMemory objects; read/write copy bytes out of / into the memory's
+    // host mapping. See virglrenderer.h for capturable + restore-ordering rules.
+    fn virgl_renderer_limina_memory_census(
+        ctx_id: u32,
+        out_pairs: *mut *mut u64,
+        out_count: *mut u32,
+    ) -> i32;
+    fn virgl_renderer_limina_memory_read(
+        ctx_id: u32,
+        mem_id: u64,
+        buf: *mut c_void,
+        size: u64,
+    ) -> i32;
+    fn virgl_renderer_limina_memory_write(
+        ctx_id: u32,
+        mem_id: u64,
+        buf: *const c_void,
+        size: u64,
+    ) -> i32;
 }
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
@@ -577,6 +599,49 @@ impl RutabagaComponent for VirglRenderer {
 
     fn limina_replay_end(&self, ctx_id: u32) -> bool {
         unsafe { virgl_renderer_limina_replay_end(ctx_id) == 0 }
+    }
+
+    fn limina_memory_census(&self, ctx_id: u32) -> Option<Vec<(u64, u64)>> {
+        let mut pairs: *mut u64 = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        // Safe: out-params are written only on success; the pair array is malloc'd
+        // by virglrenderer and owned by us until the libc::free below (NULL with
+        // count 0 is the legitimate empty census).
+        let ret = unsafe { virgl_renderer_limina_memory_census(ctx_id, &mut pairs, &mut count) };
+        if ret != 0 {
+            return None;
+        }
+        if pairs.is_null() {
+            return Some(Vec::new());
+        }
+        let out = unsafe { std::slice::from_raw_parts(pairs, count as usize * 2) }
+            .chunks_exact(2)
+            .map(|p| (p[0], p[1]))
+            .collect();
+        unsafe { libc::free(pairs as *mut c_void) };
+        Some(out)
+    }
+
+    fn limina_memory_read(&self, ctx_id: u32, mem_id: u64, buf: &mut [u8]) -> bool {
+        unsafe {
+            virgl_renderer_limina_memory_read(
+                ctx_id,
+                mem_id,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u64,
+            ) == 0
+        }
+    }
+
+    fn limina_memory_write(&self, ctx_id: u32, mem_id: u64, buf: &[u8]) -> bool {
+        unsafe {
+            virgl_renderer_limina_memory_write(
+                ctx_id,
+                mem_id,
+                buf.as_ptr() as *const c_void,
+                buf.len() as u64,
+            ) == 0
+        }
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
