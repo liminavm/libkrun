@@ -522,6 +522,7 @@ impl GpuSnapshotPayload {
 /// format — see vkr_journal.h in the fork).
 pub struct VkrWireEntry {
     pub seq: u64,
+    pub cmd_type: u32,
     pub klass: u8,
     pub ring_key: u64,
     pub bytes: Vec<u8>,
@@ -543,7 +544,7 @@ pub fn parse_vkr_journal(data: &[u8]) -> Option<Vec<VkrWireEntry>> {
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let seq = c.u64()?;
-        let _cmd_type = c.u32()?;
+        let cmd_type = c.u32()?;
         let klass = *c.take(1)?.first()?;
         c.take(3)?; // pad
         let ring_key = c.u64()?;
@@ -553,6 +554,7 @@ pub fn parse_vkr_journal(data: &[u8]) -> Option<Vec<VkrWireEntry>> {
         c.take(padding)?;
         entries.push(VkrWireEntry {
             seq,
+            cmd_type,
             klass,
             ring_key,
             bytes,

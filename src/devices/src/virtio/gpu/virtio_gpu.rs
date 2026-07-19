@@ -916,6 +916,9 @@ impl VirtioGpu {
         // (context/blob/mapping) leaves guest-visible state missing and fails the replay.
         let mut wire_failed = 0u32;
         let mut op_failed = 0u32;
+        // Per-class drop histogram (klass 0..=8), reported in the completion log so a
+        // failing run says exactly which entry classes it lost.
+        let mut drops_by_klass = [0u32; 9];
         // Feed ctx's wire entries with seq <= fence (0 = none pending). Ring-stream
         // entries go to the target ring's decoder; everything else to the context.
         macro_rules! replay_wire_upto {
@@ -936,6 +939,27 @@ impl VirtioGpu {
                         };
                         if !ok {
                             wire_failed += 1;
+                            *drops_by_klass
+                                .get_mut(e.klass.min(8) as usize)
+                                .unwrap() += 1;
+                            // Class matters: TRANSIENT..NOTED drops are the benign
+                            // stale-reference kind (a retained vkUpdateDescriptorSets /
+                            // vkBind*Memory naming an object destroyed pre-snapshot — its
+                            // write was dangling before and stays unwritten after). A
+                            // dropped RING class (create/destroy/stream) is load-bearing:
+                            // it can skew the ring's command/reply stream and corrupt the
+                            // live session after resume.
+                            if e.klass >= 6 {
+                                warn!(
+                                    "gpu restore: dropped LOAD-BEARING ring entry ctx={} seq={} klass={} cmd={} ring={:#x} size={}",
+                                    $ctx, e.seq, e.klass, e.cmd_type, e.ring_key, e.bytes.len()
+                                );
+                            } else {
+                                debug!(
+                                    "gpu restore: dropped stale wire entry ctx={} seq={} klass={} cmd={} size={}",
+                                    $ctx, e.seq, e.klass, e.cmd_type, e.bytes.len()
+                                );
+                            }
                         }
                         *pos += 1;
                     }
@@ -1075,7 +1099,7 @@ impl VirtioGpu {
         }
         if wire_failed > 0 {
             warn!(
-                "gpu restore: replay complete with {wire_failed} dropped wire entries (stale references)"
+                "gpu restore: replay complete with {wire_failed} dropped wire entries (stale references); drops by class [transient,create,recording,noted,free,pool-reset,ring-create,ring-destroy,ring-stream] = {drops_by_klass:?}"
             );
         } else {
             info!("gpu restore: replay complete (session state re-created)");
