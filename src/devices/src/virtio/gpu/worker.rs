@@ -49,6 +49,12 @@ pub enum WorkerCmd {
     Deactivate,
     /// Tear the worker down (device drop / VMM teardown).
     Shutdown,
+    /// limina M9.3: serialize the GPU re-creation state (rutabaga journal + venus wire
+    /// journals + mapped-blob contents) for the VMM snapshot. Sent with the vCPUs quiesced,
+    /// so no queue traffic races the capture.
+    Snapshot {
+        reply: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+    },
 }
 
 /// How the inner service loop ended.
@@ -82,6 +88,11 @@ pub struct Worker {
     resize_evt: Arc<EventFd>,
     /// The pending resize `(display_id, width, height)`, taken on a `resize_evt` wake.
     resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    /// limina M9.3: a staged GPU snapshot payload ('LGPU'), taken and replayed on the next
+    /// activation. Staged by the restore path; the guest's thaw resets the device (bus
+    /// fallback: reset → features → DRIVER_OK), so replay must run AFTER that reset's
+    /// `reset_session` and before any queue command — i.e. exactly at activation.
+    pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Worker {
@@ -100,6 +111,7 @@ impl Worker {
         events_read: Arc<AtomicU32>,
         resize_evt: Arc<EventFd>,
         resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+        pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
     ) -> Self {
         Self {
             stop_fd,
@@ -116,6 +128,7 @@ impl Worker {
             events_read,
             resize_evt,
             resize_pending,
+            pending_restore,
         }
     }
 
@@ -154,6 +167,12 @@ impl Worker {
                 // A Deactivate while already inactive is a no-op; Shutdown / closed channel ends.
                 Ok(WorkerCmd::Deactivate) => continue,
                 Ok(WorkerCmd::Shutdown) | Err(_) => return,
+                // limina M9.3: a snapshot request can arrive while inactive (unlikely — the
+                // production suspend path snapshots with the device DRIVER_OK — but harmless).
+                Ok(WorkerCmd::Snapshot { reply }) => {
+                    let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
+                    continue;
+                }
             };
 
             // Own each activation's queue eventfds + queues; publish the transport so the
@@ -167,6 +186,19 @@ impl Worker {
                 control_queue: control_queue.clone(),
                 interrupt: interrupt.clone(),
             });
+
+            // limina M9.3: a staged GPU snapshot payload replays NOW — after the thaw
+            // reset's `reset_session` (which would have wiped it) and before the first
+            // queue command (whose venus state it re-creates). The guest kernel is still
+            // mid-thaw at DRIVER_OK, so userspace can't touch mapped blobs yet.
+            let staged = self.pending_restore.lock().unwrap().take();
+            if let Some(data) = staged {
+                if self.gpu_restore(&mut virtio_gpu, &data, &mem) {
+                    info!("gpu worker: staged snapshot replay complete");
+                } else {
+                    warn!("gpu worker: staged snapshot replay failed; guest session will restart");
+                }
+            }
 
             let exit = self.service(
                 &mut virtio_gpu,
@@ -187,6 +219,21 @@ impl Worker {
                 InnerExit::Deactivate => continue,
                 InnerExit::Shutdown => return,
             }
+        }
+    }
+
+    /// limina M9.3: replay a GPU snapshot section into the (fresh) renderer. macOS-only
+    /// mechanism today — the venus/KK stack this exists for; elsewhere report failure so
+    /// the caller falls back to fresh-renderer behavior.
+    fn gpu_restore(&self, virtio_gpu: &mut VirtioGpu, data: &[u8], mem: &GuestMemoryMmap) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            virtio_gpu.restore_gpu_payload(data, &self.shm_region, mem)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (virtio_gpu, data, mem);
+            false
         }
     }
 
@@ -262,6 +309,11 @@ impl Worker {
                     match self.cmd_rx.try_recv() {
                         Ok(WorkerCmd::Deactivate) => return InnerExit::Deactivate,
                         Ok(WorkerCmd::Shutdown) => return InnerExit::Shutdown,
+                        // limina M9.3: snapshot with the transport bound (vCPUs quiesced by
+                        // the caller, so the queues are idle).
+                        Ok(WorkerCmd::Snapshot { reply }) => {
+                            let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
+                        }
                         // An Activate while already active shouldn't happen (the lifecycle is
                         // activate→reset→activate); ignore it. Empty = spurious wake.
                         Ok(WorkerCmd::Activate { .. })
@@ -569,6 +621,9 @@ impl Worker {
                     mem,
                 );
                 if r.is_ok() {
+                    // The vkr wire watermark is the cross-layer replay fence: everything the
+                    // blob depends on (its vkAllocateMemory) is at or below this seq.
+                    let vkr_seq = virtio_gpu.journal_vkr_seq(ctx_id);
                     virtio_gpu.journal_mut().create_blob(
                         ctx_id,
                         resource_id,
@@ -577,6 +632,7 @@ impl Worker {
                         info.blob_id,
                         info.size,
                         backing,
+                        vkr_seq,
                     );
                 }
                 r

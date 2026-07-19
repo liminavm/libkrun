@@ -113,6 +113,9 @@ pub struct Gpu {
     /// The latest pending resize `(display_id, width, height)`; set by the handle, taken by
     /// the worker.
     resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    /// limina M9.3: a staged GPU snapshot payload, set by the restore path and replayed by
+    /// the worker on the next activation (after the guest thaw's device reset).
+    pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Gpu {
@@ -145,6 +148,7 @@ impl Gpu {
             events_read: Arc::new(AtomicU32::new(0)),
             resize_evt: Arc::new(EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?),
             resize_pending: Arc::new(Mutex::new(None)),
+            pending_restore: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -225,6 +229,62 @@ impl Gpu {
         have_used
     }
     */
+}
+
+impl Gpu {
+    /// Spawn the long-lived worker thread (which owns the process-global renderer) if it
+    /// isn't running yet, and return the command channel. Called on first activation, and
+    /// early by the restore path so a GPU snapshot replay can run before the guest does.
+    fn ensure_worker(&mut self) -> &CmdSender<WorkerCmd> {
+        if self.worker_tx.is_none() {
+            let shm_region = match self.shm_region.as_ref() {
+                Some(s) => s.clone(),
+                None => panic!("virtio_gpu: missing SHM region"),
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let active: Arc<Mutex<Option<GpuActivation>>> = Arc::new(Mutex::new(None));
+            let worker = Worker::new(
+                shm_region,
+                self.virgl_flags,
+                self.software_2d,
+                self.worker_stopfd.try_clone().unwrap(),
+                rx,
+                active,
+                #[cfg(target_os = "macos")]
+                self.map_sender.clone(),
+                self.export_table.take(),
+                self.displays.clone(),
+                self.display_backend,
+                self.events_read.clone(),
+                self.resize_evt.clone(),
+                self.resize_pending.clone(),
+                self.pending_restore.clone(),
+            );
+            self.worker_thread = Some(worker.run());
+            self.worker_tx = Some(tx);
+        }
+        self.worker_tx.as_ref().unwrap()
+    }
+
+    /// limina M9.3: ask the worker to serialize the GPU re-creation state (rutabaga journal
+    /// + venus wire journals + mapped-blob contents). Call with the vCPUs quiesced. `None`
+    /// means nothing to save (software-2D, stock guest, or an empty journal).
+    pub fn snapshot_gpu(&self) -> Option<Vec<u8>> {
+        let tx = self.worker_tx.as_ref()?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        tx.send(WorkerCmd::Snapshot { reply: reply_tx }).ok()?;
+        let _ = self.worker_stopfd.write(1);
+        reply_rx.recv().ok().flatten()
+    }
+
+    /// limina M9.3: stage a GPU snapshot payload for replay. The worker replays it at the
+    /// next activation — which on the restore path is the guest thaw's DRIVER_OK, right
+    /// after the thaw reset (which would wipe an earlier replay) and before any queue
+    /// command. Replaying earlier also deadlocks: the blob-mapping messages it emits are
+    /// serviced by a VMM thread that only starts after `build_microvm` returns.
+    pub fn restore_gpu(&mut self, data: Vec<u8>) {
+        *self.pending_restore.lock().unwrap() = Some(data);
+    }
 }
 
 impl VirtioDevice for Gpu {
@@ -316,41 +376,13 @@ impl VirtioDevice for Gpu {
             ActivateError::BadActivate
         })?;
 
-        // Spawn the worker ONCE, on the first activation. It owns the process-global,
-        // thread-bound renderer for the whole VMM lifetime; later activations (driver rebind,
-        // EFI→kernel hand-off, reboot) reuse the same thread+renderer and just rebind transport.
-        // This is the renderer-singleton fix: `virgl_renderer_init` can't be re-run, so we must
-        // never drop+recreate the renderer on reset.
-        let tx = match &self.worker_tx {
-            Some(tx) => tx,
-            None => {
-                let shm_region = match self.shm_region.as_ref() {
-                    Some(s) => s.clone(),
-                    None => panic!("virtio_gpu: missing SHM region"),
-                };
-                let (tx, rx) = std::sync::mpsc::channel();
-                let active: Arc<Mutex<Option<GpuActivation>>> = Arc::new(Mutex::new(None));
-                let worker = Worker::new(
-                    shm_region,
-                    self.virgl_flags,
-                    self.software_2d,
-                    self.worker_stopfd.try_clone().unwrap(),
-                    rx,
-                    active,
-                    #[cfg(target_os = "macos")]
-                    self.map_sender.clone(),
-                    self.export_table.take(),
-                    self.displays.clone(),
-                    self.display_backend,
-                    self.events_read.clone(),
-                    self.resize_evt.clone(),
-                    self.resize_pending.clone(),
-                );
-                self.worker_thread = Some(worker.run());
-                self.worker_tx = Some(tx);
-                self.worker_tx.as_ref().unwrap()
-            }
-        };
+        // Spawn the worker ONCE, on the first activation (or earlier, if a GPU snapshot
+        // replay needed it — see `ensure_worker`). It owns the process-global, thread-bound
+        // renderer for the whole VMM lifetime; later activations (driver rebind, EFI→kernel
+        // hand-off, reboot) reuse the same thread+renderer and just rebind transport.
+        // This is the renderer-singleton fix: `virgl_renderer_init` can't be re-run, so we
+        // must never drop+recreate the renderer on reset.
+        let tx = self.ensure_worker();
 
         // Bind this activation's transport. The worker is in its outer recv() (first activate)
         // or just deactivated, so a plain send wakes it — no stop_fd kick needed here.

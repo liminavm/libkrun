@@ -248,6 +248,11 @@ pub struct Vmm {
     #[cfg(feature = "gpu")]
     gpu_resize_handle: Option<devices::virtio::DisplayResizeHandle>,
 
+    /// limina M9.3: the attached virtio-gpu device itself, for GPU snapshot/replay (the venus
+    /// re-creation journal round-trip with the GPU worker). `None` if no GPU is configured.
+    #[cfg(feature = "gpu")]
+    gpu_device: Option<Arc<Mutex<devices::virtio::Gpu>>>,
+
     /// limina: a handle for pushing balloon targets into the live virtio-balloon device, captured
     /// when the balloon is attached. `None` if no balloon (e.g. the `tee` build).
     balloon_control_handle: Option<devices::virtio::BalloonControlHandle>,
@@ -278,6 +283,29 @@ impl Vmm {
     #[cfg(feature = "gpu")]
     pub fn set_gpu_resize_handle(&mut self, handle: devices::virtio::DisplayResizeHandle) {
         self.gpu_resize_handle = Some(handle);
+    }
+
+    /// limina M9.3: record the GPU device at attach time, for snapshot/replay.
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu_device(&mut self, gpu: Arc<Mutex<devices::virtio::Gpu>>) {
+        self.gpu_device = Some(gpu);
+    }
+
+    /// limina M9.3 restore: stage a v5 GPU re-creation section on the GPU device. The
+    /// worker replays it at the guest thaw's re-activation (after the thaw reset, before
+    /// any queue command). Returns false only if the VM has no GPU device.
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    pub fn restore_gpu(&self, data: Vec<u8>) -> bool {
+        match &self.gpu_device {
+            Some(gpu) => {
+                gpu.lock().unwrap().restore_gpu(data);
+                true
+            }
+            None => {
+                warn!("restore: snapshot has a GPU section but this VM has no GPU device");
+                false
+            }
+        }
     }
 
     /// limina: the balloon control handle for the live virtio-balloon (if attached). limina-vmm
@@ -543,6 +571,19 @@ impl Vmm {
             firmware: self.arch_memory_info.ram_start_addr
                 == arch::aarch64::layout::DRAM_MEM_START_EFI,
         };
+        // M9.3 venus snapshot-replay: the GPU worker serializes its re-creation state (rutabaga
+        // journal + venus wire journals + mapped-blob contents). vCPUs are parked, so no queue
+        // traffic races the capture. None = nothing to replay (software-2D or stock guest).
+        #[cfg(feature = "gpu")]
+        let gpu = self
+            .gpu_device
+            .as_ref()
+            .and_then(|g| g.lock().unwrap().snapshot_gpu());
+        #[cfg(not(feature = "gpu"))]
+        let gpu: Option<Vec<u8>> = None;
+        if let Some(g) = &gpu {
+            info!("snapshot: GPU re-creation section is {} bytes", g.len());
+        }
         let ram = self.dump_ram();
         let snap = snapshot::Snapshot {
             vcpus,
@@ -550,6 +591,7 @@ impl Vmm {
             gpio,
             layout,
             devices,
+            gpu,
             ram,
         };
         snapshot::write(path, &snap).map_err(Error::SnapshotIo)?;
