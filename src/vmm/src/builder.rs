@@ -1186,8 +1186,14 @@ pub fn build_microvm(
             Arc<crate::vstate::RestoreGate>,
         )>,
     ) = if let Some(ref path) = restore_from {
+        let t0 = std::time::Instant::now();
         let mut snap = crate::snapshot::read(path)
             .map_err(|e| StartMicrovmError::Internal(crate::Error::SnapshotIo(e)))?;
+        info!(
+            "restore: read + validated the snapshot file ({} MiB) in {:.1}s",
+            std::fs::metadata(path).map(|m| m.len() >> 20).unwrap_or(0),
+            t0.elapsed().as_secs_f32()
+        );
         if snap.head.vcpus.len() != vcpus.len() {
             // Snapshot vCPU count must match this boot's --cpus, or the register state is nonsense.
             return Err(StartMicrovmError::Internal(crate::Error::Snapshot));

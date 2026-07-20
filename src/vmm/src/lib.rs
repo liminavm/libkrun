@@ -565,15 +565,24 @@ impl Vmm {
         // vCPUs are parked, so no new fences arrive. None = nothing to replay (software-2D or
         // stock guest).
         #[cfg(feature = "gpu")]
-        let gpu = self
-            .gpu_device
-            .as_ref()
-            .and_then(|g| g.lock().unwrap().snapshot_gpu());
+        let gpu = {
+            let t0 = std::time::Instant::now();
+            let gpu = self
+                .gpu_device
+                .as_ref()
+                .and_then(|g| g.lock().unwrap().snapshot_gpu());
+            if let Some(g) = &gpu {
+                info!(
+                    "snapshot: GPU re-creation section is {} bytes (fence drain + capture took \
+                     {:.1}s)",
+                    g.len(),
+                    t0.elapsed().as_secs_f32()
+                );
+            }
+            gpu
+        };
         #[cfg(not(feature = "gpu"))]
         let gpu: Option<Vec<u8>> = None;
-        if let Some(g) = &gpu {
-            info!("snapshot: GPU re-creation section is {} bytes", g.len());
-        }
         // GIC saved after the fence drain so it carries any line the drain-time completions
         // raised.
         let gic = hvf::save_gic_state().map_err(|_| Error::Snapshot)?;

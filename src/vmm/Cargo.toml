@@ -24,7 +24,11 @@ vhost-user = ["devices/vhost-user"]
 crossbeam-channel = ">=0.5.15"
 flate2 = "1.0.35"
 libc = ">=0.2.39"
-lz4_flex = "0.11"
+# default-features off drops safe-encode/safe-decode: the checked (iterator-based) codec paths
+# are 3-8x slower and dominated the M9 snapshot save (the serial GPU-section compress alone ran
+# ~100 MB/s). The unchecked implementation is the crate's mainline fast path; frames stay
+# CRC-verified at apply time, so corruption is still caught.
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
 log = "0.4.0"
 vm-memory = { version = "0.17.0", default-features = false, features = ["backend-mmap"] }
