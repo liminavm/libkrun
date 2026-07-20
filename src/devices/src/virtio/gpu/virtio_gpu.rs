@@ -915,7 +915,11 @@ impl VirtioGpu {
             }
         }
 
-        let content_bytes: usize = payload.memory_contents.iter().map(|(_, _, b)| b.len()).sum();
+        let content_bytes: usize = payload
+            .memory_contents
+            .iter()
+            .map(|(_, _, b)| b.len())
+            .sum();
         info!(
             "gpu snapshot: {} ops, {} vkr journals, {} blob contents, {} memory contents ({} MiB)",
             payload.ops.len(),
@@ -948,7 +952,7 @@ impl VirtioGpu {
             return false;
         };
         let GpuSnapshotPayload {
-            ops,
+            mut ops,
             vkr_journals,
             blob_contents,
             memory_contents,
@@ -1028,7 +1032,17 @@ impl VirtioGpu {
             };
         }
 
-        for entry in &ops {
+        for entry in &mut ops {
+            // GENERATION REBASE (the 2nd-resume disk of the journal): a CreateBlob's
+            // vkr_seq fence is meaningful only against the wire journal that recorded it.
+            // The fresh context re-records the replayed wire commands from seq 1, so the
+            // fence must be rewritten to the NEW journal's watermark at the exact point
+            // its old fence was satisfied — otherwise the next generation's merge is
+            // cross-epoch garbage (the first old fence, ~1M, drains the entire new wire
+            // journal, and every later import replays before its exporter blob exists:
+            // the observed fd_type=-999 cascade + KK descriptor assert). Set in the
+            // CreateBlob arm below; carrying it as a local keeps entry.op's borrow short.
+            let mut rebased_fence: Option<u64> = None;
             match &entry.op {
                 GpuJournalOp::CtxCreate {
                     ctx_id,
@@ -1098,6 +1112,13 @@ impl VirtioGpu {
                         .iter()
                         .map(|(a, l)| (GuestAddress(*a), *l))
                         .collect();
+                    // Rebase the fence into the new journal's epoch (see the loop head):
+                    // journal_vkr_seq is the new journal's last-assigned seq — everything
+                    // this fence fed has just re-recorded, so this IS the old fence's
+                    // position translated. Venus contexts only (others have no journal).
+                    if wire.contains_key(ctx_id) {
+                        rebased_fence = Some(self.journal_vkr_seq(*ctx_id));
+                    }
                     if self
                         .resource_create_blob(*ctx_id, *resource_id, create, vecs, mem)
                         .is_err()
@@ -1147,6 +1168,9 @@ impl VirtioGpu {
                         warn!("gpu restore: SET_SCANOUT_BLOB scanout {scanout_id} failed");
                     }
                 }
+            }
+            if let Some(fence) = rebased_fence {
+                entry.vkr_seq = fence;
             }
         }
 
