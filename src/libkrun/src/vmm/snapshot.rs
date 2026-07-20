@@ -9,10 +9,15 @@
 
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::sync_channel;
+use std::sync::Mutex;
 
 use devices::legacy::GpioState;
 use hvf::VcpuState;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 const MAGIC: &[u8; 8] = b"LIMINAS1";
 // v2 adds the legacy-device (PL061 GPIO) register section after the GIC blob (M9.2 restore wake).
@@ -28,12 +33,38 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // journal + per-context venus wire journals + mapped-blob contents, serialized by the GPU worker
 // ('LGPU' payload). Replayed into the fresh renderer before the guest resumes so the guest's
 // surviving venus world-view finds its host objects again instead of a dead ring.
-const VERSION: u32 = 5;
+// v6 (M9.4 snapshot speed) replaces the raw whole-RAM section + trailing whole-file CRC with:
+// a CRC32 over the head (everything before the RAM section), then per-region CHUNKED FRAMES —
+// all-zero chunks become data-less hole frames (a ballooned/idle guest is mostly zeros), the rest
+// are lz4 block frames (or raw, if lz4 would grow them), each with its own CRC32 over the stored
+// bytes. Save streams frames from a worker pool reading guest memory directly (no whole-RAM copy —
+// the old path transiently held ~2× guest RAM and CRC'd ~9 GB serially, ~54 s for an 8 GiB guest);
+// restore decompresses frames back into guest memory in parallel. Same fail-closed stance: bad
+// magic/version, a head CRC mismatch, or any frame CRC/shape mismatch is a hard error.
+const VERSION: u32 = 6;
 
-/// One guest-RAM region: its guest-physical base and raw bytes.
-pub struct RamRegion {
-    pub gpa: u64,
-    pub data: Vec<u8>,
+/// v6 RAM chunk size: 4 MiB — large enough to amortize per-frame overhead, small enough to spread
+/// across the worker pool and bound per-worker scratch memory.
+const CHUNK_SIZE: usize = 4 << 20;
+/// Frame kinds. ZERO carries no bytes (restore writes zeros); LZ4 is an lz4 block of the chunk;
+/// RAW is the chunk verbatim (only when lz4 would not shrink it).
+const FRAME_ZERO: u8 = 0;
+const FRAME_LZ4: u8 = 1;
+const FRAME_RAW: u8 = 2;
+
+/// Worker-pool width for the RAM save/restore paths: leave headroom for the VMM's own threads,
+/// and past ~8 workers the memcpy/lz4 pipeline is memory-bandwidth-bound anyway.
+fn ram_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).clamp(2, 8))
+        .unwrap_or(4)
+}
+
+fn is_all_zero(b: &[u8]) -> bool {
+    // u128 lanes; the unaligned head/tail are byte-checked. (A byte-wise `all()` over 4 MiB is the
+    // hot path of the whole save — this vectorizes, plain bytes don't reliably.)
+    let (head, mid, tail) = unsafe { b.align_to::<u128>() };
+    head.iter().all(|&x| x == 0) && mid.iter().all(|&x| x == 0) && tail.iter().all(|&x| x == 0)
 }
 
 /// Memory-layout identity of the captured VM. Restore fails closed unless the fresh worker computes an
@@ -77,8 +108,9 @@ pub struct DeviceTransportState {
     pub queues: Vec<QueueRegs>,
 }
 
-/// The full deserialized contents of a snapshot file.
-pub struct Snapshot {
+/// Everything in a snapshot except the guest RAM (v6: RAM is streamed separately as chunked
+/// frames — see [`write_streaming`] / [`SnapshotFile::apply_ram`]).
+pub struct SnapshotHead {
     /// Per-vCPU architectural state, in vCPU-index order.
     pub vcpus: Vec<VcpuState>,
     /// The VM-wide in-kernel GICv3 distributor/redistributor blob.
@@ -93,8 +125,6 @@ pub struct Snapshot {
     /// v5: the GPU re-creation section ('LGPU' payload from the GPU worker), if the VM had a
     /// venus renderer with recorded state. `None` = nothing to replay (software-2D / stock guest).
     pub gpu: Option<Vec<u8>>,
-    /// Guest RAM regions (SHM window excluded by the caller).
-    pub ram: Vec<RamRegion>,
 }
 
 /// CRC-32 (IEEE 802.3, reflected) — a small dependency-free integrity check over the payload.
@@ -176,18 +206,17 @@ fn encode_vcpu(v: &mut Vec<u8>, s: &VcpuState) {
     v.push(s.pending_fiq as u8);
 }
 
-/// Serialize a snapshot to `path` (payload + trailing CRC32).
-pub fn write(path: &Path, snap: &Snapshot) -> io::Result<()> {
+fn encode_head(head: &SnapshotHead) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(MAGIC);
     put_u32(&mut v, VERSION);
-    put_u32(&mut v, snap.vcpus.len() as u32);
-    for s in &snap.vcpus {
+    put_u32(&mut v, head.vcpus.len() as u32);
+    for s in &head.vcpus {
         encode_vcpu(&mut v, s);
     }
-    put_bytes(&mut v, &snap.gic);
+    put_bytes(&mut v, &head.gic);
     // Legacy-device (PL061 GPIO) register section: a presence byte, then the 8 registers.
-    match &snap.gpio {
+    match &head.gpio {
         Some(g) => {
             v.push(1);
             for x in [
@@ -199,13 +228,13 @@ pub fn write(path: &Path, snap: &Snapshot) -> io::Result<()> {
         None => v.push(0),
     }
     // v4 memory-layout identity header.
-    put_u64(&mut v, snap.layout.ram_start);
-    put_u64(&mut v, snap.layout.ram_last);
-    put_u64(&mut v, snap.layout.shm_start);
-    v.push(snap.layout.firmware as u8);
+    put_u64(&mut v, head.layout.ram_start);
+    put_u64(&mut v, head.layout.ram_last);
+    put_u64(&mut v, head.layout.shm_start);
+    v.push(head.layout.firmware as u8);
     // v4 per-device virtio-transport section.
-    put_u32(&mut v, snap.devices.len() as u32);
-    for d in &snap.devices {
+    put_u32(&mut v, head.devices.len() as u32);
+    for d in &head.devices {
         put_u32(&mut v, d.type_id);
         put_u64(&mut v, d.mmio_base);
         put_u32(&mut v, d.irq);
@@ -223,21 +252,155 @@ pub fn write(path: &Path, snap: &Snapshot) -> io::Result<()> {
         }
     }
     // v5 GPU re-creation section: presence byte + bytes.
-    match &snap.gpu {
+    match &head.gpu {
         Some(g) => {
             v.push(1);
             put_bytes(&mut v, g);
         }
         None => v.push(0),
     }
-    put_u32(&mut v, snap.ram.len() as u32);
-    for r in &snap.ram {
-        put_u64(&mut v, r.gpa);
-        put_bytes(&mut v, &r.data);
+    v
+}
+
+/// Save-side counters, for the operator-visible summary log line.
+#[derive(Default)]
+pub struct SaveStats {
+    /// Total guest-RAM bytes covered (the uncompressed size).
+    pub ram_bytes: u64,
+    /// Bytes actually written to the file.
+    pub written_bytes: u64,
+    pub zero_frames: u64,
+    pub lz4_frames: u64,
+    pub raw_frames: u64,
+}
+
+/// One produced RAM frame, in flight from a compressor worker to the writer.
+struct Frame {
+    off: u64,
+    kind: u8,
+    crc: u32,
+    data: Vec<u8>,
+}
+
+/// Serialize a snapshot to `path`: the head (+ its CRC32), then each RAM region as chunked frames
+/// produced by a worker pool reading `mem` directly — no whole-RAM intermediate copy. `regions` is
+/// the caller's (gpa, len) list (the GPU/fs SHM window already excluded). vCPUs must be parked:
+/// the workers read live guest memory.
+pub fn write_streaming(
+    path: &Path,
+    head: &SnapshotHead,
+    mem: &GuestMemoryMmap,
+    regions: &[(u64, u64)],
+) -> io::Result<SaveStats> {
+    let file = fs::File::create(path)?;
+    let mut out = io::BufWriter::with_capacity(4 << 20, file);
+    let mut hv = encode_head(head);
+    let hcrc = crc32(&hv);
+    put_u32(&mut hv, hcrc);
+    put_u32(&mut hv, regions.len() as u32);
+    out.write_all(&hv)?;
+
+    let mut stats = SaveStats {
+        written_bytes: hv.len() as u64,
+        ..Default::default()
+    };
+    let workers = ram_workers();
+    for &(gpa, len) in regions {
+        stats.ram_bytes += len;
+        let nchunks = len.div_ceil(CHUNK_SIZE as u64) as usize;
+        let mut rh = Vec::new();
+        put_u64(&mut rh, gpa);
+        put_u64(&mut rh, len);
+        put_u32(&mut rh, CHUNK_SIZE as u32);
+        put_u32(&mut rh, nchunks as u32);
+        out.write_all(&rh)?;
+        stats.written_bytes += rh.len() as u64;
+
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| -> io::Result<()> {
+            let (tx, rx) = sync_channel::<io::Result<Frame>>(workers * 4);
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let next = &next;
+                s.spawn(move || {
+                    let mut inbuf = vec![0u8; CHUNK_SIZE];
+                    let mut outbuf =
+                        vec![0u8; lz4_flex::block::get_maximum_output_size(CHUNK_SIZE)];
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= nchunks {
+                            return;
+                        }
+                        let off = idx as u64 * CHUNK_SIZE as u64;
+                        let clen = (len - off).min(CHUNK_SIZE as u64) as usize;
+                        let res = (|| -> io::Result<Frame> {
+                            mem.read_slice(&mut inbuf[..clen], GuestAddress(gpa + off))
+                                .map_err(|e| {
+                                    io::Error::other(format!(
+                                        "snapshot: reading RAM at 0x{:x}: {e:?}",
+                                        gpa + off
+                                    ))
+                                })?;
+                            if is_all_zero(&inbuf[..clen]) {
+                                return Ok(Frame {
+                                    off,
+                                    kind: FRAME_ZERO,
+                                    crc: 0,
+                                    data: Vec::new(),
+                                });
+                            }
+                            let n = lz4_flex::block::compress_into(&inbuf[..clen], &mut outbuf)
+                                .map_err(|e| io::Error::other(format!("snapshot: lz4: {e}")))?;
+                            let (kind, data) = if n < clen {
+                                (FRAME_LZ4, outbuf[..n].to_vec())
+                            } else {
+                                (FRAME_RAW, inbuf[..clen].to_vec())
+                            };
+                            let crc = crc32(&data);
+                            Ok(Frame {
+                                off,
+                                kind,
+                                crc,
+                                data,
+                            })
+                        })();
+                        let failed = res.is_err();
+                        if tx.send(res).is_err() || failed {
+                            return; // writer gone (error abort), or our own error is now delivered
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            // Frames arrive in completion order; each carries its offset, so order is immaterial.
+            for _ in 0..nchunks {
+                let frame = rx
+                    .recv()
+                    .map_err(|_| io::Error::other("snapshot: compressor workers died"))??;
+                let mut fh = Vec::with_capacity(21);
+                put_u64(&mut fh, frame.off);
+                fh.push(frame.kind);
+                match frame.kind {
+                    FRAME_ZERO => stats.zero_frames += 1,
+                    _ => {
+                        put_u32(&mut fh, frame.crc);
+                        put_u64(&mut fh, frame.data.len() as u64);
+                        if frame.kind == FRAME_LZ4 {
+                            stats.lz4_frames += 1;
+                        } else {
+                            stats.raw_frames += 1;
+                        }
+                    }
+                }
+                out.write_all(&fh)?;
+                out.write_all(&frame.data)?;
+                stats.written_bytes += (fh.len() + frame.data.len()) as u64;
+            }
+            Ok(())
+        })?;
     }
-    let crc = crc32(&v);
-    put_u32(&mut v, crc);
-    fs::write(path, &v)
+    out.flush()?;
+    Ok(stats)
 }
 
 // --- decode ---------------------------------------------------------------------------------
@@ -327,19 +490,173 @@ fn decode_vcpu(r: &mut Reader) -> io::Result<VcpuState> {
     })
 }
 
-/// Read + verify a snapshot from `path`. Fails closed on a bad magic, version, or CRC.
-pub fn read(path: &Path) -> io::Result<Snapshot> {
+/// A parsed-and-verified snapshot: the deserialized head plus the raw file, from which
+/// [`Self::apply_ram`] later streams the RAM frames straight into guest memory.
+pub struct SnapshotFile {
+    pub head: SnapshotHead,
+    raw: Vec<u8>,
+    /// Byte offset of the RAM section (the u32 region count) within `raw`.
+    ram_off: usize,
+}
+
+/// Restore-side counters, for the operator-visible summary log line.
+#[derive(Default)]
+pub struct ApplyStats {
+    /// Total guest-RAM bytes reconstructed (holes included).
+    pub ram_bytes: u64,
+    pub zero_frames: u64,
+    pub data_frames: u64,
+}
+
+/// One parsed RAM frame, referencing its stored bytes inside `SnapshotFile::raw`.
+struct FrameRef {
+    gpa: u64,
+    ulen: usize,
+    kind: u8,
+    crc: u32,
+    data_off: usize,
+    data_len: usize,
+}
+
+impl SnapshotFile {
+    /// Decompress every RAM frame into `mem` (holes are written as zeros — the fresh worker
+    /// already wrote a boot payload + FDT into RAM, which the snapshot must fully overwrite).
+    /// Parallel across a worker pool; frames target disjoint ranges. Fails closed on any frame
+    /// CRC/shape mismatch or an out-of-range write.
+    pub fn apply_ram(&self, mem: &GuestMemoryMmap) -> io::Result<ApplyStats> {
+        let mut r = Reader {
+            buf: &self.raw,
+            pos: self.ram_off,
+        };
+        let mut stats = ApplyStats::default();
+        let region_count = r.u32()? as usize;
+        let mut frames: Vec<FrameRef> = Vec::new();
+        let mut max_chunk = 0usize;
+        for _ in 0..region_count {
+            let gpa = r.u64()?;
+            let len = r.u64()?;
+            let chunk = r.u32()? as u64;
+            let nframes = r.u32()? as usize;
+            if chunk == 0 {
+                return Err(corrupt("zero chunk size"));
+            }
+            if nframes as u64 != len.div_ceil(chunk) {
+                return Err(corrupt("frame count does not cover the region"));
+            }
+            stats.ram_bytes += len;
+            max_chunk = max_chunk.max(chunk as usize);
+            for _ in 0..nframes {
+                let off = r.u64()?;
+                let kind = r.u8()?;
+                if off >= len || off % chunk != 0 {
+                    return Err(corrupt("frame offset out of range"));
+                }
+                let ulen = (len - off).min(chunk) as usize;
+                let (crc, data_off, data_len) = match kind {
+                    FRAME_ZERO => (0, 0, 0),
+                    FRAME_LZ4 | FRAME_RAW => {
+                        let crc = r.u32()?;
+                        let dlen = r.u64()? as usize;
+                        let start = r.pos;
+                        r.take(dlen)?;
+                        (crc, start, dlen)
+                    }
+                    _ => return Err(corrupt("bad frame kind")),
+                };
+                frames.push(FrameRef {
+                    gpa: gpa + off,
+                    ulen,
+                    kind,
+                    crc,
+                    data_off,
+                    data_len,
+                });
+            }
+        }
+        if r.pos != self.raw.len() {
+            return Err(corrupt("trailing garbage after RAM section"));
+        }
+        stats.zero_frames = frames.iter().filter(|f| f.kind == FRAME_ZERO).count() as u64;
+        stats.data_frames = frames.len() as u64 - stats.zero_frames;
+
+        let next = AtomicUsize::new(0);
+        let first_err: Mutex<Option<io::Error>> = Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..ram_workers() {
+                let next = &next;
+                let first_err = &first_err;
+                let frames = &frames;
+                let raw = &self.raw;
+                s.spawn(move || {
+                    let mut outbuf = vec![0u8; max_chunk];
+                    let zeros = vec![0u8; max_chunk];
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= frames.len() || first_err.lock().unwrap().is_some() {
+                            return;
+                        }
+                        let f = &frames[idx];
+                        let res = (|| -> io::Result<()> {
+                            let write = |buf: &[u8]| {
+                                mem.write_slice(buf, GuestAddress(f.gpa)).map_err(|e| {
+                                    io::Error::other(format!(
+                                        "snapshot: writing RAM at 0x{:x}: {e:?}",
+                                        f.gpa
+                                    ))
+                                })
+                            };
+                            match f.kind {
+                                FRAME_ZERO => write(&zeros[..f.ulen]),
+                                kind => {
+                                    let data = &raw[f.data_off..f.data_off + f.data_len];
+                                    if crc32(data) != f.crc {
+                                        return Err(corrupt("frame CRC mismatch"));
+                                    }
+                                    if kind == FRAME_RAW {
+                                        if data.len() != f.ulen {
+                                            return Err(corrupt("raw frame length mismatch"));
+                                        }
+                                        write(data)
+                                    } else {
+                                        let n = lz4_flex::block::decompress_into(
+                                            data,
+                                            &mut outbuf[..f.ulen],
+                                        )
+                                        .map_err(|e| {
+                                            corrupt(&format!("frame decompress failed: {e}"))
+                                        })?;
+                                        if n != f.ulen {
+                                            return Err(corrupt("frame decompressed size mismatch"));
+                                        }
+                                        write(&outbuf[..f.ulen])
+                                    }
+                                }
+                            }
+                        })();
+                        if let Err(e) = res {
+                            first_err.lock().unwrap().get_or_insert(e);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        match first_err.into_inner().unwrap() {
+            Some(e) => Err(e),
+            None => Ok(stats),
+        }
+    }
+}
+
+/// Read + verify a snapshot's head from `path` (magic, version, head CRC). The RAM frames are
+/// verified per-frame when [`SnapshotFile::apply_ram`] runs.
+pub fn read(path: &Path) -> io::Result<SnapshotFile> {
     let raw = fs::read(path)?;
-    if raw.len() < 12 {
+    if raw.len() < 16 {
         return Err(corrupt("too small"));
     }
-    let (payload, crc_bytes) = raw.split_at(raw.len() - 4);
-    let stored = u32::from_le_bytes(crc_bytes.try_into().unwrap());
-    if crc32(payload) != stored {
-        return Err(corrupt("CRC mismatch"));
-    }
     let mut r = Reader {
-        buf: payload,
+        buf: &raw,
         pos: 0,
     };
     if r.take(8)? != MAGIC {
@@ -424,21 +741,24 @@ pub fn read(path: &Path) -> io::Result<Snapshot> {
         1 => Some(r.bytes()?),
         _ => return Err(corrupt("bad gpu presence byte")),
     };
-    let ram_count = r.u32()? as usize;
-    let mut ram = Vec::with_capacity(ram_count);
-    for _ in 0..ram_count {
-        let gpa = r.u64()?;
-        let data = r.bytes()?;
-        ram.push(RamRegion { gpa, data });
+    // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
+    let head_end = r.pos;
+    let stored = r.u32()?;
+    if crc32(&raw[..head_end]) != stored {
+        return Err(corrupt("head CRC mismatch"));
     }
-    Ok(Snapshot {
-        vcpus,
-        gic,
-        gpio,
-        layout,
-        devices,
-        gpu,
-        ram,
+    let ram_off = r.pos;
+    Ok(SnapshotFile {
+        head: SnapshotHead {
+            vcpus,
+            gic,
+            gpio,
+            layout,
+            devices,
+            gpu,
+        },
+        raw,
+        ram_off,
     })
 }
 
@@ -500,9 +820,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snapshot_file_round_trips() {
-        let snap = Snapshot {
+    /// Two-region test memory: 8 MiB at 0x4000_0000 and 5 MiB at 0x8000_0000 (a non-chunk-multiple
+    /// tail, so the short-final-frame path is exercised).
+    const REGION_A: (u64, u64) = (0x4000_0000, 8 << 20);
+    const REGION_B: (u64, u64) = (0x8000_0000, 5 << 20);
+
+    fn test_mem() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(REGION_A.0), REGION_A.1 as usize),
+            (GuestAddress(REGION_B.0), REGION_B.1 as usize),
+        ])
+        .expect("test guest memory")
+    }
+
+    /// Fill the test memory with: a whole-chunk hole (zeros), a compressible pattern, and
+    /// LCG pseudorandom bytes (incompressible → exercises the RAW frame path).
+    fn fill_test_mem(mem: &GuestMemoryMmap) {
+        // Region A: first 4 MiB stay zero (a hole frame), second 4 MiB compressible.
+        let compressible: Vec<u8> = (0..=255u8).cycle().take(4 << 20).collect();
+        mem.write_slice(&compressible, GuestAddress(REGION_A.0 + (4 << 20)))
+            .unwrap();
+        // Region B: 5 MiB of LCG noise.
+        let mut x = 0x12345678u64;
+        let noise: Vec<u8> = (0..(5 << 20))
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (x >> 33) as u8
+            })
+            .collect();
+        mem.write_slice(&noise, GuestAddress(REGION_B.0)).unwrap();
+    }
+
+    fn read_back(mem: &GuestMemoryMmap, (gpa, len): (u64, u64)) -> Vec<u8> {
+        let mut buf = vec![0u8; len as usize];
+        mem.read_slice(&mut buf, GuestAddress(gpa)).unwrap();
+        buf
+    }
+
+    fn sample_head() -> SnapshotHead {
+        SnapshotHead {
             vcpus: vec![sample_vcpu(1), sample_vcpu(2)],
             gic: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x11],
             gpio: Some(GpioState {
@@ -517,68 +873,84 @@ mod tests {
             }),
             layout: sample_layout(),
             devices: vec![sample_gpu_device()],
-            gpu: None,
-            ram: vec![
-                RamRegion {
-                    gpa: 0x4000_0000,
-                    data: vec![7u8; 4096],
-                },
-                RamRegion {
-                    gpa: 0x8000_0000,
-                    data: (0..=255u8).cycle().take(9000).collect(),
-                },
-            ],
-        };
+            gpu: Some(vec![0x4c, 0x47, 0x50, 0x55, 9, 9]),
+        }
+    }
+
+    fn write_sample(path: &Path) -> (SaveStats, Vec<u8>, Vec<u8>) {
+        let mem = test_mem();
+        fill_test_mem(&mem);
+        let stats = write_streaming(path, &sample_head(), &mem, &[REGION_A, REGION_B])
+            .expect("write_streaming");
+        (stats, read_back(&mem, REGION_A), read_back(&mem, REGION_B))
+    }
+
+    #[test]
+    fn snapshot_file_round_trips() {
         let path =
             std::env::temp_dir().join(format!("limina-snap-test-{}.bin", std::process::id()));
-        write(&path, &snap).expect("write");
-        let got = read(&path).expect("read");
-        let _ = fs::remove_file(&path);
+        let (stats, want_a, want_b) = write_sample(&path);
+        assert_eq!(stats.ram_bytes, REGION_A.1 + REGION_B.1);
+        assert!(stats.zero_frames >= 1, "the zeroed chunk must become a hole");
+        assert!(stats.lz4_frames >= 1, "the pattern chunk must compress");
+        // The hole + compression must shrink the file well below the raw RAM size.
+        assert!(stats.written_bytes < stats.ram_bytes);
 
-        assert_eq!(got.vcpus.len(), 2);
-        assert_eq!(got.vcpus[0].x, snap.vcpus[0].x);
-        assert_eq!(got.vcpus[1].q, snap.vcpus[1].q);
-        assert_eq!(got.vcpus[0].sysregs, snap.vcpus[0].sysregs);
-        assert_eq!(got.vcpus[1].icc, snap.vcpus[1].icc);
-        assert_eq!(got.vcpus[0].pending_irq, snap.vcpus[0].pending_irq);
-        assert_eq!(got.gic, snap.gic);
-        let gpio = got.gpio.expect("gpio present");
+        let got = read(&path).expect("read");
+        let head = &got.head;
+        let want = sample_head();
+        assert_eq!(head.vcpus.len(), 2);
+        assert_eq!(head.vcpus[0].x, want.vcpus[0].x);
+        assert_eq!(head.vcpus[1].q, want.vcpus[1].q);
+        assert_eq!(head.vcpus[0].sysregs, want.vcpus[0].sysregs);
+        assert_eq!(head.vcpus[1].icc, want.vcpus[1].icc);
+        assert_eq!(head.vcpus[0].pending_irq, want.vcpus[0].pending_irq);
+        assert_eq!(head.gic, want.gic);
+        let gpio = head.gpio.as_ref().expect("gpio present");
         assert_eq!(gpio.im, 0x78);
         assert_eq!(gpio.istate, 0x40);
         assert_eq!(gpio.data, 0x40);
-        // v4: layout identity + device-transport section round-trip byte-for-byte.
-        assert_eq!(got.layout, snap.layout);
-        assert_eq!(got.devices, snap.devices);
-        assert_eq!(got.devices[0].queues[0].avail, 0x1_2340_0400);
-        assert_eq!(got.ram.len(), 2);
-        assert_eq!(got.ram[0].gpa, 0x4000_0000);
-        assert_eq!(got.ram[1].data, snap.ram[1].data);
+        assert_eq!(head.layout, want.layout);
+        assert_eq!(head.devices, want.devices);
+        assert_eq!(head.devices[0].queues[0].avail, 0x1_2340_0400);
+        assert_eq!(head.gpu, want.gpu);
+
+        // Restore into memory pre-filled with garbage: data frames AND holes must both overwrite.
+        let mem2 = test_mem();
+        let junk = vec![0xAAu8; REGION_A.1 as usize];
+        mem2.write_slice(&junk, GuestAddress(REGION_A.0)).unwrap();
+        mem2.write_slice(&junk[..REGION_B.1 as usize], GuestAddress(REGION_B.0))
+            .unwrap();
+        let astats = got.apply_ram(&mem2).expect("apply_ram");
+        let _ = fs::remove_file(&path);
+        assert_eq!(astats.ram_bytes, REGION_A.1 + REGION_B.1);
+        assert!(astats.zero_frames >= 1);
+        assert_eq!(read_back(&mem2, REGION_A), want_a);
+        assert_eq!(read_back(&mem2, REGION_B), want_b);
     }
 
     #[test]
     fn v4_device_transport_section_survives_no_devices() {
         // The common case (no sticky device) must encode an empty section and read back empty — not
         // desync the stream. Also pins the layout header round-trip in isolation.
-        let snap = Snapshot {
+        let head = SnapshotHead {
             vcpus: vec![sample_vcpu(3)],
             gic: vec![1, 2, 3, 4],
             gpio: None,
             layout: sample_layout(),
             devices: vec![],
             gpu: None,
-            ram: vec![RamRegion {
-                gpa: 0x4000_0000,
-                data: vec![9u8; 64],
-            }],
         };
+        let mem = test_mem();
         let path =
             std::env::temp_dir().join(format!("limina-snap-v4-empty-{}.bin", std::process::id()));
-        write(&path, &snap).expect("write");
+        write_streaming(&path, &head, &mem, &[REGION_A]).expect("write");
         let got = read(&path).expect("read");
         let _ = fs::remove_file(&path);
-        assert!(got.devices.is_empty());
-        assert_eq!(got.layout, sample_layout());
-        assert_eq!(got.ram[0].data, vec![9u8; 64]);
+        assert!(got.head.devices.is_empty());
+        assert!(got.head.gpio.is_none());
+        assert!(got.head.gpu.is_none());
+        assert_eq!(got.head.layout, sample_layout());
     }
 
     #[test]
@@ -608,26 +980,57 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_corruption() {
-        let snap = Snapshot {
-            vcpus: vec![sample_vcpu(9)],
-            gic: vec![1, 2, 3],
-            gpio: None,
-            layout: sample_layout(),
-            devices: vec![],
-            gpu: None,
-            ram: vec![],
-        };
-        let path =
-            std::env::temp_dir().join(format!("limina-snap-corrupt-{}.bin", std::process::id()));
-        write(&path, &snap).expect("write");
-        // Flip a payload byte; the trailing CRC must catch it.
+    fn snapshot_rejects_head_corruption() {
+        let path = std::env::temp_dir().join(format!(
+            "limina-snap-head-corrupt-{}.bin",
+            std::process::id()
+        ));
+        let _ = write_sample(&path);
+        // Flip a head byte (offset 12 is inside the vCPU section); the head CRC must catch it.
         let mut raw = fs::read(&path).unwrap();
         raw[12] ^= 0xff;
         fs::write(&path, &raw).unwrap();
         let err = read(&path)
             .err()
-            .expect("corrupted snapshot must be rejected");
+            .expect("head-corrupted snapshot must be rejected");
+        let _ = fs::remove_file(&path);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn snapshot_rejects_frame_corruption() {
+        // v6: RAM frames carry their own CRC, verified at apply time. Flip the file's last byte —
+        // region B's frames are LCG noise, so the tail is always inside a data frame's bytes.
+        let path = std::env::temp_dir().join(format!(
+            "limina-snap-frame-corrupt-{}.bin",
+            std::process::id()
+        ));
+        let _ = write_sample(&path);
+        let mut raw = fs::read(&path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        fs::write(&path, &raw).unwrap();
+        let got = read(&path).expect("head is intact; read must succeed");
+        let err = got
+            .apply_ram(&test_mem())
+            .err()
+            .expect("frame-corrupted snapshot must be rejected at apply");
+        let _ = fs::remove_file(&path);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn snapshot_rejects_truncation() {
+        let path =
+            std::env::temp_dir().join(format!("limina-snap-trunc-{}.bin", std::process::id()));
+        let _ = write_sample(&path);
+        let raw = fs::read(&path).unwrap();
+        fs::write(&path, &raw[..raw.len() - 10]).unwrap();
+        let got = read(&path).expect("head is intact; read must succeed");
+        let err = got
+            .apply_ram(&test_mem())
+            .err()
+            .expect("truncated snapshot must be rejected at apply");
         let _ = fs::remove_file(&path);
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
