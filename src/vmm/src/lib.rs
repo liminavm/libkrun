@@ -589,22 +589,32 @@ impl Vmm {
             firmware: self.arch_memory_info.ram_start_addr
                 == arch::aarch64::layout::DRAM_MEM_START_EFI,
         };
-        let ram = self.dump_ram();
-        let snap = snapshot::Snapshot {
+        let head = snapshot::SnapshotHead {
             vcpus,
             gic,
             gpio,
             layout,
             devices,
             gpu,
-            ram,
         };
-        snapshot::write(path, &snap).map_err(Error::SnapshotIo)?;
+        // v6: stream chunked RAM frames straight out of guest memory (zero-chunk holes + lz4),
+        // written by a worker pool — no whole-RAM intermediate copy, no serial multi-GB CRC.
+        let regions = self.ram_regions();
+        let t0 = std::time::Instant::now();
+        let stats = snapshot::write_streaming(path, &head, &self.guest_memory, &regions)
+            .map_err(Error::SnapshotIo)?;
         info!(
-            "snapshot written: {} vCPUs, {}-byte GIC, {} RAM regions -> {}",
-            snap.vcpus.len(),
-            snap.gic.len(),
-            snap.ram.len(),
+            "snapshot written: {} vCPUs, {}-byte GIC, {} RAM regions, {} MiB RAM -> {} MiB file \
+             ({} zero / {} lz4 / {} raw frames) in {:.1}s -> {}",
+            head.vcpus.len(),
+            head.gic.len(),
+            regions.len(),
+            stats.ram_bytes >> 20,
+            stats.written_bytes >> 20,
+            stats.zero_frames,
+            stats.lz4_frames,
+            stats.raw_frames,
+            t0.elapsed().as_secs_f32(),
             path.display()
         );
         Ok(())
@@ -620,29 +630,21 @@ impl Vmm {
         }
     }
 
-    /// Copy out the guest RAM regions for a snapshot, skipping everything at or above the SHM
-    /// window base (the GPU/fs host-shared regions, which are re-established by the guest on
-    /// resume, not carried in the snapshot).
+    /// The guest RAM regions a snapshot covers, as (gpa, len) — everything below the SHM window
+    /// base (the GPU/fs host-shared regions are re-established by the guest on resume, not
+    /// carried in the snapshot). The frame writer reads the memory itself; no copy here.
     #[cfg(target_os = "macos")]
-    fn dump_ram(&self) -> Vec<snapshot::RamRegion> {
-        use vm_memory::{Address, Bytes, GuestMemory, GuestMemoryRegion};
+    fn ram_regions(&self) -> Vec<(u64, u64)> {
+        use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
         let shm_start = self.arch_memory_info.shm_start_addr;
-        let mut regions = Vec::new();
-        for region in self.guest_memory.iter() {
-            let gpa = region.start_addr().raw_value();
-            if gpa >= shm_start {
-                continue; // GPU/fs SHM window — not part of the RAM snapshot
-            }
-            let len = region.len() as usize;
-            let mut data = vec![0u8; len];
-            // Read straight out of the mapped region; this is the same memory HVF runs on.
-            if let Err(e) = self.guest_memory.read_slice(&mut data, region.start_addr()) {
-                error!("snapshot: reading RAM region at 0x{gpa:x} failed: {e:?}; skipping");
-                continue;
-            }
-            regions.push(snapshot::RamRegion { gpa, data });
-        }
-        regions
+        self.guest_memory
+            .iter()
+            .filter_map(|region| {
+                let gpa = region.start_addr().raw_value();
+                // GPU/fs SHM window — not part of the RAM snapshot.
+                (gpa < shm_start).then_some((gpa, region.len()))
+            })
+            .collect()
     }
 
     /// Configures the system for boot.
