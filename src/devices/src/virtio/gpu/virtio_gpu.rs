@@ -396,6 +396,10 @@ pub struct VirtioGpu {
     /// limina M9.3 P0: the rutabaga-layer half of the snapshot-replay journal
     /// (the vkr wire half lives in virglrenderer). Worker-thread-only.
     journal: GpuJournal,
+    /// limina M9.3 P3: the last cursor-overlay state handed to the display backend
+    /// (pixels included), carried in the snapshot payload so a restored session
+    /// keeps its cursor (UPDATE/MOVE_CURSOR are not journaled ops).
+    cursor_state: Option<super::journal::CursorSnapshot>,
 }
 
 /// The per-activation transport the fence handler retires guest fences into.
@@ -747,6 +751,7 @@ impl VirtioGpu {
             present_fence,
             trace,
             journal,
+            cursor_state: None,
         }
     }
 
@@ -834,6 +839,7 @@ impl VirtioGpu {
             blob_contents: Vec::new(),
             memory_contents: Vec::new(),
             sync_states: Vec::new(),
+            cursor: self.cursor_state.clone(),
         };
 
         let mut ctxs: Vec<u32> = Vec::new();
@@ -947,6 +953,7 @@ impl VirtioGpu {
             blob_contents,
             memory_contents,
             sync_states,
+            cursor,
         } = payload;
 
         let mut wire: HashMap<u32, (Vec<super::journal::VkrWireEntry>, usize)> = HashMap::new();
@@ -1215,6 +1222,28 @@ impl VirtioGpu {
         // The re-created world is the payload's world (minus dropped stale writes); adopt
         // its journal so the next suspend records from a warm, accurate baseline.
         self.journal.restore_entries(ops);
+        // P3: re-apply the captured cursor overlay — the restored guest believes its cursor
+        // is set and won't re-send UPDATE_CURSOR until it next changes. Cosmetic: failures
+        // (or a backend without cursor support) degrade to the default cursor, never an error.
+        if let Some(c) = cursor {
+            match ResourceFormat::try_from(c.format) {
+                Ok(format) => {
+                    let _ = self
+                        .display_backend
+                        .set_cursor(c.width, c.height, c.hot_x, c.hot_y, format, &c.pixels);
+                    let _ = self.display_backend.move_cursor(c.x, c.y);
+                    info!(
+                        "gpu restore: cursor overlay re-applied ({}x{} at {},{})",
+                        c.width, c.height, c.x, c.y
+                    );
+                    self.cursor_state = Some(c);
+                }
+                Err(()) => warn!(
+                    "gpu restore: captured cursor has unknown format {}; skipped",
+                    c.format
+                ),
+            }
+        }
         true
     }
 
@@ -1251,6 +1280,8 @@ impl VirtioGpu {
         // The re-creation journal describes the session state just dropped; clear it so the
         // next session's recording (or a pending snapshot replay) starts from empty.
         self.journal.reset();
+        // The cursor belonged to the dropped session; the re-initialized guest re-sets it.
+        self.cursor_state = None;
         {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
@@ -1960,6 +1991,7 @@ impl VirtioGpu {
         y: u32,
     ) -> VirtioGpuResult {
         if resource_id == 0 {
+            self.cursor_state = None;
             Self::cursor_ok(self.display_backend.set_cursor(
                 0,
                 0,
@@ -2003,12 +2035,26 @@ impl VirtioGpu {
             &pixels,
         ))?;
         Self::cursor_ok(self.display_backend.move_cursor(x, y))?;
+        self.cursor_state = Some(super::journal::CursorSnapshot {
+            width: resource.width,
+            height: resource.height,
+            hot_x,
+            hot_y,
+            format: format as u32,
+            x,
+            y,
+            pixels,
+        });
         Ok(OkNoData)
     }
 
     /// limina: reposition the host cursor overlay (`VIRTIO_GPU_CMD_MOVE_CURSOR`).
     pub fn move_cursor(&mut self, x: u32, y: u32) -> VirtioGpuResult {
         Self::cursor_ok(self.display_backend.move_cursor(x, y))?;
+        if let Some(c) = &mut self.cursor_state {
+            c.x = x;
+            c.y = y;
+        }
         Ok(OkNoData)
     }
 
