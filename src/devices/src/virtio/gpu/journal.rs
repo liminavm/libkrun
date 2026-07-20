@@ -319,9 +319,12 @@ const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
 // v2 (M9.3 P2): + memory_contents — every capturable VkDeviceMemory's raw bytes
 // (not just guest-mapped blobs). v3 (P2.1): + sync_states — per-context opaque
 // vkr sync blobs (fence status + timeline counter values) for the restore-time
-// sync fast-forward. Snapshots are single-use against their exact post-suspend
-// disk, so no cross-version parse compatibility is kept.
-const PAYLOAD_VERSION: u32 = 3;
+// sync fast-forward. v4 (P3): + cursor — the last cursor-overlay state
+// (UPDATE/MOVE_CURSOR are not journaled ops; without this the restored session
+// shows the default dot cursor until the guest next changes it). Snapshots are
+// single-use against their exact post-suspend disk, so no cross-version parse
+// compatibility is kept.
+const PAYLOAD_VERSION: u32 = 4;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -365,6 +368,24 @@ pub struct GpuSnapshotPayload {
     /// timeline semaphore counter values) applied by the restore-time sync
     /// fast-forward — see vkr_renderer_sync_export/restore in the fork.
     pub sync_states: Vec<(u32, Vec<u8>)>,
+    /// v4: the last cursor-overlay state, re-applied to the display backend at
+    /// restore. `None` = cursor hidden (or never set) at snapshot.
+    pub cursor: Option<CursorSnapshot>,
+}
+
+/// The rendered cursor-overlay state as last handed to the display backend —
+/// pixels included (≤ ~64×64×4), so restore needs no resource lookup at all.
+#[derive(Clone)]
+pub struct CursorSnapshot {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    /// `ResourceFormat` as its `repr(u32)` value (already alpha-promoted).
+    pub format: u32,
+    pub x: u32,
+    pub y: u32,
+    pub pixels: Vec<u8>,
 }
 
 impl GpuSnapshotPayload {
@@ -473,6 +494,19 @@ impl GpuSnapshotPayload {
             buf.extend_from_slice(bytes);
         }
 
+        // v4 cursor section: presence byte + geometry + pixels.
+        match &self.cursor {
+            Some(c) => {
+                buf.push(1);
+                for v in [c.width, c.height, c.hot_x, c.hot_y, c.format, c.x, c.y] {
+                    put_u32(&mut buf, v);
+                }
+                put_u64(&mut buf, c.pixels.len() as u64);
+                buf.extend_from_slice(&c.pixels);
+            }
+            None => buf.push(0),
+        }
+
         buf
     }
 
@@ -577,6 +611,32 @@ impl GpuSnapshotPayload {
             let len = c.u64()? as usize;
             payload.sync_states.push((ctx_id, c.take(len)?.to_vec()));
         }
+
+        // v4 cursor section.
+        payload.cursor = match *c.take(1)?.first()? {
+            0 => None,
+            1 => {
+                let width = c.u32()?;
+                let height = c.u32()?;
+                let hot_x = c.u32()?;
+                let hot_y = c.u32()?;
+                let format = c.u32()?;
+                let x = c.u32()?;
+                let y = c.u32()?;
+                let len = c.u64()? as usize;
+                Some(CursorSnapshot {
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    format,
+                    x,
+                    y,
+                    pixels: c.take(len)?.to_vec(),
+                })
+            }
+            _ => return None,
+        };
 
         Some(payload)
     }
@@ -689,6 +749,16 @@ mod tests {
             blob_contents: vec![(7, vec![0x5a; 64])],
             memory_contents: vec![(3, 21, vec![0xc3; 48])],
             sync_states: vec![(3, vec![0x11; 16])],
+            cursor: Some(CursorSnapshot {
+                width: 64,
+                height: 64,
+                hot_x: 4,
+                hot_y: 6,
+                format: 2,
+                x: 800,
+                y: 450,
+                pixels: vec![0x7e; 64 * 64 * 4],
+            }),
         };
         let bytes = payload.to_bytes();
         let got = GpuSnapshotPayload::from_bytes(&bytes).expect("parse");
@@ -717,6 +787,13 @@ mod tests {
         assert_eq!(got.blob_contents, vec![(7, vec![0x5a; 64])]);
         assert_eq!(got.memory_contents, vec![(3, 21, vec![0xc3; 48])]);
         assert_eq!(got.sync_states, vec![(3, vec![0x11; 16])]);
+        let cur = got.cursor.expect("cursor state present");
+        assert_eq!(
+            (cur.width, cur.height, cur.hot_x, cur.hot_y),
+            (64, 64, 4, 6)
+        );
+        assert_eq!((cur.format, cur.x, cur.y), (2, 800, 450));
+        assert_eq!(cur.pixels, vec![0x7e; 64 * 64 * 4]);
     }
 
     #[test]
