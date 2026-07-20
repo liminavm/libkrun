@@ -27,12 +27,16 @@ pub(crate) const PHQ_INDEX: usize = 3;
 // Free page reporting queue.
 pub(crate) const FRQ_INDEX: usize = 4;
 
-// Supported features. DEFLATE_ON_OOM lets the guest return ballooned pages under its own memory
-// pressure (the OOM safety net) — advertised together with the inflate/deflate handlers so we never
-// drive a target the guest can't back out of.
+// Supported features. DEFLATE_ON_OOM is OFF BY DEFAULT (limina M6 addendum 2026-07-20,
+// "transparent balloon accounting"): Linux keeps ballooned pages in MemTotal (they read as
+// *used*) exactly when this bit is negotiated, and subtracts them from the totals without it
+// — so masking it makes a fresh dynamic-memory VM show its effective RAM instead of looking
+// almost out of memory. The bit's guest-side OOM net is preempted by systemd-oomd on modern
+// guests anyway (oomd reads the balloon's apparent usage as real pressure and kills first);
+// the host-side release policy is the actual pressure response. Re-advertised per VM via the
+// `deflate_on_oom` constructor knob (the vm.toml escape hatch) while confidence builds.
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_STATS_VQ as u64)
-    | (1 << uapi::VIRTIO_BALLOON_F_DEFLATE_ON_OOM as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64);
 
@@ -237,7 +241,10 @@ impl Balloon {
     /// carry the kernel fix (`virtballoon_freeze` unregisters page-reporting first). Stock guests keep
     /// the coarser `MADV_FREE_REUSABLE`-on-inflate reclaim and s2idle safely (two-tier: degraded but
     /// working).
-    pub fn new(free_page_reporting: bool) -> super::Result<Balloon> {
+    /// `deflate_on_oom` gates `VIRTIO_BALLOON_F_DEFLATE_ON_OOM` (see the AVAIL_FEATURES
+    /// comment): off by default for transparent balloon accounting; the per-VM escape
+    /// hatch re-advertises it.
+    pub fn new(free_page_reporting: bool, deflate_on_oom: bool) -> super::Result<Balloon> {
         let host_page = host_page_size();
         let sub = host_page / GUEST_PAGE;
         let full_mask = if sub >= 64 {
@@ -245,11 +252,14 @@ impl Balloon {
         } else {
             (1u64 << sub) - 1
         };
-        let avail_features = if free_page_reporting {
+        let mut avail_features = if free_page_reporting {
             AVAIL_FEATURES
         } else {
             AVAIL_FEATURES & !(1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64)
         };
+        if deflate_on_oom {
+            avail_features |= 1 << uapi::VIRTIO_BALLOON_F_DEFLATE_ON_OOM as u64;
+        }
         Ok(Balloon {
             queues: None,
             avail_features,

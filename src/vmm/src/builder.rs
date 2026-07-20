@@ -1043,6 +1043,7 @@ pub fn build_microvm(
         event_manager,
         intc.clone(),
         vm_resources.balloon_free_page_reporting,
+        vm_resources.balloon_deflate_on_oom,
     )?;
     #[cfg(not(feature = "tee"))]
     if let Some(provider) = vm_resources.battery_provider.clone() {
@@ -2834,11 +2835,12 @@ fn attach_balloon_device(
     event_manager: &mut EventManager,
     intc: IrqChip,
     free_page_reporting: bool,
+    deflate_on_oom: bool,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     let balloon = Arc::new(Mutex::new(
-        devices::virtio::Balloon::new(free_page_reporting).unwrap(),
+        devices::virtio::Balloon::new(free_page_reporting, deflate_on_oom).unwrap(),
     ));
 
     event_manager
