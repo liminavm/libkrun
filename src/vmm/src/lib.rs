@@ -599,10 +599,24 @@ impl Vmm {
         };
         // v6: stream chunked RAM frames straight out of guest memory (zero-chunk holes + lz4),
         // written by a worker pool — no whole-RAM intermediate copy, no serial multi-GB CRC.
+        //
+        // Atomic publish: stream to a sibling `.tmp` and rename into place only on success, so
+        // the canonical snapshot path NEVER holds a partial file. The supervisor treats the
+        // file's presence as "resume pending" (auto-resume, one-shot); a torn write must read
+        // as "no snapshot", not as a snapshot that fails restore after being consumed.
+        let tmp = match path.file_name() {
+            Some(n) => {
+                let mut n = n.to_os_string();
+                n.push(".tmp");
+                path.with_file_name(n)
+            }
+            None => return Err(Error::Snapshot),
+        };
         let regions = self.ram_regions();
         let t0 = std::time::Instant::now();
-        let stats = snapshot::write_streaming(path, &head, &self.guest_memory, &regions)
+        let stats = snapshot::write_streaming(&tmp, &head, &self.guest_memory, &regions)
             .map_err(Error::SnapshotIo)?;
+        std::fs::rename(&tmp, path).map_err(Error::SnapshotIo)?;
         info!(
             "snapshot written: {} vCPUs, {}-byte GIC, {} RAM regions, {} MiB RAM -> {} MiB file \
              ({} zero / {} lz4 / {} raw frames) in {:.1}s -> {}",
