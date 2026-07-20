@@ -1182,17 +1182,13 @@ pub fn build_microvm(
     let (vcpus, restore_release): (
         Vec<Vcpu>,
         Option<(
-            Vec<crate::snapshot::RamRegion>,
-            Vec<u8>,
-            Option<devices::legacy::GpioState>,
-            Vec<crate::snapshot::DeviceTransportState>,
-            Option<Vec<u8>>,
+            crate::snapshot::SnapshotFile,
             Arc<crate::vstate::RestoreGate>,
         )>,
     ) = if let Some(ref path) = restore_from {
-        let snap = crate::snapshot::read(path)
+        let mut snap = crate::snapshot::read(path)
             .map_err(|e| StartMicrovmError::Internal(crate::Error::SnapshotIo(e)))?;
-        if snap.vcpus.len() != vcpus.len() {
+        if snap.head.vcpus.len() != vcpus.len() {
             // Snapshot vCPU count must match this boot's --cpus, or the register state is nonsense.
             return Err(StartMicrovmError::Internal(crate::Error::Snapshot));
         }
@@ -1205,27 +1201,24 @@ pub fn build_microvm(
             shm_start: vmm.arch_memory_info.shm_start_addr,
             firmware: vmm.arch_memory_info.ram_start_addr == 0x4000_0000,
         };
-        if snap.layout != expected {
+        if snap.head.layout != expected {
             error!(
                 "restore: snapshot memory layout {:?} != this worker's {:?} — refusing (fail closed)",
-                snap.layout, expected
+                snap.head.layout, expected
             );
             return Err(StartMicrovmError::Internal(crate::Error::Snapshot));
         }
         let gate = Arc::new(crate::vstate::RestoreGate::default());
-        let gpio = snap.gpio;
+        let vcpu_states = std::mem::take(&mut snap.head.vcpus);
         let vcpus = vcpus
             .into_iter()
-            .zip(snap.vcpus)
+            .zip(vcpu_states)
             .map(|(mut v, st)| {
                 v.set_restore(st, gate.clone());
                 v
             })
             .collect();
-        (
-            vcpus,
-            Some((snap.ram, snap.gic, gpio, snap.devices, snap.gpu, gate)),
-        )
+        (vcpus, Some((snap, gate)))
     } else {
         (vcpus, None)
     };
@@ -1245,12 +1238,19 @@ pub fn build_microvm(
     // re-reads the FDT. (The GPU/fs SHM window was excluded at save time and is re-established by
     // the guest, per Strategy A; it is not overwritten here.)
     #[cfg(target_os = "macos")]
-    if let Some((ram, _, _, _, _, _)) = &restore_release {
-        for region in ram {
-            vmm.guest_memory()
-                .write_slice(&region.data, GuestAddress(region.gpa))
-                .map_err(|_| StartMicrovmError::Internal(crate::Error::Snapshot))?;
-        }
+    if let Some((snap, _)) = &restore_release {
+        let t0 = std::time::Instant::now();
+        let stats = snap.apply_ram(vmm.guest_memory()).map_err(|e| {
+            error!("restore: applying snapshot RAM failed: {e}");
+            StartMicrovmError::Internal(crate::Error::Snapshot)
+        })?;
+        info!(
+            "restore: applied {} MiB RAM ({} zero / {} data frames) in {:.1}s",
+            stats.ram_bytes >> 20,
+            stats.zero_frames,
+            stats.data_frames,
+            t0.elapsed().as_secs_f32()
+        );
     }
 
     #[cfg(feature = "tee")]
@@ -1296,12 +1296,15 @@ pub fn build_microvm(
     // in-kernel GIC (distributor + redistributor), then open the gate so each vCPU restores its
     // own register file (including its ICC/CPU-interface regs, on its own thread) and runs.
     #[cfg(target_os = "macos")]
-    if let Some((_, gic, gpio, devices, gpu, gate)) = &restore_release {
+    if let Some((snap, gate)) = &restore_release {
+        let gic = &snap.head.gic;
+        let devices = &snap.head.devices;
+        let gpu = &snap.head.gpu;
         hvf::restore_gic_state(gic)
             .map_err(|_| StartMicrovmError::Internal(crate::Error::Snapshot))?;
         // Restore the PL061 register file into the fresh GPIO device before releasing the vCPUs, so
         // the wake injected after resume demuxes correctly (GPIOMIS = istate & im).
-        if let Some(gpio) = gpio {
+        if let Some(gpio) = &snap.head.gpio {
             vmm.restore_gpio_state(gpio);
         }
         // M9.3: validate + log the captured device transports. We do NOT re-drive them: RED-first +
