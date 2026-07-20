@@ -265,6 +265,10 @@ pub struct VmResources {
     /// suspend-to-idle (upstream `virtballoon_freeze` bug) and wedges. Enable only for enhanced-tier
     /// guests carrying the kernel fix. See `devices::virtio::Balloon::new`.
     pub balloon_free_page_reporting: bool,
+    /// limina: advertise `VIRTIO_BALLOON_F_DEFLATE_ON_OOM`. **Default false** (transparent
+    /// balloon accounting — see the AVAIL_FEATURES comment in devices::virtio::balloon):
+    /// the per-VM escape hatch re-advertises the guest kernel's OOM deflate net.
+    pub balloon_deflate_on_oom: bool,
 }
 
 impl VmResources {
@@ -508,6 +512,7 @@ mod tests {
             snd: false,
             snd_capture: false,
             balloon_free_page_reporting: false,
+            balloon_deflate_on_oom: false,
             #[cfg(not(feature = "tee"))]
             battery_provider: None,
         }
