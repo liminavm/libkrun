@@ -251,11 +251,24 @@ fn encode_head(head: &SnapshotHead) -> Vec<u8> {
             put_u64(&mut v, q.used);
         }
     }
-    // v5 GPU re-creation section: presence byte + bytes.
+    // v5 GPU re-creation section: presence byte + bytes. v6 compresses it — on a lived-in venus
+    // guest the 'LGPU' payload (journal + blob + memory contents) dominates the head (hundreds of
+    // MB) and lz4s well. Kind 2 = lz4 with the uncompressed size prefixed; kind 1 = raw fallback
+    // when lz4 would not shrink it (tiny payloads).
     match &head.gpu {
         Some(g) => {
-            v.push(1);
-            put_bytes(&mut v, g);
+            let mut buf = vec![0u8; lz4_flex::block::get_maximum_output_size(g.len())];
+            match lz4_flex::block::compress_into(g, &mut buf) {
+                Ok(n) if n < g.len() => {
+                    v.push(2);
+                    put_u64(&mut v, g.len() as u64);
+                    put_bytes(&mut v, &buf[..n]);
+                }
+                _ => {
+                    v.push(1);
+                    put_bytes(&mut v, g);
+                }
+            }
         }
         None => v.push(0),
     }
@@ -735,10 +748,26 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
             queues,
         });
     }
-    // v5 GPU re-creation section.
+    // v5 GPU re-creation section (v6: kind 2 = lz4 with uncompressed-size prefix).
     let gpu = match r.u8()? {
         0 => None,
         1 => Some(r.bytes()?),
+        2 => {
+            let ulen = r.u64()? as usize;
+            let comp = r.bytes()?;
+            // lz4's max ratio is 255:1 — a larger claimed size is corruption, not data (and would
+            // otherwise drive a huge allocation before the head CRC is checked below).
+            if ulen > comp.len().saturating_mul(256) {
+                return Err(corrupt("gpu section size implausible"));
+            }
+            let mut out = vec![0u8; ulen];
+            let n = lz4_flex::block::decompress_into(&comp, &mut out)
+                .map_err(|e| corrupt(&format!("gpu section decompress failed: {e}")))?;
+            if n != ulen {
+                return Err(corrupt("gpu section decompressed size mismatch"));
+            }
+            Some(out)
+        }
         _ => return Err(corrupt("bad gpu presence byte")),
     };
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
@@ -977,6 +1006,31 @@ mod tests {
         put_u64(&mut h, 0x1_0000_0000u64); // exactly 4 GiB — the value a u32 truncates to 0
         let mut r = Reader { buf: &h, pos: 0 };
         assert_eq!(r.u64().unwrap(), 0x1_0000_0000u64);
+    }
+
+    #[test]
+    fn gpu_section_compresses_and_round_trips() {
+        // A realistic 'LGPU' payload is large and compressible — it must take the lz4 (kind 2)
+        // path and decode byte-identical. (sample_head()'s 6-byte payload covers the raw fallback.)
+        let payload: Vec<u8> = (0..=255u8).cycle().take(2 << 20).collect();
+        let head = SnapshotHead {
+            gpu: Some(payload.clone()),
+            ..sample_head()
+        };
+        let mem = test_mem();
+        let path =
+            std::env::temp_dir().join(format!("limina-snap-gpu-lz4-{}.bin", std::process::id()));
+        let stats = write_streaming(&path, &head, &mem, &[REGION_B]).expect("write");
+        let got = read(&path).expect("read");
+        let _ = fs::remove_file(&path);
+        assert_eq!(got.head.gpu.as_deref(), Some(payload.as_slice()));
+        // The compressible 2 MiB payload must not have been stored raw.
+        assert!(
+            stats.written_bytes < payload.len() as u64,
+            "gpu section should compress (file {} bytes vs {} payload)",
+            stats.written_bytes,
+            payload.len()
+        );
     }
 
     #[test]
