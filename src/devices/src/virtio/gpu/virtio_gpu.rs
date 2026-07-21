@@ -1322,6 +1322,25 @@ impl VirtioGpu {
         }
     }
 
+    /// limina (host-sleep s2idle): whether the present-fence plumbing holds NOTHING that
+    /// references the current activation's queue — no parked flushes, held guest flush
+    /// fences, frames awaiting shown, or completed-but-unretired presents. Together with
+    /// an empty fence ledger this makes the session safe to PARK across a device reset
+    /// instead of wiping it (see the worker's defer-and-classify path); anything pending
+    /// here indexes the about-to-be-freed queue and forces the fail-closed wipe.
+    pub fn present_quiescent(&self) -> bool {
+        match self.present_fence.as_ref() {
+            Some(pf) => {
+                pf.parked.is_empty()
+                    && pf.flush_parked_cookies.is_empty()
+                    && pf.guest_holds.is_empty()
+                    && pf.awaiting_shown.is_empty()
+                    && pf.retired.lock().unwrap().is_empty()
+            }
+            None => true,
+        }
+    }
+
     // Non-public function -- no doc comment needed!
     fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
         let Some(rutabaga) = self.rutabaga.as_ref() else {
