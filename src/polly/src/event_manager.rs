@@ -67,11 +67,57 @@ pub trait Subscriber {
     fn interest_list(&self) -> Vec<EpollEvent>;
 }
 
+/// limina wake-trace (`LIMINA_WAKE_TRACE=1`): per-fd dispatch-rate accounting for the
+/// event loop, reported to stderr every ~5s. The counters answer "what wakes this loop
+/// and how often" during host-wakeup attribution work — see
+/// docs/perf/overhead-inventory.md. Single-threaded with the loop, so plain fields.
+struct WakeTrace {
+    last_report: std::time::Instant,
+    wakes: u64,
+    dispatches: HashMap<RawFd, u64>,
+}
+
+impl WakeTrace {
+    fn new() -> Option<Self> {
+        std::env::var("LIMINA_WAKE_TRACE").ok()?;
+        Some(WakeTrace {
+            last_report: std::time::Instant::now(),
+            wakes: 0,
+            dispatches: HashMap::new(),
+        })
+    }
+
+    fn record(&mut self, events: &[EpollEvent]) {
+        self.wakes += 1;
+        for ev in events {
+            *self.dispatches.entry(ev.fd()).or_insert(0) += 1;
+        }
+        let secs = self.last_report.elapsed().as_secs_f64();
+        if secs >= 5.0 {
+            let mut by_fd: Vec<_> = self.dispatches.iter().collect();
+            by_fd.sort_by(|a, b| b.1.cmp(a.1));
+            let detail: Vec<String> = by_fd
+                .iter()
+                .map(|(fd, n)| format!("fd{}={:.0}/s", fd, **n as f64 / secs))
+                .collect();
+            eprintln!(
+                "[WAKETRACE event_manager] wakes={:.0}/s {}",
+                self.wakes as f64 / secs,
+                detail.join(" ")
+            );
+            self.wakes = 0;
+            self.dispatches.clear();
+            self.last_report = std::time::Instant::now();
+        }
+    }
+}
+
 /// Manages I/O notifications using epoll mechanism.
 pub struct EventManager {
     epoll: Epoll,
     subscribers: HashMap<RawFd, Arc<Mutex<dyn Subscriber>>>,
     ready_events: Vec<EpollEvent>,
+    wake_trace: Option<WakeTrace>,
 }
 
 impl AsRawFd for EventManager {
@@ -94,6 +140,7 @@ impl EventManager {
             // We preallocate memory for this buffer in order to not repeat this
             // operation every time `run()` loop is executed.
             ready_events: vec![epoll::EpollEvent::default(); EventManager::EVENT_BUFFER_SIZE],
+            wake_trace: WakeTrace::new(),
         })
     }
 
@@ -212,6 +259,12 @@ impl EventManager {
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => 0,
             Err(e) => return Err(Error::Poll(e)),
         };
+        if event_count > 0 {
+            if let Some(trace) = self.wake_trace.as_mut() {
+                let events = self.ready_events[..event_count].to_vec();
+                trace.record(&events);
+            }
+        }
         self.dispatch_events(event_count);
 
         Ok(event_count)
