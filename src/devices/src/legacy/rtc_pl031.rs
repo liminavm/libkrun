@@ -71,8 +71,12 @@ enum AlarmCmd {
 
 /// A RTC device following the PL031 specification..
 pub struct RTC {
-    previous_now: Instant,
-    tick_offset: i64,
+    // Guest-RTC-minus-host-wallclock, in nanoseconds. Reads are anchored to the host's
+    // CLOCK_REALTIME (which keeps counting while the host sleeps), NOT a monotonic
+    // Instant: mach absolute time freezes across a host nap, so an Instant-anchored RTC
+    // lagged the guest's clock by however long the lid was closed (and a restored
+    // snapshot by the save→restore gap). 0 until the guest loads its own time via RTCLR.
+    wall_delta_ns: i64,
     // The Match Register: the guest programs the alarm time here (see the timer thread + `Subscriber`
     // impl, which turn a match into a real wakeup IRQ — needed so a guest can wake from
     // suspend-to-idle via `rtcwake`).
@@ -102,9 +106,7 @@ impl RTC {
                 .expect("failed to clone PL031 alarm eventfd"),
         );
         RTC {
-            // This is used only for duration measuring purposes.
-            previous_now: Instant::now(),
-            tick_offset: utils::time::get_time(utils::time::ClockType::Real) as i64,
+            wall_delta_ns: 0,
             match_value: 0,
             load: 0,
             imsc: 0,
@@ -216,8 +218,8 @@ impl RTC {
     }
 
     fn get_time(&self) -> u32 {
-        let ts = (self.tick_offset as i128)
-            + (Instant::now().duration_since(self.previous_now).as_nanos() as i128);
+        let host_ns = utils::time::get_time(utils::time::ClockType::Real) as i128;
+        let ts = host_ns + self.wall_delta_ns as i128;
         (ts / utils::time::NANOS_PER_SECOND as i128) as u32
     }
 
@@ -232,10 +234,13 @@ impl RTC {
             }
             RTCLR => {
                 self.load = val;
-                self.previous_now = Instant::now();
                 // If the unwrap fails, then the internal value of the clock has been corrupted and
                 // we want to terminate the execution of the process.
-                self.tick_offset = utils::time::seconds_to_nanoseconds(i64::from(val)).unwrap();
+                let loaded_ns = utils::time::seconds_to_nanoseconds(i64::from(val)).unwrap();
+                let host_ns = utils::time::get_time(utils::time::ClockType::Real) as i64;
+                // Remember the guest-chosen time as an offset from the host wallclock, so
+                // it keeps advancing across host sleep like any real battery-backed RTC.
+                self.wall_delta_ns = loaded_ns.wrapping_sub(host_ns);
             }
             RTCIMSC => {
                 self.imsc = val & 1;
@@ -346,17 +351,30 @@ mod tests {
         let v = byte_order::read_le_u32(&data[..]);
         assert_eq!(v, 123);
 
-        // Read and write to the LR register.
-        let v = utils::time::get_time(utils::time::ClockType::Real);
-        byte_order::write_le_u32(&mut data, (v / utils::time::NANOS_PER_SECOND) as u32);
-        let previous_now_before = rtc.previous_now;
-        rtc.write(0, RTCLR, &mut data);
+        // A fresh RTC mirrors the host wallclock (delta 0).
+        assert_eq!(rtc.wall_delta_ns, 0);
+        rtc.read(0, RTCDR, &mut data);
+        let host_now =
+            (utils::time::get_time(utils::time::ClockType::Real) / utils::time::NANOS_PER_SECOND) as u32;
+        let dr = byte_order::read_le_u32(&data[..]);
+        assert!(host_now.abs_diff(dr) <= 1, "RTCDR {dr} vs host {host_now}");
 
-        assert!(rtc.previous_now > previous_now_before);
+        // Read and write to the LR register: a guest-loaded time is remembered as a
+        // wallclock-relative delta, so reads track it while the host clock advances.
+        let v = utils::time::get_time(utils::time::ClockType::Real);
+        let loaded = (v / utils::time::NANOS_PER_SECOND) as u32 - 3600; // "an hour ago"
+        byte_order::write_le_u32(&mut data, loaded);
+        rtc.write(0, RTCLR, &mut data);
+        assert!(rtc.wall_delta_ns < 0);
 
         rtc.read(0, RTCLR, &mut data);
         let v_read = byte_order::read_le_u32(&data[..]);
-        assert_eq!((v / utils::time::NANOS_PER_SECOND) as u32, v_read);
+        assert_eq!(loaded, v_read);
+
+        // And the data register serves the loaded time (± scheduling slack).
+        rtc.read(0, RTCDR, &mut data);
+        let dr = byte_order::read_le_u32(&data[..]);
+        assert!(loaded.abs_diff(dr) <= 1, "RTCDR {dr} vs loaded {loaded}");
 
         // Read and write to IMSC register.
         // Test with non zero value.
