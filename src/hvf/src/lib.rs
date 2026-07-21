@@ -204,6 +204,12 @@ pub trait Vcpus {
     fn get_pending_irq(&self, vcpuid: u64) -> u32;
     fn handle_sysreg_read(&self, vcpuid: u64, reg: u32) -> Option<u64>;
     fn handle_sysreg_write(&self, vcpuid: u64, reg: u32, val: u64) -> bool;
+    /// Record a vCPU's PSCI power state (CPU hotplug): `false` on CPU_OFF, `true` on CPU_ON.
+    /// Consulted by AFFINITY_INFO so the guest's offline reaper sees the CPU report OFF. A
+    /// vcpuid outside `[0, cpu_count)` (a bad guest-supplied MPIDR) is ignored, never panics.
+    fn set_online(&self, vcpuid: u64, online: bool);
+    /// This vCPU's PSCI power state. Out-of-range vcpuids report offline (safe default).
+    fn is_online(&self, vcpuid: u64) -> bool;
 }
 
 /// Save the in-kernel GICv3 **distributor + redistributor** state (VM-wide) as an opaque,
@@ -388,6 +394,11 @@ pub enum VcpuExit<'a> {
     Breakpoint,
     Canceled,
     CpuOn(u64, u64, u64),
+    /// PSCI `CPU_OFF` — the guest offlined THIS vCPU (CPU hotplug). The vmm must park the vCPU
+    /// thread cleanly until a matching `CpuOn` re-onlines it; CPU_OFF does not return on success,
+    /// so no result register is written. (limina addition — without it CPU_OFF returns
+    /// NOT_SUPPORTED, the guest busy-spins in `cpu_die`, and the VM wedges.)
+    CpuOff,
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
@@ -940,10 +951,58 @@ impl HvfVcpu<'_> {
         }
     }
 
-    fn handle_psci_request(&self) -> Result<VcpuExit<'_>, Error> {
+    /// Re-arm a parked (offlined) vCPU for a fresh secondary entry after PSCI CPU_ON. Clears the
+    /// transient per-exit software state left over from before the offline, then resets to a clean
+    /// secondary-boot register state at `entry_addr` — the guest re-enters at its secondary-startup
+    /// path, which re-initializes stack/MMU. Must run on the vCPU's OWN thread (HVF register access
+    /// is thread-bound), which is why the parked vCPU thread calls this itself on re-online.
+    pub fn reonline(&mut self, entry_addr: u64, fdt_addr: u64) -> Result<(), Error> {
+        self.pending_advance_pc = false;
+        self.pending_mmio_read = None;
+        // The vtimer state is per-CPU; a re-onlined CPU reprograms it from scratch. Drop any stale
+        // masked-flag from before the offline so `hvf_sync_vtimer` reconciles cleanly.
+        self.vtimer_masked = false;
+        // A running vCPU has the MMU + caches enabled. PSCI CPU_ON enters at a PHYSICAL address
+        // (the kernel's secondary_entry) with the MMU OFF, exactly as a reset CPU would — so clear
+        // the MMU (M), data-cache (C) and instruction-cache (I) enable bits before re-arming, or
+        // the guest faults executing the physical entry PC. The kernel's secondary bringup
+        // re-enables them. (At initial boot the fresh vCPU already has these clear, which is why
+        // set_initial_state alone sufficed on that path.) A nested guest runs at EL2, so its
+        // translation control is SCTLR_EL2; a normal guest's is SCTLR_EL1.
+        const SCTLR_M: u64 = 1 << 0;
+        const SCTLR_C: u64 = 1 << 2;
+        const SCTLR_I: u64 = 1 << 12;
+        let sctlr_reg = if self.nested_enabled {
+            hv_sys_reg_t_HV_SYS_REG_SCTLR_EL2
+        } else {
+            hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1
+        };
+        let sctlr = self.read_sys_reg(sctlr_reg)?;
+        self.write_sys_reg(sctlr_reg, sctlr & !(SCTLR_M | SCTLR_C | SCTLR_I))?;
+        self.set_initial_state(entry_addr, fdt_addr)
+    }
+
+    fn handle_psci_request(&self, vcpu_list: &Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
         match self.read_reg(hv_reg_t_HV_REG_X0)? {
             0x8400_0000 /* QEMU_PSCI_0_2_FN_PSCI_VERSION */ => {
                 self.write_reg(hv_reg_t_HV_REG_X0, 2)?;
+                Ok(VcpuExit::PsciHandled)
+            },
+            0x8400_0002 /* QEMU_PSCI_0_2_FN_CPU_OFF */ => {
+                // The guest is offlining THIS vCPU (CPU hotplug down). Record it OFF so the
+                // reaper's AFFINITY_INFO poll (below) completes, then hand the vmm a CpuOff exit
+                // to park this thread until re-online. CPU_OFF never returns on success — write
+                // no result register.
+                vcpu_list.set_online(self.vcpuid, false);
+                Ok(VcpuExit::CpuOff)
+            },
+            0x8400_0004 /* QEMU_PSCI_0_2_FN_AFFINITY_INFO */
+            | 0xc400_0004 /* QEMU_PSCI_0_2_FN64_AFFINITY_INFO */ => {
+                // The offline reaper polls this for the dying CPU to report OFF. `target_affinity`
+                // (X1) is the queried MPIDR = the vcpuid in our flat topology. 0 = ON, 1 = OFF.
+                let target = self.read_reg(hv_reg_t_HV_REG_X1)?;
+                let status = if vcpu_list.is_online(target) { 0 } else { 1 };
+                self.write_reg(hv_reg_t_HV_REG_X0, status)?;
                 Ok(VcpuExit::PsciHandled)
             },
             0x8400_0006 /* QEMU_PSCI_0_2_FN_MIGRATE_INFO_TYPE */ => {
@@ -960,14 +1019,17 @@ impl HvfVcpu<'_> {
                 let mpidr = self.read_reg(hv_reg_t_HV_REG_X1)?;
                 let entry = self.read_reg(hv_reg_t_HV_REG_X2)?;
                 let context_id = self.read_reg(hv_reg_t_HV_REG_X3)?;
+                // Mark the target ON (covers both initial secondary boot and re-online after a
+                // CPU_OFF); the vmm delivers `entry` to the target vCPU's boot channel.
+                vcpu_list.set_online(mpidr, true);
                 self.write_reg(hv_reg_t_HV_REG_X0, 0)?;
                 Ok(VcpuExit::CpuOn(mpidr, entry, context_id))
             }
             val => {
                 // An unmodeled PSCI/SMC function. Standard PSCI behaviour is to return
                 // NOT_SUPPORTED rather than fault — a stock guest probing an optional function
-                // (PSCI_FEATURES, CPU_OFF, AFFINITY_INFO, SYSTEM_RESET2, …) then degrades
-                // gracefully instead of taking the whole VMM down.
+                // (PSCI_FEATURES, SYSTEM_RESET2, …) then degrades gracefully instead of taking
+                // the whole VMM down.
                 warn!("unhandled PSCI/SMC function 0x{val:x}; returning NOT_SUPPORTED");
                 self.write_reg(hv_reg_t_HV_REG_X0, PSCI_RET_NOT_SUPPORTED)?;
                 Ok(VcpuExit::PsciHandled)
@@ -1170,10 +1232,10 @@ impl HvfVcpu<'_> {
                 let timeout = Duration::from_nanos(timeout_ns.min(u64::MAX as u128) as u64);
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
-            EC_AA64_HVC => self.handle_psci_request(),
+            EC_AA64_HVC => self.handle_psci_request(&vcpu_list),
             EC_AA64_SMC => {
                 self.pending_advance_pc = true;
-                self.handle_psci_request()
+                self.handle_psci_request(&vcpu_list)
             }
             _ => {
                 let pc = self.read_reg(hv_reg_t_HV_REG_PC).unwrap_or(0);

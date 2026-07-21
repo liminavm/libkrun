@@ -2267,7 +2267,14 @@ fn create_vcpus_aarch64(
         vcpus.push(vcpu);
     }
 
-    vcpus[0].set_boot_senders(boot_senders);
+    // Every vCPU gets the full boot-sender map (the senders are cheap clones sharing the same
+    // channels). At initial boot only cpu0 issues CPU_ON, but a RUNTIME re-online (CPU hotplug)
+    // issues CPU_ON from whatever CPU runs the hotplug thread — any online vCPU — so each must be
+    // able to route the entry to the target's boot channel. (Was cpu0-only, which dropped a
+    // re-online CPU_ON raised on a secondary with "CpuOn request coming from an unexpected vCPU".)
+    for vcpu in &mut vcpus {
+        vcpu.set_boot_senders(boot_senders.clone());
+    }
 
     Ok(vcpus)
 }

@@ -18,7 +18,7 @@ use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REB
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
+use crossbeam_channel::{Receiver, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, VcpuExit, VcpuState, Vcpus};
 use utils::eventfd::EventFd;
@@ -494,6 +494,10 @@ impl Vcpu {
                     debug!("vCPU {vcpuid} PSCI");
                     Ok(VcpuEmulation::Handled)
                 }
+                VcpuExit::CpuOff => {
+                    debug!("vCPU {vcpuid} PSCI CPU_OFF (offlining)");
+                    Ok(VcpuEmulation::CpuOff)
+                }
                 VcpuExit::SecureMonitorCall => {
                     debug!("vCPU {vcpuid} SMC");
                     Ok(VcpuEmulation::Handled)
@@ -602,6 +606,10 @@ impl Vcpu {
                 Ok(VcpuEmulation::Handled) => (),
                 // Emulation was interrupted by a breakpoint.
                 Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
+                // The guest offlined this vCPU (PSCI CPU_OFF). Park the thread cleanly until a
+                // matching CPU_ON re-onlines it — zero host CPU/wakeups, vs the busy-spin + VM
+                // wedge of leaving CPU_OFF unmodeled.
+                Ok(VcpuEmulation::CpuOff) => self.handle_offline(&mut hvf_vcpu),
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu)
@@ -660,6 +668,63 @@ impl Vcpu {
         };
         if paused {
             self.pause_and_park(hvf_vcpu);
+        }
+    }
+
+    /// The guest offlined this vCPU (PSCI CPU_OFF). Park the thread cleanly — blocked in a channel
+    /// `recv`, consuming no host CPU or wakeups — until the guest re-onlines it, then re-arm the
+    /// vCPU for a fresh secondary entry and return to the run loop. This is the whole point of
+    /// modeling CPU_OFF: leaving it unmodeled makes the guest busy-spin in `cpu_die` (the VMM hit
+    /// ~546% CPU) and wedge.
+    ///
+    /// Re-online reuses the DURABLE secondary boot channel (`boot_receiver`): the same channel that
+    /// delivers the initial CPU_ON entry at boot delivers every subsequent re-online entry, sent by
+    /// cpu0's `CpuOn` handler (`boot_senders`). We select on it AND the event channel so an M9
+    /// snapshot `Pause`/`Snapshot` arriving while offlined is still serviced (otherwise `pause_vcpus`
+    /// would hang waiting for this vCPU). `set_initial_state` (via `reonline`) runs here, on the
+    /// vCPU's own thread, because HVF register access is thread-bound.
+    ///
+    /// A vCPU with no boot channel (cpu0 — Linux never offlines the boot CPU) parks on events only,
+    /// with no re-online path; parking still beats spinning in the pathological case.
+    ///
+    /// KNOWN LIMITATION (snapshot + offline, task #41): the guest-visible online state lives in
+    /// `VcpuList` and is not part of the M9 snapshot. If a snapshot is taken while a vCPU is
+    /// offline-parked here, the restored worker resumes that vCPU's saved register file (PC just
+    /// past its CPU_OFF HVC) rather than re-parking it, so the offline/online bookkeeping diverges:
+    /// a later re-online of that CPU fails to bring it up (the guest's bounded CPU-bringup wait
+    /// times out — no VMM wedge). Full fidelity needs the online state snapshotted and offlined
+    /// vCPUs routed back into this park on restore.
+    fn handle_offline(&mut self, hvf_vcpu: &mut HvfVcpu) {
+        let hvf_vcpuid = hvf_vcpu.id();
+        debug!("vCPU {hvf_vcpuid} parked (offlined via PSCI CPU_OFF)");
+        // Clones so the select does not borrow `self` across the pause_and_park/handle_snapshot calls.
+        let boot = self.boot_receiver.clone();
+        let events = self.event_receiver.clone();
+        loop {
+            let mut sel = Select::new();
+            let boot_idx = boot.as_ref().map(|r| sel.recv(r));
+            let evt_idx = sel.recv(&events);
+            let op = sel.select();
+            let picked = op.index();
+            if Some(picked) == boot_idx {
+                let entry = match op.recv(boot.as_ref().unwrap()) {
+                    Ok(entry) => entry,
+                    Err(_) => return, // channel dropped: process tearing down
+                };
+                hvf_vcpu
+                    .reonline(entry, self.fdt_addr)
+                    .unwrap_or_else(|e| panic!("re-online of vCPU {hvf_vcpuid} failed: {e:?}"));
+                debug!("vCPU {hvf_vcpuid} re-onlined (PSCI CPU_ON) at entry 0x{entry:x}");
+                return;
+            }
+            debug_assert_eq!(picked, evt_idx);
+            match op.recv(&events) {
+                // A snapshot Pause/Snapshot while offlined: service it, then keep parking offline.
+                Ok(VcpuEvent::Pause) => self.pause_and_park(hvf_vcpu),
+                Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(hvf_vcpu, reply),
+                Ok(VcpuEvent::Resume(_)) => {} // stale resume with no pause: ignore
+                Err(_) => return,              // channel dropped: process tearing down
+            }
         }
     }
 
@@ -812,6 +877,8 @@ enum VcpuEmulation {
     Interrupted,
     Stopped,
     Rebooted,
+    /// The guest offlined this vCPU (PSCI CPU_OFF) — park it until re-online.
+    CpuOff,
     WaitForEvent,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
