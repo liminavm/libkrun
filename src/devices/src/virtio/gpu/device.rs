@@ -126,6 +126,11 @@ pub struct Gpu {
     /// first live `vkExecuteCommandStreamsMESA` would decode stale bytes (garbage) and
     /// FATAL the ring.
     restore_done: Arc<(Mutex<bool>, Condvar)>,
+    /// limina (host-sleep s2idle): set by the transport just before `activate` when this
+    /// activation's queues were re-armed from the stash (a bus-fallback s2idle thaw, not a
+    /// real driver re-init). Forwarded to the worker so it can classify a parked session —
+    /// adopt it on a thaw, run the deferred `reset_session` on a re-init.
+    thaw_activation: bool,
 }
 
 impl Gpu {
@@ -163,6 +168,7 @@ impl Gpu {
             resize_pending: Arc::new(Mutex::new(None)),
             pending_restore: Arc::new(Mutex::new(None)),
             restore_done: Arc::new((Mutex::new(true), Condvar::new())),
+            thaw_activation: false,
         })
     }
 
@@ -403,6 +409,7 @@ impl VirtioDevice for Gpu {
         // hand-off, reboot) reuse the same thread+renderer and just rebind transport.
         // This is the renderer-singleton fix: `virgl_renderer_init` can't be re-run, so we
         // must never drop+recreate the renderer on reset.
+        let thaw = self.thaw_activation;
         let tx = self.ensure_worker();
 
         // Bind this activation's transport. The worker is in its outer recv() (first activate)
@@ -413,6 +420,7 @@ impl VirtioDevice for Gpu {
                 control_q,
                 cursor_q,
                 interrupt: interrupt.clone(),
+                thaw,
             })
             .is_err()
         {
@@ -460,6 +468,10 @@ impl VirtioDevice for Gpu {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn set_thaw_activation(&mut self, thaw: bool) {
+        self.thaw_activation = thaw;
     }
 
     fn reset(&mut self) -> bool {

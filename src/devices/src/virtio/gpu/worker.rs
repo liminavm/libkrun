@@ -44,6 +44,10 @@ pub enum WorkerCmd {
         control_q: DeviceQueue,
         cursor_q: DeviceQueue,
         interrupt: InterruptTransport,
+        /// limina (host-sleep s2idle): the transport re-armed this activation's queues
+        /// from the previous activation's register file — a no-PM-ops driver's
+        /// bus-fallback thaw, not a real re-init. Classifies a parked session (below).
+        thaw: bool,
     },
     /// Stop servicing and release the transport, but keep the renderer alive (device reset).
     Deactivate,
@@ -160,18 +164,32 @@ impl Worker {
             self.display_backend,
         );
 
+        // limina (host-sleep s2idle, defer-and-classify): a device reset no longer wipes the
+        // session immediately — if it was quiescent, the bookkeeping is PARKED and this flag
+        // set, and the NEXT activation classifies it: a re-armed activation (`thaw`, the
+        // bus-fallback s2idle signature) adopts the parked world unchanged (the thawing guest
+        // is the same live kernel — its ids still match); a queue-programming activation is a
+        // real re-init (reboot, rebind, firmware hand-off) and runs the deferred wipe first.
+        let mut parked_session = false;
+
         loop {
             // Inactive: block on the next command from the device.
-            let (mem, control_q, cursor_q, interrupt) = match self.cmd_rx.recv() {
+            let (mem, control_q, cursor_q, interrupt, thaw) = match self.cmd_rx.recv() {
                 Ok(WorkerCmd::Activate {
                     mem,
                     control_q,
                     cursor_q,
                     interrupt,
-                }) => (mem, control_q, cursor_q, interrupt),
+                    thaw,
+                }) => (mem, control_q, cursor_q, interrupt, thaw),
                 // A Deactivate while already inactive is a no-op; Shutdown / closed channel ends.
                 Ok(WorkerCmd::Deactivate) => continue,
-                Ok(WorkerCmd::Shutdown) | Err(_) => return,
+                Ok(WorkerCmd::Shutdown) | Err(_) => {
+                    if parked_session {
+                        virtio_gpu.reset_session();
+                    }
+                    return;
+                }
                 // limina M9.3: a snapshot request can arrive while inactive (unlikely — the
                 // production suspend path snapshots with the device DRIVER_OK — but harmless).
                 Ok(WorkerCmd::Snapshot { reply }) => {
@@ -180,6 +198,23 @@ impl Worker {
                     continue;
                 }
             };
+
+            // Classify a parked session against this activation (see `parked_session`).
+            if parked_session {
+                parked_session = false;
+                if thaw {
+                    info!(
+                        "gpu worker: adopting the parked session across a bus-fallback thaw \
+                         (in-place s2idle; no replay needed)"
+                    );
+                } else {
+                    info!(
+                        "gpu worker: dropping the parked session — this activation programmed \
+                         its queues (real driver re-init)"
+                    );
+                    virtio_gpu.reset_session();
+                }
+            }
 
             // Own each activation's queue eventfds + queues; publish the transport so the
             // long-lived fence handler retires guest fences into THIS activation's queue.
@@ -222,15 +257,87 @@ impl Worker {
                 &interrupt,
             );
 
-            // Unbind the transport and drop this session's resource/scanout/fence bookkeeping
-            // (its descriptors index the now-freed queue) — but keep the renderer alive.
-            *self.active.lock().unwrap() = None;
-            virtio_gpu.reset_session();
-
+            // Unbind the transport. What happens to the session bookkeeping depends on how
+            // this activation ended (defer-and-classify, docs/design/host-sleep-s2idle.md §3):
+            //
+            // - Deactivate (guest device reset): DON'T wipe yet. If the session is quiescent —
+            //   fence ledger drained AND nothing in the present plumbing references the freed
+            //   queue — PARK it and let the next activation classify (thaw → adopt, re-init →
+            //   deferred wipe). A thaw's reset arrives after the whole suspend, so the drain
+            //   returns immediately there; a dirty reset with work in flight fails the check
+            //   and takes the fail-closed wipe (exactly the old behavior). This is what keeps
+            //   a seated venus session alive across in-place s2idle: the world was never lost,
+            //   only this wipe destroyed it.
+            // - Shutdown (device drop / VMM teardown): wipe as before — teardown ordering
+            //   frees per-session state while the renderer thread is still alive.
             match exit {
-                InnerExit::Deactivate => continue,
-                InnerExit::Shutdown => return,
+                InnerExit::Deactivate => {
+                    // Drain BEFORE unbinding the transport (§22 hardening, 2026-07-30):
+                    // fence retirement (the async fence callbacks), the guest-hold latch
+                    // (500 ms ceiling) and the present pump all need the live activation —
+                    // once `active` is cleared the fence handler drops completions on the
+                    // floor, so the old post-unbind drain could only ever succeed
+                    // vacuously. Draining here lets a session that was merely MID-FRAME
+                    // at the reset become quiescent and PARK instead of losing its whole
+                    // venus world: the couve aborted-sleep wipe was an s2idle entry
+                    // landing inside the compositor's fade-out animation.
+                    Self::drain_for_classify(&mut virtio_gpu);
+                    *self.active.lock().unwrap() = None;
+                    let (outstanding, summary) = virtio_gpu.outstanding_fences();
+                    if outstanding == 0 && virtio_gpu.present_quiescent() {
+                        parked_session = true;
+                        info!(
+                            "gpu worker: device reset with a quiescent session — PARKED for \
+                             classification at the next activation"
+                        );
+                    } else {
+                        warn!(
+                            "gpu worker: device reset with the session NOT quiescent \
+                             (fences: {outstanding} outstanding [{summary}]; {}) — wiping \
+                             (fail-closed)",
+                            virtio_gpu.present_pending_summary()
+                        );
+                        virtio_gpu.reset_session();
+                    }
+                    continue;
+                }
+                InnerExit::Shutdown => {
+                    *self.active.lock().unwrap() = None;
+                    virtio_gpu.reset_session();
+                    return;
+                }
             }
+        }
+    }
+
+    /// limina (§22 hardening): bounded present+fence drain before classifying a device
+    /// reset, run with the activation still bound. Pumps retired presents (this thread
+    /// owns the display backend, same as the service loop's present_ev handling) while
+    /// the async fence callbacks and the guest-hold latch retire the rest. The deadline
+    /// comfortably covers the guest-hold ceiling (500 ms) plus a shown-ack round trip;
+    /// a session that cannot drain (a guest that died mid-frame) pays it once and takes
+    /// the fail-closed wipe exactly as before.
+    fn drain_for_classify(virtio_gpu: &mut VirtioGpu) {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(1500);
+        loop {
+            virtio_gpu.process_retired_presents();
+            let (outstanding, _) = virtio_gpu.outstanding_fences();
+            if outstanding == 0 && virtio_gpu.present_quiescent() {
+                info!(
+                    "gpu worker: reset drain quiesced in {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "gpu worker: reset drain timed out after {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
