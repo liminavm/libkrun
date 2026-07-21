@@ -23,6 +23,10 @@ struct PerCPUInterruptControllerState {
     status: VcpuStatus,
     pending_irqs: VecDeque<u32>,
     wfe_sender: Option<Sender<u32>>,
+    /// PSCI power state for CPU hotplug: `true` = ON, `false` = OFF (parked after CPU_OFF).
+    /// Read by AFFINITY_INFO so the guest's offline reaper sees the CPU report OFF. All vCPUs
+    /// start ON (the boot model brings every vCPU up).
+    online: bool,
 }
 
 impl PerCPUInterruptControllerState {
@@ -101,6 +105,7 @@ impl VcpuList {
                 status: VcpuStatus::Running,
                 pending_irqs: VecDeque::new(),
                 wfe_sender: None,
+                online: true,
             }));
         }
 
@@ -163,6 +168,23 @@ impl Vcpus for VcpuList {
             .lock()
             .unwrap()
             .has_pending_irq()
+    }
+
+    fn set_online(&self, vcpuid: u64, online: bool) {
+        // A guest-supplied MPIDR (CPU_ON/CPU_OFF operand) is untrusted — ignore out-of-range
+        // rather than panic the VMM.
+        if let Some(vcpu) = self.vcpus.get(vcpuid as usize) {
+            vcpu.lock().unwrap().online = online;
+        }
+    }
+
+    fn is_online(&self, vcpuid: u64) -> bool {
+        // Out-of-range (a bad guest AFFINITY_INFO target) reports offline — a safe default that
+        // never panics.
+        self.vcpus
+            .get(vcpuid as usize)
+            .map(|v| v.lock().unwrap().online)
+            .unwrap_or(false)
     }
 
     fn get_pending_irq(&self, vcpuid: u64) -> u32 {
