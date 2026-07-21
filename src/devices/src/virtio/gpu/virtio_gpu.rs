@@ -426,6 +426,13 @@ impl VirtioGpu {
         present_event: utils::eventfd::EventFd,
         trace: Arc<GpuTraceStats>,
     ) -> RutabagaFenceHandler {
+        // limina wake-trace (LIMINA_WAKE_TRACE=1): guest-fence callback/signal rates,
+        // ~5s cadence — see docs/perf/overhead-inventory.md. Shared across the fence
+        // threads, hence the mutex (trace-only, env-gated).
+        let wake_trace: Option<Arc<Mutex<(std::time::Instant, [u64; 3])>>> =
+            std::env::var("LIMINA_WAKE_TRACE")
+                .ok()
+                .map(|_| Arc::new(Mutex::new((std::time::Instant::now(), [0u64; 3]))));
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
             debug!(
                 "XXX - fence called: id={}, ring_idx={}",
@@ -501,8 +508,31 @@ impl VirtioGpu {
             // One interrupt per completion callback, not per retired descriptor — and with
             // EVENT_IDX negotiated only when the guest's used_event says it's waiting
             // (`needs_notification` is always true otherwise, preserving stock behavior).
+            let mut signaled = false;
             if retired_any && queue.needs_notification(&mem).unwrap_or(true) {
                 interrupt.signal_used_queue();
+                signaled = true;
+            }
+            if let Some(tr) = wake_trace.as_ref() {
+                let mut t = tr.lock().unwrap();
+                t.1[0] += 1;
+                if retired_any {
+                    t.1[1] += 1;
+                }
+                if signaled {
+                    t.1[2] += 1;
+                }
+                let secs = t.0.elapsed().as_secs_f64();
+                if secs >= 5.0 {
+                    eprintln!(
+                        "[WAKETRACE fence] callbacks={:.0}/s retiring={:.0}/s irq_signals={:.0}/s",
+                        t.1[0] as f64 / secs,
+                        t.1[1] as f64 / secs,
+                        t.1[2] as f64 / secs,
+                    );
+                    t.1 = [0; 3];
+                    t.0 = std::time::Instant::now();
+                }
             }
             // Update the last completed fence for this context.
             // Use max() to avoid a race where an out-of-order completion

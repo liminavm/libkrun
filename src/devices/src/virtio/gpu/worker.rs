@@ -399,6 +399,11 @@ impl Worker {
         }
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        // limina wake-trace (LIMINA_WAKE_TRACE=1): per-source wake accounting for this
+        // loop, ~5s cadence — see docs/perf/overhead-inventory.md.
+        let mut wake_trace = std::env::var("LIMINA_WAKE_TRACE")
+            .ok()
+            .map(|_| (std::time::Instant::now(), [0u64; 6]));
         loop {
             let ev_cnt = match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(n) => n,
@@ -407,6 +412,37 @@ impl Worker {
                     continue;
                 }
             };
+            if let Some((last, counts)) = wake_trace.as_mut() {
+                counts[0] += 1;
+                for event in &epoll_events[0..ev_cnt] {
+                    let source = event.fd();
+                    if source == control_ev_fd {
+                        counts[1] += 1;
+                    } else if source == cursor_ev_fd {
+                        counts[2] += 1;
+                    } else if present_ev_fd >= 0 && source == present_ev_fd {
+                        counts[3] += 1;
+                    } else if source == resize_ev_fd {
+                        counts[4] += 1;
+                    } else {
+                        counts[5] += 1;
+                    }
+                }
+                let secs = last.elapsed().as_secs_f64();
+                if secs >= 5.0 {
+                    eprintln!(
+                        "[WAKETRACE gpu_worker] wakes={:.0}/s control={:.0}/s cursor={:.0}/s present={:.0}/s resize={:.0}/s other={:.0}/s",
+                        counts[0] as f64 / secs,
+                        counts[1] as f64 / secs,
+                        counts[2] as f64 / secs,
+                        counts[3] as f64 / secs,
+                        counts[4] as f64 / secs,
+                        counts[5] as f64 / secs,
+                    );
+                    *counts = [0; 6];
+                    *last = std::time::Instant::now();
+                }
+            }
             for event in &epoll_events[0..ev_cnt] {
                 let source = event.fd();
                 if source == stop_ev_fd {
