@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
@@ -24,8 +25,12 @@ use krun_display::DisplayBackend;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
-// Supported features.
+// Supported features. EVENT_IDX lets the guest suppress its doorbell writes while the
+// worker is still draining (avail_event) and lets the device skip used-buffer interrupts
+// the guest isn't waiting for (used_event) — under a 60fps venus stream both directions
+// fire thousands of times per second otherwise.
 pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
+    | (1u64 << VIRTIO_RING_F_EVENT_IDX)
     | (1u64 << uapi::VIRTIO_GPU_F_VIRGL)
     | (1u64 << uapi::VIRTIO_GPU_F_EDID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
@@ -36,6 +41,7 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
 // (all renderer-backed) and no capsets — so the guest never probes for or issues 3D
 // commands and falls back to the 2D scanout path (efifb/simpledrm/fbcon). See `Gpu::new`.
 pub(crate) const AVAIL_FEATURES_SOFTWARE_2D: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
+    | (1u64 << VIRTIO_RING_F_EVENT_IDX)
     | (1u64 << uapi::VIRTIO_GPU_F_EDID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID);
 
