@@ -477,9 +477,32 @@ impl Worker {
                         error!("Failed to read control_evt: {e:?}");
                         continue;
                     }
-                    if self.process_queue(virtio_gpu, control_queue, mem) {
-                        if let Err(e) = interrupt.try_signal_used_queue() {
-                            error!("Error signaling queue: {e:?}");
+                    // EVENT_IDX: drain inside a disable/enable-notification bracket so the
+                    // guest stops ringing the doorbell (a vmexit + this wake) while we're
+                    // already here; `enable_notification` re-arms and reports entries that
+                    // raced the re-arm. Signal only when the guest asked (used_event) —
+                    // without EVENT_IDX `needs_notification` is always true (stock behavior).
+                    loop {
+                        let _ = control_queue.lock().unwrap().disable_notification(mem);
+                        let used_any = self.process_queue(virtio_gpu, control_queue, mem);
+                        if used_any
+                            && control_queue
+                                .lock()
+                                .unwrap()
+                                .needs_notification(mem)
+                                .unwrap_or(true)
+                        {
+                            if let Err(e) = interrupt.try_signal_used_queue() {
+                                error!("Error signaling queue: {e:?}");
+                            }
+                        }
+                        match control_queue.lock().unwrap().enable_notification(mem) {
+                            Ok(true) => continue,
+                            Ok(false) => break,
+                            Err(e) => {
+                                error!("Error re-enabling control queue notification: {e:?}");
+                                break;
+                            }
                         }
                     }
                 }
@@ -488,9 +511,27 @@ impl Worker {
                         error!("Failed to read cursor_evt: {e:?}");
                         continue;
                     }
-                    if self.process_cursor_queue(virtio_gpu, cursor_queue, mem) {
-                        if let Err(e) = interrupt.try_signal_used_queue() {
-                            error!("Error signaling cursor queue: {e:?}");
+                    loop {
+                        let _ = cursor_queue.lock().unwrap().disable_notification(mem);
+                        let used_any = self.process_cursor_queue(virtio_gpu, cursor_queue, mem);
+                        if used_any
+                            && cursor_queue
+                                .lock()
+                                .unwrap()
+                                .needs_notification(mem)
+                                .unwrap_or(true)
+                        {
+                            if let Err(e) = interrupt.try_signal_used_queue() {
+                                error!("Error signaling cursor queue: {e:?}");
+                            }
+                        }
+                        match cursor_queue.lock().unwrap().enable_notification(mem) {
+                            Ok(true) => continue,
+                            Ok(false) => break,
+                            Err(e) => {
+                                error!("Error re-enabling cursor queue notification: {e:?}");
+                                break;
+                            }
                         }
                     }
                 }

@@ -473,6 +473,7 @@ impl VirtioGpu {
                 },
             };
 
+            let mut retired_any = false;
             while i < fence_state.descs.len() {
                 debug!("XXX - fence_id: {}", fence_state.descs[i].fence_id);
                 if fence_state.descs[i].ring == ring
@@ -492,11 +493,16 @@ impl VirtioGpu {
                     {
                         error!("failed to add used elements to the queue: {e:?}");
                     }
-
-                    interrupt.signal_used_queue();
+                    retired_any = true;
                 } else {
                     i += 1;
                 }
+            }
+            // One interrupt per completion callback, not per retired descriptor — and with
+            // EVENT_IDX negotiated only when the guest's used_event says it's waiting
+            // (`needs_notification` is always true otherwise, preserving stock behavior).
+            if retired_any && queue.needs_notification(&mem).unwrap_or(true) {
+                interrupt.signal_used_queue();
             }
             // Update the last completed fence for this context.
             // Use max() to avoid a race where an out-of-order completion
