@@ -439,13 +439,16 @@ impl MmioTransport {
 
     fn activate(&mut self) {
         // limina M9.3: bus-fallback resume detection — see `rearm_queues_from_stash`.
-        if !self.queues_programmed
+        // The verdict doubles as the thaw classification handed to the device below
+        // (host-sleep s2idle defer-and-classify): a re-armed activation is a thaw, a
+        // queue-programming one is a real re-init.
+        let rearmed = !self.queues_programmed
             && self
                 .queues
                 .as_ref()
                 .is_some_and(|qs| qs.iter().all(|q| !q.ready))
-            && self.activated_queue_regs.iter().any(|r| r.ready)
-        {
+            && self.activated_queue_regs.iter().any(|r| r.ready);
+        if rearmed {
             self.rearm_queues_from_stash();
         }
 
@@ -478,6 +481,7 @@ impl MmioTransport {
         for dq in &mut device_queues {
             dq.queue.set_event_idx(event_idx_enabled);
         }
+        locked_device.set_thaw_activation(rearmed);
         locked_device
             .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
             .expect("Failed to activate device");
