@@ -165,6 +165,16 @@ pub trait VirtioDevice: AsAny + Send {
     /// Checks if the resources of this device are activated.
     fn is_activated(&self) -> bool;
 
+    /// limina (host-sleep s2idle): called by the transport just before [`activate`] with
+    /// `thaw = true` when this activation's queues were RE-ARMED from the previous
+    /// activation's register file — the signature of a no-PM-ops driver's bus-fallback
+    /// s2idle thaw (reset → renegotiate → DRIVER_OK with no queue writes; see
+    /// `MmioTransport::rearm_queues_from_stash`). A driver that re-initializes for real
+    /// always programs its queues, so `thaw = false` there. Devices that defer session
+    /// teardown across a reset (virtio-gpu) use this to classify the activation; the
+    /// default implementation ignores it.
+    fn set_thaw_activation(&mut self, _thaw: bool) {}
+
     /// Optionally deactivates this device. The device should drop its queues.
     /// After reset, the transport will recreate queues from queue_config().
     fn reset(&mut self) -> bool {
