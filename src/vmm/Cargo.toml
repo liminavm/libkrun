@@ -17,6 +17,7 @@ blk = ["devices/blk"]
 gpu = ["devices/gpu", "krun_display"]
 input = ["devices/input", "krun_input"]
 snd = ["devices/snd"]
+usb = ["devices/usb"]
 aws-nitro = []
 vhost-user = ["devices/vhost-user"]
 

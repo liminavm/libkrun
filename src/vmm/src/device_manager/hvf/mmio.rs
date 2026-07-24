@@ -77,6 +77,14 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// Currently hardcoded to 4K.
 const MMIO_LEN: u64 = 0x1000;
 
+/// The xHCI controller needs a larger MMIO window than the default per-device
+/// `MMIO_LEN`: its register file spans capability + operational + runtime +
+/// doorbell + extended-capability regions. 64 KiB (matches the FDT `reg` size and
+/// `devices::usb::XhciDevice::XHCI_MMIO_LEN`). The bump allocator stays otherwise
+/// unchanged — registering the controller just reserves this many bytes.
+#[cfg(feature = "usb")]
+const XHCI_MMIO_LEN: u64 = 0x1_0000;
+
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
@@ -283,6 +291,54 @@ impl MMIODeviceManager {
         );
 
         self.mmio_base += MMIO_LEN;
+        self.irq += 1;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "usb"))]
+    /// Register the emulated xHCI USB controller (platform `generic-xhci`).
+    ///
+    /// Unlike the other platform devices this claims a 64 KiB MMIO window
+    /// ([`XHCI_MMIO_LEN`]) rather than the default `MMIO_LEN`. The interrupt is wired
+    /// exactly like the RTC (hold the `IrqChip` handle + SPI line so the Stage B
+    /// worker can pulse the interrupter); Stage A generates no events so it never
+    /// fires. `event_manager` is unused until Stage B subscribes the ring worker.
+    pub fn register_mmio_xhci(
+        &mut self,
+        _vm: &Vm,
+        intc: IrqChip,
+        _event_manager: &mut EventManager,
+    ) -> Result<()> {
+        if self.irq > self.last_irq {
+            return Err(Error::IrqsExhausted);
+        }
+
+        let xhci_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        let xhci = Arc::new(Mutex::new(devices::usb::XhciDevice::new(
+            xhci_evt.try_clone().map_err(Error::EventFd)?,
+        )));
+        {
+            let mut xhci = xhci.lock().unwrap();
+            xhci.set_intc(intc);
+            xhci.set_irq_line(self.irq);
+        }
+
+        self.bus
+            .insert(xhci, self.mmio_base, XHCI_MMIO_LEN)
+            .map_err(Error::BusError)?;
+
+        let ret = self.mmio_base;
+        self.id_to_dev_info.insert(
+            (DeviceType::Xhci, "xhci".to_string()),
+            MMIODeviceInfo {
+                addr: ret,
+                len: XHCI_MMIO_LEN,
+                irq: self.irq,
+            },
+        );
+
+        self.mmio_base += XHCI_MMIO_LEN;
         self.irq += 1;
 
         Ok(())
