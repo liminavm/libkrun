@@ -1,29 +1,38 @@
 // Copyright 2026 The limina Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The xHCI controller register file (a `BusDevice`).
+//! The xHCI controller register file (a `BusDevice`) plus the shared controller
+//! state the ring worker drives.
 //!
-//! Stage A (controller bring-up) implements a *functional register file with a
-//! stub data path*: enough of the capability / operational / runtime / doorbell
-//! register semantics that the guest's stock `xhci-plat` driver resets the
-//! controller, reads its parameters, programs the DCBAA / command ring / event
-//! ring, and declares the HCD running with the root hub up — all with **no
-//! device connected and no ring processing**. The command/event/transfer ring
-//! walkers and the `UsbDeviceModel` gadgets land in Stage B.
+//! Stage A brought up a *functional register file with a stub data path*: enough
+//! of the capability / operational / runtime / doorbell register semantics for a
+//! stock `xhci-plat` guest to reset the controller, read its parameters, program
+//! the DCBAA / command ring / event ring, and declare the HCD running with the
+//! root hub up. **Stage B1** adds the data path: the command/event/transfer ring
+//! walkers, the command set, EP0 control transfers, port enumeration and the
+//! [`UsbDeviceModel`] gadgets, so a stock guest **enumerates** an attached device.
 //!
-//! The premise (verified against Linux `drivers/usb/host/xhci.c`, v6.12): a
-//! `generic-xhci` platform controller with no NEC quirk issues **zero xHCI
-//! commands** during `xhci_run`/`xhci_start` — it only sets `USBCMD.RS` and
-//! waits for `USBSTS.HCH` to clear. `xhci_reset` waits for `USBCMD.HCRST` to
-//! self-clear and then for `USBSTS.CNR` to clear; `xhci_mem_init` reads
-//! `PAGESIZE` (bit 0 = 4 KiB), `HCSPARAMS1/2`, `HCCPARAMS1` (walking the
-//! extended-capabilities list for the Supported Protocol cap), and stores
-//! `DCBAAP`/`CRCR`/`CONFIG` and the interrupter-0 event-ring registers. So a
-//! register file alone brings the HCD up; no command completions are needed
-//! until a device connects.
+//! ## Threading & locking (the #1 structural hazard)
+//!
+//! The whole controller is one `Arc<Mutex<XhciDevice>>`:
+//! - the **vcpu thread** locks it for each MMIO register access (short; register
+//!   mutation only — a doorbell/RS write enqueues work and kicks the worker);
+//! - the **worker thread** locks it to walk the rings, run the command set and
+//!   collect EP0 transfer work, then **releases the lock before calling any
+//!   gadget** (a gadget may block for seconds on Touch ID);
+//! - a **completion** (invoked from any thread when a gadget finishes) re-locks it
+//!   to post the Transfer Event + interrupt.
+//!
+//! There is exactly one lock and it is never held across a gadget call, so a
+//! synchronous gadget completion (the mock) cannot re-enter it and no lock-order
+//! cycle exists — the design cannot deadlock. See `engine.rs` / `worker.rs`.
+
+use std::sync::Arc;
 
 use utils::eventfd::EventFd;
 
+use super::super::model::UsbDeviceModel;
+use super::trb::{EventRing, RingWalker};
 use crate::legacy::IrqChip;
 use crate::BusDevice;
 
@@ -121,29 +130,41 @@ const IMAN_IE: u32 = 1 << 1; // Interrupt Enable (RW)
 
 // ---- PORTSC bits ------------------------------------------------------------
 
-// Current Connect Status (RO) — Stage B sets it on connect; Stage A asserts it absent.
-#[allow(dead_code)]
-const PORTSC_CCS: u32 = 1 << 0;
+const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status (RO)
 const PORTSC_PED: u32 = 1 << 1; // Port Enabled/Disabled (RW1C to disable)
 const PORTSC_PR: u32 = 1 << 4; // Port Reset (RW1S, self-clearing)
 const PORTSC_PLS_SHIFT: u32 = 5;
 const PORTSC_PLS_MASK: u32 = 0xf << PORTSC_PLS_SHIFT; // Port Link State (RWS via LWS)
 const PORTSC_PP: u32 = 1 << 9; // Port Power (RW)
+const PORTSC_SPEED_SHIFT: u32 = 10;
+const PORTSC_SPEED_MASK: u32 = 0xf << PORTSC_SPEED_SHIFT; // Port Speed (RO)
 const PORTSC_PIC_MASK: u32 = 0x3 << 14; // Port Indicator Control (RW)
 const PORTSC_LWS: u32 = 1 << 16; // Link State Write Strobe (gates PLS write)
+const PORTSC_CSC: u32 = 1 << 17; // Connect Status Change (RW1C)
+const PORTSC_PRC: u32 = 1 << 21; // Port Reset Change (RW1C)
 const PORTSC_WAKE_MASK: u32 = 0x7 << 25; // WCE/WDE/WOE (RW)
 const PORTSC_WPR: u32 = 1 << 31; // Warm Port Reset (RW1S, self-clearing)
 /// PORTSC change bits (CSC, PEC, WRC, OCC, PRC, PLC, CEC) — all write-1-to-clear.
 const PORTSC_RW1C_MASK: u32 = 0x7f << 17;
 /// Port Link State value for a powered but disconnected port (RxDetect).
 const PLS_RX_DETECT: u32 = 5;
+/// Port Link State: Polling (USB2 on connect, pre-reset).
+const PLS_POLLING: u32 = 7;
+/// Port Link State: U0 (enabled, post-reset).
+const PLS_U0: u32 = 0;
 /// A freshly powered, nothing-connected USB2 port.
 const PORTSC_DEFAULT: u32 = PORTSC_PP | (PLS_RX_DETECT << PORTSC_PLS_SHIFT);
+/// Port Speed ID for a full-speed device (`XDEV_FS`, Linux `xhci.h`).
+const SPEED_FULL: u32 = 1;
+const SPEED_LOW: u32 = 2;
+const SPEED_HIGH: u32 = 3;
 
 // ---- extended capability: Supported Protocol (USB 2.0, ports 1-4) -----------
 
 const XECP_CAP_ID_SUPPORTED_PROTOCOL: u32 = 0x02;
-// dword0: CapID=0x02, Next=0 (end of list), MinorRev=0x00, MajorRev=0x02.
+// dword0: CapID=0x02, Next=0 (end of list), MinorRev=0x00, MajorRev=0x02. The
+// zero-shifted fields are kept explicit to mirror the spec's field layout.
+#[allow(clippy::identity_op)]
 const XECP_DW0: u32 = XECP_CAP_ID_SUPPORTED_PROTOCOL | (0x00 << 8) | (0x00 << 16) | (0x02 << 24);
 // dword1: name string "USB " (little-endian bytes 'U','S','B',' ').
 const XECP_DW1: u32 = u32::from_le_bytes(*b"USB ");
@@ -152,12 +173,38 @@ const XECP_DW2: u32 = 0x01 | ((NUM_PORTS as u32) << 8);
 // dword3: Protocol Slot Type = 0.
 const XECP_DW3: u32 = 0x0000_0000;
 
-/// The emulated xHCI controller: a synchronous register file on the vcpu thread.
-///
-/// Stage A carries the interrupt plumbing (`intc` + `irq_line` + `interrupt_evt`,
-/// wired exactly like the PL031 RTC) but never asserts — with no device attached
-/// there are no transfer/event-ring writes to signal. Stage B's worker thread
-/// uses [`XhciDevice::assert_interrupt`] on each event-ring batch.
+/// Per-slot controller state, keyed by Slot ID (1-based). Created at Enable Slot
+/// (port unknown), bound to a port + model at Address Device.
+pub(super) struct SlotCtx {
+    /// Root-hub port number (1-based), set at Address Device.
+    pub port: u8,
+    /// Assigned USB device address (bookkeeping; xHCI addressing is internal).
+    #[allow(dead_code)]
+    pub address: u8,
+    /// Slot state (see `context::slot_state`).
+    pub state: u32,
+    /// Current configuration value (SET_CONFIGURATION).
+    pub config_value: u8,
+    /// The EP0 (control) transfer-ring consumer position.
+    pub ep0_ring: Option<RingWalker>,
+}
+
+/// Work the vcpu-thread register writes hand to the worker, drained each pass.
+#[derive(Default)]
+pub(super) struct WorkQueue {
+    /// USBCMD.RS went 0→1: scan ports for cold-plugged devices and post connects.
+    pub run_started: bool,
+    /// The command-ring doorbell (DB[0]) was rung.
+    pub cmd_doorbell: bool,
+    /// Slot transfer doorbells: (slot_id, endpoint DCI).
+    pub ep_doorbells: Vec<(u8, u8)>,
+    /// Ports needing a Port Status Change Event (1-based ids).
+    pub port_events: Vec<u8>,
+}
+
+/// The emulated xHCI controller: the register file (serviced on the vcpu thread)
+/// plus the ring/slot/port state the worker drives. One `Arc<Mutex<_>>` shared by
+/// the bus, the worker and transfer completions (see the module docs).
 pub struct XhciDevice {
     // Operational registers.
     usbcmd: u32,
@@ -175,13 +222,26 @@ pub struct XhciDevice {
     erstba: u64,
     erdp: u64,
 
-    // Interrupt plumbing (unused until Stage B raises event-ring interrupts).
-    #[allow(dead_code)]
+    // Interrupt plumbing (HVF: intc + irq_line; KVM: interrupt_evt irqfd).
     intc: Option<IrqChip>,
-    #[allow(dead_code)]
     irq_line: Option<u32>,
-    #[allow(dead_code)]
     interrupt_evt: EventFd,
+
+    // ---- Stage B controller state ----
+    /// The command-ring walker (rebuilt when CRCR is (re)programmed).
+    pub(super) cmd_ring: Option<RingWalker>,
+    /// The single-segment event ring (built from ERSTBA on first use).
+    pub(super) event_ring: Option<EventRing>,
+    /// Per-slot state (index 0 unused; 1..=NUM_SLOTS).
+    pub(super) slots: Vec<Option<SlotCtx>>,
+    /// Device models per root port (index 0 = port 1).
+    pub(super) port_models: Vec<Option<Arc<dyn UsbDeviceModel>>>,
+    /// Next USB device address to hand out at Address Device (BSR=0).
+    pub(super) next_address: u8,
+    /// Pending worker work, set by register writes.
+    pub(super) work: WorkQueue,
+    /// Nudges the worker thread; `None` in unit tests (work stays queued).
+    worker_kick: Option<EventFd>,
 }
 
 impl XhciDevice {
@@ -205,33 +265,91 @@ impl XhciDevice {
             intc: None,
             irq_line: None,
             interrupt_evt,
+            cmd_ring: None,
+            event_ring: None,
+            slots: (0..=NUM_SLOTS).map(|_| None).collect(),
+            port_models: (0..NUM_PORTS).map(|_| None).collect(),
+            next_address: 1,
+            work: WorkQueue::default(),
+            worker_kick: None,
         }
     }
 
     /// Wire the controller to the interrupt controller (macOS/HVF path), mirroring
-    /// the PL031 RTC. On KVM `intc` stays `None` and the event-ring worker pokes the
-    /// registered irqfd directly. Unused in Stage A (no events are generated).
+    /// the PL031 RTC. On KVM `intc` stays `None` and the worker pokes the irqfd.
     pub fn set_intc(&mut self, intc: IrqChip) {
         self.intc = Some(intc);
     }
 
-    /// The SPI line this controller's interrupter raises (edge-triggered; the FDT
-    /// declares it so, matching the RTC/GPIO one-shot `hv_gic_set_spi` pulse).
+    /// The SPI line this controller's interrupter raises (edge-triggered).
     pub fn set_irq_line(&mut self, irq: u32) {
         self.irq_line = Some(irq);
     }
 
-    /// Assert the interrupter-0 SPI (HVF) or poke the irqfd (KVM). Stage B calls this
-    /// on each event-ring batch while `IMAN.IE` is set; unused in Stage A.
-    #[allow(dead_code)]
-    pub fn assert_interrupt(&mut self) {
-        // Only signal when the interrupter is enabled (IMAN.IE) and the guest has
-        // globally enabled interrupts (USBCMD.INTE).
-        if self.iman & IMAN_IE == 0 || self.usbcmd & CMD_INTE == 0 {
-            return;
+    /// Attach the cold-plugged device models (one per root port, in order) and the
+    /// worker kick eventfd. Called once at registration, before boot.
+    pub fn attach_devices(&mut self, models: Vec<Arc<dyn UsbDeviceModel>>, kick: EventFd) {
+        for (i, m) in models.into_iter().enumerate() {
+            if i < NUM_PORTS {
+                self.port_models[i] = Some(m);
+            } else {
+                warn!("xhci: more USB devices than root ports ({NUM_PORTS}); dropping extras");
+                break;
+            }
         }
+        self.worker_kick = Some(kick);
+    }
+
+    /// A clone of the guest-visible interrupt eventfd (for the worker's irqfd path
+    /// bookkeeping / KVM). Not otherwise used on HVF.
+    pub fn interrupt_evt(&self) -> &EventFd {
+        &self.interrupt_evt
+    }
+
+    /// Nudge the worker to process queued work (no-op in unit tests).
+    fn kick_worker(&self) {
+        if let Some(k) = &self.worker_kick {
+            if let Err(e) = k.write(1) {
+                warn!("xhci: failed to kick worker: {e:?}");
+            }
+        }
+    }
+
+    /// Assert the interrupter-0 SPI (HVF) or poke the irqfd (KVM).
+    ///
+    /// Per spec (and the Stage A reviewer's mandate): **latch IMAN.IP and
+    /// USBSTS.EINT unconditionally** when an event is posted — a guest that polls,
+    /// or that enables interrupts *after* an event, must still observe them. Only
+    /// the physical SPI pulse is gated by IMAN.IE && USBCMD.INTE.
+    pub fn assert_interrupt(&mut self) {
         self.iman |= IMAN_IP;
         self.usbsts |= STS_EINT;
+        if self.iman & IMAN_IE == 0 || self.usbcmd & CMD_INTE == 0 {
+            return; // latched, but no edge delivered while masked
+        }
+        self.pulse_spi();
+    }
+
+    /// If an interrupt is latched (IMAN.IP) and the guest has just armed delivery
+    /// (IMAN.IE && USBCMD.INTE), pulse the edge now. We are edge-triggered, so a
+    /// guest that posts an event while masked and *then* enables interrupts would
+    /// otherwise never see the edge — this synthesizes the level-triggered
+    /// behavior QEMU/crosvm get for free from INTx.
+    fn deliver_latched_on_enable(&mut self) {
+        if self.iman & IMAN_IP != 0 && self.iman & IMAN_IE != 0 && self.usbcmd & CMD_INTE != 0 {
+            self.pulse_spi();
+        }
+    }
+
+    fn pulse_spi(&self) {
+        log::trace!(
+            "xhci: SPI pulse irq={:?} iman={:#x} usbcmd={:#x} erdp={:#x} enq={:#x}",
+            self.irq_line,
+            self.iman,
+            self.usbcmd,
+            self.erdp & !0xf,
+            self.event_ring.map(|e| e.enqueue_addr()).unwrap_or(0)
+        );
         if let Some(intc) = &self.intc {
             if let Err(e) = intc
                 .lock()
@@ -245,9 +363,17 @@ impl XhciDevice {
         }
     }
 
-    /// A guest-visible host controller reset (`USBCMD.HCRST`): clear the whole
-    /// register file back to the post-power-on state, but with `CNR` **cleared**
-    /// (the controller is ready) — this is the transition `xhci_reset` waits on.
+    /// True while the event ring holds events the guest hasn't dequeued (its
+    /// enqueue pointer is ahead of ERDP). Used by the lost-edge re-pulse guard.
+    fn event_ring_has_pending(&self) -> bool {
+        self.event_ring
+            .map(|er| er.enqueue_addr() != (self.erdp & !0xf))
+            .unwrap_or(false)
+    }
+
+    /// A guest-visible host controller reset (`USBCMD.HCRST`): back to post-power-on
+    /// state with `CNR` cleared (ready) — the transition `xhci_reset` waits on — and
+    /// all Stage B ring/slot state discarded (the attached models persist).
     fn reset_controller(&mut self) {
         self.usbcmd = 0;
         self.usbsts = STS_HCH; // halted, ready (CNR clear)
@@ -261,6 +387,13 @@ impl XhciDevice {
         self.erstsz = 0;
         self.erstba = 0;
         self.erdp = 0;
+        self.cmd_ring = None;
+        self.event_ring = None;
+        for s in self.slots.iter_mut() {
+            *s = None;
+        }
+        self.next_address = 1;
+        self.work = WorkQueue::default();
     }
 
     // ---- register read/write dispatch ---------------------------------------
@@ -289,8 +422,10 @@ impl XhciDevice {
             _ if off == OP_BASE + OP_USBSTS => self.usbsts,
             _ if off == OP_BASE + OP_PAGESIZE => 0x1, // 4 KiB page size supported
             _ if off == OP_BASE + OP_DNCTRL => self.dnctrl,
-            _ if off == OP_BASE + OP_CRCR_LO => self.crcr as u32,
-            _ if off == OP_BASE + OP_CRCR_HI => (self.crcr >> 32) as u32,
+            // Per spec the Command Ring Pointer field reads as 0; CRR is modelled
+            // minimally as 0 (we never leave a command mid-execution).
+            _ if off == OP_BASE + OP_CRCR_LO => 0,
+            _ if off == OP_BASE + OP_CRCR_HI => 0,
             _ if off == OP_BASE + OP_DCBAAP_LO => self.dcbaap as u32,
             _ if off == OP_BASE + OP_DCBAAP_HI => (self.dcbaap >> 32) as u32,
             _ if off == OP_BASE + OP_CONFIG => self.config,
@@ -339,10 +474,13 @@ impl XhciDevice {
             _ if off == OP_BASE + OP_PAGESIZE => {} // read-only
             _ if off == OP_BASE + OP_DNCTRL => self.dnctrl = val,
             _ if off == OP_BASE + OP_CRCR_LO => {
-                self.crcr = (self.crcr & 0xffff_ffff_0000_0000) | u64::from(val)
+                self.crcr = (self.crcr & 0xffff_ffff_0000_0000) | u64::from(val);
+                // A CRCR (re)program rebases the command ring.
+                self.cmd_ring = None;
             }
             _ if off == OP_BASE + OP_CRCR_HI => {
-                self.crcr = (self.crcr & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32)
+                self.crcr = (self.crcr & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32);
+                self.cmd_ring = None;
             }
             _ if off == OP_BASE + OP_DCBAAP_LO => {
                 self.dcbaap = (self.dcbaap & 0xffff_ffff_0000_0000) | u64::from(val)
@@ -353,27 +491,24 @@ impl XhciDevice {
             _ if off == OP_BASE + OP_CONFIG => self.config = val,
 
             // Runtime registers (interrupter 0).
-            _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_IMAN => {
-                let mut iman = self.iman;
-                if val & IMAN_IP != 0 {
-                    iman &= !IMAN_IP; // write-1-to-clear
-                }
-                iman = (iman & !IMAN_IE) | (val & IMAN_IE);
-                self.iman = iman;
-            }
+            _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_IMAN => self.handle_iman(val),
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_IMOD => self.imod = val,
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERSTSZ => self.erstsz = val,
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERSTBA_LO => {
-                self.erstba = (self.erstba & 0xffff_ffff_0000_0000) | u64::from(val)
+                self.erstba = (self.erstba & 0xffff_ffff_0000_0000) | u64::from(val);
+                // A new ERST rebuilds the event ring.
+                self.event_ring = None;
             }
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERSTBA_HI => {
-                self.erstba = (self.erstba & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32)
+                self.erstba = (self.erstba & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32);
+                self.event_ring = None;
             }
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERDP_LO => {
-                // ERDP bit 3 (EHB) is write-1-to-clear; we never set it (no events),
-                // so keep the dequeue pointer and force EHB low.
+                // ERDP bit 3 (EHB) is write-1-to-clear; store the dequeue pointer
+                // (with EHB forced low) for ring-full detection.
                 let ptr = val & !(1 << 3);
-                self.erdp = (self.erdp & 0xffff_ffff_0000_0000) | u64::from(ptr)
+                self.erdp = (self.erdp & 0xffff_ffff_0000_0000) | u64::from(ptr);
+                log::trace!("xhci: ERDP write ptr={ptr:#x} (ehb-clear)");
             }
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERDP_HI => {
                 self.erdp = (self.erdp & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32)
@@ -388,33 +523,89 @@ impl XhciDevice {
                 // PORTPMSC/PORTLI/PORTHLPMC are accepted and dropped for now.
             }
 
-            // Doorbell array: accepted, no-op until Stage B walks the rings.
-            _ if (DB_BASE..DB_BASE + (NUM_SLOTS as u64 + 1) * 4).contains(&off) => {}
+            // Doorbell array: enqueue worker work and kick.
+            _ if (DB_BASE..DB_BASE + (NUM_SLOTS as u64 + 1) * 4).contains(&off) => {
+                self.handle_doorbell(((off - DB_BASE) / 4) as u8, val);
+            }
 
             // Read-only capability registers and reserved space: ignore writes.
             _ => {}
         }
     }
 
-    /// USBCMD write: a HCRST triggers a full reset; otherwise store the RW bits and
-    /// keep `USBSTS.HCH` in sync with `RS`.
+    /// IMAN write: IE is RW, IP is RW1C. Reviewer-mandated lost-edge guard — after
+    /// a write clears IP, if the event ring still holds undelivered events we are
+    /// edge-triggered, so re-latch IP and pulse again (QEMU/crosvm get this free
+    /// from level INTx; we must synthesize the missed edge).
+    fn handle_iman(&mut self, val: u32) {
+        let cleared_ip = val & IMAN_IP != 0 && self.iman & IMAN_IP != 0;
+        let ie_was_off = self.iman & IMAN_IE == 0;
+        let mut iman = self.iman;
+        if val & IMAN_IP != 0 {
+            iman &= !IMAN_IP;
+        }
+        iman = (iman & !IMAN_IE) | (val & IMAN_IE);
+        self.iman = iman;
+        log::trace!(
+            "xhci: IMAN write val={:#x} cleared_ip={} pending={} iman_now={:#x}",
+            val,
+            cleared_ip,
+            self.event_ring_has_pending(),
+            self.iman
+        );
+        if cleared_ip && self.event_ring_has_pending() {
+            // Lost-edge guard: undelivered events remain — re-latch and re-pulse.
+            self.assert_interrupt();
+        } else if ie_was_off && iman & IMAN_IE != 0 {
+            // Interrupts just enabled: deliver anything latched while masked.
+            self.deliver_latched_on_enable();
+        }
+    }
+
+    /// Handle a doorbell write: DB[0] is the command ring; DB[slot] is a device
+    /// slot with the endpoint DCI in the low byte. Queue the work and kick.
+    fn handle_doorbell(&mut self, index: u8, val: u32) {
+        if index == 0 {
+            self.work.cmd_doorbell = true;
+        } else {
+            let dci = (val & 0xff) as u8;
+            self.work.ep_doorbells.push((index, dci));
+        }
+        self.kick_worker();
+    }
+
+    /// USBCMD write: a HCRST triggers a full reset; otherwise store the RW bits,
+    /// keep `USBSTS.HCH` in sync with `RS`, and flag the run edge for the worker
+    /// (the port connect scan happens there, with guest memory in hand).
     fn handle_usbcmd(&mut self, val: u32) {
         if val & CMD_HCRST != 0 {
             self.reset_controller();
             return;
         }
         // Light HC reset (bit 7) self-clears with no other effect here.
+        let was_running = self.usbcmd & CMD_RS != 0;
+        let inte_was_off = self.usbcmd & CMD_INTE == 0;
         let stored = val & CMD_STORE_MASK;
         self.usbcmd = stored;
         if stored & CMD_RS != 0 {
             self.usbsts &= !STS_HCH; // running
+            if !was_running {
+                self.work.run_started = true;
+                self.kick_worker();
+            }
         } else {
             self.usbsts |= STS_HCH; // halted
         }
+        // Interrupts just globally enabled: deliver anything latched while masked.
+        if inte_was_off && stored & CMD_INTE != 0 {
+            self.deliver_latched_on_enable();
+        }
     }
 
-    /// PORTSC write with the spec's mixed RW / RW1C / RW1S semantics; read-only bits
-    /// (CCS, OCA, speed, CAS, DR) are preserved.
+    /// PORTSC write with the spec's mixed RW / RW1C / RW1S semantics. A Port Reset
+    /// on a connected port completes immediately (USB2 emulated): PR self-clears,
+    /// PED sets, PLS→U0, the speed field latches, PRC latches, and a Port Status
+    /// Change Event is queued for the worker.
     fn write_portsc(&mut self, idx: usize, val: u32) {
         let mut p = self.ports[idx];
         // Write-1-to-clear the change bits.
@@ -433,10 +624,33 @@ impl XhciDevice {
         }
         // Wake-enable bits (RW).
         p = (p & !PORTSC_WAKE_MASK) | (val & PORTSC_WAKE_MASK);
-        // PR / WPR initiate a reset. With nothing connected the reset completes
-        // instantly and the bit self-clears — leave it low, raise no change event.
-        let _ = (PORTSC_PR, PORTSC_WPR);
+
+        // PR / WPR initiate a reset.
+        let reset = val & (PORTSC_PR | PORTSC_WPR) != 0;
         self.ports[idx] = p;
+        if reset && p & PORTSC_CCS != 0 {
+            self.complete_port_reset(idx);
+        }
+    }
+
+    /// Complete an emulated USB2 port reset: enable the port, drop it to U0, latch
+    /// the device speed and the Port Reset Change bit, and queue the change event.
+    fn complete_port_reset(&mut self, idx: usize) {
+        let speed = match self.port_models[idx].as_ref().map(|m| m.speed()) {
+            Some(super::super::model::UsbSpeed::Low) => SPEED_LOW,
+            Some(super::super::model::UsbSpeed::High) => SPEED_HIGH,
+            _ => SPEED_FULL,
+        };
+        let mut p = self.ports[idx];
+        p &= !PORTSC_PR; // reset done (self-clearing)
+        p |= PORTSC_PED; // port enabled
+        p = (p & !PORTSC_PLS_MASK) | (PLS_U0 << PORTSC_PLS_SHIFT);
+        p = (p & !PORTSC_SPEED_MASK) | (speed << PORTSC_SPEED_SHIFT);
+        p |= PORTSC_PRC; // reset-change latched
+        self.ports[idx] = p;
+        self.usbsts |= STS_PCD;
+        self.work.port_events.push((idx + 1) as u8);
+        self.kick_worker();
     }
 
     /// If `off` lands in the PORTSC array, return `(port index, sub-register offset)`.
@@ -449,6 +663,39 @@ impl XhciDevice {
         } else {
             None
         }
+    }
+
+    // ---- accessors used by the engine (engine.rs) ---------------------------
+
+    pub(super) fn crcr_ptr(&self) -> u64 {
+        self.crcr & !0x3f
+    }
+    pub(super) fn crcr_rcs(&self) -> bool {
+        self.crcr & 1 != 0
+    }
+    pub(super) fn dcbaap(&self) -> u64 {
+        self.dcbaap & !0x3f
+    }
+    pub(super) fn erstba(&self) -> u64 {
+        self.erstba & !0x3f
+    }
+    pub(super) fn erdp_ptr(&self) -> u64 {
+        self.erdp & !0xf
+    }
+    pub(super) fn set_port_connected(&mut self, idx: usize) {
+        let mut p = self.ports[idx];
+        p |= PORTSC_CCS | PORTSC_CSC;
+        p = (p & !PORTSC_PLS_MASK) | (PLS_POLLING << PORTSC_PLS_SHIFT);
+        self.ports[idx] = p;
+        self.usbsts |= STS_PCD;
+    }
+    pub(super) fn port_populated(&self, idx: usize) -> bool {
+        self.port_models[idx].is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_dcbaap_for_test(&mut self, v: u64) {
+        self.dcbaap = v;
     }
 }
 
@@ -540,6 +787,7 @@ mod tests {
     const PAGESIZE: u64 = OP_BASE + OP_PAGESIZE;
     const CONFIG: u64 = OP_BASE + OP_CONFIG;
     const DCBAAP: u64 = OP_BASE + OP_DCBAAP_LO;
+    const CRCR: u64 = OP_BASE + OP_CRCR_LO;
     const PORTSC0: u64 = OP_BASE + OP_PORTSC_BASE;
     const IMAN0: u64 = RUNTIME_BASE + RT_IR0_BASE + IR_IMAN;
 
@@ -578,16 +826,17 @@ mod tests {
     #[test]
     fn extended_caps_walk_reaches_usb2_supported_protocol() {
         let mut d = dev();
-        // Follow HCCPARAMS1.xECP to the caps list.
         let hcc = r32(&mut d, CAP_HCCPARAMS1);
         let xecp = u64::from((hcc >> 16) << 2);
         let dw0 = r32(&mut d, xecp);
-        assert_eq!(dw0 & 0xff, XECP_CAP_ID_SUPPORTED_PROTOCOL, "Supported Protocol cap id");
+        assert_eq!(
+            dw0 & 0xff,
+            XECP_CAP_ID_SUPPORTED_PROTOCOL,
+            "Supported Protocol cap id"
+        );
         assert_eq!((dw0 >> 8) & 0xff, 0, "Next pointer = 0 (end of list)");
         assert_eq!((dw0 >> 24) & 0xff, 0x02, "Major revision 2 (USB 2.0)");
-        // Name string "USB ".
         assert_eq!(r32(&mut d, xecp + 4), u32::from_le_bytes(*b"USB "));
-        // Compatible port offset 1, count 4.
         let dw2 = r32(&mut d, xecp + 8);
         assert_eq!(dw2 & 0xff, 1, "compatible port offset");
         assert_eq!((dw2 >> 8) & 0xff, NUM_PORTS as u32, "compatible port count");
@@ -596,13 +845,9 @@ mod tests {
     #[test]
     fn hcrst_self_clears_and_clears_cnr() {
         let mut d = dev();
-        // Fresh controller: not-ready (CNR) and halted (HCH).
         assert_ne!(r32(&mut d, USBSTS) & STS_CNR, 0, "CNR set at power-on");
-        // Issue a host controller reset.
         w32(&mut d, USBCMD, CMD_HCRST);
-        // HCRST reads back as 0 (self-clearing) ...
         assert_eq!(r32(&mut d, USBCMD) & CMD_HCRST, 0, "HCRST self-cleared");
-        // ... and the controller is now ready (CNR clear) and still halted.
         assert_eq!(r32(&mut d, USBSTS) & STS_CNR, 0, "CNR cleared after reset");
         assert_ne!(r32(&mut d, USBSTS) & STS_HCH, 0, "still halted after reset");
     }
@@ -611,24 +856,32 @@ mod tests {
     fn hch_tracks_run_stop() {
         let mut d = dev();
         assert_ne!(r32(&mut d, USBSTS) & STS_HCH, 0, "halted before run");
-        // Run.
         w32(&mut d, USBCMD, CMD_RS);
         assert_eq!(r32(&mut d, USBSTS) & STS_HCH, 0, "HCH clears when running");
-        // Stop.
         w32(&mut d, USBCMD, 0);
         assert_ne!(r32(&mut d, USBSTS) & STS_HCH, 0, "HCH sets when stopped");
     }
 
     #[test]
+    fn crcr_pointer_reads_as_zero() {
+        let mut d = dev();
+        // Program a command ring pointer (RCS=1).
+        let addr: u64 = 0x0000_0001_2345_6041;
+        d.write(0, CRCR, &addr.to_le_bytes());
+        // Per spec the pointer field reads back as 0.
+        assert_eq!(r64(&mut d, CRCR), 0, "CRCR pointer reads as 0");
+        // But the internal value is retained for the command ring walker.
+        assert_eq!(d.crcr_ptr(), addr & !0x3f);
+        assert!(d.crcr_rcs());
+    }
+
+    #[test]
     fn usbsts_eint_is_write_one_to_clear() {
         let mut d = dev();
-        // Seed an event-interrupt status (Stage B would set this on a real event).
         d.usbsts |= STS_EINT;
         assert_ne!(r32(&mut d, USBSTS) & STS_EINT, 0);
-        // Writing 0 to the bit must NOT clear it.
         w32(&mut d, USBSTS, 0);
         assert_ne!(r32(&mut d, USBSTS) & STS_EINT, 0, "0 must not clear EINT");
-        // Writing 1 clears it.
         w32(&mut d, USBSTS, STS_EINT);
         assert_eq!(r32(&mut d, USBSTS) & STS_EINT, 0, "EINT is RW1C");
     }
@@ -636,18 +889,35 @@ mod tests {
     #[test]
     fn iman_ip_is_rw1c_and_ie_is_rw() {
         let mut d = dev();
-        // Enable interrupts (IE) and seed a pending interrupt (IP).
         w32(&mut d, IMAN0, IMAN_IE);
         d.iman |= IMAN_IP;
         assert_ne!(r32(&mut d, IMAN0) & IMAN_IP, 0);
-        // Writing IE=1 without IP=1 leaves IP set ...
         w32(&mut d, IMAN0, IMAN_IE);
-        assert_ne!(r32(&mut d, IMAN0) & IMAN_IP, 0, "IP not cleared by writing 0");
+        assert_ne!(
+            r32(&mut d, IMAN0) & IMAN_IP,
+            0,
+            "IP not cleared by writing 0"
+        );
         assert_ne!(r32(&mut d, IMAN0) & IMAN_IE, 0, "IE stays enabled");
-        // ... writing IP=1 clears it.
         w32(&mut d, IMAN0, IMAN_IE | IMAN_IP);
         assert_eq!(r32(&mut d, IMAN0) & IMAN_IP, 0, "IP is RW1C");
         assert_ne!(r32(&mut d, IMAN0) & IMAN_IE, 0, "IE preserved");
+    }
+
+    #[test]
+    fn assert_interrupt_latches_even_while_masked() {
+        let mut d = dev();
+        // Interrupts globally and locally disabled.
+        assert_eq!(d.usbcmd & CMD_INTE, 0);
+        assert_eq!(d.iman & IMAN_IE, 0);
+        // A posted event must still latch IP and EINT (guest may poll / enable later).
+        d.assert_interrupt();
+        assert_ne!(r32(&mut d, IMAN0) & IMAN_IP, 0, "IP latched while masked");
+        assert_ne!(
+            r32(&mut d, USBSTS) & STS_EINT,
+            0,
+            "EINT latched while masked"
+        );
     }
 
     #[test]
@@ -661,19 +931,38 @@ mod tests {
     #[test]
     fn portsc_change_bits_are_rw1c_and_preserve_power() {
         let mut d = dev();
-        // Seed a connect-status-change (bit 17) as a hotplug would. PP is set by default.
-        const CSC: u32 = 1 << 17;
-        d.ports[0] |= CSC;
-        assert_ne!(r32(&mut d, PORTSC0) & CSC, 0);
-        // The driver clears change bits with a read-modify-write, always writing PP
-        // back. Writing PP with the change bit 0 must NOT clear the change bit.
+        d.ports[0] |= PORTSC_CSC;
+        assert_ne!(r32(&mut d, PORTSC0) & PORTSC_CSC, 0);
         w32(&mut d, PORTSC0, PORTSC_PP);
-        assert_ne!(r32(&mut d, PORTSC0) & CSC, 0, "0 in the change bit must not clear CSC");
+        assert_ne!(
+            r32(&mut d, PORTSC0) & PORTSC_CSC,
+            0,
+            "0 in change bit must not clear CSC"
+        );
         assert_ne!(r32(&mut d, PORTSC0) & PORTSC_PP, 0, "PP preserved");
-        // Writing 1 to the change bit (PP still set) clears just that bit.
-        w32(&mut d, PORTSC0, PORTSC_PP | CSC);
-        assert_eq!(r32(&mut d, PORTSC0) & CSC, 0, "CSC is RW1C");
+        w32(&mut d, PORTSC0, PORTSC_PP | PORTSC_CSC);
+        assert_eq!(r32(&mut d, PORTSC0) & PORTSC_CSC, 0, "CSC is RW1C");
         assert_ne!(r32(&mut d, PORTSC0) & PORTSC_PP, 0, "PP still set");
+    }
+
+    #[test]
+    fn port_reset_completes_and_latches_full_speed() {
+        let mut d = dev();
+        // Cold-plug a full-speed mock on port 1 and mark it connected (as the run
+        // scan would), then drive a port reset.
+        d.port_models[0] = Some(Arc::new(super::super::super::mock::MockUsbDevice::new()));
+        d.set_port_connected(0);
+        w32(&mut d, PORTSC0, PORTSC_PR | PORTSC_PP);
+        let p = r32(&mut d, PORTSC0);
+        assert_eq!(p & PORTSC_PR, 0, "PR self-cleared");
+        assert_ne!(p & PORTSC_PED, 0, "port enabled after reset");
+        assert_ne!(p & PORTSC_PRC, 0, "reset-change latched");
+        assert_eq!(
+            (p & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT,
+            SPEED_FULL,
+            "full speed"
+        );
+        assert_eq!(d.work.port_events, vec![1], "port change event queued");
     }
 
     #[test]
@@ -682,7 +971,6 @@ mod tests {
         w32(&mut d, CONFIG, NUM_SLOTS);
         assert_eq!(r32(&mut d, CONFIG), NUM_SLOTS, "CONFIG.MaxSlotsEn stored");
 
-        // DCBAAP written as a single 64-bit access, read back whole and in halves.
         let addr: u64 = 0x0000_0001_2345_6000;
         d.write(0, DCBAAP, &addr.to_le_bytes());
         assert_eq!(r64(&mut d, DCBAAP), addr, "64-bit store/readback");
@@ -694,10 +982,34 @@ mod tests {
     fn sixtyfour_bit_register_written_in_two_halves() {
         let mut d = dev();
         let addr: u64 = 0x0000_00ab_cdef_0000;
-        // Low dword then high dword, as the driver's xhci_write_64 does on a
-        // 32-bit-only accessor.
         w32(&mut d, DCBAAP, addr as u32);
         w32(&mut d, DCBAAP + 4, (addr >> 32) as u32);
-        assert_eq!(r64(&mut d, DCBAAP), addr, "halves reassemble to the 64-bit value");
+        assert_eq!(
+            r64(&mut d, DCBAAP),
+            addr,
+            "halves reassemble to the 64-bit value"
+        );
+    }
+
+    #[test]
+    fn doorbell_queues_worker_work() {
+        let mut d = dev();
+        // Command ring doorbell (DB[0]).
+        w32(&mut d, DB_BASE, 0);
+        assert!(d.work.cmd_doorbell, "command doorbell queued");
+        // Slot 1 doorbell, EP0 (DCI 1).
+        w32(&mut d, DB_BASE + 4, 1);
+        assert_eq!(
+            d.work.ep_doorbells,
+            vec![(1u8, 1u8)],
+            "slot doorbell queued"
+        );
+    }
+
+    #[test]
+    fn run_start_flags_worker() {
+        let mut d = dev();
+        w32(&mut d, USBCMD, CMD_RS);
+        assert!(d.work.run_started, "run edge flagged for the port scan");
     }
 }
