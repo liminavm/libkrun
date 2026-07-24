@@ -976,7 +976,13 @@ pub fn build_microvm(
         #[cfg(feature = "usb")]
         if vm_resources.usb {
             mmio_device_manager
-                .register_mmio_xhci(&vm, intc.clone(), event_manager)
+                .register_mmio_xhci(
+                    &vm,
+                    intc.clone(),
+                    event_manager,
+                    &guest_memory,
+                    vm_resources.usb_devices.clone(),
+                )
                 .map_err(Error::RegisterMMIODevice)
                 .map_err(StartMicrovmError::Internal)?;
         }

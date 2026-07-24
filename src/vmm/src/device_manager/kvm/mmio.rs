@@ -281,22 +281,38 @@ impl MMIODeviceManager {
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "usb"))]
-    /// Register the emulated xHCI USB controller (platform `generic-xhci`), claiming
-    /// a 64 KiB MMIO window ([`XHCI_MMIO_LEN`]) rather than the default `MMIO_LEN`.
-    /// The controller's interrupter eventfd is registered as an irqfd (KVM path);
-    /// Stage A generates no events so it never fires.
-    pub fn register_mmio_xhci(&mut self, vm: &VmFd) -> Result<()> {
+    /// Register the emulated xHCI USB controller (platform `generic-xhci`) and spawn
+    /// its ring worker, claiming a 64 KiB MMIO window ([`XHCI_MMIO_LEN`]). The
+    /// controller's interrupter eventfd is registered as an irqfd (KVM path); the
+    /// worker pokes it on each event-ring batch. `mem`/`usb_devices` mirror the HVF
+    /// path (this KVM path is not wired into the aarch64/Linux builder yet).
+    pub fn register_mmio_xhci(
+        &mut self,
+        vm: &VmFd,
+        mem: &vm_memory::GuestMemoryMmap,
+        usb_devices: Vec<Arc<dyn devices::usb::UsbDeviceModel>>,
+    ) -> Result<()> {
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
         let xhci_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
-        let device = devices::usb::XhciDevice::new(xhci_evt.try_clone().map_err(Error::EventFd)?);
+        let kick = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        let stop = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        let xhci = Arc::new(Mutex::new(devices::usb::XhciDevice::new(
+            xhci_evt.try_clone().map_err(Error::EventFd)?,
+        )));
         vm.register_irqfd(&xhci_evt, self.irq)
             .map_err(Error::RegisterIrqFd)?;
+        xhci.lock()
+            .unwrap()
+            .attach_devices(usb_devices, kick.try_clone().map_err(Error::EventFd)?);
+
+        let weak = Arc::downgrade(&xhci);
+        devices::usb::spawn_worker(weak, mem.clone(), kick, stop);
 
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, XHCI_MMIO_LEN)
+            .insert(xhci, self.mmio_base, XHCI_MMIO_LEN)
             .map_err(Error::BusError)?;
 
         self.id_to_dev_info.insert(
