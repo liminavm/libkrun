@@ -297,24 +297,30 @@ impl MMIODeviceManager {
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "usb"))]
-    /// Register the emulated xHCI USB controller (platform `generic-xhci`).
+    /// Register the emulated xHCI USB controller (platform `generic-xhci`) and
+    /// spawn its ring worker.
     ///
     /// Unlike the other platform devices this claims a 64 KiB MMIO window
     /// ([`XHCI_MMIO_LEN`]) rather than the default `MMIO_LEN`. The interrupt is wired
-    /// exactly like the RTC (hold the `IrqChip` handle + SPI line so the Stage B
-    /// worker can pulse the interrupter); Stage A generates no events so it never
-    /// fires. `event_manager` is unused until Stage B subscribes the ring worker.
+    /// exactly like the RTC (hold the `IrqChip` handle + SPI line so the worker can
+    /// pulse the interrupter). `mem` is the guest memory the worker DMAs the rings
+    /// through; `usb_devices` are the cold-plugged gadgets (one per root port).
     pub fn register_mmio_xhci(
         &mut self,
         _vm: &Vm,
         intc: IrqChip,
         _event_manager: &mut EventManager,
+        mem: &vm_memory::GuestMemoryMmap,
+        usb_devices: Vec<Arc<dyn devices::usb::UsbDeviceModel>>,
     ) -> Result<()> {
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
         let xhci_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        // The worker is woken by register writes (`kick`) and torn down via `stop`.
+        let kick = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        let stop = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let xhci = Arc::new(Mutex::new(devices::usb::XhciDevice::new(
             xhci_evt.try_clone().map_err(Error::EventFd)?,
         )));
@@ -322,7 +328,13 @@ impl MMIODeviceManager {
             let mut xhci = xhci.lock().unwrap();
             xhci.set_intc(intc);
             xhci.set_irq_line(self.irq);
+            xhci.attach_devices(usb_devices, kick.try_clone().map_err(Error::EventFd)?);
         }
+
+        // The worker holds a Weak handle (no reference cycle: VMM teardown drops the
+        // bus's strong ref and ends the thread). Downgrade before the bus takes it.
+        let weak = Arc::downgrade(&xhci);
+        devices::usb::spawn_worker(weak, mem.clone(), kick, stop);
 
         self.bus
             .insert(xhci, self.mmio_base, XHCI_MMIO_LEN)

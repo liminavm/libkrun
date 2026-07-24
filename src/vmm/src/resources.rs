@@ -260,6 +260,11 @@ pub struct VmResources {
     /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
     /// a stock guest without it simply has no USB bus.
     pub usb: bool,
+    /// limina: software-defined USB devices cold-plugged to the emulated xHCI
+    /// controller's root ports (one per port, in order) before boot. Set by the
+    /// caller (`limina-vmm`); the controller enumerates them once `usb` is on.
+    #[cfg(feature = "usb")]
+    pub usb_devices: Vec<std::sync::Arc<dyn devices::usb::UsbDeviceModel>>,
     /// limina: host battery mirror — when set, a virtio-i2c adapter with an
     /// emulated SBS smart battery is attached, answering register reads from
     /// this callback (see devices::virtio::i2c).
