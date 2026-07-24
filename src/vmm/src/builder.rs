@@ -969,6 +969,17 @@ pub fn build_microvm(
             _restart_efd,
             _wake_efd,
         )?;
+
+        // limina: emulated xHCI USB controller (opt-in). Registered after the legacy
+        // devices so their MMIO/IRQ layout is unchanged when USB is off; a stock guest
+        // binds it via its own xhci-plat driver (see devices::usb::xhci).
+        #[cfg(feature = "usb")]
+        if vm_resources.usb {
+            mmio_device_manager
+                .register_mmio_xhci(&vm, intc.clone(), event_manager)
+                .map_err(Error::RegisterMMIODevice)
+                .map_err(StartMicrovmError::Internal)?;
+        }
     }
 
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]

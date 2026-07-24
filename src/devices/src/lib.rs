@@ -18,6 +18,8 @@ pub mod display;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod fdt;
 pub mod legacy;
+#[cfg(all(feature = "usb", target_arch = "aarch64"))]
+pub mod usb;
 pub mod virtio;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
@@ -50,6 +52,9 @@ pub enum DeviceType {
     /// Device Type: RTC.
     #[cfg(target_arch = "aarch64")]
     RTC,
+    /// Device Type: USB xHCI controller (platform `generic-xhci`).
+    #[cfg(target_arch = "aarch64")]
+    Xhci,
 }
 
 impl fmt::Display for DeviceType {
