@@ -166,9 +166,11 @@ pub struct EpAddr {
     pub dir_in: bool,
 }
 
-/// A non-control (interrupt/bulk) transfer. B1 defines the shape but only EP0 is
-/// exercised; the controller stalls non-EP0 endpoints until B2 wires data flow.
-#[allow(dead_code)]
+/// A non-control (interrupt/bulk) transfer handed to a gadget. An **IN** transfer
+/// with no data ready is simply *held* (the gadget keeps this object; the TRBs stay
+/// outstanding on the ring) until data arrives — xHCI's natural NAK analogue and the
+/// FIDO/HID gadget's core need. An **OUT** transfer carries the guest's bytes in
+/// `data_out`. Completion may be deferred to any thread (see [`Completion`]).
 pub struct Transfer {
     /// For an OUT transfer: the host→device bytes. Empty for IN.
     data_out: Vec<u8>,
@@ -177,7 +179,6 @@ pub struct Transfer {
     completion: Completion,
 }
 
-#[allow(dead_code)]
 impl Transfer {
     pub(crate) fn new(data_out: Vec<u8>, in_len: usize, completion: Completion) -> Self {
         Transfer {

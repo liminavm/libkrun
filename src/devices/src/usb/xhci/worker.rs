@@ -98,6 +98,7 @@ fn work(dev: Weak<Mutex<XhciDevice>>, mem: GuestMemoryMmap, kick: EventFd, stop:
         for call in deferred {
             match call {
                 DeferredCall::Control(model, xfer) => model.handle_control(xfer),
+                DeferredCall::Transfer(model, ep, xfer) => model.handle_transfer(ep, xfer),
                 DeferredCall::Reset(model) => model.reset(),
             }
         }
