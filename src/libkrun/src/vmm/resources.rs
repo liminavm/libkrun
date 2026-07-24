@@ -123,6 +123,11 @@ pub struct VmResources {
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
+    /// limina: attach the emulated xHCI USB controller (platform `generic-xhci`).
+    /// A plain bool so callers need no `usb`-feature cfg; the builder only acts on
+    /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
+    /// a stock guest without it simply has no USB bus.
+    pub usb: bool,
 }
 
 impl VmResources {
@@ -268,6 +273,7 @@ mod tests {
             acpi_enabled: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
+            usb: false,
         }
     }
 
