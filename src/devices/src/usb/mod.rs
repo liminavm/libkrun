@@ -11,9 +11,11 @@
 
 pub mod xhci;
 
+mod hid;
 mod mock;
 mod model;
 
+pub use self::hid::HidMockDevice;
 pub use self::mock::MockUsbDevice;
 pub use self::model::{
     ControlTransfer, DeviceDescriptors, EpAddr, SetupPacket, Transfer, UsbDeviceModel, UsbSpeed,

@@ -13,23 +13,49 @@ use std::sync::{Arc, Mutex};
 
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::super::model::{Completion, ControlTransfer, SetupPacket, UsbDeviceModel, XferOutcome};
-use super::context::{
-    dcbaa_entry, ep_tr_dequeue, input_add_flags, input_ep_offset, output_ep_offset, set_ep_state,
-    set_slot_address, set_slot_state, slot_root_hub_port, Ctx32, INPUT_SLOT_OFFSET,
+use super::super::model::{
+    Completion, ControlTransfer, EpAddr, SetupPacket, Transfer, UsbDeviceModel, XferOutcome,
 };
-use super::device::{SlotCtx, XhciDevice, NUM_PORTS};
+use super::context::{
+    dcbaa_entry, ep_state, ep_tr_dequeue, ep_type, input_add_flags, input_drop_flags,
+    input_ep_offset, output_ep_offset, set_ep_state, set_slot_address, set_slot_state,
+    slot_root_hub_port, Ctx32, INPUT_SLOT_OFFSET,
+};
+use super::device::{EpRing, SlotCtx, XhciDevice, NUM_PORTS};
 use super::trb::{
     cc, command_completion_event, port_status_change_event, transfer_event, trb_type, EventRing,
-    RingError, RingWalker, Trb, CTRL_BSR, CTRL_DC, CTRL_DIR_IN, CTRL_IOC,
+    RingError, RingWalker, Trb, CTRL_BSR, CTRL_CHAIN, CTRL_DC, CTRL_DIR_IN, CTRL_IOC,
 };
 
 /// A gadget call the worker makes with the controller lock **released**.
 pub(super) enum DeferredCall {
     /// Forward a class/vendor EP0 control request to the gadget.
     Control(Arc<dyn UsbDeviceModel>, ControlTransfer),
+    /// Forward an interrupt/bulk transfer to the gadget (it may hold the TRBs).
+    Transfer(Arc<dyn UsbDeviceModel>, EpAddr, Transfer),
     /// Reset the device model (Disable Slot / Reset Device).
     Reset(Arc<dyn UsbDeviceModel>),
+}
+
+/// Everything a non-EP0 transfer's completion needs to post its Transfer Event —
+/// captured while walking the ring, replayed (possibly seconds later, from any
+/// thread) on completion. `generation` is the staleness token (see [`EpRing`]).
+#[derive(Clone)]
+pub(super) struct EpEvents {
+    slot_id: u8,
+    ep_id: u8,
+    /// Whether this is an IN (device-to-host) transfer.
+    dir_in: bool,
+    /// Data-buffer guest segments `(addr, len)` (IN scatter target / OUT gather source).
+    data_segs: Vec<(u64, u32)>,
+    /// The TRB the Transfer Event points at (the TD's last / IOC-carrying TRB).
+    event_trb: u64,
+    /// The endpoint generation captured at dispatch; a completion whose endpoint has
+    /// since been re-programmed (this value stale) is dropped.
+    generation: u64,
+    /// (ptr, dcs) of the TRB after this TD — the output Endpoint Context TR Dequeue to
+    /// publish once the transfer completes, keeping `hw_deq` truthful for Stop/stall.
+    td_next: (u64, bool),
 }
 
 /// Everything a control transfer's completion needs to post its Transfer
@@ -95,10 +121,7 @@ impl XhciDevice {
             if dci == 1 {
                 self.collect_ep0_work(mem, slot, dev_arc, &mut deferred);
             } else {
-                // B1 exercises EP0 only; non-EP0 endpoints stall until B2 wires
-                // interrupt/bulk data flow. The mock has no such endpoints, so a
-                // stock guest never rings these.
-                debug!("xhci: non-EP0 doorbell slot {slot} dci {dci} ignored (B1: EP0 only)");
+                self.collect_ep_work(mem, slot, dci, dev_arc, &mut deferred);
             }
         }
         deferred
@@ -231,7 +254,8 @@ impl XhciDevice {
             trb_type::CONFIGURE_ENDPOINT => {
                 let slot = trb.slot_id();
                 let deconfig = trb.control & CTRL_DC != 0;
-                match self.cmd_configure_endpoint(mem, slot, deconfig) {
+                let input = trb.parameter & !0xf;
+                match self.cmd_configure_endpoint(mem, slot, input, deconfig) {
                     Ok(()) => (cc::SUCCESS, slot),
                     Err(code) => (code, slot),
                 }
@@ -244,13 +268,30 @@ impl XhciDevice {
             trb_type::RESET_ENDPOINT => {
                 let slot = trb.slot_id();
                 let dci = trb.endpoint_id();
+                // Clear the halt: back to Running, and bump the generation so any
+                // outstanding (pre-halt) completion is dropped rather than posting onto
+                // the ring the guest is about to reposition with Set TR Dequeue.
                 self.set_output_ep_state(mem, slot, dci, es::RUNNING);
+                if let Some(e) = self.ep_mut(slot, dci) {
+                    e.state = es::RUNNING;
+                    e.generation = e.generation.wrapping_add(1);
+                }
                 (cc::SUCCESS, slot)
             }
             trb_type::STOP_ENDPOINT => {
                 let slot = trb.slot_id();
                 let dci = trb.endpoint_id();
+                // Quiesce the endpoint: mark it Stopped and bump the generation, so a
+                // late gadget completion (a still-held IN transfer) is dropped — the
+                // command completes only after this bump, i.e. after the endpoint can no
+                // longer post onto the ring. Publish the current dequeue as `hw_deq`.
                 self.set_output_ep_state(mem, slot, dci, es::STOPPED);
+                if let Some(e) = self.ep_mut(slot, dci) {
+                    e.state = es::STOPPED;
+                    e.generation = e.generation.wrapping_add(1);
+                    let (p, c) = (e.ring.ptr(), e.ring.ccs());
+                    self.write_output_ep_dequeue(mem, slot, dci, p, c, None);
+                }
                 (cc::SUCCESS, slot)
             }
             trb_type::SET_TR_DEQUEUE => {
@@ -263,6 +304,13 @@ impl XhciDevice {
                     if let Some(s) = self.slots.get_mut(slot as usize).and_then(|x| x.as_mut()) {
                         s.ep0_ring = Some(RingWalker::new(ptr, dcs));
                     }
+                } else if let Some(e) = self.ep_mut(slot, dci) {
+                    // Reposition the ring and bump the generation: a completion still in
+                    // flight against the old ring is now stale and must not corrupt the
+                    // re-programmed dequeue. Endpoint stays Stopped until the next doorbell.
+                    e.ring = RingWalker::new(ptr, dcs);
+                    e.state = ep_state::STOPPED;
+                    e.generation = e.generation.wrapping_add(1);
                 }
                 // Mirror the repositioned dequeue into the output Endpoint Context so
                 // a subsequent xhci_get_hw_deq reads the value the guest just set.
@@ -275,6 +323,8 @@ impl XhciDevice {
                 if let Some(s) = self.slots.get_mut(slot as usize).and_then(|x| x.as_mut()) {
                     s.state = ss::DEFAULT;
                     s.config_value = 0;
+                    // Data endpoints are torn down; any late completion finds no ring.
+                    s.eps.clear();
                 }
                 (cc::SUCCESS, slot)
             }
@@ -294,6 +344,7 @@ impl XhciDevice {
                     state: super::context::slot_state::DISABLED_ENABLED,
                     config_value: 0,
                     ep0_ring: None,
+                    eps: Default::default(),
                 });
                 return Some(id as u8);
             }
@@ -365,6 +416,7 @@ impl XhciDevice {
                 state: new_state,
                 config_value: 0,
                 ep0_ring: Some(RingWalker::new(dq, dcs)),
+                eps: Default::default(),
             });
             Ok(slot_id)
         })();
@@ -375,33 +427,101 @@ impl XhciDevice {
         }
     }
 
-    /// Configure Endpoint: apply the input context's add/drop flags. Our
-    /// gadgets carry no non-EP0 endpoints in B1, so this only advances the slot
-    /// state; the machinery to add EP contexts lands with B2 data endpoints.
+    /// Configure Endpoint: apply the input context's Add / Drop flags. For every
+    /// added data endpoint (DCI 2..=31) read its Endpoint Context (type + TR Dequeue),
+    /// copy it into the output Device Context in the Running state, and stand up a live
+    /// [`EpRing`] the worker walks on that endpoint's doorbell. Dropped endpoints are
+    /// torn down. Deconfigure (DC bit) drops all data endpoints and returns the slot to
+    /// the Addressed state.
     fn cmd_configure_endpoint(
         &mut self,
         mem: &GuestMemoryMmap,
         slot_id: u8,
+        input: u64,
         deconfig: bool,
     ) -> Result<(), u32> {
         use super::context::slot_state as ss;
         let out = dcbaa_entry(mem, self.dcbaap(), slot_id).map_err(|_| cc::TRB_ERROR)?;
-        let mut oslot = Ctx32::read(mem, out).map_err(|_| cc::TRB_ERROR)?;
-        let new_state = if deconfig {
-            ss::ADDRESSED
+
+        if deconfig {
+            let mut oslot = Ctx32::read(mem, out).map_err(|_| cc::TRB_ERROR)?;
+            set_slot_state(&mut oslot, ss::ADDRESSED);
+            oslot.write(mem, out).map_err(|_| cc::TRB_ERROR)?;
+            if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+                s.state = ss::ADDRESSED;
+                s.eps.clear();
+            }
+            return Ok(());
+        }
+
+        let ictl = Ctx32::read(mem, input).map_err(|_| cc::TRB_ERROR)?;
+        let add = input_add_flags(&ictl);
+        let drop = input_drop_flags(&ictl);
+
+        // Slot context: if A0 is set the guest supplies an updated Slot Context (Context
+        // Entries grown for the new endpoints); otherwise keep the current one. Either
+        // way the slot ends Configured.
+        let mut oslot = if add & 1 != 0 {
+            Ctx32::read(mem, input + INPUT_SLOT_OFFSET).map_err(|_| cc::TRB_ERROR)?
         } else {
-            ss::CONFIGURED
+            Ctx32::read(mem, out).map_err(|_| cc::TRB_ERROR)?
         };
-        set_slot_state(&mut oslot, new_state);
+        set_slot_state(&mut oslot, ss::CONFIGURED);
         oslot.write(mem, out).map_err(|_| cc::TRB_ERROR)?;
-        if let Some(s) = self
-            .slots
-            .get_mut(slot_id as usize)
-            .and_then(|x| x.as_mut())
-        {
-            s.state = new_state;
+
+        for dci in 2u8..=31 {
+            let bit = 1u32 << dci;
+            if drop & bit != 0 {
+                if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+                    s.eps.remove(&dci);
+                }
+                let addr = out + output_ep_offset(dci);
+                if let Ok(mut ep) = Ctx32::read(mem, addr) {
+                    set_ep_state(&mut ep, ep_state::DISABLED);
+                    let _ = ep.write(mem, addr);
+                }
+            }
+            if add & bit != 0 {
+                let iep = Ctx32::read(mem, input + input_ep_offset(dci)).map_err(|_| cc::TRB_ERROR)?;
+                let etype = ep_type(&iep);
+                let (dq, dcs) = ep_tr_dequeue(&iep);
+                // DCI parity is the authoritative direction (IN = odd DCI); the type
+                // field is kept for bookkeeping and agrees with it.
+                let dir_in = dci & 1 == 1;
+                let mut oep = iep;
+                set_ep_state(&mut oep, ep_state::RUNNING);
+                oep.write(mem, out + output_ep_offset(dci))
+                    .map_err(|_| cc::TRB_ERROR)?;
+                if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+                    // Re-adding an existing endpoint bumps its generation so a completion
+                    // still in flight against the old ring is dropped.
+                    let generation = s.eps.get(&dci).map(|e| e.generation.wrapping_add(1)).unwrap_or(0);
+                    s.eps.insert(
+                        dci,
+                        EpRing {
+                            ring: RingWalker::new(dq, dcs),
+                            dir_in,
+                            ep_type: etype,
+                            state: ep_state::RUNNING,
+                            generation,
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+            s.state = ss::CONFIGURED;
         }
         Ok(())
+    }
+
+    /// Mutable access to a slot's data endpoint (DCI 2..=31), if it exists.
+    fn ep_mut(&mut self, slot_id: u8, dci: u8) -> Option<&mut EpRing> {
+        self.slots
+            .get_mut(slot_id as usize)
+            .and_then(|x| x.as_mut())
+            .and_then(|s| s.eps.get_mut(&dci))
     }
 
     fn set_output_ep_state(&self, mem: &GuestMemoryMmap, slot_id: u8, dci: u8, state: u32) {
@@ -588,8 +708,13 @@ impl XhciDevice {
                     1 => desc.device,
                     2 => desc.configs.get(idx).cloned()?,
                     3 => desc.strings.get(idx).cloned()?,
-                    // Device qualifier / BOS / other: not a full-speed feature — stall.
-                    _ => return Some(XferOutcome::Stall),
+                    // Device qualifier / other-speed config: a full-speed-only device
+                    // must stall these (the guest uses the stall to conclude "no
+                    // high-speed alternate"). Answered inline so the mock needs no code.
+                    6 | 7 => return Some(XferOutcome::Stall),
+                    // Class/vendor descriptor types (HID 0x21, Report 0x22, Physical
+                    // 0x23, …) are the gadget's to serve — forward rather than stall.
+                    _ => return None,
                 };
                 let n = (s.length as usize).min(full.len());
                 Some(XferOutcome::In(full[..n].to_vec()))
@@ -721,6 +846,204 @@ impl XhciDevice {
             self.write_output_ep_dequeue(mem, ev.slot_id, ev.ep_id, p, c, None);
         }
     }
+
+    // ---- non-EP0 (interrupt/bulk) transfers ---------------------------------
+
+    /// Walk a doorbelled data endpoint's transfer ring, forwarding each TD to the
+    /// gadget as a [`Transfer`] with a deferred completion. An **IN** transfer the
+    /// gadget can't satisfy yet is *held* (the TRBs stay outstanding, the walker
+    /// stays committed past them); an **OUT** transfer carries the guest's bytes.
+    ///
+    /// A ringing doorbell on a Stopped endpoint restarts it (Running); a Halted
+    /// endpoint is left alone until Reset Endpoint clears it.
+    fn collect_ep_work(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        slot_id: u8,
+        dci: u8,
+        dev_arc: &Arc<Mutex<XhciDevice>>,
+        deferred: &mut Vec<DeferredCall>,
+    ) {
+        let model = match self.slots.get(slot_id as usize).and_then(|x| x.as_ref()) {
+            Some(s) if s.port != 0 => self
+                .port_models
+                .get((s.port - 1) as usize)
+                .and_then(|m| m.clone()),
+            _ => None,
+        };
+        let Some(model) = model else {
+            debug!("xhci: data doorbell for unaddressed slot {slot_id}");
+            return;
+        };
+
+        loop {
+            // Snapshot the endpoint (ring walker, generation, direction, state).
+            let Some((mut walker, generation, dir_in, state)) = self
+                .slots
+                .get(slot_id as usize)
+                .and_then(|x| x.as_ref())
+                .and_then(|s| s.eps.get(&dci))
+                .map(|e| (e.ring, e.generation, e.dir_in, e.state))
+            else {
+                debug!("xhci: data doorbell slot {slot_id} dci {dci} has no endpoint");
+                return;
+            };
+            if state == ep_state::HALTED {
+                // A halted endpoint stays wedged until the guest issues Reset Endpoint.
+                return;
+            }
+            if state == ep_state::STOPPED {
+                // A doorbell restarts a stopped endpoint.
+                if let Some(e) = self.ep_mut(slot_id, dci) {
+                    e.state = ep_state::RUNNING;
+                }
+                self.set_output_ep_state(mem, slot_id, dci, ep_state::RUNNING);
+            }
+
+            let saved = walker;
+            match read_data_td(mem, &mut walker) {
+                Ok(DataTdRead::Complete { segs, event_trb }) => {
+                    let td_next = (walker.ptr(), walker.ccs());
+                    // Commit the walker past this TD (a held IN must not be re-fetched).
+                    if let Some(e) = self.ep_mut(slot_id, dci) {
+                        e.ring = walker;
+                    }
+                    let capacity: usize = segs.iter().map(|(_, l)| *l as usize).sum();
+                    let (data_out, in_len) = if dir_in {
+                        (Vec::new(), capacity)
+                    } else {
+                        (read_out_data(mem, &segs), 0)
+                    };
+                    let events = EpEvents {
+                        slot_id,
+                        ep_id: dci,
+                        dir_in,
+                        data_segs: segs,
+                        event_trb,
+                        generation,
+                        td_next,
+                    };
+                    let dev2 = dev_arc.clone();
+                    let mem2 = mem.clone();
+                    // NOTE: the Completion must not be dropped while the controller lock
+                    // is held (its Drop fires the stall closure, which re-locks). We hand
+                    // it straight to the DeferredCall below with no intervening early
+                    // return, exactly as the EP0 path does.
+                    let completion = Completion::new(move |outcome| {
+                        let mut d = dev2.lock().unwrap();
+                        d.post_transfer_result(&mem2, &events, outcome);
+                    });
+                    deferred.push(DeferredCall::Transfer(
+                        model.clone(),
+                        EpAddr {
+                            num: dci >> 1,
+                            dir_in,
+                        },
+                        Transfer::new(data_out, in_len, completion),
+                    ));
+                }
+                Ok(DataTdRead::Empty) => {
+                    // Commit the walker (it followed Link TRBs to reach the boundary).
+                    if let Some(e) = self.ep_mut(slot_id, dci) {
+                        e.ring = walker;
+                    }
+                    return;
+                }
+                Ok(DataTdRead::Incomplete) => {
+                    // The guest is still writing this TD — restore and await the next doorbell.
+                    if let Some(e) = self.ep_mut(slot_id, dci) {
+                        e.ring = saved;
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!("xhci: data ring error slot {slot_id} dci {dci}: {e:?}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Post the Transfer Event for a completed non-EP0 transfer — called from a gadget
+    /// completion closure (which re-locks the controller), possibly long after dispatch.
+    ///
+    /// The **generation guard** is the staleness fix: if the endpoint has been
+    /// re-programmed (Stop / Reset Endpoint, Set TR Dequeue, re-Configure) or torn down
+    /// (Disable Slot / Reset Device) since this transfer was dispatched, the captured
+    /// generation no longer matches (or the endpoint is gone) and the completion is
+    /// dropped — its TRBs are gone, so posting its event could corrupt a re-programmed
+    /// ring or a re-used slot.
+    pub(super) fn post_transfer_result(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        ev: &EpEvents,
+        outcome: XferOutcome,
+    ) {
+        let live = self
+            .slots
+            .get(ev.slot_id as usize)
+            .and_then(|x| x.as_ref())
+            .and_then(|s| s.eps.get(&ev.ep_id))
+            .map(|e| e.generation == ev.generation)
+            .unwrap_or(false);
+        if !live {
+            debug!(
+                "xhci: dropping stale completion slot {} dci {} (endpoint re-programmed)",
+                ev.slot_id, ev.ep_id
+            );
+            return;
+        }
+
+        match outcome {
+            XferOutcome::In(bytes) => {
+                let capacity: u32 = ev.data_segs.iter().map(|(_, l)| *l).sum();
+                let written = scatter_in(mem, &ev.data_segs, &bytes);
+                let residue = capacity.saturating_sub(written);
+                let code = if residue > 0 {
+                    cc::SHORT_PACKET
+                } else {
+                    cc::SUCCESS
+                };
+                self.post_event(
+                    mem,
+                    transfer_event(ev.event_trb, residue, code, ev.slot_id, ev.ep_id, false),
+                );
+                let (p, c) = ev.td_next;
+                self.write_output_ep_dequeue(mem, ev.slot_id, ev.ep_id, p, c, None);
+            }
+            XferOutcome::Ack => {
+                // OUT / zero-length: success with no residue.
+                let residue = if ev.dir_in {
+                    ev.data_segs.iter().map(|(_, l)| *l).sum()
+                } else {
+                    0
+                };
+                let code = if residue > 0 {
+                    cc::SHORT_PACKET
+                } else {
+                    cc::SUCCESS
+                };
+                self.post_event(
+                    mem,
+                    transfer_event(ev.event_trb, residue, code, ev.slot_id, ev.ep_id, false),
+                );
+                let (p, c) = ev.td_next;
+                self.write_output_ep_dequeue(mem, ev.slot_id, ev.ep_id, p, c, None);
+            }
+            XferOutcome::Stall => {
+                self.post_event(
+                    mem,
+                    transfer_event(ev.event_trb, 0, cc::STALL_ERROR, ev.slot_id, ev.ep_id, false),
+                );
+                // Halt the endpoint: leave the dequeue at the TD start and wait for the
+                // guest's Reset Endpoint + Set TR Dequeue recovery.
+                if let Some(e) = self.ep_mut(ev.slot_id, ev.ep_id) {
+                    e.state = ep_state::HALTED;
+                }
+                self.set_output_ep_state(mem, ev.slot_id, ev.ep_id, ep_state::HALTED);
+            }
+        }
+    }
 }
 
 // ---- pure ring/memory helpers -----------------------------------------------
@@ -846,6 +1169,68 @@ fn read_control_td(
     }
 }
 
+/// The outcome of trying to read one interrupt/bulk TD off a data endpoint ring.
+enum DataTdRead {
+    /// A full TD (chain-terminated): its data-buffer `segs` and the TRB the Transfer
+    /// Event should point at (the last / IOC-carrying TRB). The walker is committed past it.
+    Complete { segs: Vec<(u64, u32)>, event_trb: u64 },
+    /// The ring is empty at a TD boundary (nothing queued). Commit the walker.
+    Empty,
+    /// A chained TD is only partially written (the guest is mid-enqueue). Restore + wait.
+    Incomplete,
+}
+
+/// Read one interrupt/bulk TD off a data endpoint ring: consecutive Normal TRBs, each
+/// chained to the next except the last (Chain bit clear). Collects each TRB's data
+/// buffer `(addr, len)` and returns the address of the terminating TRB as the Transfer
+/// Event target. Bounded/hostile-input-safe via the shared [`RingWalker`].
+fn read_data_td(mem: &GuestMemoryMmap, walker: &mut RingWalker) -> Result<DataTdRead, RingError> {
+    let mut segs: Vec<(u64, u32)> = Vec::new();
+    let mut first = true;
+    loop {
+        let (addr, trb) = match walker.next(mem)? {
+            Some(v) => v,
+            // No (further) TRB published: an empty ring at the start, else a half-written
+            // chained TD.
+            None => {
+                return Ok(if first {
+                    DataTdRead::Empty
+                } else {
+                    DataTdRead::Incomplete
+                });
+            }
+        };
+        first = false;
+        match trb.trb_type() {
+            trb_type::NORMAL => {
+                let len = trb.transfer_len();
+                if len > 0 {
+                    segs.push((trb.parameter, len));
+                }
+                if trb.control & CTRL_CHAIN == 0 {
+                    return Ok(DataTdRead::Complete {
+                        segs,
+                        event_trb: addr,
+                    });
+                }
+            }
+            trb_type::EVENT_DATA => {
+                // An Event Data TRB terminates the TD; it carries the completion.
+                if trb.control & CTRL_CHAIN == 0 {
+                    return Ok(DataTdRead::Complete {
+                        segs,
+                        event_trb: addr,
+                    });
+                }
+            }
+            other => {
+                warn!("xhci: unexpected TRB type {other} in data TD; treating as boundary");
+                return Ok(DataTdRead::Empty);
+            }
+        }
+    }
+}
+
 /// Scatter `bytes` into the guest IN data-stage segments, returning how many
 /// bytes were written (bounded by the segments' total capacity).
 fn scatter_in(mem: &GuestMemoryMmap, segs: &[(u64, u32)], bytes: &[u8]) -> u32 {
@@ -907,6 +1292,7 @@ mod tests {
             state: slot_state::ADDRESSED,
             config_value: 0,
             ep0_ring: Some(RingWalker::new(ep0, true)),
+            eps: Default::default(),
         });
     }
 
@@ -1207,5 +1593,314 @@ mod tests {
         };
         let (code, _) = d.run_command(&m, &trb, &mut deferred);
         assert_eq!(code, cc::TRB_ERROR);
+    }
+
+    // ---- B2: non-EP0 (interrupt/bulk) data flow ----------------------------
+
+    use super::super::context::ep_state;
+    use crate::usb::model::Transfer;
+
+    /// Insert a live data endpoint (DCI `dci`) whose ring dequeues at `ring`.
+    fn add_ep(d: &mut XhciDevice, dci: u8, ring: u64, dir_in: bool) {
+        let s = d.slots[1].as_mut().unwrap();
+        s.eps.insert(
+            dci,
+            EpRing {
+                ring: RingWalker::new(ring, true),
+                dir_in,
+                ep_type: if dir_in { 7 } else { 3 },
+                state: ep_state::RUNNING,
+                generation: 0,
+            },
+        );
+    }
+
+    /// Lay a single Normal TRB (one-TRB TD, Chain clear, IOC set) at `addr` pointing at
+    /// data buffer `buf` of length `len`.
+    fn put_normal(m: &GuestMemoryMmap, addr: u64, buf: u64, len: u32) {
+        Trb {
+            parameter: buf,
+            status: len,
+            control: (trb_type::NORMAL << 10) | CTRL_CYCLE | CTRL_IOC,
+        }
+        .write(m, addr)
+        .unwrap();
+    }
+
+    /// Extract the single dispatched Transfer from a deferred batch.
+    fn take_transfer(deferred: Vec<DeferredCall>) -> Transfer {
+        for c in deferred {
+            if let DeferredCall::Transfer(_, _, x) = c {
+                return x;
+            }
+        }
+        panic!("no transfer was dispatched");
+    }
+
+    /// Configure Endpoint stands up a live per-endpoint transfer ring from the input
+    /// Endpoint Context and writes the output context Running.
+    #[test]
+    fn configure_endpoint_creates_data_ring() {
+        let m = mem();
+        let dev = new_dev();
+        let dcbaap = 0x9000u64;
+        let out = 0x8000u64;
+        m.write_obj::<u64>(out, GuestAddress(dcbaap + 8)).unwrap();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            d.set_dcbaap_for_test(dcbaap);
+        }
+        // Input context at 0x6000: add A0 (slot) + A3 (DCI 3, interrupt IN).
+        let input = 0x6000u64;
+        Ctx32([0, (1 << 0) | (1 << 3), 0, 0, 0, 0, 0, 0])
+            .write(&m, input)
+            .unwrap();
+        Ctx32::default().write(&m, input + INPUT_SLOT_OFFSET).unwrap();
+        // EP context DCI 3: type 7 (interrupt IN), TR dequeue 0xA001 (DCS=1).
+        let mut iep = Ctx32::default();
+        iep.0[1] = 7 << 3;
+        iep.0[2] = 0xA001;
+        iep.write(&m, input + input_ep_offset(3)).unwrap();
+
+        let mut deferred = Vec::new();
+        let (code, _) = {
+            let mut d = dev.lock().unwrap();
+            let trb = Trb {
+                parameter: input,
+                status: 0,
+                control: (trb_type::CONFIGURE_ENDPOINT << 10) | (1 << 24),
+            };
+            d.run_command(&m, &trb, &mut deferred)
+        };
+        assert_eq!(code, cc::SUCCESS);
+
+        let d = dev.lock().unwrap();
+        let ep = d.slots[1].as_ref().unwrap().eps.get(&3).expect("ep created");
+        assert_eq!(ep.ring.ptr(), 0xA000, "ring dequeue from input context");
+        assert!(ep.dir_in, "DCI 3 is IN");
+        assert_eq!(ep.state, ep_state::RUNNING);
+        // Output Endpoint Context reflects Running.
+        let oep = Ctx32::read(&m, out + output_ep_offset(3)).unwrap();
+        assert_eq!(oep.0[0] & 0x7, ep_state::RUNNING);
+    }
+
+    /// A doorbell on a data endpoint walks the ring and dispatches one Transfer per TD.
+    #[test]
+    fn data_doorbell_dispatches_one_transfer_per_td() {
+        let m = mem();
+        let dev = new_dev();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            add_ep(&mut d, 3, 0xA000, true);
+        }
+        // Two IN TDs (each a single Normal TRB, 64-byte buffer).
+        put_normal(&m, 0xA000, 0x5000, 64);
+        put_normal(&m, 0xA010, 0x5100, 64);
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep_work(&m, 1, 3, &dev, &mut deferred);
+        }
+        let n = deferred
+            .iter()
+            .filter(|c| matches!(c, DeferredCall::Transfer(..)))
+            .count();
+        assert_eq!(n, 2, "one Transfer dispatched per TD");
+    }
+
+    /// A held interrupt-IN transfer, completed later, scatters its data into the guest
+    /// buffer and posts a SUCCESS Transfer Event on the endpoint.
+    #[test]
+    fn held_in_completes_and_posts_event() {
+        let m = mem();
+        let dev = new_dev();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            add_ep(&mut d, 3, 0xA000, true);
+        }
+        put_normal(&m, 0xA000, 0x5000, 64);
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep_work(&m, 1, 3, &dev, &mut deferred);
+        }
+        let xfer = take_transfer(deferred);
+        // Complete it now (as a gadget would, from any thread): 64 bytes.
+        let payload: Vec<u8> = (0..64).collect();
+        xfer.complete_in(payload.clone());
+
+        // Guest buffer got the bytes.
+        let mut got = [0u8; 64];
+        m.read_slice(&mut got, GuestAddress(0x5000)).unwrap();
+        assert_eq!(&got[..], &payload[..]);
+        // A SUCCESS Transfer Event on the Normal TRB, DCI 3.
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_eq!(ev.trb_type(), trb_type::TRANSFER_EVENT);
+        assert_eq!(ev.status >> 24, cc::SUCCESS);
+        assert_eq!(ev.parameter, 0xA000, "event points at the data TRB");
+        assert_eq!((ev.control >> 16) & 0x1f, 3, "endpoint id = DCI 3");
+    }
+
+    /// A short interrupt-IN read reports the residue with a SHORT_PACKET completion.
+    #[test]
+    fn short_packet_residue_on_interrupt_in() {
+        let m = mem();
+        let dev = new_dev();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            add_ep(&mut d, 3, 0xA000, true);
+        }
+        put_normal(&m, 0xA000, 0x5000, 64); // buffer 64
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep_work(&m, 1, 3, &dev, &mut deferred);
+        }
+        take_transfer(deferred).complete_in(vec![0xEE; 20]); // only 20 bytes
+
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_eq!(ev.trb_type(), trb_type::TRANSFER_EVENT);
+        assert_eq!(ev.status >> 24, cc::SHORT_PACKET);
+        assert_eq!(ev.status & 0xff_ffff, 44, "residue = 64 - 20");
+    }
+
+    /// The staleness guard: a completion firing after Set TR Dequeue re-programmed the
+    /// endpoint is dropped — no event posted, the re-programmed ring untouched.
+    #[test]
+    fn stale_completion_after_set_tr_dequeue_is_dropped() {
+        let m = mem();
+        let dev = new_dev();
+        let dcbaap = 0x9000u64;
+        m.write_obj::<u64>(0x8000, GuestAddress(dcbaap + 8)).unwrap();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            d.set_dcbaap_for_test(dcbaap);
+            add_ep(&mut d, 3, 0xA000, true);
+        }
+        put_normal(&m, 0xA000, 0x5000, 64);
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep_work(&m, 1, 3, &dev, &mut deferred);
+        }
+        let xfer = take_transfer(deferred);
+
+        // Guest re-programs the ring with Set TR Dequeue (bumps the generation).
+        {
+            let mut cmd_deferred = Vec::new();
+            let mut d = dev.lock().unwrap();
+            let trb = Trb {
+                parameter: 0xB001, // new dequeue 0xB000, DCS=1
+                status: 0,
+                control: (trb_type::SET_TR_DEQUEUE << 10) | (3 << 16) | (1 << 24),
+            };
+            d.run_command(&m, &trb, &mut cmd_deferred);
+        }
+
+        // The late completion must be dropped: no Transfer Event, and the ring stays at
+        // the re-programmed dequeue.
+        xfer.complete_in(vec![0u8; 64]);
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_ne!(
+            ev.trb_type(),
+            trb_type::TRANSFER_EVENT,
+            "stale completion posted no event"
+        );
+        let d = dev.lock().unwrap();
+        assert_eq!(
+            d.slots[1].as_ref().unwrap().eps.get(&3).unwrap().ring.ptr(),
+            0xB000,
+            "ring left at the re-programmed dequeue"
+        );
+    }
+
+    /// Stop Endpoint quiesces: it marks the endpoint Stopped and bumps the generation so
+    /// a still-held IN transfer's later completion is dropped (the command completes only
+    /// after the endpoint can no longer post onto the ring).
+    #[test]
+    fn stop_endpoint_quiesces_outstanding_transfer() {
+        let m = mem();
+        let dev = new_dev();
+        let dcbaap = 0x9000u64;
+        m.write_obj::<u64>(0x8000, GuestAddress(dcbaap + 8)).unwrap();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            d.set_dcbaap_for_test(dcbaap);
+            add_ep(&mut d, 3, 0xA000, true);
+        }
+        put_normal(&m, 0xA000, 0x5000, 64);
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep_work(&m, 1, 3, &dev, &mut deferred);
+        }
+        let xfer = take_transfer(deferred);
+
+        // Stop Endpoint (DCI 3).
+        let (code, _) = {
+            let mut cmd_deferred = Vec::new();
+            let mut d = dev.lock().unwrap();
+            let trb = Trb {
+                parameter: 0,
+                status: 0,
+                control: (trb_type::STOP_ENDPOINT << 10) | (3 << 16) | (1 << 24),
+            };
+            d.run_command(&m, &trb, &mut cmd_deferred)
+        };
+        assert_eq!(code, cc::SUCCESS);
+        {
+            let d = dev.lock().unwrap();
+            assert_eq!(
+                d.slots[1].as_ref().unwrap().eps.get(&3).unwrap().state,
+                ep_state::STOPPED,
+                "endpoint marked Stopped"
+            );
+        }
+        // The late completion is dropped — no event on the ring.
+        xfer.complete_in(vec![0u8; 64]);
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_ne!(ev.trb_type(), trb_type::TRANSFER_EVENT);
+    }
+
+    /// An interrupt-OUT transfer delivers the guest's bytes to the gadget (via the
+    /// Transfer's data_out), and an Ack posts a SUCCESS event.
+    #[test]
+    fn interrupt_out_delivers_bytes_and_acks() {
+        let m = mem();
+        let dev = new_dev();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            add_ep(&mut d, 2, 0xA000, false); // DCI 2 = interrupt OUT
+        }
+        // Guest writes 64 bytes into 0x5000, then a Normal OUT TRB referencing it.
+        let payload: Vec<u8> = (0..64u8).map(|b| b ^ 0x5a).collect();
+        m.write_slice(&payload, GuestAddress(0x5000)).unwrap();
+        put_normal(&m, 0xA000, 0x5000, 64);
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep_work(&m, 1, 2, &dev, &mut deferred);
+        }
+        let xfer = take_transfer(deferred);
+        assert_eq!(xfer.data_out(), &payload[..], "OUT bytes delivered to gadget");
+        xfer.ack();
+
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_eq!(ev.trb_type(), trb_type::TRANSFER_EVENT);
+        assert_eq!(ev.status >> 24, cc::SUCCESS);
+        assert_eq!((ev.control >> 16) & 0x1f, 2, "endpoint id = DCI 2");
     }
 }

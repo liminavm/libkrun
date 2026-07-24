@@ -27,6 +27,7 @@
 //! synchronous gadget completion (the mock) cannot re-enter it and no lock-order
 //! cycle exists — the design cannot deadlock. See `engine.rs` / `worker.rs`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use utils::eventfd::EventFd;
@@ -173,6 +174,30 @@ const XECP_DW2: u32 = 0x01 | ((NUM_PORTS as u32) << 8);
 // dword3: Protocol Slot Type = 0.
 const XECP_DW3: u32 = 0x0000_0000;
 
+/// A live data (interrupt/bulk) endpoint: its transfer-ring consumer position plus
+/// the state a held transfer's completion needs to stay correct across cancellation.
+///
+/// The **generation counter** is the staleness guard (the QEMU "endpoint stopped/reset
+/// with transfers in flight" rough edge, done right): it is captured into every
+/// forwarded transfer's completion closure and bumped whenever the endpoint is
+/// re-programmed (Stop / Reset Endpoint, Set TR Dequeue, re-Configure). A gadget
+/// completion firing against a stale generation is silently dropped — the TRBs it
+/// referenced are gone, so posting its event could corrupt a re-programmed ring.
+pub(super) struct EpRing {
+    /// The transfer-ring consumer position.
+    pub ring: RingWalker,
+    /// Transfer direction (true = device-to-host / IN).
+    pub dir_in: bool,
+    /// Endpoint type (EP Context dword1 bits 5:3; bookkeeping / future gating).
+    #[allow(dead_code)]
+    pub ep_type: u32,
+    /// Endpoint state (see `context::ep_state`): RUNNING fetches TDs, STOPPED waits for a
+    /// doorbell, HALTED waits for Reset Endpoint.
+    pub state: u32,
+    /// Bumped on every re-program; a completion carrying an older value is dropped.
+    pub generation: u64,
+}
+
 /// Per-slot controller state, keyed by Slot ID (1-based). Created at Enable Slot
 /// (port unknown), bound to a port + model at Address Device.
 pub(super) struct SlotCtx {
@@ -187,6 +212,8 @@ pub(super) struct SlotCtx {
     pub config_value: u8,
     /// The EP0 (control) transfer-ring consumer position.
     pub ep0_ring: Option<RingWalker>,
+    /// Live data endpoints, keyed by DCI (2..=31); EP0 (DCI 1) stays in `ep0_ring`.
+    pub eps: HashMap<u8, EpRing>,
 }
 
 /// Work the vcpu-thread register writes hand to the worker, drained each pass.
