@@ -19,6 +19,8 @@ pub mod display;
 pub mod fdt;
 pub mod legacy;
 pub mod pci;
+#[cfg(all(feature = "usb", target_arch = "aarch64"))]
+pub mod usb;
 pub mod virtio;
 #[cfg(windows)]
 pub mod windows_console;
@@ -53,6 +55,9 @@ pub enum DeviceType {
     /// Device Type: RTC.
     #[cfg(target_arch = "aarch64")]
     RTC,
+    /// Device Type: USB xHCI controller (platform `generic-xhci`).
+    #[cfg(target_arch = "aarch64")]
+    Xhci,
 }
 
 impl fmt::Display for DeviceType {

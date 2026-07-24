@@ -128,6 +128,11 @@ pub struct VmResources {
     /// RISC-V ISA information discovered from KVM
     #[cfg(target_arch = "riscv64")]
     pub riscv_isa_info: Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
+    /// limina: attach the emulated xHCI USB controller (platform `generic-xhci`).
+    /// A plain bool so callers need no `usb`-feature cfg; the builder only acts on
+    /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
+    /// a stock guest without it simply has no USB bus.
+    pub usb: bool,
 }
 
 impl VmResources {
@@ -276,6 +281,7 @@ mod tests {
             kernel_console: None,
             #[cfg(target_arch = "riscv64")]
             riscv_isa_info: None,
+            usb: false,
         }
     }
 
