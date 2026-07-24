@@ -14,6 +14,7 @@ pub mod xhci;
 mod hid;
 mod mock;
 mod model;
+mod report_pipe;
 
 pub use self::hid::HidMockDevice;
 pub use self::mock::MockUsbDevice;
@@ -21,4 +22,5 @@ pub use self::model::{
     ControlTransfer, DeviceDescriptors, EpAddr, SetupPacket, Transfer, UsbDeviceModel, UsbSpeed,
     XferOutcome,
 };
+pub use self::report_pipe::{HidReportPipe, ReportSink};
 pub use self::xhci::{spawn_worker, XhciDevice, XHCI_MMIO_LEN};
