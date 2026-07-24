@@ -416,6 +416,38 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(())
 }
 
+fn create_xhci_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let xhci_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
+    // The Linux `xhci-plat` driver binds DT `compatible = "generic-xhci"` with one
+    // `reg`, one `interrupts`, and optional `dma-coherent` (its guest-facing binding).
+    #[cfg(target_os = "linux")]
+    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_EDGE_RISING]);
+    // macOS/HVF: the in-kernel GIC's `set_irq` (hv_gic_set_spi) takes the SPI index and
+    // only asserts a one-shot pulse, so declare the interrupt edge-triggered (like the
+    // RTC/GPIO devices) and write the SPI index (irq - 32), not the absolute INTID.
+    #[cfg(target_os = "macos")]
+    let irq = generate_prop32(&[
+        GIC_FDT_IRQ_TYPE_SPI,
+        dev_info.irq() - 32,
+        IRQ_TYPE_EDGE_RISING,
+    ]);
+
+    let xhci_node = fdt.begin_node(&format!("usb@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "generic-xhci")?;
+    fdt.property("reg", &xhci_reg_prop)?;
+    fdt.property("interrupts", &irq)?;
+    fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+    // Guest RAM is coherent with the emulated controller's DMA (there is no real
+    // device cache to maintain), so advertise dma-coherent to skip cache ops.
+    fdt.property_null("dma-coherent")?;
+    fdt.end_node(xhci_node)?;
+
+    Ok(())
+}
+
 fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
@@ -497,6 +529,7 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
             DeviceType::Gpio => create_gpio_node(fdt, info)?,
             DeviceType::RTC => create_rtc_node(fdt, info)?,
             DeviceType::Serial => create_serial_node(fdt, info)?,
+            DeviceType::Xhci => create_xhci_node(fdt, info)?,
             DeviceType::Virtio(virtio_type) => {
                 ordered_virtio_device.push((info, *virtio_type));
             }
