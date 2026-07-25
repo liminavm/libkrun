@@ -970,7 +970,12 @@ impl Worker {
 
                 match GpuCommand::decode(&mut reader) {
                     Ok((hdr, cmd)) => {
+                        // limina wake-probe: time each command so a drain that overruns can
+                        // name the command that caused it. Two clock reads per command, only
+                        // while the probe is on.
+                        let t0 = crate::virtio::wake_probe::cmd_start();
                         resp = self.process_gpu_command(virtio_gpu, &mem, hdr, cmd, &mut reader);
+                        crate::virtio::wake_probe::cmd_end(t0, hdr.type_);
                         ctrl_hdr = Some(hdr);
                         gpu_cmd = Some(cmd);
                     }
