@@ -63,6 +63,9 @@ pub mod cc {
     pub const SHORT_PACKET: u32 = 13;
     pub const PARAMETER_ERROR: u32 = 17;
     pub const CONTEXT_STATE_ERROR: u32 = 19;
+    /// The command ring was stopped by a `CRCR.CS`/`CA` write — the completion code the guest's
+    /// command-abort recovery (`xhci_handle_stopped_cmd_ring`) waits for.
+    pub const COMMAND_RING_STOPPED: u32 = 24;
 }
 
 // ---- control-word flag bits -------------------------------------------------

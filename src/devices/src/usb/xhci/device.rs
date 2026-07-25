@@ -110,8 +110,23 @@ const CMD_RS: u32 = 1 << 0; // Run/Stop
 const CMD_HCRST: u32 = 1 << 1; // Host Controller Reset (RW1S, self-clearing)
 const CMD_INTE: u32 = 1 << 2; // Interrupter Enable
 const CMD_LHCRST: u32 = 1 << 7; // Light HC Reset (RW1S, self-clearing)
-/// Bits USBCMD holds as plain RW state (everything but the self-clearing resets).
-const CMD_STORE_MASK: u32 = !(CMD_HCRST | CMD_LHCRST);
+/// Controller Save State (RW1S): the guest's `xhci_suspend` sets it and polls `USBSTS.SSS`
+/// (which we never raise) for the save to finish. **Self-clearing** — our "save" is the VM
+/// snapshot, and a sticky bit would ride back into the guest's `USBCMD` reads on resume.
+const CMD_CSS: u32 = 1 << 8;
+/// Controller Restore State (RW1S), the resume counterpart of [`CMD_CSS`]. Also self-clearing;
+/// `USBSTS.RSS` is never raised, so the guest's handshake is satisfied immediately.
+const CMD_CRS: u32 = 1 << 9;
+/// Bits USBCMD holds as plain RW state (everything but the self-clearing resets and the
+/// save/restore strobes).
+const CMD_STORE_MASK: u32 = !(CMD_HCRST | CMD_LHCRST | CMD_CSS | CMD_CRS);
+
+// ---- CRCR bits (low dword) --------------------------------------------------
+
+/// Command Stop (RW1S): stop the command ring where it is.
+const CRCR_CS: u32 = 1 << 1;
+/// Command Abort (RW1S): abort the command in flight and stop the ring.
+const CRCR_CA: u32 = 1 << 2;
 
 // ---- USBSTS bits ------------------------------------------------------------
 
@@ -143,6 +158,7 @@ const PORTSC_PIC_MASK: u32 = 0x3 << 14; // Port Indicator Control (RW)
 const PORTSC_LWS: u32 = 1 << 16; // Link State Write Strobe (gates PLS write)
 const PORTSC_CSC: u32 = 1 << 17; // Connect Status Change (RW1C)
 const PORTSC_PRC: u32 = 1 << 21; // Port Reset Change (RW1C)
+const PORTSC_PLC: u32 = 1 << 22; // Port Link State Change (RW1C)
 const PORTSC_WAKE_MASK: u32 = 0x7 << 25; // WCE/WDE/WOE (RW)
 const PORTSC_WPR: u32 = 1 << 31; // Warm Port Reset (RW1S, self-clearing)
 /// PORTSC change bits (CSC, PEC, WRC, OCC, PRC, PLC, CEC) — all write-1-to-clear.
@@ -153,6 +169,11 @@ const PLS_RX_DETECT: u32 = 5;
 const PLS_POLLING: u32 = 7;
 /// Port Link State: U0 (enabled, post-reset).
 const PLS_U0: u32 = 0;
+/// Port Link State: U3 (suspended) — where `xhci_bus_suspend` parks a connected port. The
+/// controller never *writes* this state (the guest drives it via LWS), so it is only referenced
+/// from the PM tests that stand a suspended port up.
+#[cfg(test)]
+const PLS_U3: u32 = 3;
 /// A freshly powered, nothing-connected USB2 port.
 const PORTSC_DEFAULT: u32 = PORTSC_PP | (PLS_RX_DETECT << PORTSC_PLS_SHIFT);
 /// Port Speed ID for a full-speed device (`XDEV_FS`, Linux `xhci.h`).
@@ -223,6 +244,8 @@ pub(super) struct WorkQueue {
     pub run_started: bool,
     /// The command-ring doorbell (DB[0]) was rung.
     pub cmd_doorbell: bool,
+    /// A `CRCR.CA` (Command Abort) write needs its Command Ring Stopped event posted.
+    pub cmd_abort: bool,
     /// Slot transfer doorbells: (slot_id, endpoint DCI).
     pub ep_doorbells: Vec<(u8, u8)>,
     /// Ports needing a Port Status Change Event (1-based ids).
@@ -267,6 +290,9 @@ pub struct XhciDevice {
     pub(super) next_address: u8,
     /// Pending worker work, set by register writes.
     pub(super) work: WorkQueue,
+    /// Latched by a `CRCR` low-dword stop/abort write so the paired high-dword write is ignored
+    /// (see [`Self::write_crcr_lo`]).
+    crcr_stop_write: bool,
     /// Nudges the worker thread; `None` in unit tests (work stays queued).
     worker_kick: Option<EventFd>,
 }
@@ -298,6 +324,7 @@ impl XhciDevice {
             port_models: (0..NUM_PORTS).map(|_| None).collect(),
             next_address: 1,
             work: WorkQueue::default(),
+            crcr_stop_write: false,
             worker_kick: None,
         }
     }
@@ -421,6 +448,7 @@ impl XhciDevice {
         }
         self.next_address = 1;
         self.work = WorkQueue::default();
+        self.crcr_stop_write = false;
     }
 
     // ---- register read/write dispatch ---------------------------------------
@@ -500,15 +528,8 @@ impl XhciDevice {
             }
             _ if off == OP_BASE + OP_PAGESIZE => {} // read-only
             _ if off == OP_BASE + OP_DNCTRL => self.dnctrl = val,
-            _ if off == OP_BASE + OP_CRCR_LO => {
-                self.crcr = (self.crcr & 0xffff_ffff_0000_0000) | u64::from(val);
-                // A CRCR (re)program rebases the command ring.
-                self.cmd_ring = None;
-            }
-            _ if off == OP_BASE + OP_CRCR_HI => {
-                self.crcr = (self.crcr & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32);
-                self.cmd_ring = None;
-            }
+            _ if off == OP_BASE + OP_CRCR_LO => self.write_crcr_lo(val),
+            _ if off == OP_BASE + OP_CRCR_HI => self.write_crcr_hi(val),
             _ if off == OP_BASE + OP_DCBAAP_LO => {
                 self.dcbaap = (self.dcbaap & 0xffff_ffff_0000_0000) | u64::from(val)
             }
@@ -522,13 +543,10 @@ impl XhciDevice {
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_IMOD => self.imod = val,
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERSTSZ => self.erstsz = val,
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERSTBA_LO => {
-                self.erstba = (self.erstba & 0xffff_ffff_0000_0000) | u64::from(val);
-                // A new ERST rebuilds the event ring.
-                self.event_ring = None;
+                self.set_erstba((self.erstba & 0xffff_ffff_0000_0000) | u64::from(val));
             }
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERSTBA_HI => {
-                self.erstba = (self.erstba & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32);
-                self.event_ring = None;
+                self.set_erstba((self.erstba & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32));
             }
             _ if off == RUNTIME_BASE + RT_IR0_BASE + IR_ERDP_LO => {
                 // ERDP bit 3 (EHB) is write-1-to-clear; store the dequeue pointer
@@ -557,6 +575,74 @@ impl XhciDevice {
 
             // Read-only capability registers and reserved space: ignore writes.
             _ => {}
+        }
+    }
+
+    /// CRCR low-dword write.
+    ///
+    /// A write carrying **Command Stop (CS)** or **Command Abort (CA)** is *not* a (re)program:
+    /// per spec the Command Ring Pointer field reads back as 0, and Linux's command watchdog
+    /// writes `CRCR = readl(CRCR) | CMD_RING_ABORT` — i.e. `0x4`, pointer bits zero. Treating that
+    /// as a rebase pointed the walker at guest address 0 and bricked the controller for good
+    /// (`command ring walk error: BadAccess(0)` every 5 s forever). So a CS/CA write leaves the
+    /// ring exactly where it is and only stops/aborts it.
+    ///
+    /// `lo_hi_writeq` splits the guest's 64-bit store into a low then a high dword MMIO access, and
+    /// the CS/CA bits live only in the low one — hence [`Self::crcr_stop_write`], which tells the
+    /// paired high-dword write (value 0, carrying no pointer) not to clobber the retained base.
+    fn write_crcr_lo(&mut self, val: u32) {
+        if val & (CRCR_CS | CRCR_CA) != 0 {
+            self.crcr_stop_write = true;
+            if val & CRCR_CA != 0 {
+                // Acknowledge the abort with a Command Ring Stopped event (posted by the worker,
+                // which has guest memory). Without it the guest's `xhci_handle_stopped_cmd_ring`
+                // never runs, its `cmd_ring_state` stays ABORTED and every later command is
+                // refused — the ring survives but USB is just as dead.
+                self.work.cmd_abort = true;
+                self.kick_worker();
+            }
+            debug!(
+                "xhci: CRCR stop/abort write {val:#x} (ring kept at {:#x})",
+                self.crcr_ptr()
+            );
+            return;
+        }
+        self.crcr_stop_write = false;
+        self.crcr = (self.crcr & 0xffff_ffff_0000_0000) | u64::from(val);
+        // A genuine CRCR (re)program rebases the command ring. The guest only ever writes the
+        // pointer to reposition the dequeue at its segment base (`xhci_set_cmd_ring_deq`), so an
+        // unconditional rebase here is right.
+        self.cmd_ring = None;
+    }
+
+    /// CRCR high-dword write — the second half of the guest's 64-bit store. Ignored when the
+    /// preceding low-dword write was a stop/abort (see [`Self::write_crcr_lo`]): that write's
+    /// pointer field is zero, and a guest whose command ring lives above 4 GiB would otherwise
+    /// have its base truncated by the paired zero.
+    fn write_crcr_hi(&mut self, val: u32) {
+        if self.crcr_stop_write {
+            return;
+        }
+        self.crcr = (self.crcr & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32);
+        self.cmd_ring = None;
+    }
+
+    /// ERSTBA write: rebuild the event ring **only when the segment-table base actually changes.**
+    ///
+    /// The guest's `xhci_restore_registers` rewrites ERSTBA with the value it saved — the same one
+    /// — on every resume. Dropping the ring there rebuilt the producer at index 0 with PCS=1 while
+    /// the guest's consumer (ERDP + its own cycle state, which it does *not* reset on this path)
+    /// sat mid-ring: every event we then posted landed in slots the guest had already read and
+    /// stayed invisible until the producer wrapped around to its dequeue pointer. Lost command
+    /// completions → 5 s command timeouts → an aborted ring.
+    ///
+    /// A half-programmed transient (the low dword written before the high one) can never build a
+    /// ring here because [`super::engine`] builds it lazily at the next worker pass, not on write.
+    fn set_erstba(&mut self, new: u64) {
+        let changed = (new & !0x3f) != (self.erstba & !0x3f);
+        self.erstba = new;
+        if changed {
+            self.event_ring = None;
         }
     }
 
@@ -637,7 +723,14 @@ impl XhciDevice {
         let mut p = self.ports[idx];
         // Write-1-to-clear the change bits.
         p &= !(val & PORTSC_RW1C_MASK);
-        // PED is write-1-to-clear (writing 1 disables the port).
+        // PED is write-1-to-clear (writing 1 disables the port), and that is ALL it does: no PEC
+        // latch, no port-change event. Deliberately, and checked against the driver — the only two
+        // places Linux writes PED=1 are `xhci_disable_port` and the SS_DISABLED link-state write,
+        // both *intentional* disables, and the latter clears `PORT_PEC` in the very same word
+        // "so that we get a new connection event". Latching a change here would fight that: the hub
+        // thread would see PED=0 with CCS still set and re-enable a port the guest just disabled.
+        // (`xhci_bus_resume` never reaches this path — `PORT_RWC_BITS` *includes* `PORT_PE`
+        // (xhci-hub.c), so its write-back clears PE rather than asserting it.)
         if val & PORTSC_PED != 0 {
             p &= !PORTSC_PED;
         }
@@ -645,9 +738,25 @@ impl XhciDevice {
         p = (p & !PORTSC_PP) | (val & PORTSC_PP);
         // Port Indicator Control (RW).
         p = (p & !PORTSC_PIC_MASK) | (val & PORTSC_PIC_MASK);
-        // Port Link State is writable only when the Link State Write Strobe is set.
+        // Port Link State is writable only when the Link State Write Strobe is set. A write that
+        // lands the link in U0 from some other state *completes a link transition*, so latch
+        // PORTSC.PLC and queue the change event: `xhci_bus_resume` writes `LWS | U0` and then polls
+        // PORTSC for PLC with a **10 ms** timeout, and on timeout it skips `xhci_ring_device` — the
+        // doorbell ring that restarts every endpoint `xhci_bus_suspend` stopped. That is why the
+        // latch happens here, synchronously on the vcpu thread, and only the event is deferred.
+        //
+        // Deliberately narrow (this mirrors QEMU): latching on *any* PLS change would also fire on
+        // bus_suspend's `LWS | U3` write, raising a port change and an event just as the system
+        // suspends. The guest pre-clears PLC before its U0 write, so nothing else needs it.
+        let mut link_reached_u0 = false;
         if val & PORTSC_LWS != 0 {
+            let was_u0 = (p & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT == PLS_U0;
             p = (p & !PORTSC_PLS_MASK) | (val & PORTSC_PLS_MASK);
+            let is_u0 = (p & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT == PLS_U0;
+            if is_u0 && !was_u0 {
+                p |= PORTSC_PLC;
+                link_reached_u0 = true;
+            }
         }
         // Wake-enable bits (RW).
         p = (p & !PORTSC_WAKE_MASK) | (val & PORTSC_WAKE_MASK);
@@ -655,6 +764,11 @@ impl XhciDevice {
         // PR / WPR initiate a reset.
         let reset = val & (PORTSC_PR | PORTSC_WPR) != 0;
         self.ports[idx] = p;
+        if link_reached_u0 {
+            self.usbsts |= STS_PCD;
+            self.work.port_events.push((idx + 1) as u8);
+            self.kick_worker();
+        }
         if reset && p & PORTSC_CCS != 0 {
             self.complete_port_reset(idx);
         }
@@ -719,10 +833,25 @@ impl XhciDevice {
     pub(super) fn port_populated(&self, idx: usize) -> bool {
         self.port_models[idx].is_some()
     }
+    /// True when the port already reports a connected device (`PORTSC.CCS`).
+    pub(super) fn port_connected(&self, idx: usize) -> bool {
+        self.ports[idx] & PORTSC_CCS != 0
+    }
 
     #[cfg(test)]
     pub(super) fn set_dcbaap_for_test(&mut self, v: u64) {
         self.dcbaap = v;
+    }
+    #[cfg(test)]
+    pub(super) fn portsc_for_test(&self, idx: usize) -> u32 {
+        self.ports[idx]
+    }
+    /// Stand in for "the guest enumerated the device": clear the change bits and park the link
+    /// in U0, the state a resume's run edge must not disturb.
+    #[cfg(test)]
+    pub(super) fn clear_port_change_for_test(&mut self, idx: usize) {
+        self.ports[idx] &= !PORTSC_RW1C_MASK;
+        self.ports[idx] = (self.ports[idx] & !PORTSC_PLS_MASK) | (PLS_U0 << PORTSC_PLS_SHIFT);
     }
 }
 
@@ -817,6 +946,7 @@ mod tests {
     const CRCR: u64 = OP_BASE + OP_CRCR_LO;
     const PORTSC0: u64 = OP_BASE + OP_PORTSC_BASE;
     const IMAN0: u64 = RUNTIME_BASE + RT_IR0_BASE + IR_IMAN;
+    const ERSTBA: u64 = RUNTIME_BASE + RT_IR0_BASE + IR_ERSTBA_LO;
 
     #[test]
     fn caplength_and_hciversion_pack_into_dword0() {
@@ -1038,5 +1168,168 @@ mod tests {
         let mut d = dev();
         w32(&mut d, USBCMD, CMD_RS);
         assert!(d.work.run_started, "run edge flagged for the port scan");
+    }
+
+    // ---- suspend/resume register semantics (docs/design/usb-xhci-snapshot/) --------------
+    //
+    // Each of these reproduces a bug that broke a guest's xHCI across a system suspend. They are
+    // register-level, so they run in microseconds and need no guest.
+
+    /// A `CRCR` write carrying Command Abort must NOT rebase the command ring. Linux's command
+    /// watchdog writes `CRCR = readl(CRCR) | CMD_RING_ABORT`; CRCR's pointer field reads back as 0
+    /// per spec, so the value written is `0x4` — pointer bits zero. Rebasing on that pointed the
+    /// walker at guest address 0 and bricked the controller forever
+    /// (`command ring walk error: BadAccess(0)` every 5 s).
+    #[test]
+    fn crcr_abort_write_does_not_rebase_the_ring() {
+        let mut d = dev();
+        // A command ring above 4 GiB, so a truncating high-dword write is visible too.
+        let base: u64 = 0x0000_0001_8400_4000;
+        d.write(0, CRCR, &(base | 1).to_le_bytes());
+        assert_eq!(d.crcr_ptr(), base);
+
+        // Linux's abort: a 64-bit store of `0 | CMD_RING_ABORT` (low then high dword).
+        d.write(0, CRCR, &(CRCR_CA as u64).to_le_bytes());
+        assert_eq!(
+            d.crcr_ptr(),
+            base,
+            "an abort write must leave the command ring base intact"
+        );
+        assert!(
+            d.work.cmd_abort,
+            "the abort must be acknowledged with a Command Ring Stopped event"
+        );
+    }
+
+    /// The same, for a plain Command Stop write (no abort event, ring still kept).
+    #[test]
+    fn crcr_stop_write_keeps_the_ring_and_posts_no_event() {
+        let mut d = dev();
+        let base: u64 = 0x8400_4000;
+        d.write(0, CRCR, &(base | 1).to_le_bytes());
+        d.write(0, CRCR, &(CRCR_CS as u64).to_le_bytes());
+        assert_eq!(d.crcr_ptr(), base, "a stop write must keep the ring base");
+        assert!(!d.work.cmd_abort, "CS is not an abort");
+    }
+
+    /// After a stop/abort write, a genuine (re)program must work again — the suppression latch
+    /// must not stick.
+    #[test]
+    fn crcr_reprogram_after_an_abort_still_rebases() {
+        let mut d = dev();
+        d.write(0, CRCR, &(0x8400_4000u64 | 1).to_le_bytes());
+        d.write(0, CRCR, &(CRCR_CA as u64).to_le_bytes());
+        let new: u64 = 0x0000_0001_9000_0000;
+        d.write(0, CRCR, &(new | 1).to_le_bytes());
+        assert_eq!(d.crcr_ptr(), new, "a later pointer write must rebase");
+        assert!(d.crcr_rcs());
+    }
+
+    /// Rewriting `ERSTBA` with the value it already holds must not reset the event-ring producer.
+    /// The guest's `xhci_restore_registers` does exactly that on every resume, while its own
+    /// consumer (ERDP + cycle state) stays mid-ring — a producer reset desyncs the two and the
+    /// events we post become invisible until the producer wraps around.
+    #[test]
+    fn erstba_rewrite_with_the_same_base_keeps_the_producer() {
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2_0000)]).unwrap();
+        let mut d = dev();
+        let erstba: u64 = 0x8000;
+        d.write(0, ERSTBA, &erstba.to_le_bytes());
+        // Stand in for "the worker built the ring and the guest consumed a few events", i.e. a
+        // producer sitting mid-segment — which is the state a reset silently throws away.
+        let mut er = super::super::trb::EventRing::new(0x1_0000, 16);
+        let ev = super::super::trb::port_status_change_event(1);
+        for _ in 0..3 {
+            er.enqueue(&mem, ev, 0x1_0000).unwrap();
+        }
+        d.event_ring = Some(er);
+        let before = d.event_ring.unwrap().enqueue_addr();
+        assert_ne!(before, 0x1_0000, "the producer has advanced off the base");
+        d.write(0, ERSTBA, &erstba.to_le_bytes());
+        assert!(
+            d.event_ring.is_some(),
+            "an unchanged ERSTBA must not drop the event ring"
+        );
+        assert_eq!(
+            d.event_ring.unwrap().enqueue_addr(),
+            before,
+            "the producer position must survive an idempotent ERSTBA rewrite"
+        );
+
+        // A genuinely different base does rebuild it.
+        d.write(0, ERSTBA, &0x9000u64.to_le_bytes());
+        assert!(
+            d.event_ring.is_none(),
+            "a changed ERSTBA must rebuild the event ring"
+        );
+    }
+
+    /// A `PORTSC` link-state write that lands the port in U0 must latch `PLC` and queue a port
+    /// change event. `xhci_bus_resume` polls PORTSC for `PLC` with a 10 ms timeout after writing
+    /// U0, and on timeout it skips `xhci_ring_device` — the doorbell ring that restarts every
+    /// endpoint the bus suspend stopped.
+    #[test]
+    fn link_state_write_to_u0_latches_plc_and_posts_a_port_event() {
+        let mut d = dev();
+        d.port_models[0] = Some(Arc::new(super::super::super::mock::MockUsbDevice::new()));
+        d.set_port_connected(0);
+        // Suspended link (what bus_suspend leaves behind).
+        d.ports[0] = (d.ports[0] & !PORTSC_PLS_MASK) | (PLS_U3 << PORTSC_PLS_SHIFT);
+        d.work.port_events.clear();
+
+        w32(&mut d, PORTSC0, PORTSC_LWS | (PLS_U0 << PORTSC_PLS_SHIFT));
+        let p = r32(&mut d, PORTSC0);
+        assert_eq!(
+            (p & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT,
+            PLS_U0,
+            "link moved to U0"
+        );
+        assert_ne!(p & PORTSC_PLC, 0, "PLC latched on the U0 transition");
+        assert_eq!(
+            d.work.port_events,
+            vec![1],
+            "a Port Status Change Event is queued for the link change"
+        );
+        // And PLC is write-1-to-clear, as the guest's handshake expects.
+        w32(&mut d, PORTSC0, PORTSC_PLC);
+        assert_eq!(r32(&mut d, PORTSC0) & PORTSC_PLC, 0, "PLC is RW1C");
+    }
+
+    /// The `PLC` latch is deliberately narrow: `xhci_bus_suspend`'s `LWS | U3` write must NOT raise
+    /// a port change or an event, or we would signal a port event exactly as the system suspends.
+    #[test]
+    fn link_state_write_to_u3_does_not_latch_plc() {
+        let mut d = dev();
+        d.port_models[0] = Some(Arc::new(super::super::super::mock::MockUsbDevice::new()));
+        d.set_port_connected(0);
+        d.ports[0] = (d.ports[0] & !PORTSC_PLS_MASK) | (PLS_U0 << PORTSC_PLS_SHIFT);
+        d.work.port_events.clear();
+
+        w32(&mut d, PORTSC0, PORTSC_LWS | (PLS_U3 << PORTSC_PLS_SHIFT));
+        let p = r32(&mut d, PORTSC0);
+        assert_eq!(
+            (p & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT,
+            PLS_U3,
+            "link parked in U3"
+        );
+        assert_eq!(p & PORTSC_PLC, 0, "no PLC on the suspend-entry write");
+        assert!(
+            d.work.port_events.is_empty(),
+            "no port event on the suspend-entry write"
+        );
+    }
+
+    /// `CSS` / `CRS` are RW1S strobes the controller clears when the (instantaneous, for us)
+    /// save/restore completes. A sticky bit would ride back into the guest's `USBCMD` reads.
+    #[test]
+    fn css_and_crs_are_self_clearing() {
+        let mut d = dev();
+        w32(&mut d, USBCMD, CMD_INTE | CMD_CSS);
+        let cmd = r32(&mut d, USBCMD);
+        assert_eq!(cmd & CMD_CSS, 0, "CSS self-clears");
+        assert_ne!(cmd & CMD_INTE, 0, "the RW bits alongside it are kept");
+        w32(&mut d, USBCMD, CMD_INTE | CMD_CRS);
+        assert_eq!(r32(&mut d, USBCMD) & CMD_CRS, 0, "CRS self-clears");
     }
 }
