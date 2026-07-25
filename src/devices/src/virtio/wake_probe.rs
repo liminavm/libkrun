@@ -98,29 +98,176 @@ pub fn take_coalesced() -> u64 {
 const BUCKET_BOUNDS_NS: [u64; 3] = [1_000_000, 4_000_000, 16_000_000];
 const BUCKET_NAMES: [&str; 4] = ["<1ms  ", "1-4ms ", "4-16ms", ">=16ms"];
 
+/// A log2-spaced latency histogram, ~12% wide per bin. Reports p50/p95 rather than a mean,
+/// because the numbers this is compared against — gnome-shell-rs's idle sweep — are medians,
+/// and because on a real desktop the traffic is heavy-tailed enough that a mean describes
+/// nothing anyone experiences. `max` is kept alongside: one bad sample is worth seeing, it
+/// just must not be mistaken for the distribution.
+#[derive(Clone, Copy)]
+struct Hist {
+    /// Bin i covers [2^(i/8), 2^((i+1)/8)) ns, so 8 bins per octave up to ~4 s.
+    bins: [u32; 256],
+    n: u64,
+    max: u64,
+}
+
+impl Default for Hist {
+    fn default() -> Self {
+        Self {
+            bins: [0; 256],
+            n: 0,
+            max: 0,
+        }
+    }
+}
+
+impl Hist {
+    fn add(&mut self, ns: u64) {
+        self.n += 1;
+        self.max = self.max.max(ns);
+        // 8 bins per octave: bin = 8*log2(ns), read off the exponent plus 3 mantissa bits.
+        let bin = if ns < 2 {
+            0
+        } else {
+            let oct = 63 - ns.leading_zeros() as usize;
+            let mant = ((ns >> (oct.saturating_sub(3))) & 0x7) as usize;
+            (oct * 8 + mant).min(255)
+        };
+        self.bins[bin] += 1;
+    }
+
+    /// Upper edge of the bin holding the `p`th percentile. Coarse by construction (~12%), which
+    /// is far finer than the effect being measured.
+    fn pct(&self, p: f64) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        let target = (self.n as f64 * p).ceil() as u64;
+        let mut seen = 0u64;
+        for (i, &c) in self.bins.iter().enumerate() {
+            seen += c as u64;
+            if seen >= target {
+                return 2f64.powf((i + 1) as f64 / 8.0);
+            }
+        }
+        self.max as f64
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 struct Bucket {
     n: u64,
-    kick_wake_sum: u64,
-    kick_wake_max: u64,
-    wake_drain_sum: u64,
-    wake_drain_max: u64,
-    drain_sig_sum: u64,
-    drain_sig_max: u64,
-    calib_sum: u64,
-    calib_max: u64,
+    kick_wake: Hist,
+    wake_drain: Hist,
+    drain_sig: Hist,
+    calib: Hist,
 }
 
 impl Bucket {
     fn add(&mut self, kick_wake: u64, wake_drain: u64, drain_sig: u64) {
         self.n += 1;
-        self.kick_wake_sum += kick_wake;
-        self.kick_wake_max = self.kick_wake_max.max(kick_wake);
-        self.wake_drain_sum += wake_drain;
-        self.wake_drain_max = self.wake_drain_max.max(wake_drain);
-        self.drain_sig_sum += drain_sig;
-        self.drain_sig_max = self.drain_sig_max.max(drain_sig);
+        self.kick_wake.add(kick_wake);
+        self.wake_drain.add(wake_drain);
+        self.drain_sig.add(drain_sig);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The return half: host raises the used-queue IRQ -> the guest's handler acknowledges it.
+//
+// This looked at first like it needed a guest-side stamp, because `drained->signal` only times
+// the CALL that raises the interrupt, not when the guest sees it. It does not — but the obvious
+// hook is the wrong one, which is worth recording.
+//
+// The obvious hook is the guest's GIC acknowledge (ICC_IAR1_EL1), which traps to
+// `legacy/vcpu.rs::handle_sysreg_read`. It produced ZERO samples, because macOS 26 gives us
+// Apple's IN-KERNEL GIC (`HvfGicV3`, `hv_gic_set_spi`): injection and acknowledge both happen
+// inside HVF and never come out to us. That hook only fires on the userspace `GicV3` fallback.
+//
+// The hook that always works is one layer up, in the transport. A virtio-mmio driver's ISR
+// handler acknowledges by WRITING InterruptACK (reg 0x64), and MMIO always traps. So the
+// measurement is: raise the used-queue interrupt -> the guest's virtio-gpu interrupt handler
+// runs and acks. That spans the vCPU coming back (out of WFI or hv_vcpu_run), the injection,
+// guest IRQ entry, and the driver's handler reaching its ack — every host-adjacent part of the
+// return path. Attribution is exact because the ack is per-device: it is keyed on the same
+// queue eventfd the doorbell is.
+//
+// The GIC hook is kept anyway, for the one thing the transport ack cannot tell us: whether the
+// vCPU was parked. `set_irq_common` knows (`VcpuStatus::Waiting`, woken through its channel,
+// vs Running, kicked out with hv_vcpus_exit), and those are very different costs — if the
+// idle-gap effect lives anywhere on the host, a parked vCPU is where to expect it. That split
+// is only available on the userspace GIC, and is reported only there.
+
+static IRQ_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IRQ_BUCKET: AtomicI32 = AtomicI32::new(-1);
+static IRQ_RAISE_NS: AtomicU64 = AtomicU64::new(0);
+static IRQ_PARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// [bucket][parked] -> (count, ns sum, ns max). Written from the vCPU thread on ack, read by
+/// the worker thread when it reports; atomics rather than the `Profile`'s plain fields because
+/// the two ends are different threads.
+static IRQ_STATS: [[(AtomicU64, AtomicU64, AtomicU64); 2]; 4] =
+    [const { [const { (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)) }; 2] }; 4];
+/// Raises that landed on a line the guest had not yet serviced. Expected to dwarf the sample
+/// count — it is the coalescing ratio, not an error.
+static IRQ_COALESCED: AtomicU64 = AtomicU64::new(0);
+/// Whether the return half is measurable at all. macOS 26 gives us Apple's IN-KERNEL GIC
+/// (`HvfGicV3`, `hv_gic_set_spi`), which injects and acknowledges entirely inside HVF: neither
+/// `set_irq_common` nor the ICC_IAR1_EL1 trap is on that path, so there is nothing to hook.
+/// Only the userspace `GicV3` fallback can be timed. Defaults to false so the common case
+/// reports the hop as UNAVAILABLE rather than silently printing no column — an absent number
+/// that looks like a quiet path is how you talk yourself into a wrong conclusion.
+static SOFTWARE_GIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn note_software_gic() {
+    SOFTWARE_GIC.store(true, Ordering::Relaxed);
+}
+
+/// Arm the return-path measurement, immediately before the used-queue interrupt is raised.
+///
+/// Keeps the OLDEST unacked raise, like the doorbell cell does. The guest coalesces heavily —
+/// the used-queue interrupt is one level-triggered SPI, so one ISR entry and one ack can cover
+/// a few hundred raises, and in a busy window raises outnumber acks ~250:1. Only the raise that
+/// found the line idle actually causes an ISR entry; the rest are absorbed into an interrupt
+/// already pending. Overwriting on each raise (the first version of this) measured "last raise
+/// before the ack -> ack", which is a fraction of a delivery and reads about 5x too fast.
+pub fn irq_arm(bucket: usize) {
+    if IRQ_ARMED.swap(true, Ordering::AcqRel) {
+        // Already armed: this raise landed on a line the guest has not serviced yet.
+        IRQ_COALESCED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    IRQ_BUCKET.store(bucket as i32, Ordering::Relaxed);
+    IRQ_PARKED.store(false, Ordering::Relaxed);
+    IRQ_RAISE_NS.store(now_ns(), Ordering::Release);
+}
+
+/// Called from `set_irq_common` (userspace GIC only) with whether the vCPU was parked. Records
+/// nothing by itself; it just labels the sample the transport ack will close.
+pub fn irq_raised(_irq: u32, parked: bool) {
+    if parked && IRQ_ARMED.load(Ordering::Relaxed) {
+        IRQ_PARKED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Called from the virtio-mmio InterruptACK write (reg 0x64) with the acking device's first
+/// queue eventfd. Closes the sample when it is the device being watched.
+pub fn irq_acked_transport(fd: RawFd) {
+    if fd != WATCHED_FD.load(Ordering::Relaxed) {
+        return;
+    }
+    // Close first, so a raise racing this one re-arms cleanly rather than being counted twice.
+    if !IRQ_ARMED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let bucket = IRQ_BUCKET.load(Ordering::Relaxed);
+    if bucket < 0 {
+        return;
+    }
+    let dt = now_ns().saturating_sub(IRQ_RAISE_NS.load(Ordering::Acquire));
+    let slot = &IRQ_STATS[bucket as usize][IRQ_PARKED.load(Ordering::Relaxed) as usize];
+    slot.0.fetch_add(1, Ordering::Relaxed);
+    slot.1.fetch_add(dt, Ordering::Relaxed);
+    slot.2.fetch_max(dt, Ordering::Relaxed);
 }
 
 /// Fixed-work control. Runs the identical arithmetic every time, timed on the worker thread
@@ -158,6 +305,10 @@ pub struct Profile {
     no_kick: u64,
     last_kick_ns: u64,
     report_at_ns: u64,
+    /// Bucket chosen by `arm`, consumed by `record`. The two are separate calls because the
+    /// return-path measurement has to be armed BEFORE the interrupt is raised, while the
+    /// forward-path sample can only be completed after.
+    pending_idx: Option<usize>,
 }
 
 impl Profile {
@@ -170,16 +321,37 @@ impl Profile {
             no_kick: 0,
             last_kick_ns: 0,
             report_at_ns: now_ns() + 5_000_000_000,
+            pending_idx: None,
         })
+    }
+
+    /// Classify this doorbell by its idle gap. Called by the worker after the drain.
+    pub fn arm(&mut self, kick_ns: u64) {
+        let gap = kick_ns.saturating_sub(self.last_kick_ns);
+        self.last_kick_ns = kick_ns;
+        self.pending_idx = Some(BUCKET_BOUNDS_NS.iter().position(|&b| gap < b).unwrap_or(3));
+    }
+
+    /// Arm the return-path measurement, immediately before the used-queue interrupt is raised.
+    ///
+    /// Separate from `arm` because most drains raise NO interrupt: with EVENT_IDX the guest
+    /// asks for one only when it wants it (`needs_notification`), and a drain that used no
+    /// descriptors never signals at all. Arming on every doorbell instead of only on the ones
+    /// that actually interrupt left `irq_unacked` in the thousands against a handful of
+    /// samples — an unacked count that size means the arm point is wrong, not that the guest
+    /// is dropping interrupts.
+    pub fn arm_irq(&self) {
+        if let Some(idx) = self.pending_idx {
+            irq_arm(idx);
+        }
     }
 
     /// Record one doorbell's worth of the VMM path. `kick_ns` is the stamp taken on the vCPU
     /// thread; the rest are taken by the worker around its own work.
     pub fn record(&mut self, kick_ns: u64, wake_ns: u64, drained_ns: u64, signaled_ns: u64) {
-        let gap = kick_ns.saturating_sub(self.last_kick_ns);
-        self.last_kick_ns = kick_ns;
-
-        let idx = BUCKET_BOUNDS_NS.iter().position(|&b| gap < b).unwrap_or(3);
+        let Some(idx) = self.pending_idx.take() else {
+            return;
+        };
         let b = &mut self.buckets[idx];
         b.add(
             wake_ns.saturating_sub(kick_ns),
@@ -188,9 +360,7 @@ impl Profile {
         );
         // After the hops are recorded, so the control never inflates what it is controlling for.
         if calib_enabled() {
-            let c = calibrate();
-            b.calib_sum += c;
-            b.calib_max = b.calib_max.max(c);
+            b.calib.add(calibrate());
         }
     }
 
@@ -211,25 +381,56 @@ impl Profile {
             if b.n == 0 {
                 continue;
             }
-            let n = b.n as f64;
-            eprintln!(
-                "[GPUWAKE idle {}] n={} kick->wake avg {:.3} ms max {:.3} ms | \
-                 wake->drained avg {:.3} ms max {:.3} ms | drained->signal avg {:.3} ms max {:.3} ms \
-                 | calib avg {:.3} ms max {:.3} ms",
+            // p50/p95/max per hop, in ms. Add the three p50s for the VMM-side floor.
+            let h = |x: &Hist| {
+                format!(
+                    "{:.3}/{:.3}/{:.3}",
+                    ms(x.pct(0.50) as u64),
+                    ms(x.pct(0.95) as u64),
+                    ms(x.max)
+                )
+            };
+            let mut line = format!(
+                "[GPUWAKE idle {}] n={} p50/p95/max ms | kick->wake {} | wake->drained {} \
+                 | drained->signal {}",
                 BUCKET_NAMES[i],
                 b.n,
-                ms(b.kick_wake_sum) / n,
-                ms(b.kick_wake_max),
-                ms(b.wake_drain_sum) / n,
-                ms(b.wake_drain_max),
-                ms(b.drain_sig_sum) / n,
-                ms(b.drain_sig_max),
-                ms(b.calib_sum) / n,
-                ms(b.calib_max),
+                h(&b.kick_wake),
+                h(&b.wake_drain),
+                h(&b.drain_sig),
             );
+            // Return path. The parked/running split needs the userspace GIC; the hop itself
+            // does not, so only the labels change.
+            let sw_gic = SOFTWARE_GIC.load(Ordering::Relaxed);
+            for (parked, label) in [(0usize, "irq->ack"), (1usize, "irq->ack PARKED")] {
+                let slot = &IRQ_STATS[i][parked];
+                let n = slot.0.swap(0, Ordering::Relaxed);
+                let sum = slot.1.swap(0, Ordering::Relaxed);
+                let mx = slot.2.swap(0, Ordering::Relaxed);
+                if n > 0 {
+                    let label = if parked == 0 && sw_gic {
+                        "irq->ack running"
+                    } else {
+                        label
+                    };
+                    line.push_str(&format!(
+                        " | {label} n={n} avg {:.3} max {:.3}",
+                        ms(sum) / n as f64,
+                        ms(mx)
+                    ));
+                }
+            }
+            if b.calib.n > 0 {
+                line.push_str(&format!(" | calib {}", h(&b.calib)));
+            }
+            eprintln!("{line}");
         }
-        if self.no_kick > 0 || coalesced > 0 {
-            eprintln!("[GPUWAKE] no_kick={} coalesced={coalesced}", self.no_kick);
+        let irq_coal = IRQ_COALESCED.swap(0, Ordering::Relaxed);
+        if self.no_kick > 0 || coalesced > 0 || irq_coal > 0 {
+            eprintln!(
+                "[GPUWAKE] no_kick={} coalesced={coalesced} irq_coalesced={irq_coal}",
+                self.no_kick
+            );
         }
         self.buckets = [Bucket::default(); 4];
         self.no_kick = 0;

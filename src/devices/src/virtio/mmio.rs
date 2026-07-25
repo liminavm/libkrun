@@ -713,6 +713,12 @@ impl BusDevice for MmioTransport {
                         }
                     }
                     0x64 => {
+                        // limina wake-probe: the guest's virtio ISR handler acking. This is the
+                        // end of the return path, and unlike the GIC acknowledge it traps to us
+                        // even with Apple's in-kernel GIC.
+                        if let Some(evt) = self.queue_evts.first() {
+                            super::wake_probe::irq_acked_transport(evt.as_raw_fd());
+                        }
                         if self.check_device_status(device_status::DRIVER_OK, 0) {
                             self.interrupt
                                 .status()
