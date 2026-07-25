@@ -552,6 +552,9 @@ impl Worker {
                         let _ = control_queue.lock().unwrap().disable_notification(mem);
                         let used_any = self.process_queue(virtio_gpu, control_queue, mem);
                         let drained_ns = probe_pass.map(|_| crate::virtio::wake_probe::now_ns());
+                        if let (Some(p), Some(k)) = (wake_probe.as_mut(), probe_pass) {
+                            p.arm(k);
+                        }
                         if used_any
                             && control_queue
                                 .lock()
@@ -559,6 +562,12 @@ impl Worker {
                                 .needs_notification(mem)
                                 .unwrap_or(true)
                         {
+                            // Arm the return-path measurement here, not with `arm` above: this
+                            // is the only branch that actually interrupts the guest, and the
+                            // guest can ack before this thread runs again.
+                            if let Some(p) = wake_probe.as_ref() {
+                                p.arm_irq();
+                            }
                             if let Err(e) = interrupt.try_signal_used_queue() {
                                 error!("Error signaling queue: {e:?}");
                             }

@@ -37,6 +37,12 @@ impl PerCPUInterruptControllerState {
         );
         self.pending_irqs.push_back(irq);
 
+        // limina wake-probe: the return half of the venus wake chain starts here. `status` is
+        // the interesting part — a Waiting vCPU is parked in WFI/WFE and has to come back
+        // through its channel, a Running one is only kicked out of hv_vcpu_run, and those are
+        // very different costs. No-op unless LIMINA_WAKE_PROBE is set and the gpu worker armed.
+        crate::virtio::wake_probe::irq_raised(irq, matches!(self.status, VcpuStatus::Waiting));
+
         match self.status {
             VcpuStatus::Waiting => {
                 self.wfe_sender
