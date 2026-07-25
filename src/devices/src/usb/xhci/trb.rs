@@ -156,7 +156,16 @@ pub enum RingError {
     BadAccess(u64),
     /// The Link-TRB chain exceeded the hop bound (a loop or a pathological ring).
     LinkLoop,
+    /// A single TD chained more work TRBs than [`MAX_TD_TRBS`] — a hostile ring whose
+    /// Chain bit never clears (unbounded data-buffer / immediate accumulation).
+    TdTooLong,
 }
+
+/// The maximum number of work (Normal/Event-Data) TRBs to accept in a single TD before
+/// declaring it malformed. A TD whose Chain bit never clears (hostile input) would otherwise
+/// grow the collected segment / immediate buffers without bound and hang the worker. Real TDs
+/// are a handful of TRBs; this bound is generous.
+pub const MAX_TD_TRBS: usize = 1024;
 
 /// The maximum number of consecutive Link TRBs to follow before declaring the
 /// ring malformed. A self-referential or looping Link chain (hostile input)
