@@ -218,6 +218,11 @@ impl Worker {
 
             // Own each activation's queue eventfds + queues; publish the transport so the
             // long-lived fence handler retires guest fences into THIS activation's queue.
+            // limina wake-probe: watch the TRANSPORT's fd, not the try_clone below — try_clone
+            // dups, so the worker's copy has a different raw fd and would never match the
+            // doorbell the vCPU stamps. (This is exactly what the first run got wrong: every
+            // wake landed in `no_kick`.)
+            crate::virtio::wake_probe::watch(control_q.event.as_raw_fd());
             let control_evt = control_q.event.try_clone().unwrap();
             let cursor_evt = cursor_q.event.try_clone().unwrap();
             let control_queue = Arc::new(Mutex::new(control_q.queue));
@@ -404,6 +409,11 @@ impl Worker {
         let mut wake_trace = std::env::var("LIMINA_WAKE_TRACE")
             .ok()
             .map(|_| (std::time::Instant::now(), [0u64; 6]));
+        // limina wake-probe (LIMINA_WAKE_PROBE=1): the VMM half of the venus wake chain —
+        // guest doorbell -> this thread scheduled -> control queue drained (which is where
+        // vkr_ring_notify happens) -> used-queue interrupt raised. Joins virglrenderer's
+        // LIMINA_RING_WAKE_PROFILE, which covers everything after cnd_signal.
+        let mut wake_probe = crate::virtio::wake_probe::Profile::new();
         loop {
             let ev_cnt = match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(n) => n,
@@ -411,6 +421,13 @@ impl Worker {
                     debug!("gpu worker epoll wait failed: {e}");
                     continue;
                 }
+            };
+            // Stamped before any per-event work, so `kick -> wake` is the scheduling latency
+            // alone and nothing this loop does afterwards leaks into it.
+            let wake_ns = if wake_probe.is_some() {
+                crate::virtio::wake_probe::now_ns()
+            } else {
+                0
             };
             if let Some((last, counts)) = wake_trace.as_mut() {
                 counts[0] += 1;
@@ -478,9 +495,23 @@ impl Worker {
                     // already here; `enable_notification` re-arms and reports entries that
                     // raced the re-arm. Signal only when the guest asked (used_event) —
                     // without EVENT_IDX `needs_notification` is always true (stock behavior).
+                    // limina wake-probe: the doorbell behind this wake, if any. Taken before
+                    // the drain so a kick that lands mid-drain stays for the next wake rather
+                    // than being credited to this one.
+                    let kick_ns = wake_probe
+                        .as_mut()
+                        .and_then(|_| crate::virtio::wake_probe::consume_kick());
+                    // First pass only: that is the pass carrying the command the doorbell
+                    // announced (vkNotifyRingMESA included). Later passes are the
+                    // enable_notification re-arm race, a different question.
+                    let mut probe_pass = kick_ns;
+                    if let (Some(p), None) = (wake_probe.as_mut(), kick_ns) {
+                        p.record_no_kick();
+                    }
                     loop {
                         let _ = control_queue.lock().unwrap().disable_notification(mem);
                         let used_any = self.process_queue(virtio_gpu, control_queue, mem);
+                        let drained_ns = probe_pass.map(|_| crate::virtio::wake_probe::now_ns());
                         if used_any
                             && control_queue
                                 .lock()
@@ -491,6 +522,12 @@ impl Worker {
                             if let Err(e) = interrupt.try_signal_used_queue() {
                                 error!("Error signaling queue: {e:?}");
                             }
+                        }
+                        if let (Some(p), Some(k), Some(d)) =
+                            (wake_probe.as_mut(), probe_pass, drained_ns)
+                        {
+                            p.record(k, wake_ns, d, crate::virtio::wake_probe::now_ns());
+                            probe_pass = None;
                         }
                         match control_queue.lock().unwrap().enable_notification(mem) {
                             Ok(true) => continue,
@@ -551,6 +588,9 @@ impl Worker {
                 if present_ev_fd >= 0 && source == present_ev_fd {
                     virtio_gpu.process_retired_presents();
                 }
+            }
+            if let Some(p) = wake_probe.as_mut() {
+                p.maybe_report();
             }
         }
     }

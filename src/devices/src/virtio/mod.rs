@@ -41,6 +41,7 @@ pub mod snd;
 #[cfg(feature = "vhost-user")]
 pub mod vhost_user;
 pub mod vsock;
+pub mod wake_probe;
 
 #[cfg(not(feature = "tee"))]
 pub use self::balloon::*;
