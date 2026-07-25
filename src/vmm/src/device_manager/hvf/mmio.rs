@@ -95,6 +95,11 @@ pub struct MMIODeviceManager {
     /// Handle to the live PL061 GPIO device (M9 snapshot save/restore of its register file, and
     /// wake injection). `None` until `register_mmio_gpio` runs (macOS/aarch64 only).
     pub gpio: Option<Arc<Mutex<devices::legacy::Gpio>>>,
+    /// Handle to the live xHCI USB controller, for snapshot save/restore of its host-side state
+    /// (M14 suspend/resume — without it a restored guest's USB stack dies). `None` until
+    /// `register_mmio_xhci` runs, i.e. unless USB is enabled.
+    #[cfg(feature = "usb")]
+    pub xhci: Option<Arc<Mutex<devices::usb::XhciDevice>>>,
 }
 
 impl MMIODeviceManager {
@@ -111,6 +116,8 @@ impl MMIODeviceManager {
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
             gpio: None,
+            #[cfg(feature = "usb")]
+            xhci: None,
         }
     }
 
@@ -335,6 +342,10 @@ impl MMIODeviceManager {
         // bus's strong ref and ends the thread). Downgrade before the bus takes it.
         let weak = Arc::downgrade(&xhci);
         devices::usb::spawn_worker(weak, mem.clone(), kick, stop);
+
+        // Keep our own strong handle: the snapshot save/restore path needs to reach the
+        // controller, and the bus does not hand its devices back out.
+        self.xhci = Some(xhci.clone());
 
         self.bus
             .insert(xhci, self.mmio_base, XHCI_MMIO_LEN)
