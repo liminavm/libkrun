@@ -941,7 +941,14 @@ pub fn build_microvm(
             // userspace implementation.
             let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
-                Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
+                Err(_) => {
+                    // limina wake-probe: only the userspace GIC routes interrupts through
+                    // `set_irq_common` and traps the guest's ICC_IAR1_EL1 acknowledge, so only
+                    // here can the return half of the wake chain be timed. Tell the probe, so
+                    // it says the hop is unavailable instead of just omitting it.
+                    devices::virtio::wake_probe::note_software_gic();
+                    IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone())))
+                }
             };
             Arc::new(Mutex::new(gic))
         };
