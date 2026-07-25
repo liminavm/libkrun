@@ -291,6 +291,83 @@ fn calibrate() -> u64 {
     now_ns().saturating_sub(t0)
 }
 
+// ---------------------------------------------------------------------------------------
+// Outlier attribution.
+//
+// The 5 s buckets report a max per hop, which is enough to know a stall happened and useless
+// for finding out why. The first dogfood run showed exactly that: two windows where a single
+// control-queue drain took 25.0 ms and 18.7 ms while the median in those same windows was
+// 0.012 ms — long enough to be a visible hitch, with nothing to say about the cause.
+//
+// So: time every command inside the drain, keep the worst one, and when a drain overruns the
+// threshold emit ONE line immediately naming it. The wall-clock stamp is CLOCK_REALTIME rather
+// than MONOTONIC on purpose — the guest's clock is anchored to the host's (libkrun 0088 +
+// control-plane TimeSync), so a realtime stamp can be lined up against the compositor's own
+// frame log, which a host monotonic stamp cannot.
+
+/// Milliseconds a single drain may take before it is reported individually. Chosen below one
+/// 60 Hz frame so anything capable of dropping a frame is caught, and far above the ~0.04 ms
+/// median so normal traffic is silent.
+const OUTLIER_MS: f64 = 5.0;
+
+static CMD_WORST_NS: AtomicU64 = AtomicU64::new(0);
+static CMD_WORST_TYPE: AtomicU64 = AtomicU64::new(0);
+static CMD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Start timing one virtio-gpu command. Returns 0 (and costs one relaxed load) when off.
+pub fn cmd_start() -> u64 {
+    if enabled() {
+        now_ns()
+    } else {
+        0
+    }
+}
+
+/// Finish timing one virtio-gpu command, keeping the worst of the current drain.
+pub fn cmd_end(start_ns: u64, cmd_type: u32) {
+    if start_ns == 0 {
+        return;
+    }
+    let dt = now_ns().saturating_sub(start_ns);
+    CMD_COUNT.fetch_add(1, Ordering::Relaxed);
+    if dt > CMD_WORST_NS.load(Ordering::Relaxed) {
+        CMD_WORST_NS.store(dt, Ordering::Relaxed);
+        CMD_WORST_TYPE.store(cmd_type as u64, Ordering::Relaxed);
+    }
+}
+
+/// virtio-gpu control command names, for the outlier line. Unknown codes print as hex rather
+/// than being dropped — an unnamed stall is still worth seeing.
+fn cmd_name(t: u32) -> String {
+    match t {
+        0x0100 => "GET_DISPLAY_INFO".into(),
+        0x0101 => "RESOURCE_CREATE_2D".into(),
+        0x0102 => "RESOURCE_UNREF".into(),
+        0x0103 => "SET_SCANOUT".into(),
+        0x0104 => "RESOURCE_FLUSH".into(),
+        0x0105 => "TRANSFER_TO_HOST_2D".into(),
+        0x0106 => "RESOURCE_ATTACH_BACKING".into(),
+        0x0107 => "RESOURCE_DETACH_BACKING".into(),
+        0x0108 => "GET_CAPSET_INFO".into(),
+        0x0109 => "GET_CAPSET".into(),
+        0x010a => "GET_EDID".into(),
+        0x010b => "RESOURCE_ASSIGN_UUID".into(),
+        0x010c => "RESOURCE_CREATE_BLOB".into(),
+        0x010d => "SET_SCANOUT_BLOB".into(),
+        0x0200 => "CTX_CREATE".into(),
+        0x0201 => "CTX_DESTROY".into(),
+        0x0202 => "CTX_ATTACH_RESOURCE".into(),
+        0x0203 => "CTX_DETACH_RESOURCE".into(),
+        0x0204 => "RESOURCE_CREATE_3D".into(),
+        0x0205 => "TRANSFER_TO_HOST_3D".into(),
+        0x0206 => "TRANSFER_FROM_HOST_3D".into(),
+        0x0207 => "SUBMIT_3D".into(),
+        0x0208 => "RESOURCE_MAP_BLOB".into(),
+        0x0209 => "RESOURCE_UNMAP_BLOB".into(),
+        other => format!("0x{other:04x}"),
+    }
+}
+
 fn ms(ns: u64) -> f64 {
     ns as f64 / 1e6
 }
@@ -362,6 +439,39 @@ impl Profile {
         if calib_enabled() {
             b.calib.add(calibrate());
         }
+
+        // Per-drain command tally, consumed whether or not this drain overran, so the next one
+        // starts clean.
+        let cmds = CMD_COUNT.swap(0, Ordering::Relaxed);
+        let worst_ns = CMD_WORST_NS.swap(0, Ordering::Relaxed);
+        let worst_type = CMD_WORST_TYPE.swap(0, Ordering::Relaxed) as u32;
+
+        let drain_ns = drained_ns.saturating_sub(wake_ns);
+        let total_ns = signaled_ns.saturating_sub(kick_ns);
+        if ms(drain_ns) < OUTLIER_MS {
+            return;
+        }
+        // CLOCK_REALTIME so this can be lined up against the guest's own frame log; the guest
+        // clock is anchored to ours.
+        let mut rt = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `rt` is a valid, properly aligned timespec we own for the duration of the call.
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut rt) };
+        eprintln!(
+            "[GPUWAKE OUTLIER] realtime={}.{:09} idle={} total {:.3} ms | kick->wake {:.3} \
+             wake->drained {:.3} drained->signal {:.3} | {cmds} cmds, worst {} {:.3} ms",
+            rt.tv_sec,
+            rt.tv_nsec,
+            BUCKET_NAMES[idx].trim(),
+            ms(total_ns),
+            ms(wake_ns.saturating_sub(kick_ns)),
+            ms(drain_ns),
+            ms(signaled_ns.saturating_sub(drained_ns)),
+            cmd_name(worst_type),
+            ms(worst_ns),
+        );
     }
 
     pub fn record_no_kick(&mut self) {
