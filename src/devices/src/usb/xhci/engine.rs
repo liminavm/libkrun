@@ -111,6 +111,9 @@ impl XhciDevice {
         for pid in ports {
             self.post_port_event(mem, pid);
         }
+        if std::mem::take(&mut self.work.cmd_abort) {
+            self.post_command_ring_stopped(mem);
+        }
         if std::mem::take(&mut self.work.cmd_doorbell) {
             self.process_command_ring(mem, &mut deferred);
         }
@@ -184,13 +187,43 @@ impl XhciDevice {
     /// On USBCMD.RS 0→1: latch a connect on every port that has a cold-plugged
     /// device and post a Port Status Change Event so the guest's hub thread starts
     /// enumeration.
+    /// **Idempotent**, because the run edge fires on every resume too (`xhci_resume` sets
+    /// `USBCMD.RS` again): a port already reporting `CCS` is left alone. Re-latching `CSC` and
+    /// forcing PLS back to Polling there made the guest's `xhci_bus_resume` see a port that was no
+    /// longer in U3 — so it abandoned the resume — while the fresh `CSC` made its hub thread treat
+    /// the still-present device as a re-plug and tear it down. Devices blinked out and back on
+    /// every single suspend/resume cycle.
+    ///
+    /// Skipping by `CCS` (rather than "did we scan before") is what still lets a genuinely-changed
+    /// port re-enumerate: a restore that reconciles a port to disconnected leaves `CCS` clear, so
+    /// this scan latches a fresh connect for whatever model is there now.
     fn scan_ports_on_run(&mut self, mem: &GuestMemoryMmap) {
         for idx in 0..NUM_PORTS {
-            if self.port_populated(idx) {
+            if self.port_populated(idx) && !self.port_connected(idx) {
                 self.set_port_connected(idx);
                 self.post_port_event(mem, (idx + 1) as u8);
             }
         }
+    }
+
+    /// Acknowledge a `CRCR.CA` (Command Abort) write with a **Command Ring Stopped** Command
+    /// Completion Event pointing at the current dequeue position.
+    ///
+    /// This is what lets the guest recover. Linux's command watchdog aborts the ring on a 5 s
+    /// timeout and then waits for exactly this event: `xhci_handle_stopped_cmd_ring` reads the
+    /// dequeue pointer out of it, restarts the ring and re-queues the pending commands. With no
+    /// event its `cmd_ring_state` stays `CMD_RING_STATE_ABORTED` and every subsequent command is
+    /// refused outright — the ring is intact but USB is dead all the same.
+    fn post_command_ring_stopped(&mut self, mem: &GuestMemoryMmap) {
+        let deq = self
+            .cmd_ring
+            .map(|w| w.ptr())
+            .unwrap_or_else(|| self.crcr_ptr());
+        debug!("xhci: command ring aborted; posting Command Ring Stopped at {deq:#x}");
+        self.post_event(
+            mem,
+            command_completion_event(deq, cc::COMMAND_RING_STOPPED, 0),
+        );
     }
 
     fn post_port_event(&mut self, mem: &GuestMemoryMmap, port_id: u8) {
@@ -200,6 +233,14 @@ impl XhciDevice {
     // ---- command ring --------------------------------------------------------
 
     fn process_command_ring(&mut self, mem: &GuestMemoryMmap, deferred: &mut Vec<DeferredCall>) {
+        // Never walk address 0. A doorbell can arrive with no ring programmed (a stray write, or
+        // the tail end of a guest tearing a dead HCD down), and building a walker at `crcr_ptr() ==
+        // 0` turns that into an unbounded `BadAccess(0)` log loop. Belt-and-braces alongside the
+        // CRCR stop/abort handling in `device.rs`.
+        if self.cmd_ring.is_none() && self.crcr_ptr() == 0 {
+            debug!("xhci: command doorbell with no command ring programmed; ignored");
+            return;
+        }
         let mut walker = self
             .cmd_ring
             .take()
@@ -1306,6 +1347,7 @@ mod tests {
     use crate::usb::mock::MockUsbDevice;
     use crate::usb::xhci::context::slot_state;
     use crate::usb::xhci::trb::{CTRL_CYCLE, CTRL_IDT};
+    use crate::BusDevice;
     use utils::eventfd::EventFd;
 
     fn mem() -> GuestMemoryMmap {
@@ -2014,5 +2056,100 @@ mod tests {
             read_data_td(&m, &mut walker),
             Err(RingError::TdTooLong)
         ));
+    }
+
+    // ---- suspend/resume behaviour (docs/design/usb-xhci-snapshot/) -----------------------
+
+    /// The `USBCMD.RS` 0→1 edge fires on every **resume** too (`xhci_resume` step 4), not just at
+    /// boot. The port scan it triggers must therefore be idempotent: re-latching `CCS | CSC` and
+    /// forcing PLS back to Polling made the guest's `xhci_bus_resume` see a port no longer in U3
+    /// (so it abandoned the resume) *and* made its hub thread treat the still-present device as a
+    /// re-plug — devices blinked out and back on every suspend/resume cycle.
+    #[test]
+    fn run_edge_does_not_relatch_an_already_connected_port() {
+        let m = mem();
+        let dev = new_dev();
+        let mut d = dev.lock().unwrap();
+        d.port_models[0] = Some(Arc::new(MockUsbDevice::new()));
+        d.event_ring = Some(EventRing::new(0x3000, 16));
+
+        // First run edge: the cold-plug is latched and announced (the boot path, unchanged).
+        d.work.run_started = true;
+        d.run_worker_pass(&m, &dev);
+        assert!(
+            d.port_connected(0),
+            "cold plug latched on the first run edge"
+        );
+        let first_event = Trb::read(&m, 0x3000).unwrap();
+        assert_eq!(first_event.trb_type(), trb_type::PORT_STATUS_CHANGE);
+
+        // The guest enumerates: it clears CSC and the port ends up in U0.
+        d.clear_port_change_for_test(0);
+        let before = d.portsc_for_test(0);
+
+        // A resume's run edge must leave that port completely alone — no re-latched CSC, no PLS
+        // rewrite, and no second Port Status Change Event.
+        d.work.run_started = true;
+        d.run_worker_pass(&m, &dev);
+        assert_eq!(
+            d.portsc_for_test(0),
+            before,
+            "PORTSC must be untouched by a resume's run edge"
+        );
+        let second = Trb::read(&m, 0x3010).unwrap();
+        assert_eq!(
+            second.trb_type(),
+            0,
+            "no second port event may be posted (slot is still an empty TRB)"
+        );
+    }
+
+    /// A command doorbell with no command ring programmed must be ignored, not turned into a walk
+    /// of guest address 0 (`BadAccess(0)` forever). Reachable whenever a guest rings DB0 while
+    /// `CRCR` is zero — e.g. the tail of a dead-HCD teardown.
+    #[test]
+    fn command_doorbell_with_no_ring_is_ignored() {
+        let m = mem();
+        let dev = new_dev();
+        let mut d = dev.lock().unwrap();
+        d.event_ring = Some(EventRing::new(0x3000, 16));
+        d.work.cmd_doorbell = true;
+        d.run_worker_pass(&m, &dev);
+        // Nothing posted: the event ring's first slot is still an untouched TRB.
+        assert_eq!(
+            Trb::read(&m, 0x3000).unwrap(),
+            Trb::default(),
+            "a doorbell with crcr == 0 must post nothing at all"
+        );
+    }
+
+    /// A `CRCR.CA` (Command Abort) write must be acknowledged with a **Command Ring Stopped**
+    /// Command Completion Event. Linux's command watchdog waits for exactly that event to restart
+    /// the ring (`xhci_handle_stopped_cmd_ring`); without it `cmd_ring_state` stays ABORTED and
+    /// every later command is refused, so the ring survives but USB is dead all the same.
+    #[test]
+    fn command_ring_abort_posts_a_command_ring_stopped_event() {
+        let m = mem();
+        let dev = new_dev();
+        let mut d = dev.lock().unwrap();
+        d.event_ring = Some(EventRing::new(0x3000, 16));
+        // A programmed command ring, then the guest's abort write.
+        d.write(0, 0x20 + 0x18, &(0x4000u64 | 1).to_le_bytes());
+        d.write(0, 0x20 + 0x18, &(0x4u64).to_le_bytes()); // CRCR.CA
+        assert!(d.work.cmd_abort, "the abort was queued for the worker");
+
+        d.run_worker_pass(&m, &dev);
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_eq!(ev.trb_type(), trb_type::COMMAND_COMPLETION);
+        assert_eq!(
+            ev.status >> 24,
+            cc::COMMAND_RING_STOPPED,
+            "completion code must be Command Ring Stopped (24)"
+        );
+        assert_eq!(
+            ev.parameter & !0xf,
+            0x4000,
+            "the event carries the dequeue pointer the guest restarts from"
+        );
     }
 }
