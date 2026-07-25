@@ -21,6 +21,9 @@ pub mod legacy;
 pub mod pci;
 #[cfg(all(feature = "usb", target_arch = "aarch64"))]
 pub mod usb;
+/// Snapshot-carried xHCI controller state. Deliberately NOT behind the `usb` feature gate: the
+/// snapshot file format must not depend on which features the VMM was built with.
+pub mod usb_state;
 pub mod virtio;
 #[cfg(windows)]
 pub mod windows_console;
