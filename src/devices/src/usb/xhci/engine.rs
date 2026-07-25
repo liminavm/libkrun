@@ -24,7 +24,7 @@ use super::context::{
 use super::device::{EpRing, SlotCtx, XhciDevice, NUM_PORTS};
 use super::trb::{
     cc, command_completion_event, port_status_change_event, transfer_event, trb_type, EventRing,
-    RingError, RingWalker, Trb, CTRL_BSR, CTRL_CHAIN, CTRL_DC, CTRL_DIR_IN, CTRL_IOC,
+    RingError, RingWalker, Trb, CTRL_BSR, CTRL_CHAIN, CTRL_DC, CTRL_DIR_IN, CTRL_IDT, CTRL_IOC,
 };
 
 /// A gadget call the worker makes with the controller lock **released**.
@@ -902,15 +902,23 @@ impl XhciDevice {
 
             let saved = walker;
             match read_data_td(mem, &mut walker) {
-                Ok(DataTdRead::Complete { segs, event_trb }) => {
+                Ok(DataTdRead::Complete {
+                    segs,
+                    immediate,
+                    event_trb,
+                }) => {
                     let td_next = (walker.ptr(), walker.ccs());
                     // Commit the walker past this TD (a held IN must not be re-fetched).
                     if let Some(e) = self.ep_mut(slot_id, dci) {
                         e.ring = walker;
                     }
                     let capacity: usize = segs.iter().map(|(_, l)| *l as usize).sum();
+                    // OUT data comes from inline immediate bytes (IDT=1) when present, else gathered
+                    // from the guest DMA segments. IN transfers never carry immediate data.
                     let (data_out, in_len) = if dir_in {
                         (Vec::new(), capacity)
+                    } else if let Some(imm) = immediate {
+                        (imm, 0)
                     } else {
                         (read_out_data(mem, &segs), 0)
                     };
@@ -1171,9 +1179,14 @@ fn read_control_td(
 
 /// The outcome of trying to read one interrupt/bulk TD off a data endpoint ring.
 enum DataTdRead {
-    /// A full TD (chain-terminated): its data-buffer `segs` and the TRB the Transfer
-    /// Event should point at (the last / IOC-carrying TRB). The walker is committed past it.
-    Complete { segs: Vec<(u64, u32)>, event_trb: u64 },
+    /// A full TD (chain-terminated): its data-buffer `segs`, any inline `immediate` data
+    /// (IDT=1, OUT only — carried in the TRB parameter instead of guest memory), and the TRB the
+    /// Transfer Event should point at (the last / IOC-carrying TRB). The walker is committed past it.
+    Complete {
+        segs: Vec<(u64, u32)>,
+        immediate: Option<Vec<u8>>,
+        event_trb: u64,
+    },
     /// The ring is empty at a TD boundary (nothing queued). Commit the walker.
     Empty,
     /// A chained TD is only partially written (the guest is mid-enqueue). Restore + wait.
@@ -1186,6 +1199,9 @@ enum DataTdRead {
 /// Event target. Bounded/hostile-input-safe via the shared [`RingWalker`].
 fn read_data_td(mem: &GuestMemoryMmap, walker: &mut RingWalker) -> Result<DataTdRead, RingError> {
     let mut segs: Vec<(u64, u32)> = Vec::new();
+    // Immediate data (IDT=1) accumulated inline from the TRB parameter fields instead of DMA'd
+    // from guest memory (xHCI §4.11.7). OUT direction only; a real guest uses a single small TRB.
+    let mut immediate: Vec<u8> = Vec::new();
     let mut first = true;
     loop {
         let (addr, trb) = match walker.next(mem)? {
@@ -1204,12 +1220,20 @@ fn read_data_td(mem: &GuestMemoryMmap, walker: &mut RingWalker) -> Result<DataTd
         match trb.trb_type() {
             trb_type::NORMAL => {
                 let len = trb.transfer_len();
-                if len > 0 {
+                if trb.control & CTRL_IDT != 0 {
+                    // Immediate Data (xHCI §4.11.7): up to 8 data bytes live in the TRB's
+                    // parameter field itself, not at a DMA pointer. Linux xhci-hcd uses this for
+                    // small bulk-OUT transfers (e.g. the 3-byte elanmoc commands). `len` (≤ 8) is
+                    // the byte count; the bytes are little-endian in the parameter dword pair.
+                    let n = (len as usize).min(8);
+                    immediate.extend_from_slice(&trb.parameter.to_le_bytes()[..n]);
+                } else if len > 0 {
                     segs.push((trb.parameter, len));
                 }
                 if trb.control & CTRL_CHAIN == 0 {
                     return Ok(DataTdRead::Complete {
                         segs,
+                        immediate: (!immediate.is_empty()).then_some(immediate),
                         event_trb: addr,
                     });
                 }
@@ -1219,6 +1243,7 @@ fn read_data_td(mem: &GuestMemoryMmap, walker: &mut RingWalker) -> Result<DataTd
                 if trb.control & CTRL_CHAIN == 0 {
                     return Ok(DataTdRead::Complete {
                         segs,
+                        immediate: (!immediate.is_empty()).then_some(immediate),
                         event_trb: addr,
                     });
                 }
@@ -1902,5 +1927,57 @@ mod tests {
         assert_eq!(ev.trb_type(), trb_type::TRANSFER_EVENT);
         assert_eq!(ev.status >> 24, cc::SUCCESS);
         assert_eq!((ev.control >> 16) & 0x1f, 2, "endpoint id = DCI 2");
+    }
+
+    /// Immediate Data (IDT=1) OUT: the guest carries a small payload inline in the TRB parameter
+    /// field, not at a DMA pointer (xHCI §4.11.7 — Linux xhci-hcd does this for small bulk-OUT
+    /// commands, e.g. the 3-byte elanmoc fingerprint-reader commands). The gadget must receive the
+    /// immediate bytes, NOT bytes read from `parameter` misinterpreted as an address. This is the
+    /// regression guard for the fingerprint reader's open sequence (was read as garbage → stall).
+    #[test]
+    fn immediate_data_out_delivers_inline_bytes_not_a_dma_read() {
+        let m = mem();
+        let dev = new_dev();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+            add_ep(&mut d, 2, 0xA000, false); // DCI 2 = bulk/interrupt OUT
+        }
+        // The 3-byte elanmoc cal-status command `40 ff 00`, packed little-endian into the TRB
+        // parameter. Poison the address it would be misread as (0x0000_0000_00ff_0040 & guest
+        // range) to prove we never DMA from `parameter`.
+        let cmd = [0x40u8, 0xff, 0x00];
+        let mut param = [0u8; 8];
+        param[..3].copy_from_slice(&cmd);
+        let param = u64::from_le_bytes(param);
+        // If the fix regressed, read_out_data would read 3 bytes from GuestAddress(param); seed it
+        // with different bytes so a regression produces a visibly wrong payload.
+        if (param as usize) < 0x100000 - 3 {
+            m.write_slice(&[0xde, 0xad, 0xbe], GuestAddress(param)).unwrap();
+        }
+        Trb {
+            parameter: param,
+            status: cmd.len() as u32, // transfer length = 3 (≤ 8)
+            control: (trb_type::NORMAL << 10) | CTRL_CYCLE | CTRL_IOC | CTRL_IDT,
+        }
+        .write(&m, 0xA000)
+        .unwrap();
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep_work(&m, 1, 2, &dev, &mut deferred);
+        }
+        let xfer = take_transfer(deferred);
+        assert_eq!(
+            xfer.data_out(),
+            &cmd[..],
+            "IDT immediate bytes delivered verbatim, not a DMA read of the parameter"
+        );
+        xfer.ack();
+
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_eq!(ev.trb_type(), trb_type::TRANSFER_EVENT);
+        assert_eq!(ev.status >> 24, cc::SUCCESS, "OUT ack, no residue");
     }
 }
