@@ -598,6 +598,27 @@ impl Vmm {
             firmware: self.arch_memory_info.ram_start_addr
                 == arch::aarch64::layout::DRAM_MEM_START_EFI,
         };
+        // M14: the xHCI controller's host-side state. The guest suspends with xHCI's own
+        // `USBCMD.CSS` (Controller Save State) and light-resumes expecting its rings, slots and
+        // ports intact — but a snapshot-suspend tears this worker down, so unless we carry that
+        // state the restored controller is reborn blank and the guest's USB stack dies. See
+        // docs/design/usb-xhci-snapshot/. `None` when the VM has no USB controller.
+        #[cfg(feature = "usb")]
+        let usb = self
+            .mmio_device_manager
+            .xhci
+            .as_ref()
+            .map(|x| x.lock().unwrap().save_state());
+        #[cfg(not(feature = "usb"))]
+        let usb: Option<devices::usb_state::XhciState> = None;
+        if let Some(u) = &usb {
+            info!(
+                "snapshot: capturing xHCI state — {} populated port(s), {} slot(s), {} endpoint(s)",
+                u.ports.iter().filter(|p| p.model_id.is_some()).count(),
+                u.slots.len(),
+                u.slots.iter().map(|s| s.eps.len()).sum::<usize>(),
+            );
+        }
         let head = snapshot::SnapshotHead {
             vcpus,
             gic,
@@ -605,6 +626,7 @@ impl Vmm {
             layout,
             devices,
             gpu,
+            usb,
         };
         // v6: stream chunked RAM frames straight out of guest memory (zero-chunk holes + lz4),
         // written by a worker pool — no whole-RAM intermediate copy, no serial multi-GB CRC.
@@ -650,6 +672,22 @@ impl Vmm {
     pub fn restore_gpio_state(&self, gpio: &devices::legacy::GpioState) {
         if let Some(g) = &self.mmio_device_manager.gpio {
             g.lock().unwrap().restore_state(gpio);
+        }
+    }
+
+    /// M14 restore: load the captured xHCI controller state into the fresh controller before the
+    /// guest resumes, so the light resume its driver performs (which assumes the controller
+    /// preserved everything across `CSS`/`CRS`) finds the rings, slots and ports it expects and
+    /// its USB devices survive the suspend transparently. No-op if the VM has no USB controller —
+    /// including the case where a snapshot carries USB state but this boot disabled it (the guest
+    /// then simply has no controller to resume, which its own driver handles).
+    #[cfg(all(target_os = "macos", feature = "usb"))]
+    pub fn restore_xhci_state(&self, usb: &devices::usb_state::XhciState) {
+        match &self.mmio_device_manager.xhci {
+            Some(x) => x.lock().unwrap().restore_state(usb),
+            None => warn!(
+                "restore: the snapshot carries xHCI state but this worker has no USB controller"
+            ),
         }
     }
 

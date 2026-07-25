@@ -523,6 +523,9 @@ mod tests {
             snd_capture: false,
             balloon_free_page_reporting: false,
             balloon_deflate_on_oom: false,
+            usb: false,
+            #[cfg(feature = "usb")]
+            usb_devices: Vec::new(),
             #[cfg(not(feature = "tee"))]
             battery_provider: None,
         }

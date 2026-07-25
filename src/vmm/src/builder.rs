@@ -1331,6 +1331,16 @@ pub fn build_microvm(
         if let Some(gpio) = &snap.head.gpio {
             vmm.restore_gpio_state(gpio);
         }
+        // M14: and the xHCI controller's host-side state, so the guest's light resume finds the
+        // controller it saved rather than a blank one (docs/design/usb-xhci-snapshot/). Ordered
+        // AFTER `restore_gic_state` on purpose: restoring can queue a port-change event, and the
+        // worker that eventually posts it pulses an SPI into whatever GIC state exists. The
+        // restore deliberately does NOT kick the worker — the guest's own resume register writes
+        // do that, once its vCPUs are released below.
+        #[cfg(feature = "usb")]
+        if let Some(usb) = &snap.head.usb {
+            vmm.restore_xhci_state(usb);
+        }
         // M9.3: validate + log the captured device transports. We do NOT re-drive them: RED-first +
         // R4 (2026-07-18) proved the guest re-negotiates every virtio device ITSELF on s2idle thaw
         // (`virtio_device_restore` resets + re-drives DRIVER_OK; the fresh worker activates from the
