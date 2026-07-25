@@ -16,6 +16,9 @@ use std::sync::mpsc::sync_channel;
 use std::sync::Mutex;
 
 use devices::legacy::GpioState;
+use devices::usb_state::{
+    XhciEpState, XhciEventRingState, XhciPortState, XhciSlotState, XhciState,
+};
 use hvf::VcpuState;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -41,7 +44,13 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // the old path transiently held ~2× guest RAM and CRC'd ~9 GB serially, ~54 s for an 8 GiB guest);
 // restore decompresses frames back into guest memory in parallel. Same fail-closed stance: bad
 // magic/version, a head CRC mismatch, or any frame CRC/shape mismatch is a hard error.
-const VERSION: u32 = 6;
+// v7 adds an optional xHCI USB controller section (the M14 suspend/resume fix). A
+// snapshot-suspend tears the worker down, so the controller's host-side state — its registers, the
+// command-ring walker, the event-ring producer, and the per-slot / per-endpoint ring positions —
+// is lost, while the guest resumes believing xHCI's own CSS/CRS save-restore preserved it: it
+// light-resumes, its first command walks a blank controller, and USB dies. See
+// docs/design/usb-xhci-snapshot/ in the limina repo.
+const VERSION: u32 = 7;
 
 /// v6 RAM chunk size: 4 MiB — large enough to amortize per-frame overhead, small enough to spread
 /// across the worker pool and bound per-worker scratch memory.
@@ -125,6 +134,10 @@ pub struct SnapshotHead {
     /// v5: the GPU re-creation section ('LGPU' payload from the GPU worker), if the VM had a
     /// venus renderer with recorded state. `None` = nothing to replay (software-2D / stock guest).
     pub gpu: Option<Vec<u8>>,
+    /// v7: the emulated xHCI USB controller's host-side state, restored into the fresh
+    /// controller before the guest resumes so its USB devices survive the suspend transparently.
+    /// `None` when the VM has no USB controller.
+    pub usb: Option<XhciState>,
 }
 
 /// CRC-32 (IEEE 802.3, reflected) — a small dependency-free integrity check over the payload.
@@ -272,7 +285,99 @@ fn encode_head(head: &SnapshotHead) -> Vec<u8> {
         }
         None => v.push(0),
     }
+    // v7 xHCI USB controller section: a presence byte, then the register file, the ring positions
+    // and the per-slot/per-endpoint state. Small and fixed-shape (no compression).
+    match &head.usb {
+        Some(u) => {
+            v.push(1);
+            encode_usb(&mut v, u);
+        }
+        None => v.push(0),
+    }
     v
+}
+
+/// Encode a ring position (dequeue pointer + Consumer Cycle State), presence-prefixed.
+fn put_ring_pos(v: &mut Vec<u8>, p: &Option<(u64, bool)>) {
+    match p {
+        Some((ptr, ccs)) => {
+            v.push(1);
+            put_u64(v, *ptr);
+            v.push(*ccs as u8);
+        }
+        None => v.push(0),
+    }
+}
+
+fn encode_usb(v: &mut Vec<u8>, u: &XhciState) {
+    put_u32(v, u.usbcmd);
+    put_u32(v, u.usbsts);
+    put_u32(v, u.dnctrl);
+    put_u64(v, u.crcr);
+    put_u64(v, u.dcbaap);
+    put_u32(v, u.config);
+    put_u32(v, u.iman);
+    put_u32(v, u.imod);
+    put_u32(v, u.erstsz);
+    put_u64(v, u.erstba);
+    put_u64(v, u.erdp);
+    v.push(u.next_address);
+    v.push(u.crcr_stop_write as u8);
+    // Ports: PORTSC + the attached gadget's (idVendor, idProduct) identity.
+    put_u32(v, u.ports.len() as u32);
+    for p in &u.ports {
+        put_u32(v, p.portsc);
+        match p.model_id {
+            Some((vid, pid)) => {
+                v.push(1);
+                put_u16(v, vid);
+                put_u16(v, pid);
+            }
+            None => v.push(0),
+        }
+    }
+    put_ring_pos(v, &u.cmd_ring);
+    match &u.event_ring {
+        Some(er) => {
+            v.push(1);
+            put_u64(v, er.seg_base);
+            put_u32(v, er.seg_size);
+            put_u32(v, er.enqueue_idx);
+            v.push(er.pcs as u8);
+        }
+        None => v.push(0),
+    }
+    put_u32(v, u.slots.len() as u32);
+    for s in &u.slots {
+        v.push(s.slot_id);
+        v.push(s.port);
+        v.push(s.address);
+        put_u32(v, s.state);
+        v.push(s.config_value);
+        put_ring_pos(v, &s.ep0_ring);
+        put_u32(v, s.eps.len() as u32);
+        for e in &s.eps {
+            v.push(e.dci);
+            put_u64(v, e.ring.0);
+            v.push(e.ring.1 as u8);
+            v.push(e.dir_in as u8);
+            put_u32(v, e.ep_type);
+            put_u32(v, e.state);
+            put_u64(v, e.generation);
+        }
+    }
+    v.push(u.work_run_started as u8);
+    v.push(u.work_cmd_doorbell as u8);
+    v.push(u.work_cmd_abort as u8);
+    put_u32(v, u.work_ep_doorbells.len() as u32);
+    for (slot, dci) in &u.work_ep_doorbells {
+        v.push(*slot);
+        v.push(*dci);
+    }
+    put_u32(v, u.work_port_events.len() as u32);
+    for p in &u.work_port_events {
+        v.push(*p);
+    }
 }
 
 /// Save-side counters, for the operator-visible summary log line.
@@ -661,6 +766,150 @@ impl SnapshotFile {
     }
 }
 
+/// Decode a presence-prefixed ring position.
+fn decode_ring_pos(r: &mut Reader) -> io::Result<Option<(u64, bool)>> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => {
+            let ptr = r.u64()?;
+            Ok(Some((ptr, decode_bool(r)?)))
+        }
+        _ => Err(corrupt("bad ring-position presence byte")),
+    }
+}
+
+fn decode_bool(r: &mut Reader) -> io::Result<bool> {
+    match r.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(corrupt("bad boolean byte")),
+    }
+}
+
+/// Bound a decoded element count before it drives an allocation. The head CRC is only checked
+/// *after* the whole head parses, so a corrupt length must not be trusted this far — and every
+/// count here has a small hard ceiling from the controller's geometry anyway.
+fn bounded_count(r: &mut Reader, max: u32, what: &str) -> io::Result<usize> {
+    let n = r.u32()?;
+    if n > max {
+        return Err(corrupt(&format!("implausible {what} count {n}")));
+    }
+    Ok(n as usize)
+}
+
+fn decode_usb(r: &mut Reader) -> io::Result<XhciState> {
+    let usbcmd = r.u32()?;
+    let usbsts = r.u32()?;
+    let dnctrl = r.u32()?;
+    let crcr = r.u64()?;
+    let dcbaap = r.u64()?;
+    let config = r.u32()?;
+    let iman = r.u32()?;
+    let imod = r.u32()?;
+    let erstsz = r.u32()?;
+    let erstba = r.u64()?;
+    let erdp = r.u64()?;
+    let next_address = r.u8()?;
+    let crcr_stop_write = decode_bool(r)?;
+
+    let port_count = bounded_count(r, 256, "usb port")?;
+    let mut ports = Vec::with_capacity(port_count);
+    for _ in 0..port_count {
+        let portsc = r.u32()?;
+        let model_id = match r.u8()? {
+            0 => None,
+            1 => Some((r.u16()?, r.u16()?)),
+            _ => return Err(corrupt("bad usb model-id presence byte")),
+        };
+        ports.push(XhciPortState { portsc, model_id });
+    }
+
+    let cmd_ring = decode_ring_pos(r)?;
+    let event_ring = match r.u8()? {
+        0 => None,
+        1 => Some(XhciEventRingState {
+            seg_base: r.u64()?,
+            seg_size: r.u32()?,
+            enqueue_idx: r.u32()?,
+            pcs: decode_bool(r)?,
+        }),
+        _ => return Err(corrupt("bad usb event-ring presence byte")),
+    };
+
+    let slot_count = bounded_count(r, 256, "usb slot")?;
+    let mut slots = Vec::with_capacity(slot_count);
+    for _ in 0..slot_count {
+        let slot_id = r.u8()?;
+        let port = r.u8()?;
+        let address = r.u8()?;
+        let state = r.u32()?;
+        let config_value = r.u8()?;
+        let ep0_ring = decode_ring_pos(r)?;
+        let ep_count = bounded_count(r, 32, "usb endpoint")?;
+        let mut eps = Vec::with_capacity(ep_count);
+        for _ in 0..ep_count {
+            let dci = r.u8()?;
+            let ptr = r.u64()?;
+            eps.push(XhciEpState {
+                dci,
+                ring: (ptr, decode_bool(r)?),
+                dir_in: decode_bool(r)?,
+                ep_type: r.u32()?,
+                state: r.u32()?,
+                generation: r.u64()?,
+            });
+        }
+        slots.push(XhciSlotState {
+            slot_id,
+            port,
+            address,
+            state,
+            config_value,
+            ep0_ring,
+            eps,
+        });
+    }
+
+    let work_run_started = decode_bool(r)?;
+    let work_cmd_doorbell = decode_bool(r)?;
+    let work_cmd_abort = decode_bool(r)?;
+    let db_count = bounded_count(r, 8192, "usb doorbell")?;
+    let mut work_ep_doorbells = Vec::with_capacity(db_count);
+    for _ in 0..db_count {
+        work_ep_doorbells.push((r.u8()?, r.u8()?));
+    }
+    let pe_count = bounded_count(r, 8192, "usb port event")?;
+    let mut work_port_events = Vec::with_capacity(pe_count);
+    for _ in 0..pe_count {
+        work_port_events.push(r.u8()?);
+    }
+
+    Ok(XhciState {
+        usbcmd,
+        usbsts,
+        dnctrl,
+        crcr,
+        dcbaap,
+        config,
+        ports,
+        iman,
+        imod,
+        erstsz,
+        erstba,
+        erdp,
+        cmd_ring,
+        event_ring,
+        slots,
+        next_address,
+        crcr_stop_write,
+        work_run_started,
+        work_cmd_doorbell,
+        work_cmd_abort,
+        work_ep_doorbells,
+        work_port_events,
+    })
+}
+
 /// Read + verify a snapshot's head from `path` (magic, version, head CRC). The RAM frames are
 /// verified per-frame when [`SnapshotFile::apply_ram`] runs.
 pub fn read(path: &Path) -> io::Result<SnapshotFile> {
@@ -770,6 +1019,12 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
         }
         _ => return Err(corrupt("bad gpu presence byte")),
     };
+    // v7 xHCI USB controller section.
+    let usb = match r.u8()? {
+        0 => None,
+        1 => Some(decode_usb(&mut r)?),
+        _ => return Err(corrupt("bad usb presence byte")),
+    };
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
     let head_end = r.pos;
     let stored = r.u32()?;
@@ -785,6 +1040,7 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
             layout,
             devices,
             gpu,
+            usb,
         },
         raw,
         ram_off,
@@ -886,6 +1142,75 @@ mod tests {
         buf
     }
 
+    /// A lived-in xHCI controller: two populated ports (one with a gadget that has since gone),
+    /// an addressed+configured slot with two data endpoints, a mid-ring command walker and a
+    /// mid-segment event-ring producer.
+    fn sample_usb() -> XhciState {
+        XhciState {
+            usbcmd: 0x5,
+            usbsts: 0x8,
+            dnctrl: 0x5,
+            crcr: 0x8400_4001,
+            dcbaap: 0x8400_6000,
+            config: 8,
+            ports: vec![
+                XhciPortState {
+                    portsc: 0x0e01_0203,
+                    model_id: Some((0x04f3, 0x0c7d)),
+                },
+                XhciPortState {
+                    portsc: 0x0000_02a0,
+                    model_id: None,
+                },
+            ],
+            iman: 0x2,
+            imod: 0x40,
+            erstsz: 16,
+            erstba: 0x8400_8000,
+            erdp: 0x8401_0030,
+            cmd_ring: Some((0x8400_4020, true)),
+            event_ring: Some(XhciEventRingState {
+                seg_base: 0x8401_0000,
+                seg_size: 16,
+                enqueue_idx: 5,
+                pcs: false,
+            }),
+            slots: vec![XhciSlotState {
+                slot_id: 1,
+                port: 1,
+                address: 2,
+                state: 3,
+                config_value: 1,
+                ep0_ring: Some((0x8402_0000, true)),
+                eps: vec![
+                    XhciEpState {
+                        dci: 2,
+                        ring: (0x8403_0000, true),
+                        dir_in: false,
+                        ep_type: 2,
+                        state: 1,
+                        generation: 7,
+                    },
+                    XhciEpState {
+                        dci: 3,
+                        ring: (0x8404_0010, false),
+                        dir_in: true,
+                        ep_type: 6,
+                        state: 3,
+                        generation: 9,
+                    },
+                ],
+            }],
+            next_address: 3,
+            crcr_stop_write: true,
+            work_run_started: true,
+            work_cmd_doorbell: false,
+            work_cmd_abort: true,
+            work_ep_doorbells: vec![(1, 3), (1, 2)],
+            work_port_events: vec![1, 2],
+        }
+    }
+
     fn sample_head() -> SnapshotHead {
         SnapshotHead {
             vcpus: vec![sample_vcpu(1), sample_vcpu(2)],
@@ -903,6 +1228,7 @@ mod tests {
             layout: sample_layout(),
             devices: vec![sample_gpu_device()],
             gpu: Some(vec![0x4c, 0x47, 0x50, 0x55, 9, 9]),
+            usb: Some(sample_usb()),
         }
     }
 
@@ -943,6 +1269,9 @@ mod tests {
         assert_eq!(head.devices, want.devices);
         assert_eq!(head.devices[0].queues[0].avail, 0x1_2340_0400);
         assert_eq!(head.gpu, want.gpu);
+        // v7: the whole xHCI controller state, field for field (the `PartialEq` covers every
+        // register, ring position, slot and endpoint — a dropped field fails here).
+        assert_eq!(head.usb, want.usb);
 
         // Restore into memory pre-filled with garbage: data frames AND holes must both overwrite.
         let mem2 = test_mem();
@@ -969,6 +1298,7 @@ mod tests {
             layout: sample_layout(),
             devices: vec![],
             gpu: None,
+            usb: None,
         };
         let mem = test_mem();
         let path =
@@ -979,7 +1309,23 @@ mod tests {
         assert!(got.head.devices.is_empty());
         assert!(got.head.gpio.is_none());
         assert!(got.head.gpu.is_none());
+        assert!(
+            got.head.usb.is_none(),
+            "an absent USB section must decode as None"
+        );
         assert_eq!(got.head.layout, sample_layout());
+    }
+
+    /// A corrupt element count in the USB section must fail closed, not drive a huge allocation:
+    /// the head CRC is only verified once the whole head has parsed, so the counts cannot be
+    /// trusted while decoding.
+    #[test]
+    fn usb_section_rejects_implausible_counts() {
+        let mut v = Vec::new();
+        put_u32(&mut v, 0xffff_ffff); // a "slot count" of 4 billion
+        let mut r = Reader { buf: &v, pos: 0 };
+        let err = bounded_count(&mut r, 256, "usb slot").expect_err("must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

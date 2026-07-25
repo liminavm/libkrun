@@ -35,6 +35,7 @@ use utils::eventfd::EventFd;
 use super::super::model::UsbDeviceModel;
 use super::trb::{EventRing, RingWalker};
 use crate::legacy::IrqChip;
+use crate::usb_state::{XhciEpState, XhciPortState, XhciSlotState, XhciState};
 use crate::BusDevice;
 
 // ---- controller geometry ----------------------------------------------------
@@ -449,6 +450,217 @@ impl XhciDevice {
         self.next_address = 1;
         self.work = WorkQueue::default();
         self.crcr_stop_write = false;
+    }
+
+    // ---- snapshot (suspend/resume) ------------------------------------------
+
+    /// Capture the controller's host-side state for a VM snapshot.
+    ///
+    /// Written field-by-field against `XhciDevice`'s definition on purpose: a field added there
+    /// and forgotten here silently loses state across a suspend. The fields deliberately *not*
+    /// captured are the ones the fresh worker re-establishes for itself — `intc`, `irq_line`,
+    /// `interrupt_evt`, `worker_kick` (interrupt plumbing) and `port_models` (the cold-plugged
+    /// gadgets, whose *identity* is captured per port so the restore can check it).
+    pub fn save_state(&self) -> XhciState {
+        XhciState {
+            usbcmd: self.usbcmd,
+            usbsts: self.usbsts,
+            dnctrl: self.dnctrl,
+            crcr: self.crcr,
+            dcbaap: self.dcbaap,
+            config: self.config,
+            ports: (0..NUM_PORTS)
+                .map(|i| XhciPortState {
+                    portsc: self.ports[i],
+                    model_id: self.port_model_id(i),
+                })
+                .collect(),
+            iman: self.iman,
+            imod: self.imod,
+            erstsz: self.erstsz,
+            erstba: self.erstba,
+            erdp: self.erdp,
+            cmd_ring: self.cmd_ring.map(|w| (w.ptr(), w.ccs())),
+            event_ring: self.event_ring.map(|er| er.state()),
+            slots: self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(id, s)| {
+                    let s = s.as_ref()?;
+                    let mut eps: Vec<XhciEpState> = s
+                        .eps
+                        .iter()
+                        .map(|(dci, e)| XhciEpState {
+                            dci: *dci,
+                            ring: (e.ring.ptr(), e.ring.ccs()),
+                            dir_in: e.dir_in,
+                            ep_type: e.ep_type,
+                            state: e.state,
+                            generation: e.generation,
+                        })
+                        .collect();
+                    // `eps` is a HashMap: sort so a capture is deterministic (and so the
+                    // round-trip test can compare states directly).
+                    eps.sort_by_key(|e| e.dci);
+                    Some(XhciSlotState {
+                        slot_id: id as u8,
+                        port: s.port,
+                        address: s.address,
+                        state: s.state,
+                        config_value: s.config_value,
+                        ep0_ring: s.ep0_ring.map(|w| (w.ptr(), w.ccs())),
+                        eps,
+                    })
+                })
+                .collect(),
+            next_address: self.next_address,
+            crcr_stop_write: self.crcr_stop_write,
+            work_run_started: self.work.run_started,
+            work_cmd_doorbell: self.work.cmd_doorbell,
+            work_cmd_abort: self.work.cmd_abort,
+            work_ep_doorbells: self.work.ep_doorbells.clone(),
+            work_port_events: self.work.port_events.clone(),
+        }
+    }
+
+    /// Restore captured state into a freshly-built controller, before the guest's vCPUs resume.
+    ///
+    /// The guest comes back from what it believes was a state-preserving suspend: it handshakes
+    /// `USBSTS.CNR`, rewrites the registers it saved, sets `CRS`, then `RS`, and resumes its ports
+    /// from U3. All of that only works against a controller that still knows its rings, slots and
+    /// ports — hence this.
+    ///
+    /// Ports whose attached gadget's identity no longer matches the capture are **reconciled** to
+    /// an honest unplug rather than bound to the wrong device (see [`XhciPortState::model_id`]).
+    /// No worker kick is issued: the guest's own resume register writes do that, and posting
+    /// events while the restored controller is still halted would be a spec deviation for nothing.
+    pub fn restore_state(&mut self, s: &XhciState) {
+        self.usbcmd = s.usbcmd;
+        // NEVER hand a restored guest a Controller-Not-Ready controller. `xhci_resume` handshakes
+        // CNR for TEN SECONDS and then declares the HCD dead — and since only `HCRST` clears our
+        // CNR, and a light resume issues none, that verdict would be permanent.
+        self.usbsts = s.usbsts & !STS_CNR;
+        self.dnctrl = s.dnctrl;
+        self.crcr = s.crcr;
+        self.dcbaap = s.dcbaap;
+        self.config = s.config;
+        self.iman = s.iman;
+        self.imod = s.imod;
+        self.erstsz = s.erstsz;
+        self.erstba = s.erstba;
+        self.erdp = s.erdp;
+        self.next_address = s.next_address;
+        self.crcr_stop_write = s.crcr_stop_write;
+        self.cmd_ring = s.cmd_ring.map(|(p, c)| RingWalker::new(p, c));
+        self.event_ring = s.event_ring.as_ref().map(EventRing::from_state);
+        self.work = WorkQueue {
+            run_started: s.work_run_started,
+            cmd_doorbell: s.work_cmd_doorbell,
+            cmd_abort: s.work_cmd_abort,
+            ep_doorbells: s.work_ep_doorbells.clone(),
+            port_events: s.work_port_events.clone(),
+        };
+
+        // Ports, with the identity check. A mismatch means the device that was on this port is
+        // gone (or a different one took its place): present it as a real unplug — powered,
+        // RxDetect, connect-change latched — and queue the change event. `CCS` stays clear, so if
+        // a *different* model is now there the guest's own resume run-edge scan latches a fresh
+        // connect and enumerates it.
+        if s.ports.len() != NUM_PORTS {
+            warn!(
+                "xhci restore: snapshot has {} ports, this controller has {NUM_PORTS}",
+                s.ports.len()
+            );
+        }
+        let mut reconciled = [false; NUM_PORTS];
+        for (idx, p) in s.ports.iter().enumerate().take(NUM_PORTS) {
+            let now = self.port_model_id(idx);
+            if now == p.model_id {
+                self.ports[idx] = p.portsc;
+                continue;
+            }
+            warn!(
+                "xhci restore: port {} held {:?} at suspend but has {:?} now — presenting an \
+                 unplug",
+                idx + 1,
+                p.model_id,
+                now
+            );
+            self.ports[idx] = PORTSC_DEFAULT | PORTSC_CSC;
+            self.usbsts |= STS_PCD;
+            self.work.port_events.push((idx + 1) as u8);
+            reconciled[idx] = true;
+        }
+
+        // Slots, skipping any bound to a reconciled port — that device is gone, so its slot must
+        // not survive pointing at whatever model is there now. The guest's teardown commands
+        // against a vacant slot all complete, so dropping it cannot wedge it.
+        for slot in self.slots.iter_mut() {
+            *slot = None;
+        }
+        for st in &s.slots {
+            let id = st.slot_id as usize;
+            if id == 0 || id >= self.slots.len() {
+                warn!("xhci restore: dropping out-of-range slot id {id}");
+                continue;
+            }
+            let port_idx = st.port as usize;
+            if port_idx >= 1 && port_idx <= NUM_PORTS && reconciled[port_idx - 1] {
+                warn!(
+                    "xhci restore: dropping slot {id} (its port {} was reconciled)",
+                    st.port
+                );
+                continue;
+            }
+            self.slots[id] = Some(SlotCtx {
+                port: st.port,
+                address: st.address,
+                state: st.state,
+                config_value: st.config_value,
+                ep0_ring: st.ep0_ring.map(|(p, c)| RingWalker::new(p, c)),
+                eps: st
+                    .eps
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.dci,
+                            EpRing {
+                                ring: RingWalker::new(e.ring.0, e.ring.1),
+                                dir_in: e.dir_in,
+                                ep_type: e.ep_type,
+                                state: e.state,
+                                generation: e.generation,
+                            },
+                        )
+                    })
+                    .collect(),
+            });
+        }
+
+        let eps: usize = s.slots.iter().map(|s| s.eps.len()).sum();
+        info!(
+            "xhci restore: {} slot(s), {eps} data endpoint(s), usbcmd={:#x} usbsts={:#x} \
+             crcr={:#x} dcbaap={:#x}",
+            self.slots.iter().filter(|s| s.is_some()).count(),
+            self.usbcmd,
+            self.usbsts,
+            self.crcr_ptr(),
+            self.dcbaap(),
+        );
+    }
+
+    /// `(idVendor, idProduct)` of the gadget cold-plugged on `idx`, from its device descriptor.
+    /// A stable identity with no `UsbDeviceModel` trait change.
+    fn port_model_id(&self, idx: usize) -> Option<(u16, u16)> {
+        let d = self.port_models[idx].as_ref()?.descriptors().device;
+        if d.len() < 12 {
+            return None;
+        }
+        Some((
+            u16::from_le_bytes([d[8], d[9]]),
+            u16::from_le_bytes([d[10], d[11]]),
+        ))
     }
 
     // ---- register read/write dispatch ---------------------------------------

@@ -2128,6 +2128,174 @@ mod tests {
         );
     }
 
+    /// The snapshot invariant: a controller rebuilt from `save_state` must be
+    /// **indistinguishable** from the one it was captured from. Uses a genuinely lived-in
+    /// controller (enumerated slot, configured data endpoints, an advanced event-ring producer,
+    /// a mid-ring command walker) so a forgotten field shows up as a difference.
+    #[test]
+    fn save_state_round_trips_a_lived_in_controller() {
+        let m = mem();
+        let dev = new_dev();
+        let captured = {
+            let mut d = dev.lock().unwrap();
+            d.port_models[0] = Some(Arc::new(MockUsbDevice::new()));
+            // Bring the controller up the way a guest does: reset (clears CNR), program the
+            // rings, run.
+            // Every register gets a DISTINCTIVE value, so that dropping any one of them from
+            // the carry shows up as a round-trip difference rather than matching a default.
+            d.write(0, 0x20, &2u32.to_le_bytes()); // USBCMD.HCRST
+            d.write(0, 0x20 + 0x18, &(0x4000u64 | 1).to_le_bytes()); // CRCR
+            d.write(0, 0x20 + 0x30, &0x6000u64.to_le_bytes()); // DCBAAP
+            d.write(0, 0x20 + 0x14, &0x5u32.to_le_bytes()); // DNCTRL
+            d.write(0, 0x20 + 0x38, &0x8u32.to_le_bytes()); // CONFIG (MaxSlotsEn)
+            d.write(0, 0x1000 + 0x20 + 0x10, &0x2000u64.to_le_bytes()); // ERSTBA
+            d.write(0, 0x1000 + 0x20 + 0x08, &16u32.to_le_bytes()); // ERSTSZ
+            d.write(0, 0x1000 + 0x20 + 0x04, &0x40u32.to_le_bytes()); // IMOD
+            d.write(0, 0x1000 + 0x20 + 0x00, &0x2u32.to_le_bytes()); // IMAN.IE
+            d.write(0, 0x1000 + 0x20 + 0x18, &0x3010u64.to_le_bytes()); // ERDP, mid-ring
+            d.next_address = 3;
+            d.event_ring = Some(EventRing::new(0x3000, 16));
+            d.work.run_started = true;
+            d.run_worker_pass(&m, &dev);
+            // An addressed, configured slot with one IN and one OUT data endpoint.
+            prime(&mut d, 0x4000, 0x3000, 16);
+            add_ep(&mut d, 3, 0x7000, true);
+            add_ep(&mut d, 2, 0x8000, false);
+            // One ring's consumer cycle state is FALSE — i.e. it has walked an odd number of Link
+            // TRBs. `RingWalker::new`'s natural starting value is `true`, so without this a restore
+            // that hardcoded `true` would round-trip cleanly and the cycle-bit carry would go
+            // untested.
+            if let Some(s) = d.slots[1].as_mut() {
+                s.eps.get_mut(&2).unwrap().ring = RingWalker::new(0x8000, false);
+            }
+            if let Some(s) = d.slots[1].as_mut() {
+                s.state = slot_state::CONFIGURED;
+                s.config_value = 1;
+                // A non-default generation and a stopped endpoint, so a restore that resets
+                // either is visible.
+                let ep = s.eps.get_mut(&3).unwrap();
+                ep.generation = 7;
+                ep.state = ep_state::STOPPED;
+            }
+            // Advance the command walker off its base, so a "rebuild from CRCR" would differ...
+            d.cmd_ring = Some(RingWalker::new(0x4020, true));
+            // ...and the event-ring producer off ITS base (prime() reset it), so a "rebuild from
+            // ERSTBA" would differ too.
+            let ev = super::super::trb::port_status_change_event(1);
+            for _ in 0..2 {
+                d.event_ring
+                    .as_mut()
+                    .unwrap()
+                    .enqueue(&m, ev, 0x3000)
+                    .unwrap();
+            }
+            // Finally the state a running guest leaves USBCMD in.
+            d.write(0, 0x20, &(1u32 | 4).to_le_bytes()); // RS | INTE
+            // An in-flight CRCR stop (the guest's command watchdog), and work the worker has not
+            // drained yet — a snapshot is taken from the vcpu thread, so all of this can genuinely
+            // be pending at capture.
+            d.write(0, 0x20 + 0x18, &0x2u64.to_le_bytes()); // CRCR.CS
+            d.work.cmd_doorbell = true;
+            d.work.cmd_abort = true;
+            d.work.ep_doorbells.push((1, 3));
+            d.work.port_events.push(1);
+            d.save_state()
+        };
+        assert!(!captured.slots.is_empty(), "the capture has a live slot");
+        assert_eq!(
+            captured.slots[0].eps.len(),
+            2,
+            "both data endpoints carried"
+        );
+        let er = captured.event_ring.expect("the producer is carried");
+        assert_eq!(er.enqueue_idx, 2, "the producer sits mid-segment");
+        assert_eq!(captured.ports[0].model_id, Some((0x1d6b, 0x0f10)));
+        // Every carried field holds a value distinguishable from a fresh controller's default,
+        // which is what makes "drop one field and the round-trip notices" a real test.
+        let fresh_portsc = new_dev().lock().unwrap().save_state().ports[0].portsc;
+        assert_ne!(captured.ports[0].portsc, fresh_portsc);
+        assert_eq!(captured.slots[0].slot_id, 1);
+        assert!(captured.slots[0].ep0_ring.is_some_and(|(_, ccs)| ccs));
+        // Both cycle-bit polarities are present, so neither a hardcoded `true` nor a hardcoded
+        // `false` on the restore side can survive the round-trip.
+        assert!(captured.slots[0].eps.iter().any(|e| e.ring.1));
+        assert!(captured.slots[0].eps.iter().any(|e| !e.ring.1));
+        assert!(captured.crcr_stop_write);
+        assert!(captured.work_run_started && captured.work_cmd_doorbell && captured.work_cmd_abort);
+        assert_eq!(captured.work_ep_doorbells, vec![(1, 3)]);
+        assert_eq!(captured.work_port_events, vec![1]);
+
+        // A brand-new controller with the same gadget cold-plugged — the restore worker's shape.
+        let fresh = new_dev();
+        let restored = {
+            let mut d = fresh.lock().unwrap();
+            d.port_models[0] = Some(Arc::new(MockUsbDevice::new()));
+            d.restore_state(&captured);
+            d.save_state()
+        };
+        assert_eq!(
+            restored, captured,
+            "a restored controller must capture identically to the original"
+        );
+    }
+
+    /// If the gadget on a port is not the one that was there at suspend (a cold-plug that failed
+    /// to build shifts the rest onto different ports), the restore must NOT bind the slot to the
+    /// wrong device: it presents an unplug and drops the slot.
+    #[test]
+    fn restore_reconciles_a_port_whose_gadget_changed() {
+        let m = mem();
+        let dev = new_dev();
+        let captured = {
+            let mut d = dev.lock().unwrap();
+            d.port_models[0] = Some(Arc::new(MockUsbDevice::new()));
+            d.event_ring = Some(EventRing::new(0x3000, 16));
+            d.work.run_started = true;
+            d.run_worker_pass(&m, &dev);
+            prime(&mut d, 0x4000, 0x3000, 16);
+            d.save_state()
+        };
+        assert!(captured.ports[0].model_id.is_some());
+        assert_eq!(captured.slots.len(), 1);
+
+        // Restore into a worker where that port came up EMPTY.
+        let fresh = new_dev();
+        let mut d = fresh.lock().unwrap();
+        d.restore_state(&captured);
+        assert!(
+            !d.port_connected(0),
+            "the vanished device must not be reported as still connected"
+        );
+        assert_eq!(
+            d.save_state().slots.len(),
+            0,
+            "the slot bound to the vanished device is dropped"
+        );
+        assert_eq!(
+            d.work.port_events,
+            vec![1],
+            "the guest is told the port changed"
+        );
+    }
+
+    /// `CNR` must never survive into a restored controller: `xhci_resume` handshakes it for ten
+    /// seconds and then declares the HCD dead for good (nothing on a light-resume path issues the
+    /// `HCRST` that would clear it).
+    #[test]
+    fn restore_never_leaves_the_controller_not_ready() {
+        let dev = new_dev();
+        let mut state = dev.lock().unwrap().save_state();
+        state.usbsts |= 1 << 11; // CNR, as a fresh controller reports at power-on
+        let fresh = new_dev();
+        let mut d = fresh.lock().unwrap();
+        d.restore_state(&state);
+        assert_eq!(
+            d.save_state().usbsts & (1 << 11),
+            0,
+            "the restored controller must report itself ready"
+        );
+    }
+
     /// A `CRCR.CA` (Command Abort) write must be acknowledged with a **Command Ring Stopped**
     /// Command Completion Event. Linux's command watchdog waits for exactly that event to restart
     /// the ring (`xhci_handle_stopped_cmd_ring`); without it `cmd_ring_state` stays ABORTED and
