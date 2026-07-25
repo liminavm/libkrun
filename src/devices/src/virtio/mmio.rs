@@ -7,6 +7,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -702,6 +703,10 @@ impl BusDevice for MmioTransport {
                     0x50 => {
                         // Queue notification - write to the eventfd for the specified queue.
                         if let Some(eventfd) = self.queue_evts.get(v as usize) {
+                            // limina wake-probe: stamp the doorbell BEFORE the eventfd write, so
+                            // the worker's `kick -> wake` covers the wake itself. No-op (one
+                            // never-matching relaxed load) unless LIMINA_WAKE_PROBE=1.
+                            super::wake_probe::kick(eventfd.as_raw_fd());
                             eventfd.write(1).unwrap();
                         } else {
                             warn!("invalid queue index for notification: {v}");
