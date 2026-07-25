@@ -112,6 +112,11 @@ impl XhciDevice {
             self.post_port_event(mem, pid);
         }
         if std::mem::take(&mut self.work.cmd_abort) {
+            // An abort STOPS the ring: any doorbell still queued from before it must not be
+            // honoured. The guest's recovery (`xhci_handle_stopped_cmd_ring`) rewrites the
+            // aborted commands to no-ops and only then re-rings the doorbell, so executing them
+            // here would run commands it believes it cancelled.
+            self.work.cmd_doorbell = false;
             self.post_command_ring_stopped(mem);
         }
         if std::mem::take(&mut self.work.cmd_doorbell) {
@@ -2156,6 +2161,13 @@ mod tests {
             prime(&mut d, 0x4000, 0x3000, 16);
             add_ep(&mut d, 3, 0x7000, true);
             add_ep(&mut d, 2, 0x8000, false);
+            // One ring's consumer cycle state is FALSE — i.e. it has walked an odd number of Link
+            // TRBs. `RingWalker::new`'s natural starting value is `true`, so without this a restore
+            // that hardcoded `true` would round-trip cleanly and the cycle-bit carry would go
+            // untested.
+            if let Some(s) = d.slots[1].as_mut() {
+                s.eps.get_mut(&2).unwrap().ring = RingWalker::new(0x8000, false);
+            }
             if let Some(s) = d.slots[1].as_mut() {
                 s.state = slot_state::CONFIGURED;
                 s.config_value = 1;
@@ -2179,6 +2191,14 @@ mod tests {
             }
             // Finally the state a running guest leaves USBCMD in.
             d.write(0, 0x20, &(1u32 | 4).to_le_bytes()); // RS | INTE
+            // An in-flight CRCR stop (the guest's command watchdog), and work the worker has not
+            // drained yet — a snapshot is taken from the vcpu thread, so all of this can genuinely
+            // be pending at capture.
+            d.write(0, 0x20 + 0x18, &0x2u64.to_le_bytes()); // CRCR.CS
+            d.work.cmd_doorbell = true;
+            d.work.cmd_abort = true;
+            d.work.ep_doorbells.push((1, 3));
+            d.work.port_events.push(1);
             d.save_state()
         };
         assert!(!captured.slots.is_empty(), "the capture has a live slot");
@@ -2190,6 +2210,20 @@ mod tests {
         let er = captured.event_ring.expect("the producer is carried");
         assert_eq!(er.enqueue_idx, 2, "the producer sits mid-segment");
         assert_eq!(captured.ports[0].model_id, Some((0x1d6b, 0x0f10)));
+        // Every carried field holds a value distinguishable from a fresh controller's default,
+        // which is what makes "drop one field and the round-trip notices" a real test.
+        let fresh_portsc = new_dev().lock().unwrap().save_state().ports[0].portsc;
+        assert_ne!(captured.ports[0].portsc, fresh_portsc);
+        assert_eq!(captured.slots[0].slot_id, 1);
+        assert!(captured.slots[0].ep0_ring.is_some_and(|(_, ccs)| ccs));
+        // Both cycle-bit polarities are present, so neither a hardcoded `true` nor a hardcoded
+        // `false` on the restore side can survive the round-trip.
+        assert!(captured.slots[0].eps.iter().any(|e| e.ring.1));
+        assert!(captured.slots[0].eps.iter().any(|e| !e.ring.1));
+        assert!(captured.crcr_stop_write);
+        assert!(captured.work_run_started && captured.work_cmd_doorbell && captured.work_cmd_abort);
+        assert_eq!(captured.work_ep_doorbells, vec![(1, 3)]);
+        assert_eq!(captured.work_port_events, vec![1]);
 
         // A brand-new controller with the same gadget cold-plugged — the restore worker's shape.
         let fresh = new_dev();
@@ -2290,5 +2324,45 @@ mod tests {
             0x4000,
             "the event carries the dequeue pointer the guest restarts from"
         );
+    }
+
+    /// An abort STOPS the ring, so a doorbell queued before it must not still be honoured in the
+    /// same worker pass. The guest's recovery path (`xhci_handle_stopped_cmd_ring`) rewrites every
+    /// aborted command to a no-op and only *then* re-rings the doorbell — running them here would
+    /// execute commands it has already decided to cancel.
+    #[test]
+    fn an_abort_cancels_a_doorbell_queued_before_it() {
+        let m = mem();
+        let dev = new_dev();
+        let mut d = dev.lock().unwrap();
+        d.event_ring = Some(EventRing::new(0x3000, 16));
+        // A real command sits on the ring, with the doorbell already rung for it...
+        Trb {
+            parameter: 0,
+            status: 0,
+            control: (trb_type::ENABLE_SLOT << 10) | 1,
+        }
+        .write(&m, 0x4000)
+        .unwrap();
+        d.write(0, 0x20 + 0x18, &(0x4000u64 | 1).to_le_bytes()); // CRCR
+        d.write(0, 0x2000, &0u32.to_le_bytes()); // DB[0]: the command doorbell
+        assert!(d.work.cmd_doorbell, "the doorbell is queued");
+        // ...and then the guest aborts before the worker ever runs.
+        d.write(0, 0x20 + 0x18, &(0x4u64).to_le_bytes()); // CRCR.CA
+
+        d.run_worker_pass(&m, &dev);
+
+        assert!(
+            d.slots.iter().all(|s| s.is_none()),
+            "the aborted Enable Slot must NOT have been executed"
+        );
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_eq!(
+            ev.status >> 24,
+            cc::COMMAND_RING_STOPPED,
+            "the only completion posted is Command Ring Stopped"
+        );
+        let next = Trb::read(&m, 0x3000 + 16).unwrap();
+        assert_eq!(next.control & 1, 0, "and nothing follows it on the ring");
     }
 }

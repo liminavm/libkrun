@@ -170,7 +170,10 @@ const PLS_RX_DETECT: u32 = 5;
 const PLS_POLLING: u32 = 7;
 /// Port Link State: U0 (enabled, post-reset).
 const PLS_U0: u32 = 0;
-/// Port Link State: U3 (suspended) — where `xhci_bus_suspend` parks a connected port.
+/// Port Link State: U3 (suspended) — where `xhci_bus_suspend` parks a connected port. The
+/// controller never *writes* this state (the guest drives it via LWS), so it is only referenced
+/// from the PM tests that stand a suspended port up.
+#[cfg(test)]
 const PLS_U3: u32 = 3;
 /// A freshly powered, nothing-connected USB2 port.
 const PORTSC_DEFAULT: u32 = PORTSC_PP | (PLS_RX_DETECT << PORTSC_PLS_SHIFT);
@@ -956,7 +959,14 @@ impl XhciDevice {
         );
         // Write-1-to-clear the change bits.
         p &= !(val & PORTSC_RW1C_MASK);
-        // PED is write-1-to-clear (writing 1 disables the port).
+        // PED is write-1-to-clear (writing 1 disables the port), and that is ALL it does: no PEC
+        // latch, no port-change event. Deliberately, and checked against the driver — the only two
+        // places Linux writes PED=1 are `xhci_disable_port` and the SS_DISABLED link-state write,
+        // both *intentional* disables, and the latter clears `PORT_PEC` in the very same word
+        // "so that we get a new connection event". Latching a change here would fight that: the hub
+        // thread would see PED=0 with CCS still set and re-enable a port the guest just disabled.
+        // (`xhci_bus_resume` never reaches this path — `PORT_RWC_BITS` *includes* `PORT_PE`
+        // (xhci-hub.c), so its write-back clears PE rather than asserting it.)
         if val & PORTSC_PED != 0 {
             p &= !PORTSC_PED;
         }
