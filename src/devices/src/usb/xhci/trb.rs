@@ -253,6 +253,28 @@ impl EventRing {
         }
     }
 
+    /// Rebuild a producer from snapshot-carried state (see `devices::usb_state`). The segment
+    /// geometry and the producer position are host-only — the guest's ERDP only tells us where its
+    /// *consumer* is, so neither can be re-derived after a worker teardown.
+    pub fn from_state(s: &crate::usb_state::XhciEventRingState) -> Self {
+        EventRing {
+            seg_base: s.seg_base & !0x3f,
+            seg_size: s.seg_size.max(1),
+            enqueue_idx: s.enqueue_idx % s.seg_size.max(1),
+            pcs: s.pcs,
+        }
+    }
+
+    /// This producer's state, for a snapshot.
+    pub fn state(&self) -> crate::usb_state::XhciEventRingState {
+        crate::usb_state::XhciEventRingState {
+            seg_base: self.seg_base,
+            seg_size: self.seg_size,
+            enqueue_idx: self.enqueue_idx,
+            pcs: self.pcs,
+        }
+    }
+
     /// Guest-physical address the next event will be written to.
     pub fn enqueue_addr(&self) -> u64 {
         self.seg_base + u64::from(self.enqueue_idx) * 16
