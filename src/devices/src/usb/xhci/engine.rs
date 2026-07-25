@@ -25,6 +25,7 @@ use super::device::{EpRing, SlotCtx, XhciDevice, NUM_PORTS};
 use super::trb::{
     cc, command_completion_event, port_status_change_event, transfer_event, trb_type, EventRing,
     RingError, RingWalker, Trb, CTRL_BSR, CTRL_CHAIN, CTRL_DC, CTRL_DIR_IN, CTRL_IDT, CTRL_IOC,
+    MAX_TD_TRBS,
 };
 
 /// A gadget call the worker makes with the controller lock **released**.
@@ -1203,6 +1204,9 @@ fn read_data_td(mem: &GuestMemoryMmap, walker: &mut RingWalker) -> Result<DataTd
     // from guest memory (xHCI §4.11.7). OUT direction only; a real guest uses a single small TRB.
     let mut immediate: Vec<u8> = Vec::new();
     let mut first = true;
+    // Bound the work TRBs in one TD: a hostile ring whose Chain bit never clears would grow
+    // `segs` / `immediate` without limit and hang the worker (see MAX_TD_TRBS).
+    let mut work_trbs = 0usize;
     loop {
         let (addr, trb) = match walker.next(mem)? {
             Some(v) => v,
@@ -1217,7 +1221,15 @@ fn read_data_td(mem: &GuestMemoryMmap, walker: &mut RingWalker) -> Result<DataTd
             }
         };
         first = false;
-        match trb.trb_type() {
+        let ttype = trb.trb_type();
+        // Count work TRBs (Normal / Event Data) and refuse a TD that never terminates.
+        if matches!(ttype, trb_type::NORMAL | trb_type::EVENT_DATA) {
+            work_trbs += 1;
+            if work_trbs > MAX_TD_TRBS {
+                return Err(RingError::TdTooLong);
+            }
+        }
+        match ttype {
             trb_type::NORMAL => {
                 let len = trb.transfer_len();
                 if trb.control & CTRL_IDT != 0 {
@@ -1936,7 +1948,10 @@ mod tests {
     /// regression guard for the fingerprint reader's open sequence (was read as garbage → stall).
     #[test]
     fn immediate_data_out_delivers_inline_bytes_not_a_dma_read() {
-        let m = mem();
+        // A 32 MiB guest so the address the immediate bytes would be *misread* as
+        // (`0x00ff_0040`, ~16 MiB) is in range and can be poisoned — proving the delivered payload
+        // comes from the TRB parameter's immediate bytes, not a DMA read of that address.
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000000)]).unwrap();
         let dev = new_dev();
         {
             let mut d = dev.lock().unwrap();
@@ -1944,17 +1959,14 @@ mod tests {
             add_ep(&mut d, 2, 0xA000, false); // DCI 2 = bulk/interrupt OUT
         }
         // The 3-byte elanmoc cal-status command `40 ff 00`, packed little-endian into the TRB
-        // parameter. Poison the address it would be misread as (0x0000_0000_00ff_0040 & guest
-        // range) to prove we never DMA from `parameter`.
+        // parameter (IDT=1). Read as an address this is `0x0000_0000_00ff_0040`.
         let cmd = [0x40u8, 0xff, 0x00];
         let mut param = [0u8; 8];
         param[..3].copy_from_slice(&cmd);
         let param = u64::from_le_bytes(param);
-        // If the fix regressed, read_out_data would read 3 bytes from GuestAddress(param); seed it
-        // with different bytes so a regression produces a visibly wrong payload.
-        if (param as usize) < 0x100000 - 3 {
-            m.write_slice(&[0xde, 0xad, 0xbe], GuestAddress(param)).unwrap();
-        }
+        // Poison that misread address: a regressed reader would DMA these bytes and the assert
+        // below would see `de ad be` instead of the command.
+        m.write_slice(&[0xde, 0xad, 0xbe], GuestAddress(param)).unwrap();
         Trb {
             parameter: param,
             status: cmd.len() as u32, // transfer length = 3 (≤ 8)
@@ -1979,5 +1991,28 @@ mod tests {
         let ev = Trb::read(&m, 0x3000).unwrap();
         assert_eq!(ev.trb_type(), trb_type::TRANSFER_EVENT);
         assert_eq!(ev.status >> 24, cc::SUCCESS, "OUT ack, no residue");
+    }
+
+    /// A hostile TD whose Chain bit never clears must not grow the collected buffers without
+    /// bound: `read_data_td` refuses it after `MAX_TD_TRBS` work TRBs (a DoS guard).
+    #[test]
+    fn a_td_that_never_terminates_is_refused() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000000)]).unwrap();
+        // Lay MAX_TD_TRBS + 1 Normal TRBs, all Chain-set (never terminating), contiguously.
+        let ring = 0x10000u64;
+        for i in 0..(MAX_TD_TRBS as u64 + 1) {
+            Trb {
+                parameter: 0x5000,
+                status: 1,
+                control: (trb_type::NORMAL << 10) | CTRL_CYCLE | CTRL_CHAIN,
+            }
+            .write(&m, ring + i * 16)
+            .unwrap();
+        }
+        let mut walker = RingWalker::new(ring, true);
+        assert!(matches!(
+            read_data_td(&m, &mut walker),
+            Err(RingError::TdTooLong)
+        ));
     }
 }
