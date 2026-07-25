@@ -900,6 +900,19 @@ impl XhciDevice {
     /// keep `USBSTS.HCH` in sync with `RS`, and flag the run edge for the worker
     /// (the port connect scan happens there, with guest memory in hand).
     fn handle_usbcmd(&mut self, val: u32) {
+        // The PM trace. USBCMD writes are rare (reset, run/stop, and the suspend/resume
+        // save-restore strobes), so tracing every one costs nothing and is the oracle for what the
+        // guest's `xhci_suspend`/`xhci_resume` actually did — reconstructing that from the guest
+        // side alone cost a previous session a day. Read with `RUST_LOG=krun_devices=debug`.
+        debug!(
+            "xhci-pm: USBCMD <- {val:#x} [{}{}{}{}{}] usbsts={:#x}",
+            if val & CMD_RS != 0 { "RS " } else { "" },
+            if val & CMD_HCRST != 0 { "HCRST " } else { "" },
+            if val & CMD_INTE != 0 { "INTE " } else { "" },
+            if val & CMD_CSS != 0 { "CSS " } else { "" },
+            if val & CMD_CRS != 0 { "CRS " } else { "" },
+            self.usbsts,
+        );
         if val & CMD_HCRST != 0 {
             self.reset_controller();
             return;
@@ -930,6 +943,17 @@ impl XhciDevice {
     /// Change Event is queued for the worker.
     fn write_portsc(&mut self, idx: usize, val: u32) {
         let mut p = self.ports[idx];
+        // Part of the PM trace (see `handle_usbcmd`): the guest's bus suspend/resume drives the
+        // link state through PORTSC, so this is where U0 -> U3 -> Resume -> U0 shows up.
+        debug!(
+            "xhci-pm: PORTSC[{}] <- {val:#x}{} was {p:#x}",
+            idx + 1,
+            if val & PORTSC_LWS != 0 {
+                format!(" LWS pls={}", (val & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT)
+            } else {
+                String::new()
+            },
+        );
         // Write-1-to-clear the change bits.
         p &= !(val & PORTSC_RW1C_MASK);
         // PED is write-1-to-clear (writing 1 disables the port).
