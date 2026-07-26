@@ -310,6 +310,25 @@ fn calibrate() -> u64 {
 /// median so normal traffic is silent.
 const OUTLIER_MS: f64 = 5.0;
 
+/// CLOCK_REALTIME seconds, for stamping every line this module prints.
+///
+/// On EVERY line, not just the outliers. The periodic bucket lines shipped without one, and the
+/// first thing that cost was a wrong conclusion: a burst of 163 slow RESOURCE_FLUSHes read as
+/// "the desktop is stalling on every frame" when converting the stamps against VM start showed
+/// they were GRUB and the GNOME session coming up. The outlier lines could be checked because
+/// they carried a stamp; the bucket lines could not, and an earlier run's 25 ms stall is now
+/// permanently unattributable for exactly that reason. A measurement you cannot place in time
+/// is a measurement you cannot rule out boot from.
+fn realtime_s() -> f64 {
+    let mut rt = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `rt` is a valid, properly aligned timespec we own for the duration of the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut rt) };
+    rt.tv_sec as f64 + rt.tv_nsec as f64 / 1e9
+}
+
 static CMD_WORST_NS: AtomicU64 = AtomicU64::new(0);
 static CMD_WORST_TYPE: AtomicU64 = AtomicU64::new(0);
 static CMD_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -501,8 +520,9 @@ impl Profile {
                 )
             };
             let mut line = format!(
-                "[GPUWAKE idle {}] n={} p50/p95/max ms | kick->wake {} | wake->drained {} \
-                 | drained->signal {}",
+                "[GPUWAKE rt={:.3} idle {}] n={} p50/p95/max ms | kick->wake {} \
+                 | wake->drained {} | drained->signal {}",
+                realtime_s(),
                 BUCKET_NAMES[i],
                 b.n,
                 h(&b.kick_wake),
@@ -538,7 +558,8 @@ impl Profile {
         let irq_coal = IRQ_COALESCED.swap(0, Ordering::Relaxed);
         if self.no_kick > 0 || coalesced > 0 || irq_coal > 0 {
             eprintln!(
-                "[GPUWAKE] no_kick={} coalesced={coalesced} irq_coalesced={irq_coal}",
+                "[GPUWAKE rt={:.3}] no_kick={} coalesced={coalesced} irq_coalesced={irq_coal}",
+                realtime_s(),
                 self.no_kick
             );
         }
