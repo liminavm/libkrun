@@ -1909,19 +1909,40 @@ impl VirtioGpu {
     }
 
     /// limina (#8): true when fence-accurate presents are armed. The policy decision is
-    /// cached (per-flush getenv serialized the draw path once before — round 24); the
-    /// `/tmp/disable-limina-fence-present` marker is a live force-OFF for in-session
-    /// A/B (touch → immediate presents, rm → parked again; mid-flight parked frames
-    /// still retire normally either way). It replaced the pre-default-on force-ON
-    /// marker (`/tmp/limina-fence-present`) once 0110 made ON the windowed default.
+    /// cached (per-flush getenv serialized the draw path once before — round 24), and
+    /// the live force-OFF marker (`touch /tmp/disable-limina-fence-present` → immediate
+    /// presents, `rm` → parked again; mid-flight parked frames retire normally either
+    /// way) is polled by a dedicated thread every 500 ms into an atomic — NEVER stat'ed
+    /// on the flush path itself: a synchronous /tmp I/O there is a present-path stall
+    /// source of exactly the hard-to-attribute kind the present-miss work chases. The
+    /// flush path pays one relaxed load; the poller (windowed runs only) costs 2
+    /// wakes/s. Replaces the pre-default-on force-ON marker of the 0017 era.
     fn fence_present_enabled() -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
         static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *POLICY.get_or_init(|| {
+        static FORCE_OFF: AtomicBool = AtomicBool::new(false);
+        static POLLER: std::sync::Once = std::sync::Once::new();
+        let on = *POLICY.get_or_init(|| {
             Self::fence_present_policy(
                 std::env::var("LIMINA_FENCE_PRESENT").ok().as_deref(),
                 std::env::var_os("LIMINA_SHOWN_ACK_FD").is_some(),
             )
-        }) && std::fs::metadata("/tmp/disable-limina-fence-present").is_err()
+        });
+        if !on {
+            return false;
+        }
+        POLLER.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("gpu fence-toggle".into())
+                .spawn(|| loop {
+                    FORCE_OFF.store(
+                        std::fs::metadata("/tmp/disable-limina-fence-present").is_ok(),
+                        Ordering::Relaxed,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                });
+        });
+        !FORCE_OFF.load(Ordering::Relaxed)
     }
 
     /// limina (#8): park a zero-copy scanout flush and inject a present fence on the
