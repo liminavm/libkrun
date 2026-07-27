@@ -1903,11 +1903,32 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
-    /// limina (#8): true when fence-accurate presents are armed (env for the whole
-    /// run, marker file for live A/B within a session).
+    /// limina (#8): the fence-present policy, pure for testability.
+    ///
+    /// Explicit env wins: `LIMINA_FENCE_PRESENT=0`/`off` forces off, any other value
+    /// forces on. Unset defaults to **on exactly when the supervisor's shown-ack
+    /// channel exists** (`LIMINA_SHOWN_ACK_FD`, set only by windowed workers): the ack
+    /// path is what keeps held flush fences at display rate — without it the open-loop
+    /// latch delay serializes compositors, and on ack-less sinks (headless capture) a
+    /// parked frame's deferred `present_surface` is unsupported and would drop frames.
+    fn fence_present_policy(env: Option<&str>, ack_channel: bool) -> bool {
+        match env {
+            Some(v) => !(v == "0" || v.eq_ignore_ascii_case("off")),
+            None => ack_channel,
+        }
+    }
+
+    /// limina (#8): true when fence-accurate presents are armed. The policy decision is
+    /// cached (per-flush getenv serialized the draw path once before — round 24); the
+    /// `/tmp/limina-fence-present` marker stays a live force-on for in-session A/B.
     fn fence_present_enabled() -> bool {
-        std::env::var_os("LIMINA_FENCE_PRESENT").is_some()
-            || std::fs::metadata("/tmp/limina-fence-present").is_ok()
+        static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| {
+            Self::fence_present_policy(
+                std::env::var("LIMINA_FENCE_PRESENT").ok().as_deref(),
+                std::env::var_os("LIMINA_SHOWN_ACK_FD").is_some(),
+            )
+        }) || std::fs::metadata("/tmp/limina-fence-present").is_ok()
     }
 
     /// limina (#8): park a zero-copy scanout flush and inject a present fence on the
@@ -2846,6 +2867,24 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    // limina (#8): fence-accurate presents default ON exactly when the supervisor's
+    // shown-ack channel exists (windowed runs). Ack-less sinks (headless capture, GTK)
+    // must stay off — a parked frame's deferred present_surface is unsupported there
+    // and the no-ack fallback is the compositor-serializing open-loop latch. Explicit
+    // env always wins, `0`/`off` meaning off.
+    #[test]
+    fn fence_present_defaults_on_only_with_ack_channel() {
+        use super::VirtioGpu;
+        assert!(VirtioGpu::fence_present_policy(None, true));
+        assert!(!VirtioGpu::fence_present_policy(None, false));
+        assert!(VirtioGpu::fence_present_policy(Some("1"), false));
+        assert!(!VirtioGpu::fence_present_policy(Some("0"), true));
+        assert!(!VirtioGpu::fence_present_policy(Some("off"), true));
+        assert!(!VirtioGpu::fence_present_policy(Some("OFF"), true));
+        // The historical arming value ("any set value = on") keeps working.
+        assert!(VirtioGpu::fence_present_policy(Some(""), false));
+    }
 
     // limina: a window-resize to a non-stride-aligned width gives a scanout whose visible rect is
     // narrower than the guest's (padded) framebuffer resource (e.g. a 1000-wide mode backed by a
