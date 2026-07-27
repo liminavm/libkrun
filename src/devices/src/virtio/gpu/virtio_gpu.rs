@@ -1910,7 +1910,10 @@ impl VirtioGpu {
 
     /// limina (#8): true when fence-accurate presents are armed. The policy decision is
     /// cached (per-flush getenv serialized the draw path once before — round 24); the
-    /// `/tmp/limina-fence-present` marker stays a live force-on for in-session A/B.
+    /// `/tmp/disable-limina-fence-present` marker is a live force-OFF for in-session
+    /// A/B (touch → immediate presents, rm → parked again; mid-flight parked frames
+    /// still retire normally either way). It replaced the pre-default-on force-ON
+    /// marker (`/tmp/limina-fence-present`) once 0110 made ON the windowed default.
     fn fence_present_enabled() -> bool {
         static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *POLICY.get_or_init(|| {
@@ -1918,7 +1921,7 @@ impl VirtioGpu {
                 std::env::var("LIMINA_FENCE_PRESENT").ok().as_deref(),
                 std::env::var_os("LIMINA_SHOWN_ACK_FD").is_some(),
             )
-        }) || std::fs::metadata("/tmp/limina-fence-present").is_ok()
+        }) && std::fs::metadata("/tmp/disable-limina-fence-present").is_err()
     }
 
     /// limina (#8): park a zero-copy scanout flush and inject a present fence on the
