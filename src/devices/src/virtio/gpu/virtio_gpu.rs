@@ -2088,11 +2088,21 @@ impl VirtioGpu {
             pf.guest_holds.push(hold);
         }
         for (scanout_id, iosurface_id, resource_id, rect) in hits {
-            // Rate-limited oracle: proves the fence-accurate path is live (a silent
-            // fallback to immediate presents would otherwise look identical).
+            // Engagement oracle: proves the fence-accurate path is live (a silent
+            // fallback to immediate presents would otherwise look identical). The FIRST
+            // deferred present logs at INFO — one line per boot, so a production log
+            // (default warn is quiet, but RUST_LOG=info costs nothing per-frame) can
+            // confirm the mode without enabling the per-fence debug/trace firehose,
+            // which measurably destabilizes frame pacing (~2k sync writes/s under a
+            // benchmark — observed as 40-60 fps ping-pong, 2026-07-27). The periodic
+            // counter stays at trace.
             static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n % 512 == 0 {
+            if n == 0 {
+                log::info!(
+                    "virtio-gpu: fence-accurate presents ENGAGED (first deferred present, scanout {scanout_id}, iosurface {iosurface_id})"
+                );
+            } else if n % 512 == 0 {
                 log::trace!("[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})");
             }
             match self
