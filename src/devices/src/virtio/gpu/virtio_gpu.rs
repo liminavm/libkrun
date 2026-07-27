@@ -275,6 +275,9 @@ struct GuestFlushHold {
 struct ParkedFlush {
     scanout_id: u32,
     iosurface_id: u32,
+    /// The flushed resource — needed by the deferred readback fallback (a sink
+    /// without zero-copy reads the IOSurface's pixels back via the resource).
+    resource_id: u32,
     rect: Rect,
 }
 
@@ -1764,7 +1767,13 @@ impl VirtioGpu {
                 // present fence on the rendering context; the worker presents when it
                 // retires (true GPU completion). Falls through to the immediate
                 // present if parking isn't possible.
-                if self.try_park_present(scanout_id, iosurface_id, &rect, resource.ctx_id) {
+                if self.try_park_present(
+                    scanout_id,
+                    iosurface_id,
+                    resource_id,
+                    &rect,
+                    resource.ctx_id,
+                ) {
                     continue;
                 }
                 match self
@@ -1940,6 +1949,7 @@ impl VirtioGpu {
         &mut self,
         scanout_id: u32,
         iosurface_id: u32,
+        resource_id: u32,
         rect: &Rect,
         ctx_id: u32,
     ) -> bool {
@@ -1958,6 +1968,7 @@ impl VirtioGpu {
             ParkedFlush {
                 scanout_id,
                 iosurface_id,
+                resource_id,
                 rect: *rect,
             },
         );
@@ -1998,10 +2009,10 @@ impl VirtioGpu {
         let _ = pf.event.read();
         let cookies = std::mem::take(&mut *pf.retired.lock().unwrap());
         let shown_ids = std::mem::take(&mut *pf.shown.lock().unwrap());
-        let mut hits: Vec<(u32, u32, Rect)> = Vec::new();
+        let mut hits: Vec<(u32, u32, u32, Rect)> = Vec::new();
         for cookie in &cookies {
             if let Some(p) = pf.parked.remove(cookie) {
-                hits.push((p.scanout_id, p.iosurface_id, p.rect));
+                hits.push((p.scanout_id, p.iosurface_id, p.resource_id, p.rect));
                 // limina (#8 half 2): the frame presents below (this same thread, before
                 // anything sleeps). With acks: confirmation comes from the supervisor's
                 // "shown"; without: presenting IS the confirmation (the open-loop latch
@@ -2071,7 +2082,7 @@ impl VirtioGpu {
             }
             pf.guest_holds.push(hold);
         }
-        for (scanout_id, iosurface_id, rect) in hits {
+        for (scanout_id, iosurface_id, resource_id, rect) in hits {
             // Rate-limited oracle: proves the fence-accurate path is live (a silent
             // fallback to immediate presents would otherwise look identical).
             static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2079,12 +2090,62 @@ impl VirtioGpu {
             if n % 512 == 0 {
                 log::trace!("[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})");
             }
-            if let Err(e) =
-                self.display_backend
-                    .present_surface(scanout_id, iosurface_id, Some(&rect))
+            match self
+                .display_backend
+                .present_surface(scanout_id, iosurface_id, Some(&rect))
             {
-                error!("deferred present_surface failed for scanout {scanout_id}: {e}");
+                Ok(()) => {}
+                // A sink without zero-copy (headless capture): read the pixels back and
+                // present them as a software frame — the deferred twin of the immediate
+                // path's fallback in `flush_resource`. Before this, arming fence-present
+                // on such a sink silently dropped every parked frame.
+                #[cfg(target_os = "macos")]
+                Err(DisplayBackendError::MethodNotSupported) => {
+                    self.deferred_readback_present(scanout_id, resource_id, &rect);
+                }
+                Err(e) => {
+                    error!("deferred present_surface failed for scanout {scanout_id}: {e}");
+                }
             }
+        }
+    }
+
+    /// limina (#8): readback fallback for a retired parked frame on a sink without
+    /// zero-copy support. Mirrors the venus-IOSurface readback in `flush_resource`
+    /// (the immediate path): pull the presented IOSurface's pixels through the
+    /// renderer into a staging frame and present that.
+    #[cfg(target_os = "macos")]
+    fn deferred_readback_present(&mut self, scanout_id: u32, resource_id: u32, rect: &Rect) {
+        let Some((scan_w, scan_h)) = self
+            .scanouts
+            .get(scanout_id as usize)
+            .and_then(|s| s.as_ref())
+            .map(|s| (s.width, s.height))
+            .filter(|&(w, h)| w != 0 && h != 0)
+        else {
+            error!("deferred readback: scanout {scanout_id} has no geometry");
+            return;
+        };
+        let dst_stride = scan_w as usize * ResourceFormat::BYTES_PER_PIXEL;
+        let Some(rutabaga) = self.rutabaga.as_ref() else {
+            return;
+        };
+        let (frame_id, buffer) = match self.display_backend.alloc_frame(scanout_id) {
+            Ok(fb) => fb,
+            Err(e) => {
+                error!("deferred readback: alloc_frame failed for scanout {scanout_id}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = rutabaga.read_iosurface(resource_id, buffer, dst_stride as u32, scan_h) {
+            error!("deferred readback: read_iosurface failed for resource {resource_id}: {e}");
+            return;
+        }
+        if let Err(e) = self
+            .display_backend
+            .present_frame(scanout_id, frame_id, Some(rect))
+        {
+            error!("deferred readback: present_frame failed for scanout {scanout_id}: {e}");
         }
     }
 
