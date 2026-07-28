@@ -316,14 +316,14 @@ impl GpuJournal {
 // their bytes live in HOST allocations, not in the guest-RAM dump).
 
 const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
-// v2 (M9.3 P2): + memory_contents — every capturable VkDeviceMemory's raw bytes
-// (not just guest-mapped blobs). v3 (P2.1): + sync_states — per-context opaque
-// vkr sync blobs (fence status + timeline counter values) for the restore-time
-// sync fast-forward. v4 (P3): + cursor — the last cursor-overlay state
-// (UPDATE/MOVE_CURSOR are not journaled ops; without this the restored session
-// shows the default dot cursor until the guest next changes it). Snapshots are
-// single-use against their exact post-suspend disk, so no cross-version parse
-// compatibility is kept.
+                                        // v2 (M9.3 P2): + memory_contents — every capturable VkDeviceMemory's raw bytes
+                                        // (not just guest-mapped blobs). v3 (P2.1): + sync_states — per-context opaque
+                                        // vkr sync blobs (fence status + timeline counter values) for the restore-time
+                                        // sync fast-forward. v4 (P3): + cursor — the last cursor-overlay state
+                                        // (UPDATE/MOVE_CURSOR are not journaled ops; without this the restored session
+                                        // shows the default dot cursor until the guest next changes it). Snapshots are
+                                        // single-use against their exact post-suspend disk, so no cross-version parse
+                                        // compatibility is kept.
 const PAYLOAD_VERSION: u32 = 4;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {

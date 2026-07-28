@@ -1569,12 +1569,27 @@ impl VirtioGpu {
             format,
         )?;
 
+        // limina vrend zero-copy scanout (docs/design/vrend-iosurface-scanout.md): a plain
+        // SET_SCANOUT resource may be IOSurface-backed too (vrend allocates the surface for
+        // SCANOUT-bound textures at create). Resolve exactly like set_scanout_blob; None
+        // keeps the readback path — a stock guest with an ineligible format loses nothing.
+        #[cfg(target_os = "macos")]
+        let iosurface_id = self
+            .rutabaga
+            .as_ref()
+            .and_then(|r| r.iosurface_id(resource_id).ok())
+            .filter(|&id| id != 0);
+        #[cfg(target_os = "macos")]
+        if let Some(id) = iosurface_id {
+            log::debug!("SET_SCANOUT scanout={scanout_id} res={resource_id} -> IOSurface {id} (vrend zero-copy)");
+        }
+
         *scanout = Some(VirtioGpuScanout {
             resource_id,
             width,
             height,
             #[cfg(target_os = "macos")]
-            iosurface_id: None,
+            iosurface_id,
         });
         Ok(OkNoData)
     }
@@ -1744,6 +1759,43 @@ impl VirtioGpu {
                 .and_then(|s| s.as_ref())
                 .and_then(|s| s.iosurface_id)
             {
+                // limina vrend zero-copy scanout: non-blob (ctx_id == 0) scanouts are vrend
+                // textures — unlike venus blobs they don't render INTO the surface, so blit
+                // the current frame into it (GPU-side, sync) before presenting. On failure
+                // (vrend poisons the surface and keeps the resource alive) clear the cached
+                // id and take the readback path from now on.
+                if resource.ctx_id == 0 {
+                    if let Err(e) = self
+                        .rutabaga
+                        .as_ref()
+                        .ok_or(ErrUnspec)
+                        .and_then(|r| r.sync_iosurface(resource_id).map_err(|_| ErrUnspec))
+                    {
+                        log::warn!(
+                            "vrend iosurface sync failed for res {resource_id} ({e:?}); \
+                             falling back to readback"
+                        );
+                        if let Some(Some(s)) = self.scanouts.get_mut(scanout_id as usize) {
+                            s.iosurface_id = None;
+                        }
+                        // fall through to the readback path below
+                    } else {
+                        match self.display_backend.present_surface(
+                            scanout_id,
+                            iosurface_id,
+                            Some(&rect),
+                        ) {
+                            Ok(()) => continue,
+                            Err(DisplayBackendError::MethodNotSupported) => {}
+                            Err(e) => {
+                                log::error!(
+                                    "present_surface failed for scanout {scanout_id}: {e}"
+                                );
+                                return Err(ErrUnspec);
+                            }
+                        }
+                    }
+                } else {
                 // limina (#8): fence-accurate present — park the frame and inject a
                 // present fence on the rendering context; the worker presents when it
                 // retires (true GPU completion). Falls through to the immediate
@@ -1770,6 +1822,7 @@ impl VirtioGpu {
                         log::error!("present_surface failed for scanout {scanout_id}: {e}");
                         return Err(ErrUnspec);
                     }
+                }
                 }
             }
 

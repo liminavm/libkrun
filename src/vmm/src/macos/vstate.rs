@@ -576,7 +576,10 @@ impl Vcpu {
             // guest PC captured at snapshot time. Emitting the PC makes the resume observable to an
             // operator (and to the M9.1 acceptance test) without needing the guest to reach any
             // device — device state is not restored until M9.2.
-            info!("vCPU {hvf_vcpuid} resumed from snapshot at pc={:#x}", state.pc);
+            info!(
+                "vCPU {hvf_vcpuid} resumed from snapshot at pc={:#x}",
+                state.pc
+            );
         } else {
             let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
                 boot_receiver.recv().unwrap()
