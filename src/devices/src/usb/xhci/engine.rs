@@ -494,7 +494,11 @@ impl XhciDevice {
             let mut oslot = Ctx32::read(mem, out).map_err(|_| cc::TRB_ERROR)?;
             set_slot_state(&mut oslot, ss::ADDRESSED);
             oslot.write(mem, out).map_err(|_| cc::TRB_ERROR)?;
-            if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+            if let Some(s) = self
+                .slots
+                .get_mut(slot_id as usize)
+                .and_then(|x| x.as_mut())
+            {
                 s.state = ss::ADDRESSED;
                 s.eps.clear();
             }
@@ -519,7 +523,11 @@ impl XhciDevice {
         for dci in 2u8..=31 {
             let bit = 1u32 << dci;
             if drop & bit != 0 {
-                if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+                if let Some(s) = self
+                    .slots
+                    .get_mut(slot_id as usize)
+                    .and_then(|x| x.as_mut())
+                {
                     s.eps.remove(&dci);
                 }
                 let addr = out + output_ep_offset(dci);
@@ -529,7 +537,8 @@ impl XhciDevice {
                 }
             }
             if add & bit != 0 {
-                let iep = Ctx32::read(mem, input + input_ep_offset(dci)).map_err(|_| cc::TRB_ERROR)?;
+                let iep =
+                    Ctx32::read(mem, input + input_ep_offset(dci)).map_err(|_| cc::TRB_ERROR)?;
                 let etype = ep_type(&iep);
                 let (dq, dcs) = ep_tr_dequeue(&iep);
                 // DCI parity is the authoritative direction (IN = odd DCI); the type
@@ -539,10 +548,18 @@ impl XhciDevice {
                 set_ep_state(&mut oep, ep_state::RUNNING);
                 oep.write(mem, out + output_ep_offset(dci))
                     .map_err(|_| cc::TRB_ERROR)?;
-                if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+                if let Some(s) = self
+                    .slots
+                    .get_mut(slot_id as usize)
+                    .and_then(|x| x.as_mut())
+                {
                     // Re-adding an existing endpoint bumps its generation so a completion
                     // still in flight against the old ring is dropped.
-                    let generation = s.eps.get(&dci).map(|e| e.generation.wrapping_add(1)).unwrap_or(0);
+                    let generation = s
+                        .eps
+                        .get(&dci)
+                        .map(|e| e.generation.wrapping_add(1))
+                        .unwrap_or(0);
                     s.eps.insert(
                         dci,
                         EpRing {
@@ -557,7 +574,11 @@ impl XhciDevice {
             }
         }
 
-        if let Some(s) = self.slots.get_mut(slot_id as usize).and_then(|x| x.as_mut()) {
+        if let Some(s) = self
+            .slots
+            .get_mut(slot_id as usize)
+            .and_then(|x| x.as_mut())
+        {
             s.state = ss::CONFIGURED;
         }
         Ok(())
@@ -1088,7 +1109,14 @@ impl XhciDevice {
             XferOutcome::Stall => {
                 self.post_event(
                     mem,
-                    transfer_event(ev.event_trb, 0, cc::STALL_ERROR, ev.slot_id, ev.ep_id, false),
+                    transfer_event(
+                        ev.event_trb,
+                        0,
+                        cc::STALL_ERROR,
+                        ev.slot_id,
+                        ev.ep_id,
+                        false,
+                    ),
                 );
                 // Halt the endpoint: leave the dequeue at the TD start and wait for the
                 // guest's Reset Endpoint + Set TR Dequeue recovery.
@@ -1740,7 +1768,9 @@ mod tests {
         Ctx32([0, (1 << 0) | (1 << 3), 0, 0, 0, 0, 0, 0])
             .write(&m, input)
             .unwrap();
-        Ctx32::default().write(&m, input + INPUT_SLOT_OFFSET).unwrap();
+        Ctx32::default()
+            .write(&m, input + INPUT_SLOT_OFFSET)
+            .unwrap();
         // EP context DCI 3: type 7 (interrupt IN), TR dequeue 0xA001 (DCS=1).
         let mut iep = Ctx32::default();
         iep.0[1] = 7 << 3;
@@ -1760,7 +1790,12 @@ mod tests {
         assert_eq!(code, cc::SUCCESS);
 
         let d = dev.lock().unwrap();
-        let ep = d.slots[1].as_ref().unwrap().eps.get(&3).expect("ep created");
+        let ep = d.slots[1]
+            .as_ref()
+            .unwrap()
+            .eps
+            .get(&3)
+            .expect("ep created");
         assert_eq!(ep.ring.ptr(), 0xA000, "ring dequeue from input context");
         assert!(ep.dir_in, "DCI 3 is IN");
         assert_eq!(ep.state, ep_state::RUNNING);
@@ -1862,7 +1897,8 @@ mod tests {
         let m = mem();
         let dev = new_dev();
         let dcbaap = 0x9000u64;
-        m.write_obj::<u64>(0x8000, GuestAddress(dcbaap + 8)).unwrap();
+        m.write_obj::<u64>(0x8000, GuestAddress(dcbaap + 8))
+            .unwrap();
         {
             let mut d = dev.lock().unwrap();
             prime(&mut d, 0x4000, 0x3000, 16);
@@ -1915,7 +1951,8 @@ mod tests {
         let m = mem();
         let dev = new_dev();
         let dcbaap = 0x9000u64;
-        m.write_obj::<u64>(0x8000, GuestAddress(dcbaap + 8)).unwrap();
+        m.write_obj::<u64>(0x8000, GuestAddress(dcbaap + 8))
+            .unwrap();
         {
             let mut d = dev.lock().unwrap();
             prime(&mut d, 0x4000, 0x3000, 16);
@@ -1979,7 +2016,11 @@ mod tests {
             d.collect_ep_work(&m, 1, 2, &dev, &mut deferred);
         }
         let xfer = take_transfer(deferred);
-        assert_eq!(xfer.data_out(), &payload[..], "OUT bytes delivered to gadget");
+        assert_eq!(
+            xfer.data_out(),
+            &payload[..],
+            "OUT bytes delivered to gadget"
+        );
         xfer.ack();
 
         let ev = Trb::read(&m, 0x3000).unwrap();
@@ -2013,7 +2054,8 @@ mod tests {
         let param = u64::from_le_bytes(param);
         // Poison that misread address: a regressed reader would DMA these bytes and the assert
         // below would see `de ad be` instead of the command.
-        m.write_slice(&[0xde, 0xad, 0xbe], GuestAddress(param)).unwrap();
+        m.write_slice(&[0xde, 0xad, 0xbe], GuestAddress(param))
+            .unwrap();
         Trb {
             parameter: param,
             status: cmd.len() as u32, // transfer length = 3 (≤ 8)
@@ -2191,9 +2233,9 @@ mod tests {
             }
             // Finally the state a running guest leaves USBCMD in.
             d.write(0, 0x20, &(1u32 | 4).to_le_bytes()); // RS | INTE
-            // An in-flight CRCR stop (the guest's command watchdog), and work the worker has not
-            // drained yet — a snapshot is taken from the vcpu thread, so all of this can genuinely
-            // be pending at capture.
+                                                         // An in-flight CRCR stop (the guest's command watchdog), and work the worker has not
+                                                         // drained yet — a snapshot is taken from the vcpu thread, so all of this can genuinely
+                                                         // be pending at capture.
             d.write(0, 0x20 + 0x18, &0x2u64.to_le_bytes()); // CRCR.CS
             d.work.cmd_doorbell = true;
             d.work.cmd_abort = true;
