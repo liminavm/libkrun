@@ -564,8 +564,7 @@ impl RutabagaComponent for VirglRenderer {
         if ret != 0 || buf.is_null() {
             return None;
         }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(buf as *const u8, size as usize) }.to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, size as usize) }.to_vec();
         unsafe { libc::free(buf) };
         Some(bytes)
     }
@@ -616,8 +615,7 @@ impl RutabagaComponent for VirglRenderer {
         if ret != 0 || buf.is_null() {
             return None;
         }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(buf as *const u8, size as usize) }.to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, size as usize) }.to_vec();
         unsafe { libc::free(buf) };
         Some(bytes)
     }
@@ -728,8 +726,11 @@ impl RutabagaComponent for VirglRenderer {
             map_info: None,
             #[cfg(target_os = "macos")]
             map_ptr: None,
+            // limina vrend zero-copy scanout: a SCANOUT-bound 3D resource may be
+            // IOSurface-backed (vrend allocates the surface at create) — cache the id
+            // exactly like create_blob does, so plain SET_SCANOUT can resolve it.
             #[cfg(target_os = "macos")]
-            iosurface_id: None,
+            iosurface_id: self.iosurface_id(resource_id).ok().filter(|&id| id != 0),
             info_2d: None,
             info_3d: self.query(resource_id).ok(),
             vulkan_info: None,
@@ -833,6 +834,16 @@ impl RutabagaComponent for VirglRenderer {
                 height,
             )
         };
+        ret_to_res(ret)
+    }
+
+    // limina vrend zero-copy scanout: GPU-blit the resource's texture into its IOSurface and
+    // wait, so the following present reads a complete frame.
+    #[cfg(target_os = "macos")]
+    fn sync_iosurface(&self, resource_id: u32) -> RutabagaResult<()> {
+        // Safe because virglrenderer is initialized and the call only touches the resource's
+        // own GL objects on ctx0.
+        let ret = unsafe { virgl_renderer_resource_sync_iosurface(resource_id) };
         ret_to_res(ret)
     }
 
