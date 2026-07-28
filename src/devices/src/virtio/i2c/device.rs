@@ -15,8 +15,8 @@ use crate::virtio::InterruptTransport;
 // Request queue ("msg" in the Linux driver).
 pub(crate) const REQ_INDEX: usize = 0;
 
-pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
-    | (1 << uapi::VIRTIO_I2C_F_ZERO_LENGTH_REQUEST as u64);
+pub(crate) const AVAIL_FEATURES: u64 =
+    (1 << uapi::VIRTIO_F_VERSION_1 as u64) | (1 << uapi::VIRTIO_I2C_F_ZERO_LENGTH_REQUEST as u64);
 
 /// The 7-bit I2C address of the emulated SBS smart battery (the SBS standard slave
 /// address; the DT node `battery@b` must match).
@@ -461,8 +461,7 @@ mod tests {
 
     fn read_word(bat: &mut SbsBattery, reg: u8) -> Option<u16> {
         assert!(bat.write(&[reg]));
-        bat.read(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        bat.read(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
     }
 
     #[test]

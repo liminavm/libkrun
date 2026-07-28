@@ -194,9 +194,10 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             } else {
                 unsafe { std::slice::from_raw_parts(buffer, buffer_size) }
             };
-            from_rust_result(cast_instance::<I>(instance).set_cursor(
-                width, height, hot_x, hot_y, format, pixels,
-            ))
+            from_rust_result(
+                cast_instance::<I>(instance)
+                    .set_cursor(width, height, hot_x, hot_y, format, pixels),
+            )
         }
 
         extern "C" fn move_cursor_fn<I: DisplayBackendBasicFramebuffer>(
@@ -215,9 +216,11 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
         ) -> i32 {
             // SAFETY: The pointer obtained from the bindings should be safe
             let rect: Option<&Rect> = unsafe { ptr_to_option_ref(rect) };
-            from_rust_result(
-                cast_instance::<I>(instance).present_surface(scanout_id, iosurface_id, rect),
-            )
+            from_rust_result(cast_instance::<I>(instance).present_surface(
+                scanout_id,
+                iosurface_id,
+                rect,
+            ))
         }
 
         DisplayBackend {

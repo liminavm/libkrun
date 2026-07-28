@@ -354,8 +354,8 @@ mod tests {
         // A fresh RTC mirrors the host wallclock (delta 0).
         assert_eq!(rtc.wall_delta_ns, 0);
         rtc.read(0, RTCDR, &mut data);
-        let host_now =
-            (utils::time::get_time(utils::time::ClockType::Real) / utils::time::NANOS_PER_SECOND) as u32;
+        let host_now = (utils::time::get_time(utils::time::ClockType::Real)
+            / utils::time::NANOS_PER_SECOND) as u32;
         let dr = byte_order::read_le_u32(&data[..]);
         assert!(host_now.abs_diff(dr) <= 1, "RTCDR {dr} vs host {host_now}");
 

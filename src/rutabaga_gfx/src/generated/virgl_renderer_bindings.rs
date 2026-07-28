@@ -413,6 +413,13 @@ unsafe extern "C" {
         iosurface_id: *mut u32,
     ) -> ::std::os::raw::c_int;
 }
+// limina vrend zero-copy scanout: blit a vrend scanout resource's texture into its display
+// IOSurface (GPU-side) and wait. Call on RESOURCE_FLUSH before presenting the id; -EINVAL
+// when the resource has no IOSurface. See docs/design/vrend-iosurface-scanout.md.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    pub fn virgl_renderer_resource_sync_iosurface(res_handle: u32) -> ::std::os::raw::c_int;
+}
 // limina: copy a scanout resource's presented IOSurface into a CPU buffer (top-down BGRA). The
 // headless capture display sink uses this — venus blobs have no CPU transfer_read, so the frame
 // only lives in the IOSurface's shared storage.
