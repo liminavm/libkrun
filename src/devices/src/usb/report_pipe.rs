@@ -28,7 +28,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use super::model::{ControlTransfer, DeviceDescriptors, EpAddr, Transfer, UsbDeviceModel, UsbSpeed};
+use super::model::{
+    ControlTransfer, DeviceDescriptors, EpAddr, Transfer, UsbDeviceModel, UsbSpeed,
+};
 
 // Descriptor types.
 const DT_STRING: u8 = 0x03;
@@ -223,7 +225,8 @@ fn device_descriptor(vid: u16, pid: u16) -> Vec<u8> {
     vec![
         0x12, // bLength = 18
         0x01, // bDescriptorType = DEVICE
-        0x00, 0x02, // bcdUSB 2.00
+        0x00,
+        0x02, // bcdUSB 2.00
         0x00, // bDeviceClass (per-interface)
         0x00, // bDeviceSubClass
         0x00, // bDeviceProtocol
@@ -232,7 +235,8 @@ fn device_descriptor(vid: u16, pid: u16) -> Vec<u8> {
         (vid >> 8) as u8,
         (pid & 0xff) as u8,
         (pid >> 8) as u8,
-        0x00, 0x01, // bcdDevice 1.00
+        0x00,
+        0x01, // bcdDevice 1.00
         0x01, // iManufacturer
         0x02, // iProduct
         0x03, // iSerialNumber
@@ -245,44 +249,43 @@ fn device_descriptor(vid: u16, pid: u16) -> Vec<u8> {
 fn config_descriptor(report_len: u16) -> Vec<u8> {
     let total_len: u16 = 41;
     let mut c = vec![
-        0x09, 0x02, // CONFIGURATION
+        0x09,
+        0x02, // CONFIGURATION
         (total_len & 0xff) as u8,
         (total_len >> 8) as u8, // wTotalLength
-        0x01, // bNumInterfaces
-        0x01, // bConfigurationValue
-        0x00, // iConfiguration
-        0x80, // bmAttributes (bus-powered)
-        0x32, // bMaxPower = 100 mA
+        0x01,                   // bNumInterfaces
+        0x01,                   // bConfigurationValue
+        0x00,                   // iConfiguration
+        0x80,                   // bmAttributes (bus-powered)
+        0x32,                   // bMaxPower = 100 mA
     ];
     // Interface 0: HID, 2 endpoints.
     c.extend_from_slice(&[
-        0x09, 0x04, // INTERFACE
-        0x00, // bInterfaceNumber
-        0x00, // bAlternateSetting
-        0x02, // bNumEndpoints
+        0x09, 0x04,      // INTERFACE
+        0x00,      // bInterfaceNumber
+        0x00,      // bAlternateSetting
+        0x02,      // bNumEndpoints
         CLASS_HID, // bInterfaceClass = HID
-        0x00, // bInterfaceSubClass (no boot)
-        0x00, // bInterfaceProtocol
-        0x04, // iInterface
+        0x00,      // bInterfaceSubClass (no boot)
+        0x00,      // bInterfaceProtocol
+        0x04,      // iInterface
     ]);
     // HID descriptor.
     c.extend_from_slice(&[
-        0x09, DT_HID, // HID
-        0x11, 0x01, // bcdHID 1.11
-        0x00, // bCountryCode
-        0x01, // bNumDescriptors
+        0x09,
+        DT_HID, // HID
+        0x11,
+        0x01,          // bcdHID 1.11
+        0x00,          // bCountryCode
+        0x01,          // bNumDescriptors
         DT_HID_REPORT, // bDescriptorType (report)
         (report_len & 0xff) as u8,
         (report_len >> 8) as u8, // wDescriptorLength
     ]);
     // Interrupt-IN endpoint (0x81), wMaxPacketSize 64, bInterval 5.
-    c.extend_from_slice(&[
-        0x07, 0x05, EP_IN_ADDR, 0x03, 0x40, 0x00, 0x05,
-    ]);
+    c.extend_from_slice(&[0x07, 0x05, EP_IN_ADDR, 0x03, 0x40, 0x00, 0x05]);
     // Interrupt-OUT endpoint (0x01), wMaxPacketSize 64, bInterval 5.
-    c.extend_from_slice(&[
-        0x07, 0x05, EP_OUT_ADDR, 0x03, 0x40, 0x00, 0x05,
-    ]);
+    c.extend_from_slice(&[0x07, 0x05, EP_OUT_ADDR, 0x03, 0x40, 0x00, 0x05]);
     debug_assert_eq!(c.len(), total_len as usize);
     c
 }
@@ -350,7 +353,13 @@ mod tests {
         let mut report = vec![0u8; REPORT_LEN];
         report[0] = 0xAB;
         let (out, out_rx) = out_transfer(report.clone());
-        p.handle_transfer(EpAddr { num: 1, dir_in: false }, out);
+        p.handle_transfer(
+            EpAddr {
+                num: 1,
+                dir_in: false,
+            },
+            out,
+        );
         assert!(matches!(out_rx.recv().unwrap(), XferOutcome::Ack));
         assert_eq!(sink_rx.recv().unwrap(), report);
     }
@@ -368,7 +377,10 @@ mod tests {
             c,
         );
         p.handle_control(xfer);
-        assert!(matches!(rx.recv().unwrap(), XferOutcome::Ack), "SET_REPORT acked");
+        assert!(
+            matches!(rx.recv().unwrap(), XferOutcome::Ack),
+            "SET_REPORT acked"
+        );
         assert_eq!(sink_rx.recv().unwrap(), report);
     }
 
@@ -376,7 +388,13 @@ mod tests {
     fn held_in_completes_when_a_frame_is_pushed() {
         let (p, _rx) = pipe();
         let (in_xfer, in_rx) = in_transfer(REPORT_LEN);
-        p.handle_transfer(EpAddr { num: 1, dir_in: true }, in_xfer);
+        p.handle_transfer(
+            EpAddr {
+                num: 1,
+                dir_in: true,
+            },
+            in_xfer,
+        );
         assert!(in_rx.try_recv().is_err(), "IN held, not completed");
         let mut frame = vec![0u8; REPORT_LEN];
         frame[0] = 0xCC;
@@ -394,7 +412,13 @@ mod tests {
         frame[7] = 0x5A;
         p.push_in(frame.clone());
         let (in_xfer, in_rx) = in_transfer(REPORT_LEN);
-        p.handle_transfer(EpAddr { num: 1, dir_in: true }, in_xfer);
+        p.handle_transfer(
+            EpAddr {
+                num: 1,
+                dir_in: true,
+            },
+            in_xfer,
+        );
         match in_rx.recv().unwrap() {
             XferOutcome::In(bytes) => assert_eq!(bytes, frame),
             other => panic!("expected In, got {other:?}"),
@@ -407,11 +431,26 @@ mod tests {
     fn a_new_in_supersedes_a_stale_held_in() {
         let (p, _rx) = pipe();
         let (in1, rx1) = in_transfer(REPORT_LEN);
-        p.handle_transfer(EpAddr { num: 1, dir_in: true }, in1);
+        p.handle_transfer(
+            EpAddr {
+                num: 1,
+                dir_in: true,
+            },
+            in1,
+        );
         // A second IN arrives before any frame — the first is superseded and stalled.
         let (in2, rx2) = in_transfer(REPORT_LEN);
-        p.handle_transfer(EpAddr { num: 1, dir_in: true }, in2);
-        assert!(matches!(rx1.recv().unwrap(), XferOutcome::Stall), "stale IN stalled");
+        p.handle_transfer(
+            EpAddr {
+                num: 1,
+                dir_in: true,
+            },
+            in2,
+        );
+        assert!(
+            matches!(rx1.recv().unwrap(), XferOutcome::Stall),
+            "stale IN stalled"
+        );
         // The frame goes to the live (second) IN, in order.
         let frame = vec![0x11u8; REPORT_LEN];
         p.push_in(frame.clone());
@@ -425,13 +464,28 @@ mod tests {
     fn reset_drops_held_in_and_queue() {
         let (p, _rx) = pipe();
         let (in_xfer, in_rx) = in_transfer(REPORT_LEN);
-        p.handle_transfer(EpAddr { num: 1, dir_in: true }, in_xfer);
+        p.handle_transfer(
+            EpAddr {
+                num: 1,
+                dir_in: true,
+            },
+            in_xfer,
+        );
         p.push_in(vec![1u8; REPORT_LEN]); // completes the held IN
         assert!(matches!(in_rx.recv().unwrap(), XferOutcome::In(_)));
         // Now hold another and reset: it stalls, and any queue is cleared.
         let (in2, rx2) = in_transfer(REPORT_LEN);
-        p.handle_transfer(EpAddr { num: 1, dir_in: true }, in2);
+        p.handle_transfer(
+            EpAddr {
+                num: 1,
+                dir_in: true,
+            },
+            in2,
+        );
         p.reset();
-        assert!(matches!(rx2.recv().unwrap(), XferOutcome::Stall), "reset stalls held IN");
+        assert!(
+            matches!(rx2.recv().unwrap(), XferOutcome::Stall),
+            "reset stalls held IN"
+        );
     }
 }

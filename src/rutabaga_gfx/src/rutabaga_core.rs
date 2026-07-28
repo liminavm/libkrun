@@ -228,6 +228,13 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// limina vrend zero-copy scanout: blit the resource's current texture into its display
+    /// IOSurface (GPU-side) and wait — the pre-present step for vrend scanouts, which unlike
+    /// venus blobs do not render into the surface directly. Only virgl implements it.
+    fn sync_iosurface(&self, _resource_id: u32) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// Implementations must flush the given resource to the display.
     fn resource_flush(&self, _resource_id: &mut RutabagaResource) -> RutabagaResult<()> {
         Err(RutabagaError::Unsupported)
@@ -1082,6 +1089,20 @@ impl Rutabaga {
             .ok_or(RutabagaError::InvalidComponent)?;
 
         component.read_iosurface(resource_id, dst, dst_stride, height)
+    }
+
+    /// limina vrend zero-copy scanout: blit a vrend scanout's texture into its IOSurface and
+    /// wait (GPU-side readpixels through the pinned PBO). Call before presenting the id for a
+    /// scanout that needs the sync (plain SET_SCANOUT resources — venus blobs render into the
+    /// surface directly and never need it).
+    #[cfg(target_os = "macos")]
+    pub fn sync_iosurface(&self, resource_id: u32) -> RutabagaResult<()> {
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+
+        component.sync_iosurface(resource_id)
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device

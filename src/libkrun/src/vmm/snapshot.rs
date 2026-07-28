@@ -744,7 +744,9 @@ impl SnapshotFile {
                                             corrupt(&format!("frame decompress failed: {e}"))
                                         })?;
                                         if n != f.ulen {
-                                            return Err(corrupt("frame decompressed size mismatch"));
+                                            return Err(corrupt(
+                                                "frame decompressed size mismatch",
+                                            ));
                                         }
                                         write(&outbuf[..f.ulen])
                                     }
@@ -917,10 +919,7 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
     if raw.len() < 16 {
         return Err(corrupt("too small"));
     }
-    let mut r = Reader {
-        buf: &raw,
-        pos: 0,
-    };
+    let mut r = Reader { buf: &raw, pos: 0 };
     if r.take(8)? != MAGIC {
         return Err(corrupt("bad magic"));
     }
@@ -1129,7 +1128,9 @@ mod tests {
         let mut x = 0x12345678u64;
         let noise: Vec<u8> = (0..(5 << 20))
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (x >> 33) as u8
             })
             .collect();
@@ -1246,7 +1247,10 @@ mod tests {
             std::env::temp_dir().join(format!("limina-snap-test-{}.bin", std::process::id()));
         let (stats, want_a, want_b) = write_sample(&path);
         assert_eq!(stats.ram_bytes, REGION_A.1 + REGION_B.1);
-        assert!(stats.zero_frames >= 1, "the zeroed chunk must become a hole");
+        assert!(
+            stats.zero_frames >= 1,
+            "the zeroed chunk must become a hole"
+        );
         assert!(stats.lz4_frames >= 1, "the pattern chunk must compress");
         // The hole + compression must shrink the file well below the raw RAM size.
         assert!(stats.written_bytes < stats.ram_bytes);
