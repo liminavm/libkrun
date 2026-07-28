@@ -329,7 +329,10 @@ impl Snd {
     /// Creating the input unit on PREPARE is what triggers the mic TCC prompt.
     #[cfg(target_os = "macos")]
     fn handle_capture_lifecycle(&mut self, code: u32) {
-        debug!("snd: capture lifecycle code={code:#x} enter (have_unit={})", self.capture.is_some());
+        debug!(
+            "snd: capture lifecycle code={code:#x} enter (have_unit={})",
+            self.capture.is_some()
+        );
         match code {
             VIRTIO_SND_R_PCM_PREPARE => {
                 if let Some(c) = self.capture.as_mut() {
@@ -350,7 +353,10 @@ impl Snd {
                         Ok(s) => self.capture = Some(s),
                         Err(e) => error!("snd: CoreAudio input init failed ({e}); silent mic"),
                     }
-                    debug!("snd: capture InputStream::new end (ok={})", self.capture.is_some());
+                    debug!(
+                        "snd: capture InputStream::new end (ok={})",
+                        self.capture.is_some()
+                    );
                 }
                 if let Some(c) = self.capture.as_mut() {
                     c.reset();
@@ -372,9 +378,9 @@ impl Snd {
             VIRTIO_SND_R_PCM_RELEASE => {
                 debug!("snd: capture RELEASE — dropping InputStream begin");
                 self.capture = None; // Drop stops + disposes the unit.
-                // The Linux virtio_snd driver's PCM release blocks until every posted rx
-                // I/O buffer has been returned (msg_count == 0). Return them here, or the
-                // guest hangs and the NEXT open times out (device appears wedged).
+                                     // The Linux virtio_snd driver's PCM release blocks until every posted rx
+                                     // I/O buffer has been returned (msg_count == 0). Return them here, or the
+                                     // guest hangs and the NEXT open times out (device appears wedged).
                 self.flush_rx();
                 debug!("snd: capture RELEASE — dropped");
             }
