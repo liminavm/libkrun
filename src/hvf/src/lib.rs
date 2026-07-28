@@ -886,10 +886,8 @@ impl HvfVcpu<'_> {
             icc,
             vtimer_offset: self.read_vtimer_offset()?,
             vtimer_masked: self.read_vtimer_mask()?,
-            pending_irq: self
-                .read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
-            pending_fiq: self
-                .read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
+            pending_irq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
+            pending_fiq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
         })
     }
 
