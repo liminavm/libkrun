@@ -45,7 +45,8 @@ fn device_descriptor() -> Vec<u8> {
     vec![
         0x12, // bLength = 18
         0x01, // bDescriptorType = DEVICE
-        0x00, 0x02, // bcdUSB 2.00
+        0x00,
+        0x02, // bcdUSB 2.00
         0x00, // bDeviceClass (per-interface)
         0x00, // bDeviceSubClass
         0x00, // bDeviceProtocol
@@ -54,7 +55,8 @@ fn device_descriptor() -> Vec<u8> {
         (VID >> 8) as u8,
         (PID & 0xff) as u8,
         (PID >> 8) as u8,
-        0x00, 0x01, // bcdDevice 1.00
+        0x00,
+        0x01, // bcdDevice 1.00
         0x01, // iManufacturer
         0x02, // iProduct
         0x03, // iSerialNumber
@@ -66,21 +68,39 @@ fn device_descriptor() -> Vec<u8> {
 /// 64-byte input report and a 64-byte output report, no report IDs.
 fn report_descriptor() -> Vec<u8> {
     vec![
-        0x06, 0xd0, 0xf1, // Usage Page (0xF1D0, vendor-defined)
-        0x09, 0x01, //       Usage (0x01)
-        0xa1, 0x01, //       Collection (Application)
-        0x09, 0x20, //         Usage (0x20, data in)
-        0x15, 0x00, //         Logical Minimum (0)
-        0x26, 0xff, 0x00, //   Logical Maximum (255)
-        0x75, 0x08, //         Report Size (8)
-        0x95, REPORT_LEN as u8, // Report Count (64)
-        0x81, 0x02, //         Input (Data, Var, Abs)
-        0x09, 0x21, //         Usage (0x21, data out)
-        0x15, 0x00, //         Logical Minimum (0)
-        0x26, 0xff, 0x00, //   Logical Maximum (255)
-        0x75, 0x08, //         Report Size (8)
-        0x95, REPORT_LEN as u8, // Report Count (64)
-        0x91, 0x02, //         Output (Data, Var, Abs)
+        0x06,
+        0xd0,
+        0xf1, // Usage Page (0xF1D0, vendor-defined)
+        0x09,
+        0x01, //       Usage (0x01)
+        0xa1,
+        0x01, //       Collection (Application)
+        0x09,
+        0x20, //         Usage (0x20, data in)
+        0x15,
+        0x00, //         Logical Minimum (0)
+        0x26,
+        0xff,
+        0x00, //   Logical Maximum (255)
+        0x75,
+        0x08, //         Report Size (8)
+        0x95,
+        REPORT_LEN as u8, // Report Count (64)
+        0x81,
+        0x02, //         Input (Data, Var, Abs)
+        0x09,
+        0x21, //         Usage (0x21, data out)
+        0x15,
+        0x00, //         Logical Minimum (0)
+        0x26,
+        0xff,
+        0x00, //   Logical Maximum (255)
+        0x75,
+        0x08, //         Report Size (8)
+        0x95,
+        REPORT_LEN as u8, // Report Count (64)
+        0x91,
+        0x02, //         Output (Data, Var, Abs)
         0xc0, //             End Collection
     ]
 }
@@ -91,50 +111,57 @@ fn config_descriptor() -> Vec<u8> {
     let report_len = report_descriptor().len() as u16;
     let total_len: u16 = 41;
     let mut c = vec![
-        0x09, 0x02, // CONFIGURATION
+        0x09,
+        0x02, // CONFIGURATION
         (total_len & 0xff) as u8,
         (total_len >> 8) as u8, // wTotalLength
-        0x01, // bNumInterfaces
-        0x01, // bConfigurationValue
-        0x00, // iConfiguration
-        0x80, // bmAttributes (bus-powered)
-        0x32, // bMaxPower = 100 mA
+        0x01,                   // bNumInterfaces
+        0x01,                   // bConfigurationValue
+        0x00,                   // iConfiguration
+        0x80,                   // bmAttributes (bus-powered)
+        0x32,                   // bMaxPower = 100 mA
     ];
     // Interface 0: HID, 2 endpoints.
     c.extend_from_slice(&[
-        0x09, 0x04, // INTERFACE
-        0x00, // bInterfaceNumber
-        0x00, // bAlternateSetting
-        0x02, // bNumEndpoints
+        0x09, 0x04,      // INTERFACE
+        0x00,      // bInterfaceNumber
+        0x00,      // bAlternateSetting
+        0x02,      // bNumEndpoints
         CLASS_HID, // bInterfaceClass = HID
-        0x00, // bInterfaceSubClass (no boot)
-        0x00, // bInterfaceProtocol
-        0x04, // iInterface
+        0x00,      // bInterfaceSubClass (no boot)
+        0x00,      // bInterfaceProtocol
+        0x04,      // iInterface
     ]);
     // HID descriptor.
     c.extend_from_slice(&[
-        0x09, DT_HID, // HID
-        0x11, 0x01, // bcdHID 1.11
-        0x00, // bCountryCode
-        0x01, // bNumDescriptors
+        0x09,
+        DT_HID, // HID
+        0x11,
+        0x01,          // bcdHID 1.11
+        0x00,          // bCountryCode
+        0x01,          // bNumDescriptors
         DT_HID_REPORT, // bDescriptorType (report)
         (report_len & 0xff) as u8,
         (report_len >> 8) as u8, // wDescriptorLength
     ]);
     // Interrupt-IN endpoint (0x81), wMaxPacketSize 64, bInterval 5.
     c.extend_from_slice(&[
-        0x07, 0x05, // ENDPOINT
+        0x07,
+        0x05,       // ENDPOINT
         EP_IN_ADDR, // bEndpointAddress
-        0x03, // bmAttributes = interrupt
-        REPORT_LEN as u8, 0x00, // wMaxPacketSize = 64
+        0x03,       // bmAttributes = interrupt
+        REPORT_LEN as u8,
+        0x00, // wMaxPacketSize = 64
         0x05, // bInterval
     ]);
     // Interrupt-OUT endpoint (0x01), wMaxPacketSize 64, bInterval 5.
     c.extend_from_slice(&[
-        0x07, 0x05, // ENDPOINT
+        0x07,
+        0x05,        // ENDPOINT
         EP_OUT_ADDR, // bEndpointAddress
-        0x03, // bmAttributes = interrupt
-        REPORT_LEN as u8, 0x00, // wMaxPacketSize = 64
+        0x03,        // bmAttributes = interrupt
+        REPORT_LEN as u8,
+        0x00, // wMaxPacketSize = 64
         0x05, // bInterval
     ]);
     debug_assert_eq!(c.len(), total_len as usize);
@@ -352,7 +379,10 @@ mod tests {
             },
             out_xfer,
         );
-        assert!(matches!(out_rx.recv().unwrap(), XferOutcome::Ack), "OUT acked");
+        assert!(
+            matches!(out_rx.recv().unwrap(), XferOutcome::Ack),
+            "OUT acked"
+        );
         match in_rx.recv().unwrap() {
             XferOutcome::In(bytes) => {
                 assert_eq!(bytes, report, "held IN echoes the OUT report");
@@ -398,7 +428,9 @@ mod tests {
         let c = Completion::new(move |o| tx.send(o).unwrap());
         // GET_DESCRIPTOR (report), recipient interface.
         let xfer = ControlTransfer::new(
-            crate::usb::model::SetupPacket::from_bytes([0x81, 0x06, 0x00, 0x22, 0x00, 0x00, 0x00, 0x01]),
+            crate::usb::model::SetupPacket::from_bytes([
+                0x81, 0x06, 0x00, 0x22, 0x00, 0x00, 0x00, 0x01,
+            ]),
             Vec::new(),
             c,
         );
@@ -427,12 +459,17 @@ mod tests {
         let (tx, ctl_rx) = mpsc::channel();
         let c = Completion::new(move |o| tx.send(o).unwrap());
         let xfer = ControlTransfer::new(
-            crate::usb::model::SetupPacket::from_bytes([0x21, 0x09, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00]),
+            crate::usb::model::SetupPacket::from_bytes([
+                0x21, 0x09, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00,
+            ]),
             report.clone(),
             c,
         );
         dev.handle_control(xfer);
-        assert!(matches!(ctl_rx.recv().unwrap(), XferOutcome::Ack), "SET_REPORT acked");
+        assert!(
+            matches!(ctl_rx.recv().unwrap(), XferOutcome::Ack),
+            "SET_REPORT acked"
+        );
         match in_rx.recv().unwrap() {
             XferOutcome::In(bytes) => assert_eq!(bytes, report),
             other => panic!("expected In, got {other:?}"),
