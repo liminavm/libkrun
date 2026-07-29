@@ -409,6 +409,12 @@ impl Worker {
         // limina (#8): retired present fences wake this fd; -1 (never matched) when
         // the renderer is absent.
         let present_ev_fd = virtio_gpu.present_event_fd().unwrap_or(-1);
+        // limina (vrend fence honesty): virglrenderer's poll eventfd. vrend's sync thread
+        // parks in `wait_sync` whenever GL queries are pending until this thread (the GL
+        // thread) pumps `virgl_renderer_poll()`; unpumped, every fence behind the parked
+        // one wedges — which matters now that a vrend session's Global-ring fences route
+        // through virglrenderer (see `vrend_ctx_seen`). -1 when there's no renderer.
+        let renderer_poll_fd = virtio_gpu.renderer_poll_fd().unwrap_or(-1);
 
         // A stop signal left over from a Deactivate that arrived while we were inactive (the
         // outer loop consumed the command but not the kick) just produces one spurious wake
@@ -440,6 +446,13 @@ impl Worker {
                 ControlOperation::Add,
                 present_ev_fd,
                 &EpollEvent::new(EventSet::IN, present_ev_fd as u64),
+            );
+        }
+        if renderer_poll_fd >= 0 {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                renderer_poll_fd,
+                &EpollEvent::new(EventSet::IN, renderer_poll_fd as u64),
             );
         }
 
@@ -636,6 +649,12 @@ impl Worker {
                 // limina (#8): present fences retired — show their parked frames.
                 if present_ev_fd >= 0 && source == present_ev_fd {
                     virtio_gpu.process_retired_presents();
+                }
+                // limina (vrend fence honesty): vrend's sync thread asked for a GL-thread
+                // query check — pump virgl_renderer_poll() (flushes the eventfd, checks
+                // pending queries, signals the parked sync thread).
+                if renderer_poll_fd >= 0 && source == renderer_poll_fd {
+                    virtio_gpu.renderer_event_poll();
                 }
             }
             if let Some(p) = wake_probe.as_mut() {
