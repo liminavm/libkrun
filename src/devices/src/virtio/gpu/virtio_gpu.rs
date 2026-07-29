@@ -403,6 +403,25 @@ pub struct VirtioGpu {
     /// (pixels included), carried in the snapshot payload so a restored session
     /// keeps its cursor (UPDATE/MOVE_CURSOR are not journaled ops).
     cursor_state: Option<super::journal::CursorSnapshot>,
+    /// limina (vrend fence honesty): the renderer's poll eventfd, held for the device's
+    /// lifetime (it's a dup that closes on drop). vrend's sync thread parks in `wait_sync`
+    /// whenever GL queries are pending until someone pumps `virgl_renderer_poll()` on the
+    /// GL thread — the gpu worker registers this fd in its epoll and calls
+    /// [`Self::renderer_event_poll`] when it fires. venus never needed the pump (its
+    /// fences ride `write_context_fence` from the render server), which is why it was
+    /// never wired before Global-ring fences routed through virglrenderer.
+    renderer_poll: Option<rutabaga_gfx::RutabagaDescriptor>,
+    /// limina: true once any non-venus (vrend/GL) 3D context exists this session. From
+    /// that point Global-ring fences route through virglrenderer's GL timeline
+    /// (`virgl_renderer_create_fence` → glFenceSync → ASYNC_FENCE_CB → fence handler)
+    /// instead of being marked completed at decode: a vrend guest's `glFinish` must wait
+    /// for real GL/Metal completion. (Sync-marking every Global fence made vrend fences
+    /// loose — crossmark 2026-07-28 measured a stock guest's fenced desktop frame
+    /// "faster" than host-native references.) Before any vrend context — firmware GOP,
+    /// venus-only sessions, software-2D — the sync mark keeps its wedge-free behavior
+    /// and the hot venus scanout-flush path stays untouched. Reset with the session;
+    /// snapshot restore re-derives it by replaying CtxCreate through `create_context`.
+    vrend_ctx_seen: bool,
 }
 
 /// The per-activation transport the fence handler retires guest fences into.
@@ -777,8 +796,14 @@ impl VirtioGpu {
 
         let journal = GpuJournal::new(trace.clone());
 
+        // See the `renderer_poll` field doc: vrend's query-check pump. Only virglrenderer
+        // components expose a descriptor; None everywhere else keeps the worker's epoll
+        // unchanged.
+        let renderer_poll = rutabaga.as_ref().and_then(|r| r.poll_descriptor());
+
         Self {
             rutabaga,
+            renderer_poll,
             resources: Default::default(),
             sw2d: Default::default(),
             fence_state,
@@ -791,6 +816,7 @@ impl VirtioGpu {
             trace,
             journal,
             cursor_state: None,
+            vrend_ctx_seen: false,
         }
     }
 
@@ -798,6 +824,25 @@ impl VirtioGpu {
     /// sites and the fence handler, read by the tick reporter).
     pub fn trace(&self) -> &Arc<GpuTraceStats> {
         &self.trace
+    }
+
+    /// limina (vrend fence honesty): the renderer's poll eventfd for the worker's epoll,
+    /// or `None` when the renderer is absent or isn't virglrenderer. See `renderer_poll`.
+    pub fn renderer_poll_fd(&self) -> Option<i32> {
+        use rutabaga_gfx::AsRawDescriptor;
+        // The raw fd of the descriptor we hold — `renderer_poll` outlives every borrower
+        // (device lifetime), so handing out the raw fd is safe; no dup (a dropped clone
+        // would close it).
+        self.renderer_poll.as_ref().map(|d| d.as_raw_descriptor())
+    }
+
+    /// limina (vrend fence honesty): pump `virgl_renderer_poll()` — flushes the poll
+    /// eventfd, runs vrend's pending GL query checks on this (the GL) thread, and signals
+    /// the sync thread parked in `wait_sync`. Must be called from the gpu worker thread.
+    pub fn renderer_event_poll(&self) {
+        if let Some(r) = self.rutabaga.as_ref() {
+            r.event_poll();
+        }
     }
 
     /// limina M9.3 P0: the rutabaga-layer snapshot-replay journal (worker thread only).
@@ -1345,6 +1390,9 @@ impl VirtioGpu {
         self.journal.reset();
         // The cursor belonged to the dropped session; the re-initialized guest re-sets it.
         self.cursor_state = None;
+        // The dropped session's contexts are gone; Global-ring fence routing returns to
+        // the sync mark until the next session creates a vrend context.
+        self.vrend_ctx_seen = false;
         {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
@@ -2508,6 +2556,18 @@ impl VirtioGpu {
                 e
             })?;
         info!("CTX_CREATE ctx={ctx_id} init={context_init:#x} name={context_name:?}");
+        // A non-venus context means a vrend/GL guest is live: from here on, Global-ring
+        // fences must retire through virglrenderer's GL timeline, not the decode-time
+        // sync mark (see `vrend_ctx_seen`). capset id lives in the low byte of
+        // context_init; 0 = the pre-CONTEXT_INIT default, which is also virgl.
+        let capset_id = context_init & 0xff;
+        if capset_id != rutabaga_gfx::RUTABAGA_CAPSET_VENUS && !self.vrend_ctx_seen {
+            self.vrend_ctx_seen = true;
+            info!(
+                "vrend context ctx={ctx_id} (capset {capset_id}): \
+                 Global-ring fences now retire through virglrenderer"
+            );
+        }
         Ok(OkNoData)
     }
 
@@ -2620,14 +2680,35 @@ impl VirtioGpu {
         // descriptor immediately instead of parking it forever (which would hang any guest
         // that fences a 2D command, e.g. GTK4, or the EDK2 firmware GOP).
         //
-        // Only context-specific fences belong to a real 3D context and go to rutabaga. In the
-        // coexist device (software-2D 2D + VENUS|NO_VIRGL 3D) a venus rutabaga is present but
-        // cannot fence the Global ring (ctx 0 isn't a venus context) — routing a 2D fence there
-        // fails with ComponentError and wedges the firmware. So: Global ring -> sync, always;
-        // context ring -> rutabaga (falling back to sync if somehow there is no renderer).
+        // Context-specific fences belong to a real 3D context and go to rutabaga. Global-ring
+        // fences are two different animals depending on the session:
+        //  - Before any vrend context exists (firmware GOP, venus-only sessions, software-2D):
+        //    every Global-ring command completes synchronously before its response is encoded,
+        //    so mark the fence completed up-front. Routing it to a venus-only rutabaga would
+        //    fail with ComponentError and wedge the firmware (ctx 0 isn't a venus context).
+        //  - Once a vrend context exists (`vrend_ctx_seen`): the guest's GL work retires
+        //    asynchronously on the host GPU, so Global-ring fences MUST go through
+        //    virglrenderer (`virgl_renderer_create_fence` → glFenceSync on the sync thread →
+        //    ASYNC_FENCE_CB → fence handler), or a stock guest's glFinish returns at decode
+        //    time — loose fences, measured "faster than host-native" (crossmark 2026-07-28).
+        //    All Global fences must then take the one GL timeline: mixing sync-marked and
+        //    async fences on a single ring could retire a younger fence's watermark past an
+        //    older in-flight one. 2D fences riding the GL timeline is upstream semantics
+        //    (their work already completed synchronously; the sync only adds ordering).
         let context_ring = rutabaga_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0;
         match self.rutabaga.as_mut() {
             Some(rutabaga) if context_ring => rutabaga.create_fence(rutabaga_fence)?,
+            Some(rutabaga) if self.vrend_ctx_seen => {
+                if let Err(e) = rutabaga.create_fence(rutabaga_fence) {
+                    // Never wedge on a renderer refusal: fall back to the sync mark (the
+                    // pre-vrend behavior) and say so once per incident class in the log.
+                    warn!(
+                        "global fence {} (ctx {}) refused by renderer ({e}); completing sync",
+                        rutabaga_fence.fence_id, rutabaga_fence.ctx_id
+                    );
+                    mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                }
+            }
             _ => mark_fence_completed_sync(&self.fence_state, &rutabaga_fence),
         }
         Ok(OkNoData)
