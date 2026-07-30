@@ -1078,6 +1078,12 @@ impl Worker {
                             };
                             // limina (#8 half 2): only a flush's fence may be held for
                             // fence-accurate presents.
+                            if std::env::var_os("LIMINA_GPU_TEST_TRACE_FENCES").is_some() {
+                                warn!(
+                                    "FENCECMD id={fence_id} ctx={ctx_id} ring={ring_idx} \
+                                     cmd={cmd:?}"
+                                );
+                            }
                             let is_flush = matches!(cmd, GpuCommand::ResourceFlush(_));
                             gpu_response = match virtio_gpu.create_fence(fence, is_flush) {
                                 Ok(_) => gpu_response,
