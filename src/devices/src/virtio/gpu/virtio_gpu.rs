@@ -2692,6 +2692,27 @@ impl VirtioGpu {
         self.create_fence_inner(rutabaga_fence)
     }
 
+    /// limina TEST SEAM: file-armed "fail the next context-ring fence" fault injection.
+    /// `LIMINA_GPU_TEST_FAIL_FENCE_FILE=<path>` (set at worker start) names a trigger
+    /// file; when it EXISTS at context-fence creation, it is consumed (unlinked) and the
+    /// fence takes the failure path — exactly the way a fenced submit decoded against a
+    /// wiped session fails. Lets the `venus_fence_lost` L2 guard poison a *chosen* fence
+    /// mid-run (the last one on its ring: a later healthy fence would mask the loss,
+    /// since the guest driver signals everything at-or-below the newest signaled id).
+    /// No-op unless the env var is set; the stat runs only for context-ring fences.
+    fn test_take_fail_next_fence() -> bool {
+        static TRIGGER: std::sync::OnceLock<Option<std::path::PathBuf>> =
+            std::sync::OnceLock::new();
+        let Some(path) = TRIGGER
+            .get_or_init(|| std::env::var_os("LIMINA_GPU_TEST_FAIL_FENCE_FILE").map(Into::into))
+        else {
+            return false;
+        };
+        // Consume-by-unlink makes the injection one-shot per arming; a lost race just
+        // means the other fence took the poison, which is equally valid.
+        std::fs::remove_file(path).is_ok()
+    }
+
     fn create_fence_inner(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
         // Route the fence by ring. Software-2D (Global-ring) commands finish synchronously
         // before their response is encoded, so the fence is already signaled by the time we
@@ -2716,7 +2737,45 @@ impl VirtioGpu {
         //    (their work already completed synchronously; the sync only adds ordering).
         let context_ring = rutabaga_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0;
         match self.rutabaga.as_mut() {
-            Some(rutabaga) if context_ring => rutabaga.create_fence(rutabaga_fence)?,
+            Some(rutabaga) if context_ring => {
+                // limina TEST SEAM (`venus_fence_lost` L2): fail exactly one context-ring
+                // fence, exactly the way a fenced submit decoded against a wiped session
+                // fails (couve 2026-07-30: s2idle resume wipe → `create_fence 30247 ->
+                // ErrRutabaga(InvalidContextId)`). Armed by LIMINA_GPU_TEST_FAIL_NEXT_FENCE.
+                // Seam scope: queue rings only (ring_idx != 0). A venus submit emits a
+                // CPU-ring (ring 0) kick fence immediately before the queue fence-out
+                // that backs any exported sync_file — poisoning the kick proves nothing.
+                let injected = rutabaga_fence.ring_idx != 0 && Self::test_take_fail_next_fence();
+                if std::env::var_os("LIMINA_GPU_TEST_TRACE_FENCES").is_some() {
+                    warn!(
+                        "CTXFENCE id={} ctx={} ring={} injected={injected}",
+                        rutabaga_fence.fence_id, rutabaga_fence.ctx_id, rutabaga_fence.ring_idx
+                    );
+                }
+                let res = if injected {
+                    Err(rutabaga_gfx::RutabagaError::InvalidContextId)
+                } else {
+                    rutabaga.create_fence(rutabaga_fence)
+                };
+                if let Err(e) = res {
+                    // A guest fence must never vanish: the guest's dma_fence has no
+                    // timeout and no error path, and a KMS commit waiting on it wedges
+                    // the DRM device for every later session (the §22 wedge, caught
+                    // live 2026-07-30: the fail-closed resume wipe made this replayed
+                    // fence unfulfillable, and the parked response withheld even the
+                    // error from the guest). Retire it as lost instead: bump the ring
+                    // watermark so process_fence() delivers the error response
+                    // immediately — the guest driver signals the fence from the
+                    // response itself, error or not.
+                    warn!(
+                        "context fence {} (ctx {} ring {}) refused by renderer ({e}); \
+                         retiring as lost",
+                        rutabaga_fence.fence_id, rutabaga_fence.ctx_id, rutabaga_fence.ring_idx
+                    );
+                    mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                    return Err(e.into());
+                }
+            }
             Some(rutabaga) if self.vrend_ctx_seen => {
                 if let Err(e) = rutabaga.create_fence(rutabaga_fence) {
                     // Never wedge on a renderer refusal: fall back to the sync mark (the
