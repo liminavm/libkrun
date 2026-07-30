@@ -1428,6 +1428,25 @@ impl VirtioGpu {
         }
     }
 
+    /// What the present-fence plumbing still holds, for the defer-and-classify WARN —
+    /// the couve 2026-07-30 wipe logged "NOT quiescent (0 outstanding fence(s): 0)",
+    /// which read as a contradiction because only the FENCE half was summarized; the
+    /// non-quiescent half (this one) was invisible.
+    pub fn present_pending_summary(&self) -> String {
+        let Some(pf) = self.present_fence.as_ref() else {
+            return "present: none".to_string();
+        };
+        format!(
+            "present: {} parked, {} parked-flush-cookies, {} guest-holds, \
+             {} awaiting-shown, {} retired-unprocessed",
+            pf.parked.len(),
+            pf.flush_parked_cookies.len(),
+            pf.guest_holds.len(),
+            pf.awaiting_shown.len(),
+            pf.retired.lock().unwrap().len(),
+        )
+    }
+
     // Non-public function -- no doc comment needed!
     fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
         let Some(rutabaga) = self.rutabaga.as_ref() else {

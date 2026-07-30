@@ -275,11 +275,19 @@ impl Worker {
             //   only this wipe destroyed it.
             // - Shutdown (device drop / VMM teardown): wipe as before — teardown ordering
             //   frees per-session state while the renderer thread is still alive.
-            *self.active.lock().unwrap() = None;
-
             match exit {
                 InnerExit::Deactivate => {
-                    Self::drain_fences(&virtio_gpu);
+                    // Drain BEFORE unbinding the transport (§22 hardening, 2026-07-30):
+                    // fence retirement (the async fence callbacks), the guest-hold latch
+                    // (500 ms ceiling) and the present pump all need the live activation —
+                    // once `active` is cleared the fence handler drops completions on the
+                    // floor, so the old post-unbind drain could only ever succeed
+                    // vacuously. Draining here lets a session that was merely MID-FRAME
+                    // at the reset become quiescent and PARK instead of losing its whole
+                    // venus world: the couve aborted-sleep wipe was an s2idle entry
+                    // landing inside the compositor's fade-out animation.
+                    Self::drain_for_classify(&mut virtio_gpu);
+                    *self.active.lock().unwrap() = None;
                     let (outstanding, summary) = virtio_gpu.outstanding_fences();
                     if outstanding == 0 && virtio_gpu.present_quiescent() {
                         parked_session = true;
@@ -290,19 +298,51 @@ impl Worker {
                     } else {
                         warn!(
                             "gpu worker: device reset with the session NOT quiescent \
-                             ({outstanding} outstanding fence(s){}{summary}) — wiping \
+                             (fences: {outstanding} outstanding [{summary}]; {}) — wiping \
                              (fail-closed)",
-                            if summary.is_empty() { "" } else { ": " }
+                            virtio_gpu.present_pending_summary()
                         );
                         virtio_gpu.reset_session();
                     }
                     continue;
                 }
                 InnerExit::Shutdown => {
+                    *self.active.lock().unwrap() = None;
                     virtio_gpu.reset_session();
                     return;
                 }
             }
+        }
+    }
+
+    /// limina (§22 hardening): bounded present+fence drain before classifying a device
+    /// reset, run with the activation still bound. Pumps retired presents (this thread
+    /// owns the display backend, same as the service loop's present_ev handling) while
+    /// the async fence callbacks and the guest-hold latch retire the rest. The deadline
+    /// comfortably covers the guest-hold ceiling (500 ms) plus a shown-ack round trip;
+    /// a session that cannot drain (a guest that died mid-frame) pays it once and takes
+    /// the fail-closed wipe exactly as before.
+    fn drain_for_classify(virtio_gpu: &mut VirtioGpu) {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(1500);
+        loop {
+            virtio_gpu.process_retired_presents();
+            let (outstanding, _) = virtio_gpu.outstanding_fences();
+            if outstanding == 0 && virtio_gpu.present_quiescent() {
+                info!(
+                    "gpu worker: reset drain quiesced in {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "gpu worker: reset drain timed out after {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
