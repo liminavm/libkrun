@@ -66,8 +66,10 @@ pub struct EdidIdentity {
 pub struct RefreshRange {
     pub min_vertical_hz: u8,
     pub max_vertical_hz: u8,
-    pub min_horizontal_khz: u8,
-    pub max_horizontal_khz: u8,
+    /// Horizontal rates in kHz. Wider than the descriptor's byte on purpose: EDID 1.4
+    /// carries a +255 kHz offset flag per bound, and a 4K panel at 120 Hz needs it.
+    pub min_horizontal_khz: u16,
+    pub max_horizontal_khz: u16,
     /// Maximum pixel clock in MHz; stored in the descriptor rounded up to a 10 MHz step.
     pub max_pixel_clock_mhz: u32,
 }
