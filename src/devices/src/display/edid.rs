@@ -397,12 +397,16 @@ fn string_descriptor(tag: u8, text: [u8; 13]) -> [u8; DESCRIPTOR_LEN] {
 fn range_limits_descriptor(range: &RefreshRange) -> [u8; DESCRIPTOR_LEN] {
     let mut block = [0u8; DESCRIPTOR_LEN];
     block[0..4].copy_from_slice(&[0x00, 0x00, 0x00, TAG_RANGE_LIMITS]);
-    // Offset flags: no 255 Hz/kHz offsets — our ranges fit in a byte.
-    block[4] = 0x00;
+    // Byte 4 is the EDID 1.4 offset-flags byte: a set bit means "add 255 to this bound".
+    // The horizontal rates need it — a 4K panel at 120 Hz is 265 kHz, past what the byte
+    // holds — and understating the bound would have the guest prune a mode we advertise.
+    let (min_h, min_h_offset) = split_offset(range.min_horizontal_khz);
+    let (max_h, max_h_offset) = split_offset(range.max_horizontal_khz);
+    block[4] = (u8::from(min_h_offset) << 2) | (u8::from(max_h_offset) << 3);
     block[5] = range.min_vertical_hz;
     block[6] = range.max_vertical_hz;
-    block[7] = range.min_horizontal_khz;
-    block[8] = range.max_horizontal_khz;
+    block[7] = min_h;
+    block[8] = max_h;
     // Max pixel clock, in 10 MHz steps, rounded *up* so the advertised limit never sits below
     // a mode we also advertise.
     block[9] = range.max_pixel_clock_mhz.div_ceil(10).min(0xFF) as u8;
@@ -411,6 +415,15 @@ fn range_limits_descriptor(range: &RefreshRange) -> [u8; DESCRIPTOR_LEN] {
     block[11] = 0x0A;
     block[12..].fill(0x20);
     block
+}
+
+/// Split a range bound into the descriptor's byte plus its "+255" offset flag, saturating at
+/// the 510 the encoding can express at all.
+fn split_offset(value: u16) -> (u8, bool) {
+    match value {
+        0..=255 => (value as u8, false),
+        _ => ((value - 255).min(255) as u8, true),
+    }
 }
 
 /// The "unused descriptor" filler (§3.10.3.11).
@@ -798,7 +811,10 @@ mod tests {
         // "EDID extensions block checksum isn't for us": the structure spans [1, 127).
         let bytes = ext[2] as usize;
         let dispid_length = DISPLAYID_HEADER_LEN + bytes + 1;
-        assert!(dispid_length <= 127 - 1, "DisplayID structure overruns the block");
+        assert!(
+            dispid_length <= 127 - 1,
+            "DisplayID structure overruns the block"
+        );
         let csum = ext[1..1 + dispid_length]
             .iter()
             .fold(0u8, |acc, b| acc.wrapping_add(*b));
@@ -812,11 +828,14 @@ mod tests {
             let num_bytes = ext[idx + 2] as usize;
             assert!(idx + DISPLAYID_BLOCK_HEADER_LEN + num_bytes <= end);
             if tag == DISPLAYID_BLOCK_TYPE_7 {
-                assert_eq!(num_bytes % 20, 0, "the kernel drops a block that isn't a multiple of 20");
+                assert_eq!(
+                    num_bytes % 20,
+                    0,
+                    "the kernel drops a block that isn't a multiple of 20"
+                );
                 for t in 0..num_bytes / 20 {
                     let b = &ext[idx + DISPLAYID_BLOCK_HEADER_LEN + t * 20..];
-                    let clock_khz =
-                        (b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16) + 1;
+                    let clock_khz = (b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16) + 1;
                     let field = |at: usize| (b[at] as u32 | (b[at + 1] as u32) << 8) + 1;
                     let hactive = field(4);
                     let hblank = field(6);
@@ -1165,14 +1184,21 @@ mod tests {
         let edid = build(3024, 1964, &params);
 
         assert_eq!(edid.len(), 256, "an extension block must be appended");
-        assert!(checksum_is_valid(&edid[..128]), "base checksum covers byte 126");
+        assert!(
+            checksum_is_valid(&edid[..128]),
+            "base checksum covers byte 126"
+        );
         assert!(checksum_is_valid(&edid[128..]));
 
         // The base block still carries the mode at the *size* the guest is being driven to —
         // that is what `virtio_gpu_conn_mode_valid` matches against — with a clamped refresh.
         let base = decode_detailed(descriptor(&edid, 0));
         assert_eq!((base.0, base.1), (3024, 1964));
-        assert!(base.2 < 120, "the base timing is necessarily clamped, got {}", base.2);
+        assert!(
+            base.2 < 120,
+            "the base timing is necessarily clamped, got {}",
+            base.2
+        );
 
         // ...and the extension carries the truth, marked preferred so it sorts ahead of it.
         let timings = decode_displayid(&edid);
@@ -1207,7 +1233,11 @@ mod tests {
         };
         let edid = build(3024, 1964, &params);
         let timings = decode_displayid(&edid);
-        assert_eq!(timings, vec![(3024, 1964, 120, true)], "only the 120 Hz mode overflows");
+        assert_eq!(
+            timings,
+            vec![(3024, 1964, 120, true)],
+            "only the 120 Hz mode overflows"
+        );
         // The 60 Hz alt is still an ordinary base descriptor (slot 2: no range is set here,
         // so the alt timing follows the product name directly).
         assert_eq!(decode_detailed(descriptor(&edid, 2)), (3024, 1964, 60));
@@ -1249,5 +1279,41 @@ mod tests {
         assert!(ext[1 + DISPLAYID_HEADER_LEN + ext[2] as usize + 1..127]
             .iter()
             .all(|b| *b == 0));
+    }
+
+    /// A horizontal rate past 255 kHz — a 4K panel at 120 Hz — must ride the EDID 1.4 "+255"
+    /// offset flag rather than clamp, or the guest prunes the very mode we advertise.
+    #[test]
+    fn a_horizontal_rate_over_the_byte_uses_the_offset_flag() {
+        assert_eq!(split_offset(242), (242, false));
+        assert_eq!(split_offset(255), (255, false));
+        assert_eq!(split_offset(265), (10, true));
+        assert_eq!(split_offset(510), (255, true));
+        // Past what the encoding can express at all: saturate rather than wrap.
+        assert_eq!(split_offset(9000), (255, true));
+
+        let range = RefreshRange {
+            min_vertical_hz: 48,
+            max_vertical_hz: 120,
+            min_horizontal_khz: 106,
+            max_horizontal_khz: 265,
+            max_pixel_clock_mhz: 1200,
+        };
+        let params = EdidParams {
+            identity: Some(identity()),
+            range: Some(range),
+            ..EdidParams::default()
+        };
+        let edid = build(3840, 2160, &params);
+        let block = descriptor(&edid, 2);
+        assert_eq!(block[3], TAG_RANGE_LIMITS);
+        assert_eq!(block[4], 1 << 3, "only the max-horizontal offset is set");
+        assert_eq!(block[7], 106, "the min fits the byte untouched");
+        assert_eq!(block[8], 10, "265 - 255");
+        assert_eq!(
+            block[5..7],
+            [48, 120],
+            "vertical rates never need the offset"
+        );
     }
 }
