@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,6 +23,7 @@ use super::protocol::{
 use super::virtio_gpu::{GpuActivation, VirtioGpu};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
+use crate::virtio::gpu::device::DisplayUpdate;
 use crate::virtio::gpu::protocol::{
     VIRTIO_GPU_EVENT_DISPLAY, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
 };
@@ -90,8 +92,9 @@ pub struct Worker {
     events_read: Arc<AtomicU32>,
     /// Wakes the service loop's epoll when a resize is pending (shared with the device + handle).
     resize_evt: Arc<EventFd>,
-    /// The pending resize `(display_id, width, height)`, taken on a `resize_evt` wake.
-    resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    /// Queued display updates; one is taken per `resize_evt` wake so each reaches the guest
+    /// as its own config-change event.
+    resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
     /// limina M9.3: a staged GPU snapshot payload ('LGPU'), taken and replayed on the next
     /// activation. Staged by the restore path; the guest's thaw resets the device (bus
     /// fallback: reset → features → DRIVER_OK), so replay must run AFTER that reset's
@@ -117,7 +120,7 @@ impl Worker {
         display_backend: DisplayBackend<'static>,
         events_read: Arc<AtomicU32>,
         resize_evt: Arc<EventFd>,
-        resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+        resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
         pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
         restore_done: Arc<(Mutex<bool>, Condvar)>,
     ) -> Self {
@@ -329,10 +332,7 @@ impl Worker {
             virtio_gpu.process_retired_presents();
             let (outstanding, _) = virtio_gpu.outstanding_fences();
             if outstanding == 0 && virtio_gpu.present_quiescent() {
-                info!(
-                    "gpu worker: reset drain quiesced in {:?}",
-                    start.elapsed()
-                );
+                info!("gpu worker: reset drain quiesced in {:?}", start.elapsed());
                 return;
             }
             if std::time::Instant::now() >= deadline {
@@ -636,14 +636,33 @@ impl Worker {
                 // re-modesets (the backend reallocates on the resulting SET_SCANOUT geometry).
                 if source == resize_ev_fd {
                     let _ = self.resize_evt.read();
-                    let pending = self.resize_pending.lock().unwrap().take();
-                    if let Some((id, w, h)) = pending {
-                        virtio_gpu.set_display_size(id, w, h);
+                    // Exactly one update per wake: a connect/disconnect pair must reach the
+                    // guest as two distinct config-change events, or it would only ever observe
+                    // the final state and never notice the display went away. Anything still
+                    // queued re-kicks the eventfd so the next loop iteration picks it up.
+                    let (pending, more) = {
+                        let mut queue = self.resize_pending.lock().unwrap();
+                        (queue.pop_front(), !queue.is_empty())
+                    };
+                    if let Some(update) = pending {
+                        let id = update.display_id;
+                        if let Some((w, h)) = update.size {
+                            virtio_gpu.set_display_size(id, w, h);
+                        }
+                        if let Some(params) = update.edid {
+                            virtio_gpu.set_display_edid(id, params);
+                        }
+                        if let Some(connected) = update.connected {
+                            virtio_gpu.set_display_connected(id, connected);
+                        }
                         self.events_read
                             .fetch_or(VIRTIO_GPU_EVENT_DISPLAY, Ordering::SeqCst);
                         if let Err(e) = interrupt.try_signal_config_change() {
-                            error!("display resize: failed to signal config change: {e:?}");
+                            error!("display update: failed to signal config change: {e:?}");
                         }
+                    }
+                    if more {
+                        let _ = self.resize_evt.write(1);
                     }
                 }
                 // limina (#8): present fences retired — show their parked frames.
