@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender as CmdSender;
@@ -19,7 +20,7 @@ use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
 use super::virtio_gpu::GpuActivation;
 use super::worker::{Worker, WorkerCmd};
-use crate::display::DisplayInfo;
+use crate::display::{DisplayInfo, EdidParams};
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
 #[cfg(target_os = "macos")]
@@ -49,40 +50,96 @@ const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
     [QueueConfig::new(QUEUE_SIZE); defs::NUM_QUEUES];
 
-/// limina: a cloneable, thread-safe handle that lets the host push a runtime display resize
+/// limina: one runtime change to a scanout. Every field is optional so callers can push a
+/// resize, a new EDID, or a connect/disconnect independently — or all three at once, which is
+/// what moving the window to another host display does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DisplayUpdate {
+    /// The scanout to change.
+    pub display_id: u32,
+    /// New preferred mode, in pixels.
+    pub size: Option<(u32, u32)>,
+    /// New EDID parameters — identity, mode list and refresh range. Only meaningful for a
+    /// display whose EDID is generated (a caller-provided raw blob is left alone).
+    pub edid: Option<EdidParams>,
+    /// New connection state. `false` makes the guest's connector report *disconnected*
+    /// (`virtio_gpu_conn_detect` keys on exactly this), which is a genuine unplug.
+    pub connected: Option<bool>,
+}
+
+impl DisplayUpdate {
+    /// Can `next` be folded into this pending update instead of being queued behind it?
+    ///
+    /// Only for same-display updates that don't change connection state: each connectivity
+    /// change has to reach the guest as its own event, or a disconnect immediately followed by
+    /// a reconnect would collapse into "nothing happened" and the guest would never see the
+    /// unplug.
+    fn can_merge(&self, next: &DisplayUpdate) -> bool {
+        self.display_id == next.display_id && self.connected.is_none() && next.connected.is_none()
+    }
+
+    fn merge(&mut self, next: DisplayUpdate) {
+        if next.size.is_some() {
+            self.size = next.size;
+        }
+        if next.edid.is_some() {
+            self.edid = next.edid;
+        }
+    }
+}
+
+/// limina: a cloneable, thread-safe handle that lets the host push a runtime display change
 /// into the live GPU device after boot, from any thread (the supervisor's window-resize gesture
-/// funnels here via limina-vmm). Mechanism only — *policy* (when, and to what size) lives in
-/// limina. Obtained from [`Gpu::display_resize_handle`] before boot and held by limina-vmm.
+/// and display-migration tracker funnel here via limina-vmm). Mechanism only — *policy* (when,
+/// to what size, with which identity) lives in limina. Obtained from
+/// [`Gpu::display_resize_handle`] before boot and held by limina-vmm.
 ///
-/// A `request` stores the new dimensions and kicks the GPU worker's eventfd; the worker applies
-/// it to `displays[id]`, sets the config-space display-event bit, and raises a virtio-gpu
-/// config-change interrupt so the guest re-reads `GET_DISPLAY_INFO` and re-modesets. See
-/// `docs/design/runtime-display-resize.md`.
+/// A request is queued and kicks the GPU worker's eventfd; the worker applies it to
+/// `displays[id]`, sets the config-space display-event bit, and raises a virtio-gpu
+/// config-change interrupt so the guest re-reads `GET_DISPLAY_INFO` + `GET_EDID` and
+/// re-probes the connector. See `docs/design/runtime-display-resize.md` and
+/// `docs/design/stable-edid-hotplug.md`.
 #[derive(Clone)]
 pub struct DisplayResizeHandle {
     /// Wakes the GPU worker's epoll loop; shared (same eventfd object) with the worker.
     resize_evt: Arc<EventFd>,
-    /// The latest pending request `(display_id, width, height)`; the worker takes it on wake.
-    pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    /// Queued updates; the worker takes **one** per wake so that each reaches the guest as its
+    /// own config-change event. Consecutive updates that only change mode/EDID for the same
+    /// display are merged on push, so a burst of resizes still costs one modeset.
+    pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
     /// Number of scanouts, for validating `display_id` host-side.
     num_displays: usize,
 }
 
 impl DisplayResizeHandle {
-    /// Request the guest reflow scanout `display_id` to `width`×`height`. Stores the request
-    /// (coalescing with any not-yet-applied one) and kicks the GPU worker. Returns `false`
-    /// (logged) if `display_id` is out of range or the worker can't be woken.
+    /// Request the guest reflow scanout `display_id` to `width`×`height`.
     pub fn request(&self, display_id: u32, width: u32, height: u32) -> bool {
-        if display_id as usize >= self.num_displays {
+        self.update(DisplayUpdate {
+            display_id,
+            size: Some((width, height)),
+            ..Default::default()
+        })
+    }
+
+    /// Queue an arbitrary display change and kick the GPU worker. Returns `false` (logged) if
+    /// `display_id` is out of range or the worker can't be woken.
+    pub fn update(&self, update: DisplayUpdate) -> bool {
+        if update.display_id as usize >= self.num_displays {
             error!(
-                "display resize: invalid display id {display_id} (have {})",
-                self.num_displays
+                "display update: invalid display id {} (have {})",
+                update.display_id, self.num_displays
             );
             return false;
         }
-        *self.pending.lock().unwrap() = Some((display_id, width, height));
+        {
+            let mut pending = self.pending.lock().unwrap();
+            match pending.back_mut() {
+                Some(last) if last.can_merge(&update) => last.merge(update),
+                _ => pending.push_back(update),
+            }
+        }
         if let Err(e) = self.resize_evt.write(1) {
-            error!("display resize: failed to kick gpu worker: {e}");
+            error!("display update: failed to kick gpu worker: {e}");
             return false;
         }
         true
@@ -116,9 +173,8 @@ pub struct Gpu {
     events_read: Arc<AtomicU32>,
     /// Wakes the worker to apply a pending resize; cloned into the worker and the handle.
     resize_evt: Arc<EventFd>,
-    /// The latest pending resize `(display_id, width, height)`; set by the handle, taken by
-    /// the worker.
-    resize_pending: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    /// Queued display updates; pushed by the handle, taken one per wake by the worker.
+    resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
     /// limina M9.3: a staged GPU snapshot payload, set by the restore path and replayed by
     /// the worker on the next activation (after the guest thaw's device reset).
     pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
@@ -165,7 +221,7 @@ impl Gpu {
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?,
             events_read: Arc::new(AtomicU32::new(0)),
             resize_evt: Arc::new(EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?),
-            resize_pending: Arc::new(Mutex::new(None)),
+            resize_pending: Arc::new(Mutex::new(VecDeque::new())),
             pending_restore: Arc::new(Mutex::new(None)),
             restore_done: Arc::new((Mutex::new(true), Condvar::new())),
             thaw_activation: false,
@@ -623,5 +679,93 @@ mod tests {
 
         // Drop joins the worker (Shutdown + stop_fd kick); a broken teardown would hang here.
         drop(gpu);
+    }
+
+    fn test_handle(num_displays: usize) -> DisplayResizeHandle {
+        DisplayResizeHandle {
+            resize_evt: Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            num_displays,
+        }
+    }
+
+    fn queued(handle: &DisplayResizeHandle) -> Vec<DisplayUpdate> {
+        handle.pending.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// A burst of resizes must collapse into one update — otherwise a window drag would cost
+    /// the guest a modeset per intermediate size.
+    #[test]
+    fn consecutive_mode_updates_merge() {
+        let handle = test_handle(1);
+        assert!(handle.request(0, 1280, 800));
+        assert!(handle.request(0, 1600, 900));
+        assert!(handle.request(0, 1920, 1080));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].size, Some((1920, 1080)));
+    }
+
+    /// A resize followed by an EDID push merges into a single update carrying both — that is
+    /// exactly what moving the window to another host display produces.
+    #[test]
+    fn a_resize_and_an_edid_push_merge_into_one_update() {
+        let handle = test_handle(1);
+        assert!(handle.request(0, 1512, 982));
+        assert!(handle.update(DisplayUpdate {
+            display_id: 0,
+            edid: Some(EdidParams::default()),
+            ..Default::default()
+        }));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].size, Some((1512, 982)));
+        assert!(queue[0].edid.is_some());
+    }
+
+    /// Connectivity changes must NOT merge: a disconnect immediately followed by a reconnect
+    /// has to reach the guest as two events, or it observes only the final state and never
+    /// notices the display went away.
+    #[test]
+    fn connectivity_changes_are_never_merged_away() {
+        let handle = test_handle(1);
+        assert!(handle.update(DisplayUpdate {
+            display_id: 0,
+            connected: Some(false),
+            ..Default::default()
+        }));
+        assert!(handle.update(DisplayUpdate {
+            display_id: 0,
+            connected: Some(true),
+            size: Some((1920, 1080)),
+            ..Default::default()
+        }));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].connected, Some(false));
+        assert_eq!(queue[1].connected, Some(true));
+    }
+
+    /// Updates for different scanouts stay separate even when adjacent.
+    #[test]
+    fn updates_for_different_displays_do_not_merge() {
+        let handle = test_handle(2);
+        assert!(handle.request(0, 1280, 800));
+        assert!(handle.request(1, 1920, 1080));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].display_id, 0);
+        assert_eq!(queue[1].display_id, 1);
+    }
+
+    #[test]
+    fn an_out_of_range_display_id_is_rejected_without_queueing() {
+        let handle = test_handle(1);
+        assert!(!handle.request(3, 1280, 800));
+        assert!(queued(&handle).is_empty());
     }
 }
