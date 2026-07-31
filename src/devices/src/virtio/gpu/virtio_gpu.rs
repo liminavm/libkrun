@@ -42,7 +42,7 @@ use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
 use super::journal::{GpuJournal, GpuJournalOp};
 use super::trace::GpuTraceStats;
 use super::{GpuError, Result};
-use crate::display::DisplayInfo;
+use crate::display::{DisplayInfo, DisplayInfoEdid, EdidParams};
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
@@ -1855,41 +1855,40 @@ impl VirtioGpu {
                             Ok(()) => continue,
                             Err(DisplayBackendError::MethodNotSupported) => {}
                             Err(e) => {
-                                log::error!(
-                                    "present_surface failed for scanout {scanout_id}: {e}"
-                                );
+                                log::error!("present_surface failed for scanout {scanout_id}: {e}");
                                 return Err(ErrUnspec);
                             }
                         }
                     }
                 } else {
-                // limina (#8): fence-accurate present — park the frame and inject a
-                // present fence on the rendering context; the worker presents when it
-                // retires (true GPU completion). Falls through to the immediate
-                // present if parking isn't possible.
-                if self.try_park_present(
-                    scanout_id,
-                    iosurface_id,
-                    resource_id,
-                    &rect,
-                    resource.ctx_id,
-                ) {
-                    continue;
-                }
-                match self
-                    .display_backend
-                    .present_surface(scanout_id, iosurface_id, Some(&rect))
-                {
-                    Ok(()) => continue,
-                    Err(DisplayBackendError::MethodNotSupported) => {
-                        // Backend has no zero-copy path (e.g. headless capture); fall through
-                        // to the readback path below.
+                    // limina (#8): fence-accurate present — park the frame and inject a
+                    // present fence on the rendering context; the worker presents when it
+                    // retires (true GPU completion). Falls through to the immediate
+                    // present if parking isn't possible.
+                    if self.try_park_present(
+                        scanout_id,
+                        iosurface_id,
+                        resource_id,
+                        &rect,
+                        resource.ctx_id,
+                    ) {
+                        continue;
                     }
-                    Err(e) => {
-                        log::error!("present_surface failed for scanout {scanout_id}: {e}");
-                        return Err(ErrUnspec);
+                    match self.display_backend.present_surface(
+                        scanout_id,
+                        iosurface_id,
+                        Some(&rect),
+                    ) {
+                        Ok(()) => continue,
+                        Err(DisplayBackendError::MethodNotSupported) => {
+                            // Backend has no zero-copy path (e.g. headless capture); fall through
+                            // to the readback path below.
+                        }
+                        Err(e) => {
+                            log::error!("present_surface failed for scanout {scanout_id}: {e}");
+                            return Err(ErrUnspec);
+                        }
                     }
-                }
                 }
             }
 
@@ -2387,10 +2386,14 @@ impl VirtioGpu {
     }
 
     pub fn display_info(&self) -> VirtioGpuResult {
+        // The third element is the scanout's `enabled` flag, which the guest driver turns
+        // directly into connector status (`virtio_gpu_conn_detect`) — so this is where a
+        // display unplug becomes visible. It was hardcoded `true` when scanouts could never
+        // come and go; limina drives it (see `DisplayUpdate::connected`).
         let display_info = self
             .displays
             .iter()
-            .map(|d| (d.width, d.height, true))
+            .map(|d| (d.width, d.height, d.connected))
             .collect();
 
         Ok(OkDisplayInfo(display_info))
@@ -2417,6 +2420,42 @@ impl VirtioGpu {
                 d.height = height;
             }
             None => error!("set_display_size: invalid display id {display_id}"),
+        }
+    }
+
+    /// limina: replace a scanout's generated-EDID parameters — identity, mode list, refresh
+    /// range. Takes effect on the next `GET_EDID`, which the guest issues as part of handling
+    /// the config-change the caller raises (`virtio_gpu_config_changed_work_func` fetches EDID
+    /// *and* display info). A display configured with a caller-provided raw EDID blob keeps it:
+    /// the blob is the caller's own, and silently swapping it for a generated one would discard
+    /// whatever it was chosen to express.
+    /// See `docs/design/stable-edid-hotplug.md`.
+    pub fn set_display_edid(&mut self, display_id: u32, params: EdidParams) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => match &mut d.edid {
+                DisplayInfoEdid::Generated(current) => {
+                    debug!("set_display_edid: scanout {display_id} -> {params:?}");
+                    *current = params;
+                }
+                DisplayInfoEdid::Provided(_) => warn!(
+                    "set_display_edid: scanout {display_id} was configured with a raw EDID \
+                     blob; ignoring the generated-EDID update"
+                ),
+            },
+            None => error!("set_display_edid: invalid display id {display_id}"),
+        }
+    }
+
+    /// limina: connect or disconnect a scanout. The guest reports the connector as
+    /// disconnected while this is `false`, which is a real unplug as far as its compositor is
+    /// concerned. The caller raises the config-change that makes the guest re-probe.
+    pub fn set_display_connected(&mut self, display_id: u32, connected: bool) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => {
+                debug!("set_display_connected: scanout {display_id} -> {connected}");
+                d.connected = connected;
+            }
+            None => error!("set_display_connected: invalid display id {display_id}"),
         }
     }
 
