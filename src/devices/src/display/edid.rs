@@ -42,6 +42,10 @@ const RANGE_LIMITS_ONLY: u8 = 0x01;
 /// Feature-support bit 0 (byte 24): continuous-frequency display. Linux requires it *together*
 /// with the range descriptor before it will read the monitor's refresh range at all.
 const FEATURE_CONTINUOUS_FREQ: u8 = 1 << 0;
+/// Video input definition (byte 20): digital input, 8 bits per colour, DisplayPort. Left zero,
+/// this byte means *analog* — which is what every EDID parser then reported for a virtual
+/// display that has never been anything but digital, and it denies the guest a colour depth.
+const VIDEO_INPUT_DIGITAL_8BPC_DP: u8 = 0x80 | (0b010 << 4) | 0x05;
 const DEFAULT_HORIZONTAL_BLANKING: u16 = 560;
 const DEFAULT_VERTICAL_BLANKING: u16 = 50;
 const DEFAULT_HORIZONTAL_FRONT_PORCH: u16 = 64;
@@ -236,10 +240,11 @@ fn dummy_descriptor() -> [u8; DESCRIPTOR_LEN] {
     block
 }
 
-/// Feature-support byte (24). Declaring continuous frequency is what lets the guest read the
-/// range descriptor at all (`drm_edid.c` `drm_get_monitor_range` bails without it), so the two
-/// are set together or not at all.
+/// Video input definition (20) and feature-support (24). Declaring continuous frequency is what
+/// lets the guest read the range descriptor at all (`drm_edid.c` `drm_get_monitor_range` bails
+/// without it), so the range and that bit are set together or not at all.
 fn populate_features(edid: &mut [u8], params: &EdidParams) {
+    edid[20] = VIDEO_INPUT_DIGITAL_8BPC_DP;
     if params.range.is_some() {
         edid[24] |= FEATURE_CONTINUOUS_FREQ;
     }
@@ -635,6 +640,10 @@ mod tests {
         assert_eq!(descriptor(&edid, 1)[3], TAG_PRODUCT_NAME);
         assert_eq!(descriptor_text(descriptor(&edid, 1)), "krun-display");
         assert_eq!(decode_detailed(descriptor(&edid, 0)), (1920, 1080, 60));
+        // The display is digital, not analog — byte 20 was left zero, which every parser reads
+        // as an analog input.
+        assert_eq!(edid[20] & 0x80, 0x80, "digital input bit");
+        assert_eq!((edid[20] >> 4) & 0x07, 0b010, "8 bits per colour");
         // No identity ⇒ the historical anonymous one, and no range ⇒ no continuous-frequency bit.
         assert_eq!(&edid[10..12], &1u16.to_le_bytes());
         assert_eq!(&edid[12..16], &1u32.to_le_bytes());
