@@ -107,6 +107,10 @@ pub struct DisplayInfo {
     pub width: u32,
     pub height: u32,
     pub edid: DisplayInfoEdid,
+    /// limina: whether the guest sees this scanout as a *connected* display. Reported through
+    /// `GET_DISPLAY_INFO`, where the guest driver turns it straight into connector status
+    /// (`virtio_gpu_conn_detect`), so clearing it is a genuine unplug. Displays start connected.
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +125,7 @@ impl DisplayInfo {
             width,
             height,
             edid: DisplayInfoEdid::Generated(EdidParams::default()),
+            connected: true,
         }
     }
 
