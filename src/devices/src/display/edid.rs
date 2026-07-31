@@ -163,6 +163,17 @@ fn populate_descriptors(edid: &mut [u8], info: &EdidInfo) {
     if let Some(serial) = identity.and_then(|i| i.serial_string) {
         blocks.push(string_descriptor(TAG_SERIAL_STRING, serial));
     }
+    if blocks.len() > DESCRIPTOR_COUNT {
+        // A base EDID block has room for four descriptors and no more. Everything load-bearing
+        // (the preferred timing, the product name) is at the front of the priority order, so
+        // what falls off here is an extra: say so rather than dropping it silently.
+        debug!(
+            "edid: {} descriptors requested, {DESCRIPTOR_COUNT} fit; dropping the lowest-priority \
+             {} (a CTA extension block would carry them)",
+            blocks.len(),
+            blocks.len() - DESCRIPTOR_COUNT
+        );
+    }
     blocks.truncate(DESCRIPTOR_COUNT);
 
     // Spare blocks: a proper "unused" descriptor once we're emitting a limina identity, but
