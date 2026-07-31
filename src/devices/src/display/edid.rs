@@ -46,6 +46,36 @@ const FEATURE_CONTINUOUS_FREQ: u8 = 1 << 0;
 /// this byte means *analog* — which is what every EDID parser then reported for a virtual
 /// display that has never been anything but digital, and it denies the guest a colour depth.
 const VIDEO_INPUT_DIGITAL_8BPC_DP: u8 = 0x80 | (0b010 << 4) | 0x05;
+/// Byte 126: number of extension blocks following the base block.
+const EXTENSION_COUNT_OFFSET: usize = 126;
+/// EDID extension tag for a DisplayID structure (`DISPLAYID_EXT`).
+const DISPLAYID_EXT_TAG: u8 = 0x70;
+/// DisplayID structure version 2.0.
+const DISPLAYID_REV_2_0: u8 = 0x20;
+/// Primary use case "desktop productivity" — what a VM window is.
+const DISPLAYID_PRIMARY_USE: u8 = 4;
+/// `DATA_BLOCK_2_TYPE_7_DETAILED_TIMING`: the timing block whose pixel clock is 24-bit and in
+/// **kHz**, so it can express modes the base block's 16-bit/10 kHz field cannot.
+const DISPLAYID_BLOCK_TYPE_7: u8 = 0x22;
+/// `struct displayid_header` — rev, payload bytes, primary use, extension count.
+const DISPLAYID_HEADER_LEN: usize = 4;
+/// `struct displayid_block` — tag, rev, payload bytes.
+const DISPLAYID_BLOCK_HEADER_LEN: usize = 3;
+/// `struct displayid_detailed_timings_1`, fixed size; the kernel rejects a block whose length
+/// is not a multiple of it (`add_displayid_detailed_1_modes`).
+const DISPLAYID_TIMING_LEN: usize = 20;
+/// The DisplayID structure starts at extension byte 1 and must end before the EDID extension
+/// checksum at byte 127 ("EDID extensions block checksum isn't for us" — `drm_displayid.c`),
+/// with its own checksum byte in between.
+const DISPLAYID_MAX_PAYLOAD: usize = EDID_DATA_LENGTH - 1 - DISPLAYID_HEADER_LEN - 1 - 1;
+/// How many timings therefore fit in one extension block.
+const DISPLAYID_MAX_TIMINGS: usize =
+    (DISPLAYID_MAX_PAYLOAD - DISPLAYID_BLOCK_HEADER_LEN) / DISPLAYID_TIMING_LEN;
+/// Type VII timing flags bit 7: this timing is the display's preferred mode.
+const DISPLAYID_TIMING_PREFERRED: u8 = 0x80;
+/// The highest pixel clock a base detailed timing can express: a 16-bit field in 10 kHz steps.
+const BASE_DTD_MAX_CLOCK_KHZ: u32 = 655_350;
+
 const DEFAULT_HORIZONTAL_BLANKING: u16 = 560;
 const DEFAULT_VERTICAL_BLANKING: u16 = 50;
 const DEFAULT_HORIZONTAL_FRONT_PORCH: u16 = 64;
@@ -109,8 +139,18 @@ impl EdidInfo {
     }
 
     pub fn bytes(self) -> Box<[u8]> {
-        let mut edid_box: Box<[u8]> = vec![0; EDID_DATA_LENGTH].into_boxed_slice();
-        let edid = &mut edid_box[..];
+        // Modes the base block has to misreport get an honest copy in a DisplayID extension.
+        // Deciding this first: whether one exists sets the extension count *inside* the base
+        // block, which the base checksum then has to cover.
+        let extended = self.overflowing_timings();
+
+        let length = if extended.is_empty() {
+            EDID_DATA_LENGTH
+        } else {
+            EDID_DATA_LENGTH * 2
+        };
+        let mut edid_box: Box<[u8]> = vec![0; length].into_boxed_slice();
+        let edid = &mut edid_box[..EDID_DATA_LENGTH];
 
         populate_header(edid, self.params.identity.as_ref());
         populate_edid_version(edid);
@@ -118,10 +158,60 @@ impl EdidInfo {
         populate_features(edid, &self.params);
         populate_standard_timings(edid, self.params.standard_timings.as_ref());
         populate_descriptors(edid, &self);
+        if !extended.is_empty() {
+            edid[EXTENSION_COUNT_OFFSET] = 1;
+        }
 
         calculate_checksum(edid);
 
+        if !extended.is_empty() {
+            populate_displayid_extension(&mut edid_box[EDID_DATA_LENGTH..], &self, &extended);
+        }
+
         edid_box
+    }
+
+    /// The advertised timings whose pixel clock does not fit a base detailed timing, in the
+    /// order they should appear in the extension. The current mode comes first and is marked
+    /// preferred: the base block is *forced* to carry it (that is the only way `GET_EDID` and
+    /// `GET_DISPLAY_INFO` agree on the rect, without which `virtio_gpu_conn_mode_valid` prunes
+    /// the preferred mode outright), so its clamped refresh is a lie we are obliged to tell.
+    /// The DisplayID copy is the truth, and having the same active size it survives the same
+    /// pruning check; `drm_mode_sort` orders equal-priority modes by descending clock, so the
+    /// honest higher rate lands ahead of the clamped one.
+    fn overflowing_timings(&self) -> Vec<ExtendedTiming> {
+        let mut out = Vec::new();
+        let mut consider = |width, height, refresh_hz, preferred| {
+            if self.pixel_clock_khz(width, height, refresh_hz) > BASE_DTD_MAX_CLOCK_KHZ {
+                out.push(ExtendedTiming {
+                    width,
+                    height,
+                    refresh_hz,
+                    preferred,
+                });
+            }
+        };
+        consider(self.width, self.height, self.refresh_rate, true);
+        if let Some(alt) = self.params.alt_mode.as_ref() {
+            consider(alt.width, alt.height, alt.refresh_hz, false);
+        }
+        if out.len() > DISPLAYID_MAX_TIMINGS {
+            debug!(
+                "edid: {} timings overflow the base block, {DISPLAYID_MAX_TIMINGS} fit one \
+                 DisplayID extension; dropping {}",
+                out.len(),
+                out.len() - DISPLAYID_MAX_TIMINGS
+            );
+            out.truncate(DISPLAYID_MAX_TIMINGS);
+        }
+        out
+    }
+
+    /// Pixel clock a mode needs at our blanking, in kHz.
+    fn pixel_clock_khz(&self, width: u32, height: u32, refresh_hz: u32) -> u32 {
+        let htotal = width + u32::from(self.horizontal_blanking);
+        let vtotal = height + u32::from(self.vertical_blanking);
+        refresh_hz.saturating_mul(htotal).saturating_mul(vtotal) / 1000
     }
 }
 
@@ -173,7 +263,7 @@ fn populate_descriptors(edid: &mut [u8], info: &EdidInfo) {
         // what falls off here is an extra: say so rather than dropping it silently.
         debug!(
             "edid: {} descriptors requested, {DESCRIPTOR_COUNT} fit; dropping the lowest-priority \
-             {} (a CTA extension block would carry them)",
+             {} (a DisplayID extension block would carry them)",
             blocks.len(),
             blocks.len() - DESCRIPTOR_COUNT
         );
@@ -194,6 +284,98 @@ fn populate_descriptors(edid: &mut [u8], info: &EdidInfo) {
         let start = DESCRIPTOR_BASE + index * DESCRIPTOR_LEN;
         edid[start..start + DESCRIPTOR_LEN].copy_from_slice(block);
     }
+}
+
+/// A timing bound for the DisplayID extension block.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ExtendedTiming {
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    preferred: bool,
+}
+
+/// Write a 128-byte DisplayID 2.0 extension block holding one type VII detailed-timing block.
+///
+/// Layout, per `drm_displayid.c` (which is the parser we must satisfy — the spec allows more
+/// than the kernel reads):
+///
+/// ```text
+///   [0]      0x70                     EDID extension tag
+///   [1..5]   struct displayid_header  rev, payload bytes, primary use, extension count
+///   [5..]    struct displayid_block   tag 0x22, rev, payload bytes
+///            20 bytes per timing
+///   [..]     DisplayID checksum       over the header, the blocks and itself
+///   [127]    EDID extension checksum  "isn't for us" per the kernel, but written anyway
+/// ```
+fn populate_displayid_extension(ext: &mut [u8], info: &EdidInfo, timings: &[ExtendedTiming]) {
+    debug_assert_eq!(ext.len(), EDID_DATA_LENGTH);
+    debug_assert!(timings.len() <= DISPLAYID_MAX_TIMINGS);
+
+    let payload = DISPLAYID_BLOCK_HEADER_LEN + timings.len() * DISPLAYID_TIMING_LEN;
+
+    ext[0] = DISPLAYID_EXT_TAG;
+    ext[1] = DISPLAYID_REV_2_0;
+    ext[2] = payload as u8;
+    ext[3] = DISPLAYID_PRIMARY_USE;
+    // Extension count: DisplayID sections beyond this one, of which there are none.
+    ext[4] = 0;
+
+    let block = 1 + DISPLAYID_HEADER_LEN;
+    ext[block] = DISPLAYID_BLOCK_TYPE_7;
+    // Block revision 0; bits 4-3 hold the payload-bytes-per-timing selector, and 0 means the
+    // 20-byte `displayid_detailed_timings_1` the kernel expects.
+    ext[block + 1] = 0;
+    ext[block + 2] = (timings.len() * DISPLAYID_TIMING_LEN) as u8;
+
+    for (index, timing) in timings.iter().enumerate() {
+        let at = block + DISPLAYID_BLOCK_HEADER_LEN + index * DISPLAYID_TIMING_LEN;
+        write_displayid_timing(&mut ext[at..at + DISPLAYID_TIMING_LEN], info, timing);
+    }
+
+    // The DisplayID checksum covers the header, every block, and itself — it is *not* the EDID
+    // extension checksum, and the kernel rejects the whole structure if it does not sum to zero.
+    let end = 1 + DISPLAYID_HEADER_LEN + payload;
+    let sum = ext[1..end]
+        .iter()
+        .fold(0u8, |acc, byte| acc.wrapping_add(*byte));
+    ext[end] = sum.wrapping_neg();
+
+    calculate_checksum(ext);
+}
+
+/// One `struct displayid_detailed_timings_1`. **Every field is stored as `value - 1`** and the
+/// kernel adds it back (`drm_mode_displayid_detailed`); the sync fields additionally carry the
+/// polarity in bit 15, left zero here to match the negative polarity the base timing implies.
+fn write_displayid_timing(out: &mut [u8], info: &EdidInfo, timing: &ExtendedTiming) {
+    debug_assert_eq!(out.len(), DISPLAYID_TIMING_LEN);
+
+    // 24-bit, in kHz — the whole reason this block exists.
+    let clock = info
+        .pixel_clock_khz(timing.width, timing.height, timing.refresh_hz)
+        .clamp(1, 0x00FF_FFFF)
+        - 1;
+    out[0] = (clock & 0xFF) as u8;
+    out[1] = ((clock >> 8) & 0xFF) as u8;
+    out[2] = ((clock >> 16) & 0xFF) as u8;
+    out[3] = if timing.preferred {
+        DISPLAYID_TIMING_PREFERRED
+    } else {
+        0
+    };
+
+    let mut put = |at: usize, value: u32| {
+        let encoded = (value.max(1) - 1) as u16;
+        out[at..at + 2].copy_from_slice(&encoded.to_le_bytes());
+    };
+    put(4, timing.width);
+    put(6, u32::from(info.horizontal_blanking));
+    put(8, u32::from(info.horizontal_front));
+    put(10, u32::from(info.horizontal_sync));
+    put(12, timing.height);
+    put(14, u32::from(info.vertical_blanking));
+    put(16, u32::from(info.vertical_front));
+    put(18, u32::from(info.vertical_sync));
 }
 
 /// The historical product name. Padded to 13 bytes with the `0x0A` terminator the spec asks for.
@@ -314,9 +496,10 @@ fn populate_detailed_timing(
     // ~866 MHz with these blanking values). Truncating to u16 *wraps*, which silently encodes a
     // completely different refresh rate — 3024x1964 @ 120 Hz decoded back as 30 Hz. Saturate
     // instead: the size still comes through exactly (that is what drives the scanout) and the
-    // refresh is understated rather than fabricated. Expressing such modes honestly needs a
-    // CTA-861 extension block, which `GET_EDID` has room for — see
-    // `docs/design/stable-edid-hotplug.md`.
+    // refresh is understated rather than fabricated. The honest timing is emitted alongside,
+    // in a DisplayID type VII block (`overflowing_timings`), whose pixel clock is 24-bit and in
+    // kHz. A *CTA-861* extension would not help: its detailed timings are the same 18-byte
+    // descriptor with the same 16-bit field. See `docs/design/stable-edid-hotplug.md`.
     let raw_clock = (refresh_rate * htotal * vtotal) / 10000;
     // Round to nearest 10khz.
     let rounded = ((raw_clock + 5) / 10) * 10;
@@ -595,6 +778,56 @@ mod tests {
                 _ => hsize * 9 / 16,
             };
             out.push((hsize, vsize, (byte1 & 0x3F) as u32 + 60));
+        }
+        out
+    }
+
+    /// Parse the DisplayID extension exactly as `drm_displayid.c` does: validate the structure
+    /// checksum over `sizeof(header) + bytes + 1` starting at extension byte 1, walk the blocks
+    /// from byte 5, and decode each type VII timing with `drm_mode_displayid_detailed`'s
+    /// arithmetic. Returns (width, height, refresh Hz, preferred) per timing.
+    ///
+    /// Deliberately an independent reimplementation rather than a call back into the generator —
+    /// a decoder that shares the encoder's mistakes proves nothing.
+    fn decode_displayid(edid: &[u8]) -> Vec<(u32, u32, u32, bool)> {
+        assert_eq!(edid.len(), 256, "no extension present");
+        assert_eq!(edid[126], 1, "the base block must declare the extension");
+        let ext = &edid[128..];
+        assert_eq!(ext[0], DISPLAYID_EXT_TAG);
+
+        // "EDID extensions block checksum isn't for us": the structure spans [1, 127).
+        let bytes = ext[2] as usize;
+        let dispid_length = DISPLAYID_HEADER_LEN + bytes + 1;
+        assert!(dispid_length <= 127 - 1, "DisplayID structure overruns the block");
+        let csum = ext[1..1 + dispid_length]
+            .iter()
+            .fold(0u8, |acc, b| acc.wrapping_add(*b));
+        assert_eq!(csum, 0, "DisplayID checksum invalid");
+
+        let mut out = Vec::new();
+        let mut idx = 1 + DISPLAYID_HEADER_LEN;
+        let end = 1 + DISPLAYID_HEADER_LEN + bytes;
+        while idx + DISPLAYID_BLOCK_HEADER_LEN <= end {
+            let tag = ext[idx];
+            let num_bytes = ext[idx + 2] as usize;
+            assert!(idx + DISPLAYID_BLOCK_HEADER_LEN + num_bytes <= end);
+            if tag == DISPLAYID_BLOCK_TYPE_7 {
+                assert_eq!(num_bytes % 20, 0, "the kernel drops a block that isn't a multiple of 20");
+                for t in 0..num_bytes / 20 {
+                    let b = &ext[idx + DISPLAYID_BLOCK_HEADER_LEN + t * 20..];
+                    let clock_khz =
+                        (b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16) + 1;
+                    let field = |at: usize| (b[at] as u32 | (b[at + 1] as u32) << 8) + 1;
+                    let hactive = field(4);
+                    let hblank = field(6);
+                    let vactive = field(12);
+                    let vblank = field(14);
+                    let pixels = (hactive + hblank) * (vactive + vblank);
+                    let refresh = (clock_khz * 1000 + pixels / 2) / pixels;
+                    out.push((hactive, vactive, refresh, b[3] & 0x80 != 0));
+                }
+            }
+            idx += DISPLAYID_BLOCK_HEADER_LEN + num_bytes;
         }
         out
     }
@@ -917,5 +1150,104 @@ mod tests {
         // 1500 px @ 150 dpi = 10 in = 254 mm ⇒ 25 cm; double the pixels, double the size.
         assert_eq!((small[21], small[22]), (25, 16));
         assert_eq!((large[21], large[22]), (50, 33));
+    }
+
+    /// A mode the base block cannot express gets an honest copy in a DisplayID type VII block:
+    /// 3024x1964 @ 120 Hz needs an 866 MHz pixel clock, 1.3x the 655.35 MHz the base detailed
+    /// timing tops out at. Without this the guest is told 90 Hz and can never select 120.
+    #[test]
+    fn a_mode_over_the_base_clock_ceiling_is_carried_in_a_displayid_block() {
+        let params = EdidParams {
+            refresh_rate: 120,
+            identity: Some(identity()),
+            ..EdidParams::default()
+        };
+        let edid = build(3024, 1964, &params);
+
+        assert_eq!(edid.len(), 256, "an extension block must be appended");
+        assert!(checksum_is_valid(&edid[..128]), "base checksum covers byte 126");
+        assert!(checksum_is_valid(&edid[128..]));
+
+        // The base block still carries the mode at the *size* the guest is being driven to —
+        // that is what `virtio_gpu_conn_mode_valid` matches against — with a clamped refresh.
+        let base = decode_detailed(descriptor(&edid, 0));
+        assert_eq!((base.0, base.1), (3024, 1964));
+        assert!(base.2 < 120, "the base timing is necessarily clamped, got {}", base.2);
+
+        // ...and the extension carries the truth, marked preferred so it sorts ahead of it.
+        let timings = decode_displayid(&edid);
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0], (3024, 1964, 120, true));
+    }
+
+    /// A mode that fits the base block must not grow an extension: the historical single-block
+    /// output stays byte for byte what it was.
+    #[test]
+    fn a_representable_mode_emits_no_extension() {
+        let edid = build(1920, 1080, &EdidParams::default());
+        assert_eq!(edid.len(), 128);
+        assert_eq!(edid[126], 0, "extension count stays zero");
+        assert!(checksum_is_valid(&edid));
+    }
+
+    /// Only the overflowing timings go to the extension. An alt mode that fits stays a base
+    /// descriptor; one that doesn't joins the block, non-preferred (there is one preferred mode).
+    #[test]
+    fn only_overflowing_timings_move_to_the_extension() {
+        // Current mode overflows, alt is a comfortable 60 Hz at the same size.
+        let params = EdidParams {
+            refresh_rate: 120,
+            identity: Some(identity()),
+            alt_mode: Some(DetailedMode {
+                width: 3024,
+                height: 1964,
+                refresh_hz: 60,
+            }),
+            ..EdidParams::default()
+        };
+        let edid = build(3024, 1964, &params);
+        let timings = decode_displayid(&edid);
+        assert_eq!(timings, vec![(3024, 1964, 120, true)], "only the 120 Hz mode overflows");
+        // The 60 Hz alt is still an ordinary base descriptor (slot 2: no range is set here,
+        // so the alt timing follows the product name directly).
+        assert_eq!(decode_detailed(descriptor(&edid, 2)), (3024, 1964, 60));
+
+        // Now make the alt overflow too: it joins the block and is NOT preferred.
+        let params = EdidParams {
+            alt_mode: Some(DetailedMode {
+                width: 3024,
+                height: 1964,
+                refresh_hz: 100,
+            }),
+            ..params
+        };
+        let timings = decode_displayid(&build(3024, 1964, &params));
+        assert_eq!(
+            timings,
+            vec![(3024, 1964, 120, true), (3024, 1964, 100, false)]
+        );
+    }
+
+    /// The kernel drops the whole block if its length isn't a multiple of 20, and rejects the
+    /// whole structure on a bad checksum — both are asserted inside `decode_displayid`, so this
+    /// pins the block header fields it reads to get there.
+    #[test]
+    fn the_displayid_block_declares_what_the_kernel_expects() {
+        let params = EdidParams {
+            refresh_rate: 120,
+            ..EdidParams::default()
+        };
+        let edid = build(3024, 1964, &params);
+        let ext = &edid[128..];
+        assert_eq!(ext[0], 0x70, "DISPLAYID_EXT");
+        assert_eq!(ext[1], 0x20, "DisplayID 2.0");
+        assert_eq!(ext[2] as usize, DISPLAYID_BLOCK_HEADER_LEN + 20);
+        assert_eq!(ext[4], 0, "no further DisplayID sections");
+        assert_eq!(ext[5], 0x22, "DATA_BLOCK_2_TYPE_7_DETAILED_TIMING");
+        assert_eq!(ext[7], 20, "one 20-byte timing");
+        // Everything past the structure and before the EDID extension checksum is padding.
+        assert!(ext[1 + DISPLAYID_HEADER_LEN + ext[2] as usize + 1..127]
+            .iter()
+            .all(|b| *b == 0));
     }
 }
