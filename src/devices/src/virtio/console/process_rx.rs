@@ -11,7 +11,7 @@ use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_rx(
     mem: GuestMemoryMmap,
-    mut queue: Queue,
+    queue: &mut Queue,
     interrupt: InterruptTransport,
     input: Arc<Mutex<Box<dyn PortInput + Send>>>,
     control: Arc<ConsoleControl>,
@@ -24,7 +24,7 @@ pub(crate) fn process_rx(
 
     let mut input = input.lock().unwrap();
     loop {
-        let Some(head) = pop_head_blocking(&mut queue, mem, &interrupt, &stop) else {
+        let Some(head) = pop_head_blocking(queue, mem, &interrupt, &stop) else {
             return;
         };
 
