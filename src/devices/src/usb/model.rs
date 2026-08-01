@@ -249,6 +249,16 @@ pub trait UsbDeviceModel: Send + Sync {
         xfer.stall();
     }
 
+    /// The guest **cancelled** an endpoint's outstanding work: the controller executed a Stop
+    /// Endpoint command for `ep` (Linux's `xhci_urb_dequeue` path — a `usb_kill_urb` /
+    /// libusb transfer cancel). Any transfer the gadget is holding on that endpoint is
+    /// abandoned by the guest, and work the gadget started on its behalf should be aborted.
+    ///
+    /// This is a *notification*, not a completion: the held transfer's completion is already
+    /// stale (the controller bumped the endpoint generation), so the gadget must not rely on
+    /// delivering an outcome. Default: no-op.
+    fn endpoint_stopped(&self, _ep: EpAddr) {}
+
     /// Reset device state (Reset Device command / port reset). Default: no-op.
     fn reset(&self) {}
 }
