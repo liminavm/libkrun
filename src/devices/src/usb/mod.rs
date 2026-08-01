@@ -17,7 +17,7 @@ mod mock;
 mod model;
 mod report_pipe;
 
-pub use self::bulk_pipe::{BulkPipe, BulkSink};
+pub use self::bulk_pipe::{BulkCancelSink, BulkPipe, BulkSink};
 pub use self::hid::HidMockDevice;
 pub use self::mock::MockUsbDevice;
 pub use self::model::{

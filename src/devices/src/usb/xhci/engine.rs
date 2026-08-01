@@ -36,6 +36,9 @@ pub(super) enum DeferredCall {
     Transfer(Arc<dyn UsbDeviceModel>, EpAddr, Transfer),
     /// Reset the device model (Disable Slot / Reset Device).
     Reset(Arc<dyn UsbDeviceModel>),
+    /// Tell the gadget the guest quiesced one of its endpoints (Stop Endpoint), so it can
+    /// abandon a held transfer and abort work started for it.
+    EndpointStopped(Arc<dyn UsbDeviceModel>, EpAddr),
 }
 
 /// Everything a non-EP0 transfer's completion needs to post its Transfer Event —
@@ -339,6 +342,14 @@ impl XhciDevice {
                     let (p, c) = (e.ring.ptr(), e.ring.ccs());
                     self.write_output_ep_dequeue(mem, slot, dci, p, c, None);
                 }
+                // Tell the gadget its endpoint was cancelled (deferred, so it runs with the
+                // controller lock released). This is how a guest-side transfer cancel — the
+                // only wire evidence libusb/`usb_kill_urb` leaves — reaches a gadget that is
+                // off doing work for a held IN (e.g. the fingerprint reader waiting on a host
+                // Touch ID prompt). EP0 (dci 1) has no gadget-held transfers; skip it.
+                if dci > 1 {
+                    self.defer_endpoint_stopped(slot, dci, deferred);
+                }
                 (cc::SUCCESS, slot)
             }
             trb_type::SET_TR_DEQUEUE => {
@@ -404,6 +415,25 @@ impl XhciDevice {
             if s.port != 0 {
                 if let Some(Some(m)) = self.port_models.get((s.port - 1) as usize) {
                     deferred.push(DeferredCall::Reset(m.clone()));
+                }
+            }
+        }
+    }
+
+    /// Queue an [`DeferredCall::EndpointStopped`] for the model behind `slot`, translating the
+    /// Device Context Index to the endpoint address the gadget speaks (`dci >> 1` = endpoint
+    /// number, odd dci = IN).
+    fn defer_endpoint_stopped(&self, slot: u8, dci: u8, deferred: &mut Vec<DeferredCall>) {
+        if let Some(s) = self.slots.get(slot as usize).and_then(|x| x.as_ref()) {
+            if s.port != 0 {
+                if let Some(Some(m)) = self.port_models.get((s.port - 1) as usize) {
+                    deferred.push(DeferredCall::EndpointStopped(
+                        m.clone(),
+                        EpAddr {
+                            num: dci >> 1,
+                            dir_in: dci & 1 == 1,
+                        },
+                    ));
                 }
             }
         }
@@ -1969,8 +1999,8 @@ mod tests {
         let xfer = take_transfer(deferred);
 
         // Stop Endpoint (DCI 3).
+        let mut cmd_deferred = Vec::new();
         let (code, _) = {
-            let mut cmd_deferred = Vec::new();
             let mut d = dev.lock().unwrap();
             let trb = Trb {
                 parameter: 0,
@@ -1980,6 +2010,15 @@ mod tests {
             d.run_command(&m, &trb, &mut cmd_deferred)
         };
         assert_eq!(code, cc::SUCCESS);
+        // …and the gadget is told, so it can abort work started for the held read. DCI 3 =
+        // endpoint 1, IN.
+        match cmd_deferred.as_slice() {
+            [DeferredCall::EndpointStopped(_, ep)] => {
+                assert_eq!(ep.num, 1);
+                assert!(ep.dir_in, "DCI 3 is an IN endpoint");
+            }
+            other => panic!("expected one EndpointStopped call, got {}", other.len()),
+        }
         {
             let d = dev.lock().unwrap();
             assert_eq!(

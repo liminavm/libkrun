@@ -49,6 +49,13 @@ use super::model::{DeviceDescriptors, EpAddr, Transfer, UsbDeviceModel, UsbSpeed
 /// endpoint address (`bEndpointAddress`, e.g. `0x01`); the second is the bytes the guest wrote.
 pub type BulkSink = Arc<dyn Fn(u8, Vec<u8>) + Send + Sync>;
 
+/// A sink for **endpoint-cancel** notifications: the guest quiesced an endpoint (xHCI Stop
+/// Endpoint — a `usb_kill_urb` / libusb transfer cancel), abandoning whatever read it had posted
+/// there. Invoked with the gadget's state lock released, with the endpoint address (e.g. `0x84`).
+/// A policy that started long-running host work for a held read (the fingerprint reader's Touch ID
+/// prompt) uses this to abort it; policies that don't need it pass none.
+pub type BulkCancelSink = Arc<dyn Fn(u8) + Send + Sync>;
+
 /// A host→guest event waiting for a read to carry it: either data bytes or a stall. Ordering
 /// matters — a policy that signals "frame then error" (or two errors) must have the guest observe
 /// them in that exact order, so both live in one FIFO rather than a queue plus a separate latch.
@@ -80,6 +87,8 @@ pub struct BulkPipe {
     /// IN-endpoint state keyed by `bEndpointAddress` (e.g. `0x83`, `0x84`).
     ins: Mutex<HashMap<u8, InEndpoint>>,
     out_sink: BulkSink,
+    /// Notified when the guest cancels an endpoint (see [`BulkCancelSink`]).
+    cancel_sink: Option<BulkCancelSink>,
 }
 
 impl BulkPipe {
@@ -91,11 +100,25 @@ impl BulkPipe {
         speed: UsbSpeed,
         out_sink: BulkSink,
     ) -> Arc<BulkPipe> {
+        BulkPipe::with_cancel_sink(descriptors, speed, out_sink, None)
+    }
+
+    /// As [`BulkPipe::new`], plus a [`BulkCancelSink`] notified when the guest cancels an
+    /// endpoint's outstanding read (Stop Endpoint). Policies that start host work on behalf of a
+    /// held IN need this to learn the guest walked away — nothing is sent on the wire when libusb
+    /// cancels a transfer, so the controller's Stop Endpoint is the only evidence.
+    pub fn with_cancel_sink(
+        descriptors: DeviceDescriptors,
+        speed: UsbSpeed,
+        out_sink: BulkSink,
+        cancel_sink: Option<BulkCancelSink>,
+    ) -> Arc<BulkPipe> {
         Arc::new(BulkPipe {
             descriptors,
             speed,
             ins: Mutex::new(HashMap::new()),
             out_sink,
+            cancel_sink,
         })
     }
 
@@ -187,6 +210,24 @@ impl UsbDeviceModel for BulkPipe {
         }
     }
 
+    /// The guest cancelled this endpoint's outstanding read (Stop Endpoint). Drop the held
+    /// transfer — its completion is already stale (the controller bumped the generation) — and
+    /// discard anything still queued for it: those events answer a transaction the guest has
+    /// abandoned, and handing them to the *next* read would desync the policy (a queued stall
+    /// would fail the guest's next, unrelated request). Then notify the policy so it can abort
+    /// whatever it started for that read. OUT endpoints carry no held state; the notification
+    /// still goes through, since the policy may care.
+    fn endpoint_stopped(&self, ep: EpAddr) {
+        let addr = if ep.dir_in { 0x80 | ep.num } else { ep.num };
+        let mut st = self.ins.lock().unwrap();
+        let stale = st.remove(&addr);
+        drop(st);
+        drop(stale); // the held read's Drop stalls it; the generation guard drops that outcome
+        if let Some(sink) = &self.cancel_sink {
+            sink(addr);
+        }
+    }
+
     fn reset(&self) {
         let mut st = self.ins.lock().unwrap();
         // Take every held read and clear all pending events; stall the holds outside the lock.
@@ -222,6 +263,25 @@ mod tests {
             strings: vec![vec![0x04, 0x03, 0x09, 0x04]],
         };
         (BulkPipe::new(d, UsbSpeed::Full, sink), rx)
+    }
+
+    /// A pipe that also reports endpoint cancels; the second receiver yields the cancelled
+    /// endpoint address.
+    fn pipe_with_cancel() -> (Arc<BulkPipe>, mpsc::Receiver<u8>) {
+        let sink: BulkSink = Arc::new(|_addr: u8, _f: Vec<u8>| {});
+        let (ctx, crx) = mpsc::channel();
+        let cancel: BulkCancelSink = Arc::new(move |addr: u8| {
+            let _ = ctx.send(addr);
+        });
+        let d = DeviceDescriptors {
+            device: vec![0x12, 0x01],
+            configs: vec![vec![0x09, 0x02]],
+            strings: vec![vec![0x04, 0x03, 0x09, 0x04]],
+        };
+        (
+            BulkPipe::with_cancel_sink(d, UsbSpeed::Full, sink, Some(cancel)),
+            crx,
+        )
     }
 
     fn in_transfer(len: usize) -> (Transfer, mpsc::Receiver<XferOutcome>) {
@@ -562,6 +622,73 @@ mod tests {
         assert!(
             fresh_rx.try_recv().is_err(),
             "post-reset read is held, not draining stale queue"
+        );
+    }
+
+    /// A guest transfer cancel (Stop Endpoint) drops that endpoint's held read and tells the
+    /// policy, which is the only way it can learn the guest walked away from work it started.
+    /// Other endpoints are untouched.
+    #[test]
+    fn endpoint_stop_drops_the_held_read_and_notifies_the_policy() {
+        let (p, cancel_rx) = pipe_with_cancel();
+        let (moc_in, moc_rx) = in_transfer(2);
+        p.handle_transfer(
+            EpAddr {
+                num: EP_IN_MOC,
+                dir_in: true,
+            },
+            moc_in,
+        );
+        let (cmd_in, cmd_rx) = in_transfer(2);
+        p.handle_transfer(
+            EpAddr {
+                num: EP_IN_CMD,
+                dir_in: true,
+            },
+            cmd_in,
+        );
+
+        p.endpoint_stopped(EpAddr {
+            num: EP_IN_MOC,
+            dir_in: true,
+        });
+
+        assert_eq!(
+            cancel_rx.recv().unwrap(),
+            0x84,
+            "policy told which endpoint"
+        );
+        assert!(
+            matches!(moc_rx.recv().unwrap(), XferOutcome::Stall),
+            "the cancelled endpoint's hold is released"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "the untouched endpoint keeps its hold"
+        );
+    }
+
+    /// A reply the policy emits *after* the guest cancelled must not be delivered to the next,
+    /// unrelated read on that endpoint — the stop clears the endpoint's queue.
+    #[test]
+    fn a_stop_discards_events_queued_for_the_abandoned_transaction() {
+        let (p, _cancel_rx) = pipe_with_cancel();
+        p.push_in(0x84, vec![0x40, 0x00]); // queued: no read posted yet
+        p.endpoint_stopped(EpAddr {
+            num: EP_IN_MOC,
+            dir_in: true,
+        });
+        let (fresh, fresh_rx) = in_transfer(2);
+        p.handle_transfer(
+            EpAddr {
+                num: EP_IN_MOC,
+                dir_in: true,
+            },
+            fresh,
+        );
+        assert!(
+            fresh_rx.try_recv().is_err(),
+            "post-cancel read holds rather than draining the abandoned reply"
         );
     }
 }
