@@ -173,6 +173,7 @@ impl Console {
         let mut raise_irq = false;
 
         let mut ports_to_start = Vec::new();
+        let mut ports_to_stop = Vec::new();
 
         while let Some(head) = control_tx.queue.pop(mem) {
             raise_irq = true;
@@ -246,6 +247,7 @@ impl Console {
 
                     if !opened {
                         log::debug!("Guest closed port {}", cmd.id);
+                        ports_to_stop.push(cmd.id as usize);
                         continue;
                     }
 
@@ -255,20 +257,44 @@ impl Console {
             }
         }
 
+        // Reclaim the queues of every port the guest closed, so a later re-open finds them.
+        // Without this a second open of the same port had nothing to take, and the device
+        // aborted the whole VM on a sequence any guest can produce (close and re-open
+        // /dev/vportNpM — a `spice-vdagentd` restart does exactly that).
+        for port_id in ports_to_stop {
+            log::trace!("Stopping port io for port {port_id}");
+            let (rx_queue, tx_queue) = self.ports[port_id].shutdown();
+            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            if let Some(queue) = rx_queue {
+                self.queues[rx_idx] =
+                    Some(DeviceQueue::new(queue, self.queue_events[rx_idx].clone()));
+            }
+            if let Some(queue) = tx_queue {
+                self.queues[tx_idx] =
+                    Some(DeviceQueue::new(queue, self.queue_events[tx_idx].clone()));
+            }
+        }
+
         for port_id in ports_to_start {
             log::trace!("Starting port io for port {port_id}");
             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
 
-            // Take ownership of port queues - they are moved to the port.
-            let rx_queue = self.queues[rx_idx]
-                .take()
-                .expect("port rx queue should exist")
-                .queue;
-            let tx_queue = self.queues[tx_idx]
-                .take()
-                .expect("port tx queue should exist")
-                .queue;
+            // Take ownership of port queues - they are moved to the port. Both must be
+            // there; if a previous run's io thread panicked and lost one, refuse to start
+            // this port rather than killing the VM over a guest-issued control message.
+            // Check both before taking either, so a half-available pair doesn't lose the
+            // queue that *was* there.
+            if self.queues[rx_idx].is_none() || self.queues[tx_idx].is_none() {
+                log::error!(
+                    "port {port_id}: queues unavailable (rx_idx={rx_idx}, tx_idx={tx_idx}); \
+                     not starting port io"
+                );
+                continue;
+            }
+            let rx_queue = self.queues[rx_idx].take().unwrap().queue;
+            let tx_queue = self.queues[tx_idx].take().unwrap().queue;
 
             self.ports[port_id].start(
                 mem.clone(),

@@ -9,13 +9,13 @@ use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
 
 pub(crate) fn process_tx(
     mem: GuestMemoryMmap,
-    mut queue: Queue,
+    queue: &mut Queue,
     interrupt: InterruptTransport,
     output: Arc<Mutex<Box<dyn PortOutput + Send>>>,
     stop: Arc<AtomicBool>,
 ) {
     loop {
-        let Some(head) = pop_head_blocking(&mut queue, &mem, &interrupt, &stop) else {
+        let Some(head) = pop_head_blocking(queue, &mem, &interrupt, &stop) else {
             return;
         };
 
