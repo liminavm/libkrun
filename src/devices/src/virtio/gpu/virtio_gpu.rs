@@ -924,6 +924,7 @@ impl VirtioGpu {
             memory_contents: Vec::new(),
             sync_states: Vec::new(),
             cursor: self.cursor_state.clone(),
+            classic_contents: Vec::new(),
         };
 
         let mut ctxs: Vec<(u32, u32)> = Vec::new();
@@ -963,6 +964,18 @@ impl VirtioGpu {
                 }
             }
             if !is_venus {
+                // P2: the classic analogue of the venus memory capture below — a
+                // texture uploaded once (icon atlas, glyph cache) has its only copy
+                // in the host GL object; without this the restored world is
+                // structurally sound but shows gray blocks.
+                match self
+                    .rutabaga
+                    .as_ref()
+                    .and_then(|r| r.limina_classic_content_export(ctx_id))
+                {
+                    Some(bytes) => payload.classic_contents.push((ctx_id, bytes)),
+                    None => warn!("gpu snapshot: content export failed for classic ctx {ctx_id}"),
+                }
                 continue;
             }
             // P2.1: fence status + timeline semaphore counter values (opaque vkr
@@ -1015,13 +1028,16 @@ impl VirtioGpu {
             .iter()
             .map(|(_, _, b)| b.len())
             .sum();
+        let classic_bytes: usize = payload.classic_contents.iter().map(|(_, b)| b.len()).sum();
         info!(
-            "gpu snapshot: {} ops, {} vkr journals, {} blob contents, {} memory contents ({} MiB)",
+            "gpu snapshot: {} ops, {} vkr journals, {} blob contents, {} memory contents ({} MiB), {} classic contents ({} MiB)",
             payload.ops.len(),
             payload.vkr_journals.len(),
             payload.blob_contents.len(),
             payload.memory_contents.len(),
-            content_bytes >> 20
+            content_bytes >> 20,
+            payload.classic_contents.len(),
+            classic_bytes >> 20
         );
         Some(payload.to_bytes())
     }
@@ -1053,6 +1069,7 @@ impl VirtioGpu {
             memory_contents,
             sync_states,
             cursor,
+            classic_contents,
         } = payload;
 
         let mut wire: HashMap<u32, (Vec<super::journal::VkrWireEntry>, usize)> = HashMap::new();
@@ -1437,6 +1454,23 @@ impl VirtioGpu {
                     debug!("gpu restore: content transfer for classic res {resource_id} failed");
                 } else {
                     uploads += 1;
+                }
+            }
+            // P2: host-side content on top of the guest-shadow uploads above — the
+            // authoritative bytes for textures whose only copy lived in the host GL
+            // object (icon atlases, glyph caches, corner masks: the gray-blocks
+            // class). Runs BEFORE the scanout flips so the first presented frame
+            // composites from restored content.
+            for (ctx_id, blob) in &classic_contents {
+                if !self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_classic_content_restore(*ctx_id, blob))
+                {
+                    warn!(
+                        "gpu restore: classic content restore failed for ctx {ctx_id} ({} bytes)",
+                        blob.len()
+                    );
                 }
             }
             let mut flips = 0u32;

@@ -131,6 +131,14 @@ pub trait RutabagaComponent {
     fn limina_memory_write(&self, _ctx_id: u32, _mem_id: u64, _buf: &[u8]) -> bool {
         false
     }
+    /// limina task #19 P2: classic host-side resource content capture/restore
+    /// (virglrenderer implements; opaque blob).
+    fn limina_classic_content_export(&self, _ctx_id: u32) -> Option<Vec<u8>> {
+        None
+    }
+    fn limina_classic_content_restore(&self, _ctx_id: u32, _data: &[u8]) -> bool {
+        false
+    }
 
     /// Implementations must create a fence that represents the completion of prior work.  This is
     /// required for synchronization with the guest kernel.
@@ -718,6 +726,18 @@ impl Rutabaga {
         self.components
             .get(&self.default_component)
             .is_some_and(|c| c.limina_memory_write(ctx_id, mem_id, buf))
+    }
+
+    pub fn limina_classic_content_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
+        self.components
+            .get(&self.default_component)
+            .and_then(|c| c.limina_classic_content_export(ctx_id))
+    }
+
+    pub fn limina_classic_content_restore(&self, ctx_id: u32, data: &[u8]) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_classic_content_restore(ctx_id, data))
     }
 
     /// Creates a fence with the given `fence`.
