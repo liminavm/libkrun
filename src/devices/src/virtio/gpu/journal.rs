@@ -446,7 +446,11 @@ const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
 // v5 (task #19): + classic-vrend ops (ResourceCreate3d/2d, AttachBacking,
 // SetScanout, tags 6..=9) and classic contexts' wire journals riding
 // vkr_journals in the same VKJR format — the compositor's GL world.
-const PAYLOAD_VERSION: u32 = 5;
+// v6 (task #19 P2): + classic_contents — per classic context, the opaque vrend
+// host-side resource content blob (icon atlases, glyph caches: textures whose
+// only copy lives in the host GL object; the guest-shadow re-upload can't
+// restore those).
+const PAYLOAD_VERSION: u32 = 6;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -493,6 +497,10 @@ pub struct GpuSnapshotPayload {
     /// v4: the last cursor-overlay state, re-applied to the display backend at
     /// restore. `None` = cursor hidden (or never set) at snapshot.
     pub cursor: Option<CursorSnapshot>,
+    /// v6: per classic context, the opaque vrend resource-content blob
+    /// (virgl_renderer_limina_classic_content_export), uploaded back after the
+    /// context's wire replay.
+    pub classic_contents: Vec<(u32, Vec<u8>)>,
 }
 
 /// The rendered cursor-overlay state as last handed to the display backend —
@@ -693,6 +701,14 @@ impl GpuSnapshotPayload {
             None => buf.push(0),
         }
 
+        // v6 classic-contents section.
+        put_u32(&mut buf, self.classic_contents.len() as u32);
+        for (ctx_id, bytes) in &self.classic_contents {
+            put_u32(&mut buf, *ctx_id);
+            put_u64(&mut buf, bytes.len() as u64);
+            buf.extend_from_slice(bytes);
+        }
+
         buf
     }
 
@@ -863,6 +879,14 @@ impl GpuSnapshotPayload {
             _ => return None,
         };
 
+        // v6 classic-contents section.
+        let n = c.u32()?;
+        for _ in 0..n {
+            let ctx_id = c.u32()?;
+            let len = c.u64()? as usize;
+            payload.classic_contents.push((ctx_id, c.take(len)?.to_vec()));
+        }
+
         Some(payload)
     }
 }
@@ -984,6 +1008,7 @@ mod tests {
                 y: 450,
                 pixels: vec![0x7e; 64 * 64 * 4],
             }),
+            classic_contents: vec![(9, vec![0x42; 32])],
         };
         let bytes = payload.to_bytes();
         let got = GpuSnapshotPayload::from_bytes(&bytes).expect("parse");
@@ -1019,6 +1044,7 @@ mod tests {
         );
         assert_eq!((cur.format, cur.x, cur.y), (2, 800, 450));
         assert_eq!(cur.pixels, vec![0x7e; 64 * 64 * 4]);
+        assert_eq!(got.classic_contents, vec![(9, vec![0x42; 32])]);
     }
 
     #[test]
