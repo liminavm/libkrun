@@ -699,12 +699,21 @@ impl Worker {
                 // limina: handle 2D resources in software (host CPU memory) instead of
                 // mapping them onto a virgl GL render target — the stock path fails on a
                 // GL-less host (e.g. macOS). See VirtioGpu::resource_create_2d.
-                virtio_gpu.resource_create_2d(
+                let r = virtio_gpu.resource_create_2d(
                     info.resource_id,
                     info.format,
                     info.width,
                     info.height,
-                )
+                );
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().resource_create_2d(
+                        info.resource_id,
+                        info.format,
+                        info.width,
+                        info.height,
+                    );
+                }
+                r
             }
             GpuCommand::ResourceUnref(info) => {
                 let r = virtio_gpu.unref_resource(info.resource_id);
@@ -718,12 +727,23 @@ impl Worker {
                 }
                 r
             }
-            GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
-                info.scanout_id,
-                info.resource_id,
-                info.r.width,
-                info.r.height,
-            ),
+            GpuCommand::SetScanout(info) => {
+                let r = virtio_gpu.set_scanout(
+                    info.scanout_id,
+                    info.resource_id,
+                    info.r.width,
+                    info.r.height,
+                );
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().set_scanout(
+                        info.scanout_id,
+                        info.resource_id,
+                        info.r.width,
+                        info.r.height,
+                    );
+                }
+                r
+            }
             GpuCommand::ResourceFlush(info) => {
                 let rect = Rect {
                     x: info.r.x,
@@ -753,13 +773,27 @@ impl Worker {
                             Err(_) => return Err(GpuResponse::ErrUnspec),
                         }
                     }
-                    virtio_gpu.attach_backing(info.resource_id, mem, vecs)
+                    let backing: Vec<(u64, usize)> =
+                        vecs.iter().map(|(a, l)| (a.0, *l)).collect();
+                    let r = virtio_gpu.attach_backing(info.resource_id, mem, vecs);
+                    if r.is_ok() {
+                        virtio_gpu
+                            .journal_mut()
+                            .attach_backing(info.resource_id, backing);
+                    }
+                    r
                 } else {
                     error!("missing data for command {cmd:?}");
                     Err(GpuResponse::ErrUnspec)
                 }
             }
-            GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
+            GpuCommand::ResourceDetachBacking(info) => {
+                let r = virtio_gpu.detach_backing(info.resource_id);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().detach_backing(info.resource_id);
+                }
+                r
+            }
             GpuCommand::UpdateCursor(info) => virtio_gpu.update_cursor(
                 info.resource_id,
                 info.hot_x,
@@ -833,7 +867,23 @@ impl Worker {
                     flags: info.flags,
                 };
 
-                virtio_gpu.resource_create_3d(resource_id, resource_create_3d)
+                let r = virtio_gpu.resource_create_3d(resource_id, resource_create_3d);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().resource_create_3d(
+                        resource_id,
+                        info.target,
+                        info.format,
+                        info.bind,
+                        info.width,
+                        info.height,
+                        info.depth,
+                        info.array_size,
+                        info.last_level,
+                        info.nr_samples,
+                        info.flags,
+                    );
+                }
+                r
             }
             GpuCommand::TransferToHost3d(info) => {
                 let ctx_id = hdr.ctx_id;
