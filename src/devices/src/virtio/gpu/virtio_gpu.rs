@@ -926,11 +926,15 @@ impl VirtioGpu {
             cursor: self.cursor_state.clone(),
         };
 
-        let mut ctxs: Vec<u32> = Vec::new();
+        let mut ctxs: Vec<(u32, u32)> = Vec::new();
         let mut mapped: Vec<u32> = Vec::new();
         for e in self.journal.entries() {
             match &e.op {
-                GpuJournalOp::CtxCreate { ctx_id, .. } => ctxs.push(*ctx_id),
+                GpuJournalOp::CtxCreate {
+                    ctx_id,
+                    context_init,
+                    ..
+                } => ctxs.push((*ctx_id, *context_init)),
                 GpuJournalOp::MapBlob { resource_id, .. } => mapped.push(*resource_id),
                 _ => {}
             }
@@ -941,18 +945,25 @@ impl VirtioGpu {
             });
         }
 
-        for ctx_id in ctxs {
+        for (ctx_id, context_init) in ctxs {
+            // Task #19: classic contexts export their vrend journal through the SAME
+            // FFI (routed by context type, same VKJR wire format). Venus-only state
+            // (sync objects, device memories) is gated on the recorded capset.
+            let is_venus = (context_init & 0xff) == 4; // VIRTGPU_DRM_CAPSET_VENUS
             match self
                 .rutabaga
                 .as_ref()
                 .and_then(|r| r.limina_journal_export(ctx_id))
             {
                 Some(bytes) => payload.vkr_journals.push((ctx_id, bytes)),
-                // Normal for non-venus contexts (the kernel's ctx 1, virgl contexts).
+                // Normal for journal-less contexts (the kernel's ctx 1, VREND_JOURNAL=0).
                 None => {
-                    debug!("gpu snapshot: no vkr journal for ctx {ctx_id}");
+                    debug!("gpu snapshot: no wire journal for ctx {ctx_id}");
                     continue;
                 }
+            }
+            if !is_venus {
+                continue;
             }
             // P2.1: fence status + timeline semaphore counter values (opaque vkr
             // blob) for the restore-time sync fast-forward.
@@ -1252,6 +1263,66 @@ impl VirtioGpu {
                         warn!("gpu restore: SET_SCANOUT_BLOB scanout {scanout_id} failed");
                     }
                 }
+                GpuJournalOp::ResourceCreate3d {
+                    resource_id,
+                    target,
+                    format,
+                    bind,
+                    width,
+                    height,
+                    depth,
+                    array_size,
+                    last_level,
+                    nr_samples,
+                    flags,
+                } => {
+                    let create = ResourceCreate3D {
+                        target: *target,
+                        format: *format,
+                        bind: *bind,
+                        width: *width,
+                        height: *height,
+                        depth: *depth,
+                        array_size: *array_size,
+                        last_level: *last_level,
+                        nr_samples: *nr_samples,
+                        flags: *flags,
+                    };
+                    if self.resource_create_3d(*resource_id, create).is_err() {
+                        error!("gpu restore: RESOURCE_CREATE_3D res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                GpuJournalOp::ResourceCreate2d {
+                    resource_id,
+                    format,
+                    width,
+                    height,
+                } => {
+                    if self
+                        .resource_create_2d(*resource_id, *format, *width, *height)
+                        .is_err()
+                    {
+                        error!("gpu restore: RESOURCE_CREATE_2D res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                GpuJournalOp::AttachBacking {
+                    resource_id,
+                    backing,
+                } => {
+                    let vecs: Vec<(GuestAddress, usize)> = backing
+                        .iter()
+                        .map(|(a, l)| (GuestAddress(*a), *l))
+                        .collect();
+                    if self.attach_backing(*resource_id, mem, vecs).is_err() {
+                        error!("gpu restore: ATTACH_BACKING res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                // Classic scanouts apply in phase C — after the wire replay and the
+                // content transfers, so the first flip shows restored pixels.
+                GpuJournalOp::SetScanout { .. } => {}
             }
             if let Some(fence) = rebased_fence {
                 entry.vkr_seq = fence;
@@ -1312,6 +1383,93 @@ impl VirtioGpu {
                  whose replay was dropped — garbage-if-accessed before and after)",
                 memory_contents.len()
             );
+        }
+
+        // Task #19 phase C (classic content + scanout): the wire replay above re-created
+        // the vrend object world; now re-upload every backed classic resource's content
+        // from its guest backing store (which is in the restored RAM — the canonical
+        // storage classic transfers sync FROM), then re-bind the classic scanouts so the
+        // first presented frame shows restored pixels. Level-0/full-box only: mip chains
+        // re-fill on the guest's next upload, render targets on its next frame.
+        {
+            use std::collections::HashSet;
+            let backed: HashSet<u32> = ops
+                .iter()
+                .filter_map(|e| match &e.op {
+                    GpuJournalOp::AttachBacking { resource_id, .. } => Some(*resource_id),
+                    _ => None,
+                })
+                .collect();
+            let mut uploads = 0u32;
+            for e in &ops {
+                let (resource_id, w, h, d) = match &e.op {
+                    GpuJournalOp::ResourceCreate3d {
+                        resource_id,
+                        width,
+                        height,
+                        depth,
+                        ..
+                    } => (*resource_id, *width, *height, (*depth).max(1)),
+                    GpuJournalOp::ResourceCreate2d {
+                        resource_id,
+                        width,
+                        height,
+                        ..
+                    } => (*resource_id, *width, *height, 1),
+                    _ => continue,
+                };
+                if !backed.contains(&resource_id) {
+                    continue;
+                }
+                let transfer = Transfer3D {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    w,
+                    h: h.max(1),
+                    d,
+                    level: 0,
+                    stride: 0,
+                    layer_stride: 0,
+                    offset: 0,
+                };
+                if self.transfer_write(0, resource_id, transfer).is_err() {
+                    debug!("gpu restore: content transfer for classic res {resource_id} failed");
+                } else {
+                    uploads += 1;
+                }
+            }
+            let mut flips = 0u32;
+            for e in &ops {
+                if let GpuJournalOp::SetScanout {
+                    scanout_id,
+                    resource_id,
+                    width,
+                    height,
+                } = &e.op
+                {
+                    if self
+                        .set_scanout(*scanout_id, *resource_id, *width, *height)
+                        .is_err()
+                    {
+                        warn!("gpu restore: SET_SCANOUT scanout {scanout_id} failed");
+                        continue;
+                    }
+                    let _ = self.flush_resource(
+                        *resource_id,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width: *width,
+                            height: *height,
+                        },
+                    );
+                    flips += 1;
+                }
+            }
+            if uploads > 0 || flips > 0 {
+                info!("gpu restore: classic content re-uploaded ({uploads} resources), {flips} scanout flips");
+            }
         }
 
         if op_failed > 0 {

@@ -57,6 +57,42 @@ pub enum GpuJournalOp {
         height: u32,
         format: u32,
     },
+    /// Task #19 (classic vrend replay): a classic 3D resource create. Replay
+    /// re-creates it before the context's wire journal (which may bind it) is fed.
+    ResourceCreate3d {
+        resource_id: u32,
+        target: u32,
+        format: u32,
+        bind: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        array_size: u32,
+        last_level: u32,
+        nr_samples: u32,
+        flags: u32,
+    },
+    /// A software-2D resource create (cursor/fbdev planes).
+    ResourceCreate2d {
+        resource_id: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+    },
+    /// Latest-wins per resource: the guest iovec backing store. Replay re-attaches
+    /// it (the bytes are in the restored RAM) and then re-uploads content with a
+    /// full-box transfer — classic resources' canonical storage IS this backing.
+    AttachBacking {
+        resource_id: u32,
+        backing: Vec<(u64, usize)>,
+    },
+    /// Latest-wins per scanout (the classic, non-blob scanout binding).
+    SetScanout {
+        scanout_id: u32,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+    },
 }
 
 pub struct GpuJournalEntry {
@@ -222,6 +258,10 @@ impl GpuJournal {
             GpuJournalOp::MapBlob { resource_id: r, .. } => *r == resource_id,
             GpuJournalOp::CtxAttachResource { resource_id: r, .. } => *r == resource_id,
             GpuJournalOp::SetScanoutBlob { resource_id: r, .. } => *r == resource_id,
+            GpuJournalOp::ResourceCreate3d { resource_id: r, .. } => *r == resource_id,
+            GpuJournalOp::ResourceCreate2d { resource_id: r, .. } => *r == resource_id,
+            GpuJournalOp::AttachBacking { resource_id: r, .. } => *r == resource_id,
+            GpuJournalOp::SetScanout { resource_id: r, .. } => *r == resource_id,
             _ => false,
         });
         pinned
@@ -265,6 +305,75 @@ impl GpuJournal {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn resource_create_3d(
+        &mut self,
+        resource_id: u32,
+        target: u32,
+        format: u32,
+        bind: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        array_size: u32,
+        last_level: u32,
+        nr_samples: u32,
+        flags: u32,
+    ) {
+        self.push(GpuJournalOp::ResourceCreate3d {
+            resource_id,
+            target,
+            format,
+            bind,
+            width,
+            height,
+            depth,
+            array_size,
+            last_level,
+            nr_samples,
+            flags,
+        });
+    }
+
+    pub fn resource_create_2d(&mut self, resource_id: u32, format: u32, width: u32, height: u32) {
+        self.push(GpuJournalOp::ResourceCreate2d {
+            resource_id,
+            format,
+            width,
+            height,
+        });
+    }
+
+    pub fn attach_backing(&mut self, resource_id: u32, backing: Vec<(u64, usize)>) {
+        self.prune(
+            |op| matches!(op, GpuJournalOp::AttachBacking { resource_id: r, .. } if *r == resource_id),
+        );
+        self.push(GpuJournalOp::AttachBacking {
+            resource_id,
+            backing,
+        });
+    }
+
+    pub fn detach_backing(&mut self, resource_id: u32) {
+        self.prune(
+            |op| matches!(op, GpuJournalOp::AttachBacking { resource_id: r, .. } if *r == resource_id),
+        );
+    }
+
+    pub fn set_scanout(&mut self, scanout_id: u32, resource_id: u32, width: u32, height: u32) {
+        self.prune(
+            |op| matches!(op, GpuJournalOp::SetScanout { scanout_id: s, .. } if *s == scanout_id),
+        );
+        if resource_id != 0 {
+            self.push(GpuJournalOp::SetScanout {
+                scanout_id,
+                resource_id,
+                width,
+                height,
+            });
+        }
+    }
+
     /// Live-entry census for the GPUTRACE state dump.
     pub fn dump(&self) {
         let mut ctxs = 0u32;
@@ -272,6 +381,8 @@ impl GpuJournal {
         let mut maps = 0u32;
         let mut attaches = 0u32;
         let mut scanouts = 0u32;
+        let mut classic = 0u32;
+        let mut backings = 0u32;
         let mut blob_bytes = 0u64;
         for e in &self.entries {
             match &e.op {
@@ -282,12 +393,18 @@ impl GpuJournal {
                 }
                 GpuJournalOp::MapBlob { .. } => maps += 1,
                 GpuJournalOp::CtxAttachResource { .. } => attaches += 1,
-                GpuJournalOp::SetScanoutBlob { .. } => scanouts += 1,
+                GpuJournalOp::SetScanoutBlob { .. } | GpuJournalOp::SetScanout { .. } => {
+                    scanouts += 1
+                }
+                GpuJournalOp::ResourceCreate3d { .. } | GpuJournalOp::ResourceCreate2d { .. } => {
+                    classic += 1
+                }
+                GpuJournalOp::AttachBacking { .. } => backings += 1,
             }
         }
         warn!(
             "[GPUTRACE] gpu journal: {} live ops (recorded={} pruned={}): ctxs={} \
-             blobs={} ({} KiB) maps={} attaches={} scanouts={}",
+             blobs={} ({} KiB) maps={} attaches={} scanouts={} classic={} backings={}",
             self.entries.len(),
             self.recorded,
             self.pruned,
@@ -296,7 +413,9 @@ impl GpuJournal {
             blob_bytes / 1024,
             maps,
             attaches,
-            scanouts
+            scanouts,
+            classic,
+            backings
         );
     }
 
@@ -324,7 +443,10 @@ const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
                                         // shows the default dot cursor until the guest next changes it). Snapshots are
                                         // single-use against their exact post-suspend disk, so no cross-version parse
                                         // compatibility is kept.
-const PAYLOAD_VERSION: u32 = 4;
+// v5 (task #19): + classic-vrend ops (ResourceCreate3d/2d, AttachBacking,
+// SetScanout, tags 6..=9) and classic contexts' wire journals riding
+// vkr_journals in the same VKJR format — the compositor's GL world.
+const PAYLOAD_VERSION: u32 = 5;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -462,6 +584,70 @@ impl GpuSnapshotPayload {
                     put_u32(&mut buf, *height);
                     put_u32(&mut buf, *format);
                 }
+                GpuJournalOp::ResourceCreate3d {
+                    resource_id,
+                    target,
+                    format,
+                    bind,
+                    width,
+                    height,
+                    depth,
+                    array_size,
+                    last_level,
+                    nr_samples,
+                    flags,
+                } => {
+                    buf.push(6);
+                    for v in [
+                        *resource_id,
+                        *target,
+                        *format,
+                        *bind,
+                        *width,
+                        *height,
+                        *depth,
+                        *array_size,
+                        *last_level,
+                        *nr_samples,
+                        *flags,
+                    ] {
+                        put_u32(&mut buf, v);
+                    }
+                }
+                GpuJournalOp::ResourceCreate2d {
+                    resource_id,
+                    format,
+                    width,
+                    height,
+                } => {
+                    buf.push(7);
+                    for v in [*resource_id, *format, *width, *height] {
+                        put_u32(&mut buf, v);
+                    }
+                }
+                GpuJournalOp::AttachBacking {
+                    resource_id,
+                    backing,
+                } => {
+                    buf.push(8);
+                    put_u32(&mut buf, *resource_id);
+                    put_u32(&mut buf, backing.len() as u32);
+                    for (addr, len) in backing {
+                        put_u64(&mut buf, *addr);
+                        put_u64(&mut buf, *len as u64);
+                    }
+                }
+                GpuJournalOp::SetScanout {
+                    scanout_id,
+                    resource_id,
+                    width,
+                    height,
+                } => {
+                    buf.push(9);
+                    for v in [*scanout_id, *resource_id, *width, *height] {
+                        put_u32(&mut buf, v);
+                    }
+                }
             }
         }
 
@@ -571,6 +757,45 @@ impl GpuSnapshotPayload {
                     width: c.u32()?,
                     height: c.u32()?,
                     format: c.u32()?,
+                },
+                6 => GpuJournalOp::ResourceCreate3d {
+                    resource_id: c.u32()?,
+                    target: c.u32()?,
+                    format: c.u32()?,
+                    bind: c.u32()?,
+                    width: c.u32()?,
+                    height: c.u32()?,
+                    depth: c.u32()?,
+                    array_size: c.u32()?,
+                    last_level: c.u32()?,
+                    nr_samples: c.u32()?,
+                    flags: c.u32()?,
+                },
+                7 => GpuJournalOp::ResourceCreate2d {
+                    resource_id: c.u32()?,
+                    format: c.u32()?,
+                    width: c.u32()?,
+                    height: c.u32()?,
+                },
+                8 => {
+                    let resource_id = c.u32()?;
+                    let nbacking = c.u32()?;
+                    let mut backing = Vec::with_capacity(nbacking as usize);
+                    for _ in 0..nbacking {
+                        let addr = c.u64()?;
+                        let len = c.u64()? as usize;
+                        backing.push((addr, len));
+                    }
+                    GpuJournalOp::AttachBacking {
+                        resource_id,
+                        backing,
+                    }
+                }
+                9 => GpuJournalOp::SetScanout {
+                    scanout_id: c.u32()?,
+                    resource_id: c.u32()?,
+                    width: c.u32()?,
+                    height: c.u32()?,
                 },
                 _ => return None,
             };
