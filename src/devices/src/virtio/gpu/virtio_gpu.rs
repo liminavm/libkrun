@@ -227,6 +227,12 @@ struct GuestFlushHold {
     /// completion is idempotent, so the fallback and the ack path may both fire.
     /// Past the deadline the hold is dropped (the latch thread completed it).
     fallback_at: Option<std::time::Instant>,
+    /// Hard ceiling: the latch thread completes the fence at creation+500ms no
+    /// matter what (scheduled at creation; completion is idempotent). A display
+    /// fence held past that is already pathological — wedging the guest's whole
+    /// scanout pipeline on it is never the right outcome. Holds older than the
+    /// ceiling are dropped by process_retired_presents.
+    created_at: std::time::Instant,
 }
 
 struct ParkedFlush {
@@ -1062,7 +1068,16 @@ impl VirtioGpu {
         };
         if let Err(e) = rutabaga.create_fence(fence) {
             warn!("present fence injection failed (ctx {ctx_id}): {e}; presenting now");
-            self.present_fence.as_mut().unwrap().parked.remove(&cookie);
+            // Roll the cookie ALL the way back: leaving it in flush_parked_cookies
+            // poisons the next fenced flush's GuestFlushHold with a cookie that can
+            // never present (no parked frame, no injected fence) -> the guest's
+            // display fence never signals -> hard scanout wedge. Hit in the wild by
+            // direct scanout outliving its client: mutter keeps flipping an exited
+            // client's buffer, whose owning context is gone, so injection fails on
+            // every frame.
+            let pf = self.present_fence.as_mut().unwrap();
+            pf.parked.remove(&cookie);
+            pf.flush_parked_cookies.retain(|c| *c != cookie);
             return false;
         }
         true
@@ -1118,6 +1133,12 @@ impl VirtioGpu {
         let now = std::time::Instant::now();
         let holds = std::mem::take(&mut pf.guest_holds);
         for mut hold in holds {
+            // Past the creation-time ceiling the latch thread already completed the
+            // fence unconditionally — drop the hold (covers frames that can never
+            // present, e.g. the owning context died while its buffer was on scanout).
+            if now > hold.created_at + std::time::Duration::from_millis(500) {
+                continue;
+            }
             if hold.unconfirmed.is_empty() {
                 if pf.ack_active {
                     // Acked = latched: complete immediately.
@@ -1473,11 +1494,21 @@ impl VirtioGpu {
                 if !pf.flush_parked_cookies.is_empty() {
                     let cookies = std::mem::take(&mut pf.flush_parked_cookies);
                     let set: std::collections::BTreeSet<u64> = cookies.into_iter().collect();
+                    let now = std::time::Instant::now();
+                    // Wedge-proof ceiling: whatever happens to the parked frames
+                    // (lost ack, dead context, any future leak class), the guest's
+                    // display fence completes by now+500ms. Completion is
+                    // idempotent with the ack/fallback paths.
+                    let ceiling = now + std::time::Duration::from_millis(500);
+                    if let Err(e) = pf.latch_tx.send((ceiling, rutabaga_fence)) {
+                        error!("latch thread gone: {e}");
+                    }
                     pf.guest_holds.push(GuestFlushHold {
                         fence: rutabaga_fence,
                         unpresented: set.clone(),
                         unconfirmed: set,
                         fallback_at: None,
+                        created_at: now,
                     });
                     return Ok(OkNoData);
                 }
