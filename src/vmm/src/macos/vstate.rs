@@ -581,8 +581,11 @@ impl Vcpu {
                 state.pc
             );
         } else {
-            let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-                boot_receiver.recv().unwrap()
+            let entry_addr = if self.boot_receiver.is_some() {
+                match self.wait_for_boot_entry(&mut hvf_vcpu) {
+                    Some(entry) => entry,
+                    None => return, // channels dropped: process tearing down
+                }
             } else {
                 self.boot_entry_addr
             };
@@ -671,6 +674,41 @@ impl Vcpu {
         };
         if paused {
             self.pause_and_park(hvf_vcpu);
+        }
+    }
+
+    /// Wait for this secondary vCPU's first PSCI CPU_ON entry. Like [`Self::handle_offline`],
+    /// the wait must service out-of-band Pause/Snapshot events: a live pause or an M9 suspend
+    /// can arrive while the guest has not yet — or will never (`maxcpus=`, early-boot suspend)
+    /// — onlined this vCPU. A bare `recv` here deadlocked the whole VM: `pause`/
+    /// `snapshot_vcpus` wait for every vCPU's response while the event loop holds the vmm
+    /// lock, and this vCPU never saw the event, so Resume could not even be processed.
+    /// Returns `None` when the channels drop (process teardown).
+    ///
+    /// A never-onlined vCPU snapshotted here saves its reset-default register file; restore
+    /// fidelity for not-currently-online vCPUs is the documented task #41 limitation (see
+    /// `handle_offline`) — this wait only guarantees the save side completes.
+    fn wait_for_boot_entry(&mut self, hvf_vcpu: &mut HvfVcpu) -> Option<u64> {
+        // Clones so the select does not borrow `self` across the pause_and_park/handle_snapshot
+        // calls (same shape as handle_offline).
+        let boot = self.boot_receiver.clone().unwrap();
+        let events = self.event_receiver.clone();
+        loop {
+            let mut sel = Select::new();
+            let boot_idx = sel.recv(&boot);
+            let evt_idx = sel.recv(&events);
+            let op = sel.select();
+            let picked = op.index();
+            if picked == boot_idx {
+                return op.recv(&boot).ok();
+            }
+            debug_assert_eq!(picked, evt_idx);
+            match op.recv(&events) {
+                Ok(VcpuEvent::Pause) => self.pause_and_park(hvf_vcpu),
+                Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(hvf_vcpu, reply),
+                Ok(VcpuEvent::Resume(_)) => {} // stale resume with no pause: ignore
+                Err(_) => return None,         // channel dropped: process tearing down
+            }
         }
     }
 
