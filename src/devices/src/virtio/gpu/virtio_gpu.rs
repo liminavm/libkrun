@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::io::IoSliceMut;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -422,6 +422,85 @@ pub struct VirtioGpu {
     /// and the hot venus scanout-flush path stays untouched. Reset with the session;
     /// snapshot restore re-derives it by replaying CtxCreate through `create_context`.
     vrend_ctx_seen: bool,
+    /// limina leak forensics: see [`ScanoutLedger`].
+    scanout_ledger: ScanoutLedger,
+}
+
+/// The display path's per-resource ledger, answering one question: does the worker's display
+/// path ever let go of a scanout resource?
+///
+/// Motivation (spikes/venus-churn-retention): a compositor that mints a fresh scanout resource
+/// every frame leaves gigabytes of host memory that no guest-side release reclaims. The venus
+/// IOSurface census is balanced and the CF wrappers demonstrably deallocate, so the holder is
+/// something *outside* that ledger — and the display path is the one per-resource state a probe
+/// that never presents cannot reach. (It answered "not here": the retention turned out to live
+/// in the supervisor, billed to this process because IOSurface storage bills to its creator.
+/// The ledger stays as the standing check that this path keeps balancing.)
+///
+/// `stranded` names the one code path that can orphan a resource for the process's life:
+/// `unref_resource` removes the metadata *before* refusing a still-scanned-out resource, so the
+/// rutabaga resource survives with nothing left that can address it.
+#[derive(Default)]
+struct ScanoutLedger {
+    /// Resource ids bound to a scanout and not yet unref'd.
+    live: HashSet<u32>,
+    /// SET_SCANOUT / SET_SCANOUT_BLOB commands that bound a resource.
+    binds: u64,
+    /// Binds of an id not already in `live` — the display path "seeing" a new resource.
+    fresh: u64,
+    /// Zero-copy presents (`present_surface`), immediate + deferred.
+    presents: u64,
+    /// Unrefs that released an id the display path had seen.
+    released: u64,
+    /// Unrefs refused for a still-enabled scanout (see the struct doc).
+    stranded: u64,
+}
+
+impl ScanoutLedger {
+    /// Report every `REPORT_EVERY` binds. Binds happen per flip, so on an ordinary desktop this
+    /// is a steady trickle forever — hence `debug!`. A strand is `warn!`: it should never happen.
+    const REPORT_EVERY: u64 = 256;
+
+    fn bind(&mut self, resource_id: u32) {
+        self.binds += 1;
+        if self.live.insert(resource_id) {
+            self.fresh += 1;
+        }
+        if self.binds % Self::REPORT_EVERY == 0 {
+            self.report();
+        }
+    }
+
+    fn unref(&mut self, resource_id: u32, refused: bool) {
+        if refused {
+            self.stranded += 1;
+            warn!(
+                "[SCANOUT-LEDGER] resource {resource_id} STRANDED (its metadata is already gone, \
+                 so the rutabaga resource is now unreachable)"
+            );
+            self.report();
+            return;
+        }
+        if self.live.remove(&resource_id) {
+            self.released += 1;
+        }
+    }
+
+    fn present(&mut self) {
+        self.presents += 1;
+    }
+
+    fn report(&self) {
+        debug!(
+            "[SCANOUT-LEDGER] seen {} (fresh {}) released {} still-held {} | presents {} stranded {}",
+            self.binds,
+            self.fresh,
+            self.released,
+            self.live.len(),
+            self.presents,
+            self.stranded,
+        );
+    }
 }
 
 /// The per-activation transport the fence handler retires guest fences into.
@@ -817,6 +896,7 @@ impl VirtioGpu {
             journal,
             cursor_state: None,
             vrend_ctx_seen: false,
+            scanout_ledger: ScanoutLedger::default(),
         }
     }
 
@@ -1585,6 +1665,9 @@ impl VirtioGpu {
         // The dropped session's contexts are gone; Global-ring fence routing returns to
         // the sync mark until the next session creates a vrend context.
         self.vrend_ctx_seen = false;
+        // The ledger's live ids belonged to the dropped session; the running totals stay so a
+        // reboot mid-investigation doesn't hide what came before.
+        self.scanout_ledger.live.clear();
         {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
@@ -1749,8 +1832,10 @@ impl VirtioGpu {
                 "The driver requested unref_resource, but resource {resource_id} has \
                      associated scanouts, refusing to delete the resource."
             );
+            self.scanout_ledger.unref(resource_id, true);
             return Err(ErrUnspec);
         }
+        self.scanout_ledger.unref(resource_id, false);
 
         // limina software 2D resources have no rutabaga state.
         if self.sw2d.remove(&resource_id).is_some() {
@@ -1850,6 +1935,7 @@ impl VirtioGpu {
             #[cfg(target_os = "macos")]
             iosurface_id,
         });
+        self.scanout_ledger.bind(resource_id);
         Ok(OkNoData)
     }
 
@@ -1940,6 +2026,7 @@ impl VirtioGpu {
             height,
             iosurface_id,
         });
+        self.scanout_ledger.bind(resource_id);
         Ok(OkNoData)
     }
 
@@ -2044,7 +2131,10 @@ impl VirtioGpu {
                             iosurface_id,
                             Some(&rect),
                         ) {
-                            Ok(()) => continue,
+                            Ok(()) => {
+                                self.scanout_ledger.present();
+                                continue;
+                            }
                             Err(DisplayBackendError::MethodNotSupported) => {}
                             Err(e) => {
                                 log::error!("present_surface failed for scanout {scanout_id}: {e}");
@@ -2071,7 +2161,10 @@ impl VirtioGpu {
                         iosurface_id,
                         Some(&rect),
                     ) {
-                        Ok(()) => continue,
+                        Ok(()) => {
+                            self.scanout_ledger.present();
+                            continue;
+                        }
                         Err(DisplayBackendError::MethodNotSupported) => {
                             // Backend has no zero-copy path (e.g. headless capture); fall through
                             // to the readback path below.
@@ -2420,7 +2513,7 @@ impl VirtioGpu {
                 .display_backend
                 .present_surface(scanout_id, iosurface_id, Some(&rect))
             {
-                Ok(()) => {}
+                Ok(()) => self.scanout_ledger.present(),
                 // A sink without zero-copy (headless capture): read the pixels back and
                 // present them as a software frame — the deferred twin of the immediate
                 // path's fallback in `flush_resource`. Before this, arming fence-present
