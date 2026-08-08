@@ -1822,6 +1822,16 @@ impl VirtioGpu {
 
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
+        // A backend that handed this surface to another process has no other way to learn it is
+        // finished with, and on macOS the storage bills to the task that created it, so the
+        // holder feels no pressure of its own to let go.
+        #[cfg(target_os = "macos")]
+        let iosurface_id = self
+            .rutabaga
+            .as_ref()
+            .and_then(|r| r.iosurface_id(resource_id).ok())
+            .filter(|&id| id != 0);
+
         let resource = self
             .resources
             .remove(&resource_id)
@@ -1836,6 +1846,14 @@ impl VirtioGpu {
             return Err(ErrUnspec);
         }
         self.scanout_ledger.unref(resource_id, false);
+
+        // Must precede the rutabaga unref below, which is what drops the last host reference: an
+        // IOSurface id is reusable the moment its surface dies, so a release sent afterwards
+        // could name a surface that already belongs to someone else.
+        #[cfg(target_os = "macos")]
+        if let Some(id) = iosurface_id {
+            let _ = self.display_backend.release_surface(id);
+        }
 
         // limina software 2D resources have no rutabaga state.
         if self.sw2d.remove(&resource_id).is_some() {

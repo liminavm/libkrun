@@ -176,6 +176,14 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
             }
         }
     }
+
+    fn release_surface(&mut self, iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.release_surface(iosurface_id)
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
