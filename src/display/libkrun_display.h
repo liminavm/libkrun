@@ -212,6 +212,29 @@ typedef int32_t (*krun_display_move_cursor_fn)(void *instance, uint32_t x, uint3
 typedef int32_t (*krun_display_present_surface_fn)(void *instance, uint32_t scanout_id, uint32_t iosurface_id, const struct krun_rect* damage_area);
 
 /**
+ * (limina extension, optional) The guest dropped its last reference to a scanout resource.
+ *
+ * Called from VIRTIO_GPU_CMD_RESOURCE_UNREF for a resource backed by an IOSurface the backend has
+ * been given (one previously passed to present_surface). After this call that IOSurface will never
+ * be presented again, so a backend holding it — or having handed it to another process — may drop it.
+ *
+ * This exists because that reference is otherwise unbounded in practice. A compositor is free to
+ * allocate a fresh scanout buffer per frame, and a backend that caches by IOSurface id then
+ * accumulates one whole framebuffer per frame with nothing to tell it otherwise. On macOS the
+ * storage bills to the task that CREATED the surface, so the holder feels no pressure of its own.
+ * The guest's unref is the only accurate signal that a surface is done with.
+ *
+ * Arguments:
+ *  "instance"     - userdata set by `krun_display_create`, represents this/self argument
+ *  "iosurface_id" - The IOSurface id (IOSurfaceGetID) the released resource was backed by.
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise. The device ignores the
+ *  result: the resource is freed either way.
+ */
+typedef int32_t (*krun_display_release_surface_fn)(void *instance, uint32_t iosurface_id);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -237,6 +260,7 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_set_cursor_fn          set_cursor; // (optional) limina: hardware cursor image+hotspot
     krun_display_move_cursor_fn         move_cursor; // (optional) limina: hardware cursor position
     krun_display_present_surface_fn     present_surface; // (optional) limina: zero-copy IOSurface scanout present
+    krun_display_release_surface_fn     release_surface; // (optional) limina: guest unref'd a scanout resource
 };
 
 union krun_display_vtable {
