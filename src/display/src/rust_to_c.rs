@@ -66,6 +66,16 @@ pub trait DisplayBackendBasicFramebuffer {
     ) -> Result<(), DisplayBackendError> {
         Err(DisplayBackendError::MethodNotSupported)
     }
+
+    /// (Optional, limina) The guest dropped its last reference to a scanout resource, and the
+    /// IOSurface behind it will not be presented again.
+    ///
+    /// A backend that hands surfaces to another process cannot otherwise learn this: the guest's
+    /// `RESOURCE_UNREF` is the only signal, and on macOS an IOSurface's storage bills to the task
+    /// that created it, so the holder sees no pressure of its own to let go. Default: unsupported.
+    fn release_surface(&mut self, _iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -223,6 +233,13 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             ))
         }
 
+        extern "C" fn release_surface_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            iosurface_id: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).release_surface(iosurface_id))
+        }
+
         DisplayBackend {
             create_userdata: userdata.map_or(null(), |t| ptr::from_ref(t) as *const c_void),
             create_userdata_lifetime: PhantomData,
@@ -238,6 +255,7 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     set_cursor: Some(set_cursor_fn::<I>),
                     move_cursor: Some(move_cursor_fn::<I>),
                     present_surface: Some(present_surface_fn::<I>),
+                    release_surface: Some(release_surface_fn::<I>),
                 },
             },
         }
