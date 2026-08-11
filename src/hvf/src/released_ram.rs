@@ -147,7 +147,11 @@ impl ReleasedRam {
         }
         let host = Self::host_of(region, gpa);
         let rc = unsafe {
-            libc::madvise(host as *mut libc::c_void, len as usize, libc::MADV_FREE_REUSABLE)
+            libc::madvise(
+                host as *mut libc::c_void,
+                len as usize,
+                libc::MADV_FREE_REUSABLE,
+            )
         };
         if rc != 0 {
             // The unmap stands (a guest touch will fault and heal); only the host-side
@@ -230,8 +234,13 @@ impl ReleasedRam {
             .region_of(gpa)
             .expect("released range outside every RAM region");
         let host = Self::host_of(region, gpa);
-        let rc =
-            unsafe { libc::madvise(host as *mut libc::c_void, len as usize, libc::MADV_FREE_REUSE) };
+        let rc = unsafe {
+            libc::madvise(
+                host as *mut libc::c_void,
+                len as usize,
+                libc::MADV_FREE_REUSE,
+            )
+        };
         if rc != 0 {
             warn!(
                 "released-ram: madvise(MADV_FREE_REUSE) at {host:#x} len={len:#x} failed: {}",
@@ -271,10 +280,7 @@ fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
         new_end = new_end.max(s + l);
         map.remove(&s);
     }
-    let overlapping: Vec<u64> = map
-        .range(new_start..=new_end)
-        .map(|(&s, _)| s)
-        .collect();
+    let overlapping: Vec<u64> = map.range(new_start..=new_end).map(|(&s, _)| s).collect();
     for s in overlapping {
         let l = map.remove(&s).unwrap();
         new_end = new_end.max(s + l);
@@ -352,7 +358,10 @@ mod tests {
         // A range straddling the window start, one inside, one straddling the end.
         let mut m = set(&[(0x0, 0x8000), (0xc000, 0x4000), (0x14000, 0x8000)]);
         let got = remove_overlaps(&mut m, 0x4000, 0x18000);
-        assert_eq!(got, vec![(0x4000, 0x4000), (0xc000, 0x4000), (0x14000, 0x4000)]);
+        assert_eq!(
+            got,
+            vec![(0x4000, 0x4000), (0xc000, 0x4000), (0x14000, 0x4000)]
+        );
         // The parts outside the window survive, exactly.
         assert_eq!(m, set(&[(0x0, 0x4000), (0x18000, 0x4000)]));
     }

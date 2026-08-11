@@ -1163,7 +1163,12 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        let balloon = devices::virtio::Balloon::new(self.free_page_reporting, self.deflate_on_oom)
+        let balloon = devices::virtio::Balloon::new(
+            self.free_page_reporting,
+            self.deflate_on_oom,
+            #[cfg(target_os = "macos")]
+            ctx.vmm.released_ram.clone(),
+        )
             .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         let inner = Arc::new(Mutex::new(balloon));
         ctx.subscribe_events(inner.clone())?;
