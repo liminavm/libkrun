@@ -14,7 +14,7 @@ pub mod released_ram;
 extern crate log;
 
 use bindings::*;
-pub use released_ram::{FaultOutcome, ReleasedRam};
+pub use released_ram::{FaultOutcome, ReleasedRam, ReleasedRamStats};
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;

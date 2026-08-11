@@ -34,6 +34,18 @@ const XFSC_TRANSLATION_L3: u64 = 0b000111;
 /// How often to log a heal after the first one.
 const HEAL_LOG_EVERY: u64 = 256;
 
+/// Cumulative counters since boot. `released_bytes - remapped_bytes` is the RAM currently
+/// handed back to the OS; `heals` counts stage-2 faults taken (each one a guest reuse the
+/// balloon did not anticipate), `stray_faults` counts translation faults in guest RAM with
+/// no released range covering them (should stay 0).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ReleasedRamStats {
+    pub heals: u64,
+    pub released_bytes: u64,
+    pub remapped_bytes: u64,
+    pub stray_faults: u64,
+}
+
 pub enum FaultOutcome {
     /// The fault hit a released range; it has been re-validated and re-mapped. Re-run the
     /// vCPU without advancing the PC so the faulting access retries against the new mapping.
@@ -224,6 +236,15 @@ impl ReleasedRam {
             );
         }
         FaultOutcome::Healed
+    }
+
+    pub fn stats(&self) -> ReleasedRamStats {
+        ReleasedRamStats {
+            heals: self.heals.load(Ordering::Relaxed),
+            released_bytes: self.released_bytes.load(Ordering::Relaxed),
+            remapped_bytes: self.remapped_bytes.load(Ordering::Relaxed),
+            stray_faults: self.stray_faults.load(Ordering::Relaxed),
+        }
     }
 
     /// `MADV_FREE_REUSE` + `hv_vm_map` one extracted range. On map failure the range is
