@@ -294,7 +294,16 @@ impl Worker {
                     let (outstanding, summary) = virtio_gpu.outstanding_fences();
                     if outstanding == 0 && virtio_gpu.present_quiescent() {
                         let (cookies, shown) = virtio_gpu.discard_stale_present_bookkeeping();
-                        if cookies != 0 || shown != 0 {
+                        if shown > 100 {
+                            // A backlog this deep means shown acks stopped draining long
+                            // ago (every ack either missing or naming an unknown surface)
+                            // — the leak we want field logs to surface at default level.
+                            warn!(
+                                "gpu worker: dropped {shown} awaiting-shown entries at \
+                                 reset — the shown-ack loop was not draining this session \
+                                 ({cookies} flush-parked cookie(s) also discarded)"
+                            );
+                        } else if cookies != 0 || shown != 0 {
                             info!(
                                 "gpu worker: dropped stale present bookkeeping stranded by \
                                  the reset ({cookies} flush-parked cookie(s), {shown} \
