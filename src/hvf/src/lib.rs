@@ -1234,7 +1234,9 @@ impl HvfVcpu<'_> {
                 // fields are meaningless.
                 if let Some(released_ram) = &self.released_ram {
                     match released_ram.handle_fault(pa, syndrome & 0x3f) {
-                        FaultOutcome::Healed => return Ok(VcpuExit::StageTwoHealed),
+                        FaultOutcome::Healed | FaultOutcome::Retry => {
+                            return Ok(VcpuExit::StageTwoHealed)
+                        }
                         FaultOutcome::Fatal => return Err(Error::StageTwoHeal),
                         FaultOutcome::NotHandled => {}
                     }
@@ -1273,7 +1275,9 @@ impl HvfVcpu<'_> {
                 let pa = self.vcpu_exit.exception.physical_address;
                 if let Some(released_ram) = &self.released_ram {
                     match released_ram.handle_fault(pa, syndrome & 0x3f) {
-                        FaultOutcome::Healed => return Ok(VcpuExit::StageTwoHealed),
+                        FaultOutcome::Healed | FaultOutcome::Retry => {
+                            return Ok(VcpuExit::StageTwoHealed)
+                        }
                         FaultOutcome::Fatal => return Err(Error::StageTwoHeal),
                         FaultOutcome::NotHandled => {}
                     }
