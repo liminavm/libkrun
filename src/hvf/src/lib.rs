@@ -8,11 +8,13 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+pub mod released_ram;
 
 #[macro_use]
 extern crate log;
 
 use bindings::*;
+pub use released_ram::{FaultOutcome, ReleasedRam};
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;
@@ -124,6 +126,7 @@ const EC_AA64_HVC: u64 = 0x16;
 const EC_AA64_SMC: u64 = 0x17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
+const EC_INSTRABORT: u64 = 0x20;
 const EC_DATAABORT: u64 = 0x24;
 const EC_AA64_BKPT: u64 = 0x3c;
 
@@ -144,6 +147,9 @@ pub enum Error {
     /// system register). Not fatal to the VMM: the run loop logs it and stops the VM cleanly
     /// instead of `panic!`ing the worker process. The specifics are logged at the trap site.
     Unhandled,
+    /// A stage-2 fault on balloon-released guest RAM could not be healed (re-map failed);
+    /// resuming would fault forever on the same access, so the VM must stop.
+    StageTwoHeal,
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -169,6 +175,11 @@ impl Display for Error {
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             Unhandled => write!(f, "Unhandled guest vCPU state (see log); stopping the VM"),
+            StageTwoHeal => write!(
+                f,
+                "Failed to re-map balloon-released guest RAM on a stage-2 fault (see log); \
+                 stopping the VM"
+            ),
             NestedCheck => write!(
                 f,
                 "Nested virtualization was requested but it's not support in this system"
@@ -407,6 +418,10 @@ pub enum VcpuExit<'a> {
     Shutdown,
     /// PSCI `SYSTEM_RESET` — the guest asked to reboot (vs `Shutdown` = power off). (limina addition.)
     Reset,
+    /// A stage-2 fault on balloon-released guest RAM was healed (the range was re-validated and
+    /// re-mapped). The PC was deliberately NOT advanced: re-running the vCPU retries the faulting
+    /// access against the restored mapping. (limina addition — the FRQ/balloon unmap fix.)
+    StageTwoHealed,
     SystemRegister,
     VtimerActivated,
     WaitForEvent,
@@ -543,6 +558,10 @@ pub struct HvfVcpu<'a> {
     // Cached copy of the HVF vtimer offset (0 until a live pause advances it),
     // so the WFE deadline check doesn't issue a syscall on every wait.
     vtimer_offset: Cell<u64>,
+    /// Balloon-released guest RAM (shared with the balloon's release path): stage-2 faults on
+    /// ranges recorded here are healed in place instead of being treated as MMIO. `None` outside
+    /// limina's macOS worker.
+    released_ram: Option<Arc<ReleasedRam>>,
 }
 
 impl HvfVcpu<'_> {
@@ -591,7 +610,14 @@ impl HvfVcpu<'_> {
             vtimer_masked: false,
             nested_enabled,
             vtimer_offset: Cell::new(0),
+            released_ram: None,
         })
+    }
+
+    /// Wire up the balloon-released RAM tracker so this vCPU heals stage-2 faults on released
+    /// ranges (see [`ReleasedRam`]). Call before the first `run`.
+    pub fn set_released_ram(&mut self, released_ram: Arc<ReleasedRam>) {
+        self.released_ram = Some(released_ram);
     }
 
     pub fn set_initial_state(&self, entry_addr: u64, fdt_addr: u64) -> Result<(), Error> {
@@ -1116,6 +1142,19 @@ impl HvfVcpu<'_> {
                 );
 
                 let pa = self.vcpu_exit.exception.physical_address;
+
+                // A translation fault on balloon-released guest RAM is healed and retried, never
+                // decoded as MMIO. Must run before the PC-advance is armed and before any ISS
+                // interpretation: RAM re-touches are often ISV=0 (stp/ldp, SIMD), whose srt/sas
+                // fields are meaningless.
+                if let Some(released_ram) = &self.released_ram {
+                    match released_ram.handle_fault(pa, syndrome & 0x3f) {
+                        FaultOutcome::Healed => return Ok(VcpuExit::StageTwoHealed),
+                        FaultOutcome::Fatal => return Err(Error::StageTwoHeal),
+                        FaultOutcome::NotHandled => {}
+                    }
+                }
+
                 self.pending_advance_pc = true;
 
                 if iswrite {
@@ -1141,6 +1180,25 @@ impl HvfVcpu<'_> {
                     self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
                     Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
                 }
+            }
+            EC_INSTRABORT => {
+                // The guest can legitimately EXECUTE from a balloon-released page: free pages
+                // reallocated as page cache hold binaries. Same heal as the data-abort path; any
+                // other instruction abort is a guest state we don't model.
+                let pa = self.vcpu_exit.exception.physical_address;
+                if let Some(released_ram) = &self.released_ram {
+                    match released_ram.handle_fault(pa, syndrome & 0x3f) {
+                        FaultOutcome::Healed => return Ok(VcpuExit::StageTwoHealed),
+                        FaultOutcome::Fatal => return Err(Error::StageTwoHeal),
+                        FaultOutcome::NotHandled => {}
+                    }
+                }
+                let pc = self.read_reg(hv_reg_t_HV_REG_PC).unwrap_or(0);
+                error!(
+                    "unhandled instruction abort: pa=0x{pa:x} syndrome=0x{syndrome:x} \
+                     pc=0x{pc:x}; stopping the VM"
+                );
+                Err(Error::Unhandled)
             }
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             EC_SYSTEMREGISTERTRAP => {
