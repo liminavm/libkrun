@@ -510,6 +510,10 @@ impl Vcpu {
                     info!("vCPU {vcpuid} received reboot (PSCI SYSTEM_RESET)");
                     Ok(VcpuEmulation::Rebooted)
                 }
+                VcpuExit::StageTwoHealed => {
+                    debug!("vCPU {vcpuid} stage-2 fault on balloon-released RAM healed");
+                    Ok(VcpuEmulation::Handled)
+                }
                 VcpuExit::SystemRegister => {
                     debug!("vCPU {vcpuid} accessed a system register");
                     Ok(VcpuEmulation::Handled)
