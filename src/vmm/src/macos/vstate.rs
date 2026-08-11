@@ -20,7 +20,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, VcpuState, Vcpus};
+use hvf::{HvfVcpu, HvfVm, ReleasedRam, VcpuExit, VcpuState, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -253,6 +253,10 @@ pub struct Vcpu {
     /// M9 restore: the shared gate this vCPU waits on (after creating its HVF vCPU, before
     /// restoring) until the main thread has restored the in-kernel GIC. `None` on a fresh boot.
     restore_gate: Option<Arc<RestoreGate>>,
+
+    /// Balloon-released guest RAM (shared with the balloon device), handed to the HVF vCPU at
+    /// thread start so stage-2 faults on released ranges are healed instead of stopping the VM.
+    released_ram: Option<Arc<ReleasedRam>>,
 }
 
 impl Vcpu {
@@ -350,6 +354,7 @@ impl Vcpu {
             nested_enabled,
             restore_state: None,
             restore_gate: None,
+            released_ram: None,
         })
     }
 
@@ -400,6 +405,12 @@ impl Vcpu {
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
         self.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Wire up the balloon-released RAM tracker (see [`ReleasedRam`]); forwarded to the HVF vCPU
+    /// when its thread starts.
+    pub fn set_released_ram(&mut self, released_ram: Arc<ReleasedRam>) {
+        self.released_ram = Some(released_ram);
     }
 
     pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
@@ -551,6 +562,9 @@ impl Vcpu {
     pub fn run(&mut self, init_tls_sender: Sender<u64>) {
         let mut hvf_vcpu =
             HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
+        if let Some(released_ram) = self.released_ram.take() {
+            hvf_vcpu.set_released_ram(released_ram);
+        }
         let hvf_vcpuid = hvf_vcpu.id();
 
         // Report the HVF-assigned vCPU id (creation order is not deterministic)

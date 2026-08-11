@@ -1027,6 +1027,24 @@ pub fn build_microvm(
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
 
+    // The balloon's stage-2 release/heal tracker, over the RAM regions only: the GPU/fs SHM
+    // window at/above shm_start_addr is managed by blob mappings and must keep its M9.3
+    // unmapped-on-restore fault signature.
+    #[cfg(target_os = "macos")]
+    let released_ram = {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+        let shm_start = arch_memory_info.shm_start_addr;
+        let regions = guest_memory
+            .iter()
+            .filter(|r| shm_start == 0 || r.start_addr().raw_value() < shm_start)
+            .map(|r| {
+                let host = guest_memory.get_host_address(r.start_addr()).unwrap() as u64;
+                (r.start_addr().raw_value(), host, r.len())
+            })
+            .collect();
+        Arc::new(hvf::ReleasedRam::new(regions))
+    };
+
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
@@ -1054,6 +1072,8 @@ pub fn build_microvm(
         balloon_control_handle: None,
         #[cfg(target_os = "macos")]
         vcpu_list: vcpu_list.clone(),
+        #[cfg(target_os = "macos")]
+        released_ram,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -2881,7 +2901,13 @@ fn attach_balloon_device(
     use self::StartMicrovmError::*;
 
     let balloon = Arc::new(Mutex::new(
-        devices::virtio::Balloon::new(free_page_reporting, deflate_on_oom).unwrap(),
+        devices::virtio::Balloon::new(
+            free_page_reporting,
+            deflate_on_oom,
+            #[cfg(target_os = "macos")]
+            vmm.released_ram.clone(),
+        )
+        .unwrap(),
     ));
 
     event_manager
