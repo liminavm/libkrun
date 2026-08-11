@@ -4,7 +4,9 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+#[cfg(target_os = "macos")]
+use hvf::ReleasedRam;
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
@@ -70,19 +72,21 @@ fn host_page_size() -> usize {
 }
 
 /// Accumulates guest-reported *free* 4 KiB runs and yields only the host pages that are provably
-/// safe to return to macOS with `MADV_FREE_REUSABLE`.
+/// safe to release (stage-2 unmap + `MADV_FREE_REUSABLE`).
 ///
 /// INVARIANT — the whole safety proof for the 4 KiB-guest / 16 KiB-host page-size mismatch: a host
 /// page is emitted by [`Self::take_full_pages`] **only** when every one of its constituent guest
-/// pages was reported free, so the `madvise` can never discard a still-live guest page. Sub-page
+/// pages was reported free, so releasing it can never drop a still-live guest page. Sub-page
 /// (unaligned) fringes of a reported run are rounded *inward* (start up, end down) so a partially
 /// free guest page is never counted as free, regardless of how `MADV_FREE_REUSABLE` itself rounds.
 struct ReclaimCoalescer {
     host_page: usize,
     /// `(1 << (host_page / GUEST_PAGE)) - 1` — the all-sub-pages-free mask (`0b1111` on 16K/4K).
     full_mask: u64,
-    /// host-page base address -> bitmask of which of its 4 KiB sub-pages have been reported free.
-    partial: std::collections::HashMap<usize, u64>,
+    /// host-page base address -> (bitmask of which of its 4 KiB sub-pages have been reported free,
+    /// guest-physical address of the host page base — carried so the release can unmap the range
+    /// from the guest).
+    partial: std::collections::HashMap<usize, (u64, u64)>,
 }
 
 impl ReclaimCoalescer {
@@ -104,11 +108,12 @@ impl ReclaimCoalescer {
         }
     }
 
-    /// Record a reported-free run `[addr, addr + len)` (host addresses). Never madvises. Rounds the
-    /// run *inward* to whole guest pages so an unaligned fringe never marks a partially-live page
-    /// free. In the real FRQ path runs are already page-aligned page-multiples; the rounding is a
-    /// correctness-by-construction guard, not an expected case.
-    fn add(&mut self, addr: usize, len: usize) {
+    /// Record a reported-free run `[addr, addr + len)` (host addresses; `gpa` is the guest-physical
+    /// address of `addr`). Never releases anything. Rounds the run *inward* to whole guest pages so
+    /// an unaligned fringe never marks a partially-live page free. In the real FRQ path runs are
+    /// already page-aligned page-multiples; the rounding is a correctness-by-construction guard,
+    /// not an expected case.
+    fn add(&mut self, addr: usize, gpa: u64, len: usize) {
         if len < GUEST_PAGE {
             return;
         }
@@ -118,21 +123,30 @@ impl ReclaimCoalescer {
         while p < end {
             let base = p & !(self.host_page - 1);
             let sub = (p - base) / GUEST_PAGE;
-            *self.partial.entry(base).or_insert(0) |= 1u64 << sub;
+            // GPA of the host-page base: shift the run's gpa by the same offset its host base
+            // sits at. `base` can precede `addr` (the run starts mid-host-page), so keep the
+            // arithmetic ordered to stay in range.
+            let gpa_base = gpa + (p - addr) as u64 - (p - base) as u64;
+            let entry = self.partial.entry(base).or_insert((0, gpa_base));
+            debug_assert_eq!(
+                entry.1, gpa_base,
+                "one host page reported under two GPAs — regions overlap?"
+            );
+            entry.0 |= 1u64 << sub;
             p += GUEST_PAGE;
         }
     }
 
-    /// Drain the host pages whose every sub-page is now free, returning `(base, host_page_len)`
-    /// ranges safe to `MADV_FREE_REUSABLE`. Partially covered host pages are retained (FRQ callers
-    /// discard the coalescer after each head, so retained partials are simply not reclaimed).
-    fn take_full_pages(&mut self) -> Vec<(usize, usize)> {
+    /// Drain the host pages whose every sub-page is now free, returning `(base, gpa, host_page_len)`
+    /// ranges safe to release. Partially covered host pages are retained (FRQ callers discard the
+    /// coalescer after each head, so retained partials are simply not released).
+    fn take_full_pages(&mut self) -> Vec<(usize, u64, usize)> {
         let full = self.full_mask;
         let hp = self.host_page;
         let mut out = Vec::new();
-        self.partial.retain(|&base, &mut mask| {
+        self.partial.retain(|&base, &mut (mask, gpa)| {
             if mask == full {
-                out.push((base, hp));
+                out.push((base, gpa, hp));
                 false
             } else {
                 true
@@ -140,6 +154,22 @@ impl ReclaimCoalescer {
         });
         out
     }
+}
+
+/// Merge per-host-page `(host, gpa, len)` triples into maximal runs contiguous in BOTH address
+/// spaces, so a large reported-free block costs one release call instead of one per host page.
+fn merge_runs(mut pages: Vec<(usize, u64, usize)>) -> Vec<(usize, u64, usize)> {
+    pages.sort_unstable();
+    let mut out: Vec<(usize, u64, usize)> = Vec::new();
+    for (host, gpa, len) in pages {
+        match out.last_mut() {
+            Some(last) if last.0 + last.2 == host && last.1 + last.2 as u64 == gpa => {
+                last.2 += len;
+            }
+            _ => out.push((host, gpa, len)),
+        }
+    }
+    out
 }
 
 /// Balloon statistics surfaced to the host policy (limina drives the target; libkrun only reports).
@@ -228,6 +258,11 @@ pub struct Balloon {
     actual_shared: Arc<AtomicU32>,
     /// Cumulative bytes reclaimed via `MADV_FREE_REUSABLE`, published to the control handle.
     reclaimed_bytes: Arc<AtomicU64>,
+    /// Balloon-released guest RAM (shared with the vCPUs' stage-2 fault healing): releasing a
+    /// range here unmaps it from the guest *before* marking the host pages reusable, so the
+    /// guest can never trample pages the OS considers disposable.
+    #[cfg(target_os = "macos")]
+    released_ram: Arc<ReleasedRam>,
 }
 
 impl Balloon {
@@ -244,7 +279,11 @@ impl Balloon {
     /// `deflate_on_oom` gates `VIRTIO_BALLOON_F_DEFLATE_ON_OOM` (see the AVAIL_FEATURES
     /// comment): off by default for transparent balloon accounting; the per-VM escape
     /// hatch re-advertises it.
-    pub fn new(free_page_reporting: bool, deflate_on_oom: bool) -> super::Result<Balloon> {
+    pub fn new(
+        free_page_reporting: bool,
+        deflate_on_oom: bool,
+        #[cfg(target_os = "macos")] released_ram: Arc<ReleasedRam>,
+    ) -> super::Result<Balloon> {
         let host_page = host_page_size();
         let sub = host_page / GUEST_PAGE;
         let full_mask = if sub >= 64 {
@@ -275,6 +314,8 @@ impl Balloon {
             pending_target: Arc::new(Mutex::new(None)),
             actual_shared: Arc::new(AtomicU32::new(0)),
             reclaimed_bytes: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
+            released_ram,
         })
     }
 
@@ -297,6 +338,8 @@ impl Balloon {
         debug!("balloon: process_frq()");
         let host_page = self.host_page;
         let reclaimed = self.reclaimed_bytes.clone();
+        #[cfg(target_os = "macos")]
+        let released_ram = self.released_ram.clone();
         let mem = match self.device_state {
             DeviceState::Activated(ref mem, _) => mem,
             // This should never happen, it's been already validated in the event handler.
@@ -326,25 +369,42 @@ impl Balloon {
                     );
                     continue;
                 };
-                coalescer.add(host_addr as usize, desc.len as usize);
+                coalescer.add(host_addr as usize, desc.addr.0, desc.len as usize);
             }
-            // madvise BEFORE add_used: page_reporting keeps these pages isolated from the guest
+            // Release BEFORE add_used: page_reporting keeps these pages isolated from the guest
             // allocator until the descriptor is marked used, which closes the reallocation window.
-            // MADV_FREE_REUSABLE (not MADV_DONTNEED, which returns nothing on macOS — see
-            // spikes/balloon-madvise/RESULTS.md) actually debits the worker's phys_footprint.
-            for (base, len) in coalescer.take_full_pages() {
-                // SAFETY: `base`/`len` are host-page-aligned and every guest page inside the range
-                // was reported free in this head, so reclaiming the whole host page cannot drop
-                // live guest data.
-                let rc = unsafe {
-                    libc::madvise(base as *mut libc::c_void, len, libc::MADV_FREE_REUSABLE)
-                };
-                if rc != 0 {
-                    warn!(
-                        "balloon: madvise(MADV_FREE_REUSABLE) at {base:#x} len={len} failed: {}",
-                        std::io::Error::last_os_error()
-                    );
-                } else {
+            // The release unmaps the range from the guest FIRST and only then hands the host
+            // pages back with MADV_FREE_REUSABLE (not MADV_DONTNEED, which returns nothing on
+            // macOS — see spikes/balloon-madvise/RESULTS.md): a reusable-marked page must never
+            // stay reachable through a live stage-2 mapping, or the guest's spec-sanctioned reuse
+            // tramples pages the OS considers disposable with no event fired (see
+            // spikes/hv-ledger-gap round 8c). The guest's next touch takes a stage-2 fault the
+            // vCPU heals (ReleasedRam::handle_fault).
+            for (base, gpa, len) in merge_runs(coalescer.take_full_pages()) {
+                // SAFETY (both branches): the range is host-page-aligned and every guest page
+                // inside it was reported free in this head, so releasing the whole host page
+                // cannot drop live guest data.
+                let ok;
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = base;
+                    ok = released_ram.release(gpa, len as u64);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = gpa;
+                    let rc = unsafe {
+                        libc::madvise(base as *mut libc::c_void, len, libc::MADV_FREE_REUSABLE)
+                    };
+                    if rc != 0 {
+                        warn!(
+                            "balloon: madvise(MADV_FREE_REUSABLE) at {base:#x} len={len} failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    ok = rc == 0;
+                }
+                if ok {
                     reclaimed.fetch_add(len as u64, Ordering::Relaxed);
                 }
             }
@@ -360,15 +420,20 @@ impl Balloon {
 
     /// Inflate: the guest handed us page-frame numbers (arrays of `__le32` at
     /// `VIRTIO_BALLOON_PFN_SHIFT`) for pages it has placed in the balloon and promises not to touch
-    /// until deflate. We reclaim each fully covered 16 KiB host page with `MADV_FREE_REUSABLE`. The
+    /// until deflate. We release each fully covered 16 KiB host page (stage-2 unmap +
+    /// `MADV_FREE_REUSABLE`; the unmap is defensive hardening here — the guest promised not to
+    /// touch these, so any fault the vCPU heals on them is also a true guest-bug detector, except
+    /// under `DEFLATE_ON_OOM` where the spec lets the guest take pages back before notifying). The
     /// inflate coalescer **persists** across heads (unlike FRQ): inflated pages stay balloon-owned,
     /// so accumulating sub-pages from different heads is safe and recovers cross-head host pages on a
-    /// stock 4 KiB guest. A host page is reclaimed only once all four sub-pages are inflated, so we
+    /// stock 4 KiB guest. A host page is released only once all four sub-pages are inflated, so we
     /// never discard a still-live (non-inflated) guest page.
     pub fn process_ifq(&mut self) -> bool {
         let host_page = self.host_page;
         let full_mask = self.full_mask;
         let reclaimed = self.reclaimed_bytes.clone();
+        #[cfg(target_os = "macos")]
+        let released_ram = self.released_ram.clone();
         let mem = match self.device_state {
             DeviceState::Activated(ref mem, _) => mem.clone(),
             DeviceState::Inactive => unreachable!(),
@@ -404,23 +469,36 @@ impl Balloon {
                     let entry = self.inflate_mask.entry(base).or_insert(0);
                     *entry |= 1u64 << sub;
                     if *entry == full_mask && self.ballooned_pages.insert(base) {
-                        // SAFETY: every 4 KiB sub-page of this host page is now balloon-owned (the
-                        // guest promised not to touch them), so reclaiming the whole page is safe.
-                        let rc = unsafe {
-                            libc::madvise(
-                                base as *mut libc::c_void,
-                                host_page,
-                                libc::MADV_FREE_REUSABLE,
-                            )
-                        };
-                        if rc != 0 {
-                            warn!(
-                                "balloon: inflate madvise(REUSABLE) at {base:#x} failed: {}",
-                                std::io::Error::last_os_error()
-                            );
-                            self.ballooned_pages.remove(&base);
-                        } else {
+                        // SAFETY (both branches): every 4 KiB sub-page of this host page is now
+                        // balloon-owned (the guest promised not to touch them), so releasing the
+                        // whole page is safe.
+                        let ok;
+                        #[cfg(target_os = "macos")]
+                        {
+                            let gpa_base = guest.0 - (host_addr - base) as u64;
+                            ok = released_ram.release(gpa_base, host_page as u64);
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let rc = unsafe {
+                                libc::madvise(
+                                    base as *mut libc::c_void,
+                                    host_page,
+                                    libc::MADV_FREE_REUSABLE,
+                                )
+                            };
+                            if rc != 0 {
+                                warn!(
+                                    "balloon: inflate madvise(REUSABLE) at {base:#x} failed: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            }
+                            ok = rc == 0;
+                        }
+                        if ok {
                             reclaimed.fetch_add(host_page as u64, Ordering::Relaxed);
+                        } else {
+                            self.ballooned_pages.remove(&base);
                         }
                     }
                 }
@@ -435,13 +513,16 @@ impl Balloon {
     }
 
     /// Deflate: the guest is taking pages back out of the balloon (lowered target, or
-    /// `DEFLATE_ON_OOM` under guest pressure). We only need to drop them from the inflate bookkeeping
-    /// so a host page is no longer considered fully inflated — the deflated pages return to the guest
-    /// free pool and re-fault zero-filled on next use, which is correct. We deliberately do **not**
-    /// `MADV_FREE_REUSE` here: re-validating would needlessly re-commit the *other* still-inflated
-    /// sub-pages of the same host page.
+    /// `DEFLATE_ON_OOM` under guest pressure). Drop them from the inflate bookkeeping so a host
+    /// page is no longer considered fully inflated, and — for host pages that were actually
+    /// released — take the range back for the guest right away (`ReleasedRam::reclaim`: REUSE +
+    /// re-map). The proactive reclaim is an optimization, not a correctness requirement: anything
+    /// missed here (including a `DEFLATE_ON_OOM` guest touching pages before notifying us) heals
+    /// through the vCPU stage-2 fault path.
     pub fn process_dfq(&mut self) -> bool {
         let host_page = self.host_page;
+        #[cfg(target_os = "macos")]
+        let released_ram = self.released_ram.clone();
         let mem = match self.device_state {
             DeviceState::Activated(ref mem, _) => mem.clone(),
             DeviceState::Inactive => unreachable!(),
@@ -476,7 +557,13 @@ impl Balloon {
                             self.inflate_mask.remove(&base);
                         }
                     }
-                    self.ballooned_pages.remove(&base);
+                    if self.ballooned_pages.remove(&base) {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let gpa_base = guest.0 - ((host_addr as usize) - base) as u64;
+                            released_ram.reclaim(gpa_base, host_page as u64);
+                        }
+                    }
                 }
             }
             have_used = true;
@@ -626,26 +713,38 @@ mod tests {
     //! boot. The invariant under test: [`ReclaimCoalescer`] emits a host page for reclaim **only**
     //! when every one of its constituent guest pages was reported free, and never counts a
     //! partially-free (unaligned-fringe) guest page.
-    use super::{ReclaimCoalescer, GUEST_PAGE};
+    use super::{GUEST_PAGE, ReclaimCoalescer, merge_runs};
 
     const HOST_16K: usize = 16384;
     const BASE: usize = 0x4000_0000; // 16 KiB-aligned, mirrors the guest-RAM base.
+    /// Host VA and GPA differ by a fixed per-region offset; mirror that in the tests.
+    const GPA_DELTA: usize = 0x3000_0000;
+
+    fn gpa(host: usize) -> u64 {
+        (host - GPA_DELTA) as u64
+    }
+
+    /// add() with the GPA derived the same way the FRQ path derives it.
+    fn add(c: &mut ReclaimCoalescer, host: usize, len: usize) {
+        c.add(host, gpa(host), len);
+    }
 
     #[test]
     fn full_host_page_emitted_only_when_all_subpages_free() {
         // 3 of 4 sub-pages free -> nothing reclaimed.
         let mut c = ReclaimCoalescer::new(HOST_16K);
-        c.add(BASE, 3 * GUEST_PAGE);
+        add(&mut c, BASE, 3 * GUEST_PAGE);
         assert!(
             c.take_full_pages().is_empty(),
             "a 3-of-4 host page must never be reclaimed"
         );
 
-        // The 4th completes the host page -> exactly that one host page is reclaimed. This is also
-        // the enhanced-tier 16 KiB-guest case (a single 16 KiB-aligned run).
+        // The 4th completes the host page -> exactly that one host page is reclaimed, carrying
+        // the GPA of its base. This is also the enhanced-tier 16 KiB-guest case (a single
+        // 16 KiB-aligned run).
         let mut c = ReclaimCoalescer::new(HOST_16K);
-        c.add(BASE, 4 * GUEST_PAGE);
-        assert_eq!(c.take_full_pages(), vec![(BASE, HOST_16K)]);
+        add(&mut c, BASE, 4 * GUEST_PAGE);
+        assert_eq!(c.take_full_pages(), vec![(BASE, gpa(BASE), HOST_16K)]);
     }
 
     #[test]
@@ -653,7 +752,7 @@ mod tests {
         // A run starting 2 KiB into the first guest page: that page is only partially free and must
         // not be counted. The remaining full pages alone can't complete the host page.
         let mut c = ReclaimCoalescer::new(HOST_16K);
-        c.add(BASE + GUEST_PAGE / 2, 4 * GUEST_PAGE);
+        add(&mut c, BASE + GUEST_PAGE / 2, 4 * GUEST_PAGE);
         assert!(
             c.take_full_pages().is_empty(),
             "an unaligned fringe must never reclaim its partial page"
@@ -662,23 +761,31 @@ mod tests {
 
     #[test]
     fn boundary_spanning_run_completes_two_host_pages() {
-        // 8 contiguous guest pages spanning two 16 KiB host pages -> both reclaimed.
+        // 8 contiguous guest pages spanning two 16 KiB host pages -> both reclaimed, each with
+        // its own base GPA.
         let mut c = ReclaimCoalescer::new(HOST_16K);
-        c.add(BASE, 8 * GUEST_PAGE);
+        add(&mut c, BASE, 8 * GUEST_PAGE);
         let mut got = c.take_full_pages();
         got.sort();
-        assert_eq!(got, vec![(BASE, HOST_16K), (BASE + HOST_16K, HOST_16K)]);
+        assert_eq!(
+            got,
+            vec![
+                (BASE, gpa(BASE), HOST_16K),
+                (BASE + HOST_16K, gpa(BASE + HOST_16K), HOST_16K)
+            ]
+        );
     }
 
     #[test]
     fn split_descriptors_in_one_head_accumulate() {
         // The four sub-pages arriving as separate add() calls (separate descriptors within one
-        // head) still complete the host page.
+        // head) still complete the host page — and a mid-host-page descriptor start must still
+        // attribute the host page base's GPA, not its own.
         let mut c = ReclaimCoalescer::new(HOST_16K);
         for i in 0..4 {
-            c.add(BASE + i * GUEST_PAGE, GUEST_PAGE);
+            add(&mut c, BASE + i * GUEST_PAGE, GUEST_PAGE);
         }
-        assert_eq!(c.take_full_pages(), vec![(BASE, HOST_16K)]);
+        assert_eq!(c.take_full_pages(), vec![(BASE, gpa(BASE), HOST_16K)]);
     }
 
     #[test]
@@ -686,7 +793,34 @@ mod tests {
         // A run that covers the first host page fully then 2 KiB into the next: only the full one
         // is reclaimed; the straddled second host page is left mapped.
         let mut c = ReclaimCoalescer::new(HOST_16K);
-        c.add(BASE, 4 * GUEST_PAGE + GUEST_PAGE / 2);
-        assert_eq!(c.take_full_pages(), vec![(BASE, HOST_16K)]);
+        add(&mut c, BASE, 4 * GUEST_PAGE + GUEST_PAGE / 2);
+        assert_eq!(c.take_full_pages(), vec![(BASE, gpa(BASE), HOST_16K)]);
+    }
+
+    #[test]
+    fn merge_runs_joins_only_pages_contiguous_in_both_spaces() {
+        // Host-contiguous AND gpa-contiguous pages merge into one run.
+        let contiguous = vec![
+            (BASE + HOST_16K, gpa(BASE + HOST_16K), HOST_16K),
+            (BASE, gpa(BASE), HOST_16K),
+        ];
+        assert_eq!(
+            merge_runs(contiguous),
+            vec![(BASE, gpa(BASE), 2 * HOST_16K)]
+        );
+
+        // A host-space gap keeps runs apart.
+        let gapped = vec![
+            (BASE, gpa(BASE), HOST_16K),
+            (BASE + 3 * HOST_16K, gpa(BASE + 3 * HOST_16K), HOST_16K),
+        ];
+        assert_eq!(merge_runs(gapped.clone()), gapped);
+
+        // Host-contiguous but a GPA discontinuity (a region boundary) must NOT merge.
+        let split_gpa = vec![
+            (BASE, gpa(BASE), HOST_16K),
+            (BASE + HOST_16K, gpa(BASE) + 0x1000_0000, HOST_16K),
+        ];
+        assert_eq!(merge_runs(split_gpa.clone()), split_gpa);
     }
 }

@@ -261,6 +261,11 @@ pub struct Vmm {
     /// top of its run loop so it notices a snapshot `Pause`. See [`Self::pause_vcpus`].
     #[cfg(target_os = "macos")]
     vcpu_list: std::sync::Arc<devices::legacy::VcpuList>,
+
+    /// Balloon-released guest RAM (the FRQ/balloon stage-2 unmap fix): shared between the
+    /// balloon device (release/reclaim) and every vCPU (fault healing).
+    #[cfg(target_os = "macos")]
+    pub(crate) released_ram: std::sync::Arc<hvf::ReleasedRam>,
 }
 
 /// Out-of-band request to the running VM's event loop.
@@ -344,6 +349,8 @@ impl Vmm {
             // it never traps there); only fires after a GPU-bearing restore.
             #[cfg(target_os = "macos")]
             vcpu.set_shm_start(self.arch_memory_info.shm_start_addr);
+            #[cfg(target_os = "macos")]
+            vcpu.set_released_ram(self.released_ram.clone());
 
             self.vcpus_handles
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
