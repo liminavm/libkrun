@@ -93,6 +93,8 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         vcpu_list: Arc::new(devices::legacy::VcpuList::new(1)),
         #[cfg(feature = "gpu")]
         gpu_device: None,
+        #[cfg(target_os = "macos")]
+        released_ram: Arc::new(hvf::ReleasedRam::new(Vec::new())),
     };
 
     match control {
