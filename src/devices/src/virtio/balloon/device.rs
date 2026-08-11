@@ -180,6 +180,17 @@ pub struct BalloonStats {
     /// Cumulative bytes handed back to macOS via `MADV_FREE_REUSABLE` (free-page reporting + fully
     /// inflated host pages). A rough "how much we've returned" counter, not a live residency.
     pub reclaimed_bytes: u64,
+    /// Stage-2 heal faults taken: guest touches on released ranges the balloon did not
+    /// anticipate (macOS only; zero elsewhere). See `hvf::ReleasedRamStats`.
+    pub heals: u64,
+    /// Cumulative bytes stage-2 unmapped by release (macOS only).
+    pub released_bytes: u64,
+    /// Cumulative bytes re-validated and re-mapped (heals + deflate reclaims; macOS only).
+    /// `released_bytes - remapped_bytes` is the RAM currently held away from the guest.
+    pub remapped_bytes: u64,
+    /// Stage-2 translation faults in guest RAM outside every released range (macOS only;
+    /// should stay zero — nonzero means bookkeeping went wrong).
+    pub stray_faults: u64,
 }
 
 /// limina: a cloneable, thread-safe handle that lets the host push a balloon target into the live
@@ -201,6 +212,9 @@ pub struct BalloonControlHandle {
     actual: Arc<AtomicU32>,
     /// Cumulative bytes reclaimed via `MADV_FREE_REUSABLE`, published by the device.
     reclaimed: Arc<AtomicU64>,
+    /// Stage-2 release/heal counters, read straight from the shared tracker.
+    #[cfg(target_os = "macos")]
+    released_ram: Arc<ReleasedRam>,
 }
 
 impl BalloonControlHandle {
@@ -223,10 +237,20 @@ impl BalloonControlHandle {
 
     /// A snapshot of balloon stats for the policy.
     pub fn get_stats(&self) -> BalloonStats {
-        BalloonStats {
+        let mut stats = BalloonStats {
             actual_pages: self.actual.load(Ordering::Relaxed),
             reclaimed_bytes: self.reclaimed.load(Ordering::Relaxed),
+            ..Default::default()
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let rr = self.released_ram.stats();
+            stats.heals = rr.heals;
+            stats.released_bytes = rr.released_bytes;
+            stats.remapped_bytes = rr.remapped_bytes;
+            stats.stray_faults = rr.stray_faults;
         }
+        stats
     }
 }
 
@@ -331,6 +355,8 @@ impl Balloon {
             pending_target: self.pending_target.clone(),
             actual: self.actual_shared.clone(),
             reclaimed: self.reclaimed_bytes.clone(),
+            #[cfg(target_os = "macos")]
+            released_ram: self.released_ram.clone(),
         }
     }
 
