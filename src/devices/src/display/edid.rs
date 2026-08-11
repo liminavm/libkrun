@@ -736,7 +736,7 @@ const fn gcd(x: u32, y: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::gpu::display::DetailedMode;
+    use crate::display::types::DetailedMode;
 
     /// Decode a 13-byte descriptor payload the way a parser would: up to the `0x0A` terminator.
     fn descriptor_text(block: &[u8]) -> String {
