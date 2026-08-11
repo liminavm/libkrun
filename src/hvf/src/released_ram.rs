@@ -50,11 +50,17 @@ pub enum FaultOutcome {
     /// The fault hit a released range; it has been re-validated and re-mapped. Re-run the
     /// vCPU without advancing the PC so the faulting access retries against the new mapping.
     Healed,
-    /// Not a released-RAM fault (outside guest RAM, not a translation fault, or the range
-    /// is not in the released set) — fall through to the caller's existing handling.
+    /// A translation fault on guest RAM with no released range covering it. Almost always a
+    /// heal race: another vCPU healed the range between this vCPU's fault and our lookup, so
+    /// the mapping exists again — re-run without advancing the PC and the access succeeds.
+    /// Falling through instead would MMIO-decode a RAM access and silently swallow the
+    /// guest's load/store. A per-PA cap turns a genuine bookkeeping hole into [`Fatal`].
+    Retry,
+    /// Not a released-RAM fault (outside guest RAM, or not a translation fault) — fall
+    /// through to the caller's existing handling.
     NotHandled,
-    /// The range was released but could not be re-mapped; resuming the guest would livelock
-    /// on the same fault. The VM must stop.
+    /// The range was released but could not be re-mapped (or the same PA keeps stray-faulting
+    /// past the cap); resuming the guest would livelock or corrupt. The VM must stop.
     Fatal,
 }
 
@@ -76,7 +82,14 @@ pub struct ReleasedRam {
     released_bytes: AtomicU64,
     remapped_bytes: AtomicU64,
     stray_faults: AtomicU64,
+    /// Consecutive-stray livelock guard: (page, consecutive count) of the last stray PA.
+    /// A heal-race stray resolves on retry, so consecutive repeats of the SAME page mean a
+    /// genuine hole in the bookkeeping — cap and stop instead of spinning.
+    last_stray: Mutex<(u64, u32)>,
 }
+
+/// Consecutive stray faults on one page before we declare a real bookkeeping hole.
+const STRAY_RETRY_CAP: u32 = 64;
 
 impl ReleasedRam {
     /// `regions` are the guest RAM regions as `(gpa, host_va, len)`. Regions not aligned to
@@ -113,6 +126,7 @@ impl ReleasedRam {
             released_bytes: AtomicU64::new(0),
             remapped_bytes: AtomicU64::new(0),
             stray_faults: AtomicU64::new(0),
+            last_stray: Mutex::new((u64::MAX, 0)),
         }
     }
 
@@ -204,18 +218,39 @@ impl ReleasedRam {
 
         let mut released = self.released.lock().unwrap();
         if !contains_point(&released, pa) {
-            // A translation fault inside guest RAM that we did not create: either stale
-            // bookkeeping or an unmapped-RAM access we don't know about. Loud (it should
-            // never happen), then fall through to the caller's existing path.
+            // A translation fault inside guest RAM with no released range: almost always the
+            // heal race — another vCPU healed this range between our fault and the lookup
+            // (we block on the released lock while its REUSE+remap completes), so the
+            // mapping exists again and a retry succeeds. Retrying is the ONLY safe answer:
+            // falling through would MMIO-decode a RAM access and swallow the guest's
+            // load/store. Consecutive repeats of the same page mean the mapping is really
+            // gone with no bookkeeping — cap and stop before the guest spins forever.
             let strays = self.stray_faults.fetch_add(1, Ordering::Relaxed) + 1;
-            if strays <= 8 || strays.is_multiple_of(1024) {
+            let page = pa & !(host_page_size() - 1);
+            let mut last = self.last_stray.lock().unwrap();
+            *last = if last.0 == page {
+                (page, last.1 + 1)
+            } else {
+                (page, 1)
+            };
+            if last.1 > STRAY_RETRY_CAP {
                 error!(
-                    "released-ram: stage-2 translation fault at pa={pa:#x} (in guest RAM) with \
-                     no released range covering it (stray #{strays}); not healing"
+                    "released-ram: page {page:#x} stray-faulted {} times consecutively — a \
+                     stage-2 hole outside the released set; stopping the VM",
+                    last.1
+                );
+                return FaultOutcome::Fatal;
+            }
+            if strays <= 8 || strays.is_multiple_of(1024) {
+                warn!(
+                    "released-ram: stray stage-2 fault at pa={pa:#x} (guest RAM, not in the \
+                     released set — lost heal race); retrying (stray #{strays})"
                 );
             }
-            return FaultOutcome::NotHandled;
+            return FaultOutcome::Retry;
         }
+        // A covered fault resets the consecutive-stray guard: the vCPU is making progress.
+        *self.last_stray.lock().unwrap() = (u64::MAX, 0);
 
         let window_start = (pa & !(self.chunk - 1)).max(region.gpa);
         let window_end = (window_start + self.chunk).min(region.gpa + region.len);
@@ -347,8 +382,52 @@ fn contains_point(map: &BTreeMap<u64, u64>, p: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_point, insert_range, remove_overlaps};
+    use super::{
+        FaultOutcome, ReleasedRam, STRAY_RETRY_CAP, contains_point, insert_range,
+        remove_overlaps,
+    };
     use std::collections::BTreeMap;
+
+    /// The heal-race stray: a guest-RAM translation fault outside the released set must
+    /// RETRY (the racing heal already restored the mapping) — never fall through to MMIO
+    /// decode, which would swallow the access. Consecutive strays on one page cap to Fatal
+    /// (a genuine stage-2 hole); any other page resets the guard.
+    #[test]
+    fn stray_faults_retry_then_cap() {
+        let rr = ReleasedRam::new(vec![(0x8000_0000, 0x1_0000_0000, 1 << 20)]);
+        let xfsc = 0b000101; // translation fault, level 1
+
+        for _ in 0..STRAY_RETRY_CAP {
+            assert!(matches!(
+                rr.handle_fault(0x8000_4000, xfsc),
+                FaultOutcome::Retry
+            ));
+        }
+        assert!(matches!(
+            rr.handle_fault(0x8000_4000, xfsc),
+            FaultOutcome::Fatal
+        ));
+
+        // A different page resets the consecutive guard, and the original page starts over.
+        assert!(matches!(
+            rr.handle_fault(0x8000_8000, xfsc),
+            FaultOutcome::Retry
+        ));
+        assert!(matches!(
+            rr.handle_fault(0x8000_4000, xfsc),
+            FaultOutcome::Retry
+        ));
+
+        // Outside guest RAM and non-translation faults keep falling through.
+        assert!(matches!(
+            rr.handle_fault(0x1000_0000, xfsc),
+            FaultOutcome::NotHandled
+        ));
+        assert!(matches!(
+            rr.handle_fault(0x8000_4000, 0b001001),
+            FaultOutcome::NotHandled
+        ));
+    }
 
     fn set(ranges: &[(u64, u64)]) -> BTreeMap<u64, u64> {
         let mut m = BTreeMap::new();
