@@ -254,6 +254,37 @@ struct PresentFenceState {
     guest_fence_handler: RutabagaFenceHandler,
 }
 
+impl PresentFenceState {
+    /// Whether the plumbing holds work that references the current activation's queue.
+    /// Only the trio that does — parked flushes (their fences retire into presents),
+    /// held guest fences (completion writes the used ring) and unprocessed retirements
+    /// (their pump presents and completes holds) — counts. `flush_parked_cookies` and
+    /// `awaiting_shown` are deliberately excluded: they are forward-looking bookkeeping
+    /// (a cookie waits for a trailing flush fence, an entry waits for a supervisor ack)
+    /// that a guest freeze routinely strands — the freeze-time device reset drops
+    /// in-queue commands, splitting a flush from its trailing fence — and that no drain
+    /// can shrink once the reset is in progress. Counting them turned every synoik
+    /// s2idle wake into a fail-closed wipe (2026-08-10); the park path discards them
+    /// via `take_stale_bookkeeping` instead.
+    fn quiescent(&self) -> bool {
+        self.parked.is_empty()
+            && self.guest_holds.is_empty()
+            && self.retired.lock().unwrap().is_empty()
+    }
+
+    /// Drain the forward-looking bookkeeping a device reset strands: cookies whose
+    /// trailing flush fence the guest's freeze-time reset dropped, and shown-ack
+    /// entries whose ack cannot arrive during a reset. Left behind, a stale cookie
+    /// turns the next activation's first trailing fence into a spurious guest hold
+    /// and a stale awaiting-shown entry skews the pop-to-first ack drain forever.
+    fn take_stale_bookkeeping(&mut self) -> (usize, usize) {
+        let cookies = std::mem::take(&mut self.flush_parked_cookies).len();
+        let shown = self.awaiting_shown.len();
+        self.awaiting_shown.clear();
+        (cookies, shown)
+    }
+}
+
 struct GuestFlushHold {
     fence: RutabagaFence,
     /// Cookies whose frames haven't presented yet.
@@ -1686,20 +1717,27 @@ impl VirtioGpu {
 
     /// limina (host-sleep s2idle): whether the present-fence plumbing holds NOTHING that
     /// references the current activation's queue — no parked flushes, held guest flush
-    /// fences, frames awaiting shown, or completed-but-unretired presents. Together with
-    /// an empty fence ledger this makes the session safe to PARK across a device reset
-    /// instead of wiping it (see the worker's defer-and-classify path); anything pending
-    /// here indexes the about-to-be-freed queue and forces the fail-closed wipe.
+    /// fences, or completed-but-unretired presents. Together with an empty fence ledger
+    /// this makes the session safe to PARK across a device reset instead of wiping it
+    /// (see the worker's defer-and-classify path); anything pending here indexes the
+    /// about-to-be-freed queue and forces the fail-closed wipe. Stranded forward-looking
+    /// bookkeeping does NOT count — see `PresentFenceState::quiescent` — but must be
+    /// discarded before parking (`discard_stale_present_bookkeeping`).
     pub fn present_quiescent(&self) -> bool {
         match self.present_fence.as_ref() {
-            Some(pf) => {
-                pf.parked.is_empty()
-                    && pf.flush_parked_cookies.is_empty()
-                    && pf.guest_holds.is_empty()
-                    && pf.awaiting_shown.is_empty()
-                    && pf.retired.lock().unwrap().is_empty()
-            }
+            Some(pf) => pf.quiescent(),
             None => true,
+        }
+    }
+
+    /// Drop bookkeeping stranded by a device reset (stale flush-parked cookies and
+    /// awaiting-shown entries); returns how many of each were dropped. Call when
+    /// parking a quiescent session so the stale state can't leak into the next
+    /// activation. See `PresentFenceState::take_stale_bookkeeping`.
+    pub fn discard_stale_present_bookkeeping(&mut self) -> (usize, usize) {
+        match self.present_fence.as_mut() {
+            Some(pf) => pf.take_stale_bookkeeping(),
+            None => (0, 0),
         }
     }
 
@@ -3497,6 +3535,84 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    fn bare_present_fence_state() -> super::PresentFenceState {
+        let (latch_tx, _latch_rx) = std::sync::mpsc::channel();
+        super::PresentFenceState {
+            retired: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            event: utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            next_cookie: 1,
+            parked: std::collections::BTreeMap::new(),
+            flush_parked_cookies: Vec::new(),
+            guest_holds: Vec::new(),
+            latch_tx,
+            latch_delay: std::time::Duration::from_millis(35),
+            ack_active: true,
+            shown: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            awaiting_shown: std::collections::VecDeque::new(),
+            guest_fence_handler: rutabaga_gfx::RutabagaFenceHandler::new(|_| {}),
+        }
+    }
+
+    // limina (s2idle wake wipe, 2026-08-10): `flush_parked_cookies` and `awaiting_shown`
+    // are forward-looking host bookkeeping — a stranded cookie waits for a trailing
+    // flush fence that the guest's freeze-time device reset already dropped, and an
+    // awaiting-shown entry waits for a supervisor ack that cannot arrive during a
+    // reset. Neither references the about-to-be-freed virtio queue, and no drain can
+    // ever shrink them once the activation is gone. Counting them against quiescence
+    // turned every synoik s2idle wake into a fail-closed wipe (compositor SIGABRT).
+    #[test]
+    fn stale_present_bookkeeping_does_not_block_quiescence() {
+        let mut pf = bare_present_fence_state();
+        pf.flush_parked_cookies.push(7);
+        pf.awaiting_shown.push_back((42, 7));
+        assert!(
+            pf.quiescent(),
+            "stranded bookkeeping (no queue references) must not fail quiescence"
+        );
+    }
+
+    // The queue-referencing trio still forces the fail-closed wipe: parked flushes,
+    // held guest fences, and unprocessed retirements all index the freed queue.
+    #[test]
+    fn queue_referencing_present_state_blocks_quiescence() {
+        let mut pf = bare_present_fence_state();
+        assert!(pf.quiescent());
+        pf.parked.insert(
+            1,
+            super::ParkedFlush {
+                scanout_id: 0,
+                iosurface_id: 1,
+                resource_id: 1,
+                rect: super::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            },
+        );
+        assert!(!pf.quiescent());
+        pf.parked.clear();
+        pf.retired.lock().unwrap().push(1);
+        assert!(!pf.quiescent());
+    }
+
+    // Parking a session across a reset must DISCARD the stranded bookkeeping: a stale
+    // cookie left behind would be consumed by the next activation's first trailing
+    // fence (a spurious guest hold), and a stale awaiting-shown entry skews the
+    // pop-to-first ack drain forever.
+    #[test]
+    fn take_stale_bookkeeping_drains_and_counts() {
+        let mut pf = bare_present_fence_state();
+        pf.flush_parked_cookies.push(7);
+        pf.awaiting_shown.push_back((42, 7));
+        pf.awaiting_shown.push_back((43, 8));
+        assert_eq!(pf.take_stale_bookkeeping(), (1, 2));
+        assert!(pf.flush_parked_cookies.is_empty());
+        assert!(pf.awaiting_shown.is_empty());
+        assert_eq!(pf.take_stale_bookkeeping(), (0, 0));
+    }
 
     // limina (#8): fence-accurate presents default ON exactly when the supervisor's
     // shown-ack channel exists (windowed runs). Ack-less sinks (headless capture, GTK)

@@ -293,6 +293,15 @@ impl Worker {
                     *self.active.lock().unwrap() = None;
                     let (outstanding, summary) = virtio_gpu.outstanding_fences();
                     if outstanding == 0 && virtio_gpu.present_quiescent() {
+                        let (cookies, shown) = virtio_gpu.discard_stale_present_bookkeeping();
+                        if cookies != 0 || shown != 0 {
+                            info!(
+                                "gpu worker: dropped stale present bookkeeping stranded by \
+                                 the reset ({cookies} flush-parked cookie(s), {shown} \
+                                 awaiting-shown entr(y/ies)) — forward-looking state with \
+                                 no queue references"
+                            );
+                        }
                         parked_session = true;
                         info!(
                             "gpu worker: device reset with a quiescent session — PARKED for \
