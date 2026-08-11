@@ -292,8 +292,16 @@ fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
 /// intersected ranges outside the window are reinserted, so the set stays exact.
 fn remove_overlaps(map: &mut BTreeMap<u64, u64>, start: u64, end: u64) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    let mut candidates: Vec<u64> = map.range(..end).map(|(&s, _)| s).collect();
-    candidates.retain(|&s| s + map[&s] > start);
+    // Ranges are disjoint and sorted, so walking down from the window end can stop at the
+    // first range that ends at/before the window start — O(overlapping), not O(set).
+    let mut candidates: Vec<u64> = Vec::new();
+    for (&s, &l) in map.range(..end).rev() {
+        if s + l <= start {
+            break;
+        }
+        candidates.push(s);
+    }
+    candidates.reverse();
     for s in candidates {
         let l = map.remove(&s).unwrap();
         let e = s + l;
