@@ -414,7 +414,7 @@ impl Balloon {
                 #[cfg(target_os = "macos")]
                 {
                     let _ = base;
-                    ok = released_ram.release(gpa, len as u64);
+                    ok = released_ram.release(gpa, len as u64, false);
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -502,7 +502,7 @@ impl Balloon {
                         #[cfg(target_os = "macos")]
                         {
                             let gpa_base = guest.0 - (host_addr - base) as u64;
-                            ok = released_ram.release(gpa_base, host_page as u64);
+                            ok = released_ram.release(gpa_base, host_page as u64, true);
                         }
                         #[cfg(not(target_os = "macos"))]
                         {
