@@ -288,6 +288,12 @@ impl MmioTransport {
         }
         self.features_select = 0;
         self.acked_features_select = 0;
+        // Clear the device's negotiated features. Per virtio 1.0 §2.1.1 a reset returns the device
+        // to the state it was in just after power-on, which includes un-negotiated features. Since
+        // `ack_features_by_page` OR-accumulates into the device (see `DeviceQueue`/`set_acked_...`),
+        // not clearing here let a driver that re-acks a *smaller* set after resume keep stale bits
+        // (e.g. EVENT_IDX), diverging queue-notification semantics. Same-kernel resume masks it.
+        self.locked_device().set_acked_features(0);
         self.queue_select = 0;
         self.interrupt.0.status.store(0, Ordering::SeqCst);
         self.device_status = device_status::INIT;

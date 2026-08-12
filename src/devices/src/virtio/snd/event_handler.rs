@@ -140,6 +140,9 @@ impl Subscriber for Snd {
                 warn!("snd: unexpected event on fd {source:?}");
             }
         } else {
+            // Drain to avoid a level-triggered spurious event busy-spinning the loop while inactive
+            // (e.g. across suspend/resume). See `crate::virtio::drain_eventfd`.
+            crate::virtio::drain_eventfd(source);
             warn!("snd: not yet activated; spurious event on fd {source:?}");
         }
     }
