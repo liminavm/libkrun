@@ -86,6 +86,21 @@ pub struct ReleasedRam {
     /// A heal-race stray resolves on retry, so consecutive repeats of the SAME page mean a
     /// genuine hole in the bookkeeping — cap and stop instead of spinning.
     last_stray: Mutex<(u64, u32)>,
+    /// Which release paths zero the range before marking it REUSABLE (see [`ZeroOnRelease`]).
+    zero_on_release: ZeroOnRelease,
+}
+
+/// `LIMINA_BALLOON_RELEASE_MEMSET` — which release paths zero the range before the
+/// `MADV_FREE_REUSABLE`: unset/other = none (default), `queue` = inflate-queue releases
+/// only, `1` = every path. Zeroing settles the compressed-slot residue a plain REUSABLE
+/// leaves behind at scale (retention-testbed A/B: post-scrub pool 3.23G → 0.65G), but
+/// zeroing the free-page-reporting path re-dirties pages at churn rate (+3.5G steady-state
+/// resident under FRQ churn) — hence the per-path gate. Default-off pending adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZeroOnRelease {
+    None,
+    InflateQueue,
+    All,
 }
 
 /// Consecutive stray faults on one page before we declare a real bookkeeping hole.
@@ -127,6 +142,11 @@ impl ReleasedRam {
             remapped_bytes: AtomicU64::new(0),
             stray_faults: AtomicU64::new(0),
             last_stray: Mutex::new((u64::MAX, 0)),
+            zero_on_release: match std::env::var("LIMINA_BALLOON_RELEASE_MEMSET").as_deref() {
+                Ok("1") => ZeroOnRelease::All,
+                Ok("queue") => ZeroOnRelease::InflateQueue,
+                _ => ZeroOnRelease::None,
+            },
         }
     }
 
@@ -143,12 +163,14 @@ impl ReleasedRam {
     /// Release `[gpa, gpa + len)`: record it, unmap it from the guest, and hand the host
     /// pages back to the OS with `MADV_FREE_REUSABLE`. Returns false (with the set rolled
     /// back and no madvise issued) if the range is invalid or the unmap failed — the caller
-    /// must then leave the pages alone.
+    /// must then leave the pages alone. `from_inflate_queue` says which balloon path is
+    /// releasing (the inflate queue vs free-page reporting) — it selects whether the range
+    /// is zeroed first under the [`ZeroOnRelease`] gate.
     ///
     /// The madvise happens under the released-set lock so a concurrent guest touch can
     /// never interleave a heal (REUSE + remap) between our unmap and our REUSABLE, which
     /// would re-mark live-again pages as disposable.
-    pub fn release(&self, gpa: u64, len: u64) -> bool {
+    pub fn release(&self, gpa: u64, len: u64, from_inflate_queue: bool) -> bool {
         let page = host_page_size();
         if len == 0 || gpa % page != 0 || len % page != 0 {
             error!("released-ram: misaligned release gpa={gpa:#x} len={len:#x}; ignoring");
@@ -172,6 +194,17 @@ impl ReleasedRam {
             return false;
         }
         let host = Self::host_of(region, gpa);
+        let zero = match self.zero_on_release {
+            ZeroOnRelease::All => true,
+            ZeroOnRelease::InflateQueue => from_inflate_queue,
+            ZeroOnRelease::None => false,
+        };
+        if zero {
+            // SAFETY: the range was just unmapped from the guest (above, under the lock),
+            // is balloon-owned, and lies inside this region's host mapping — no guest
+            // access can race the write; a touch faults and heals afterward.
+            unsafe { std::ptr::write_bytes(host as *mut u8, 0, len as usize) };
+        }
         let rc = unsafe {
             libc::madvise(
                 host as *mut libc::c_void,
@@ -383,8 +416,7 @@ fn contains_point(map: &BTreeMap<u64, u64>, p: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FaultOutcome, ReleasedRam, STRAY_RETRY_CAP, contains_point, insert_range,
-        remove_overlaps,
+        FaultOutcome, ReleasedRam, STRAY_RETRY_CAP, contains_point, insert_range, remove_overlaps,
     };
     use std::collections::BTreeMap;
 
