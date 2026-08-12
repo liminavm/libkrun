@@ -752,6 +752,15 @@ impl VirtioGpu {
             // limina tier-2: an IOSurface-backed SET_SCANOUT_BLOB scanout is presented zero-copy
             // (venus already rendered into the IOSurface) — no alloc_frame, no readback.
             #[cfg(target_os = "macos")]
+            {
+                let dbg_ios = self
+                    .scanouts
+                    .get(scanout_id as usize)
+                    .and_then(|s| s.as_ref())
+                    .and_then(|s| s.iosurface_id);
+                log::info!("[FLUSHDBG] flush res={resource_id} scanout={scanout_id} iosurface_id={dbg_ios:?}");
+            }
+            #[cfg(target_os = "macos")]
             if let Some(iosurface_id) = self
                 .scanouts
                 .get(scanout_id as usize)
