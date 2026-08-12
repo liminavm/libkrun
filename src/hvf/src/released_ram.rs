@@ -91,11 +91,13 @@ pub struct ReleasedRam {
 }
 
 /// `LIMINA_BALLOON_RELEASE_MEMSET` — which release paths zero the range before the
-/// `MADV_FREE_REUSABLE`: unset/other = none (default), `queue` = inflate-queue releases
-/// only, `1` = every path. Zeroing settles the compressed-slot residue a plain REUSABLE
-/// leaves behind at scale (retention-testbed A/B: post-scrub pool 3.23G → 0.65G), but
-/// zeroing the free-page-reporting path re-dirties pages at churn rate (+3.5G steady-state
-/// resident under FRQ churn) — hence the per-path gate. Default-off pending adoption.
+/// `MADV_FREE_REUSABLE`: unset/other = `queue` (the default: inflate-queue releases only),
+/// `0`/`none` = no zeroing, `1` = every path. Zeroing settles the compressed-slot residue a
+/// plain REUSABLE leaves behind at scale (retention-testbed A/B: post-scrub pool residue
+/// 2.67G → 0.69G, timings unchanged), and inflate-queue releases only happen while the
+/// balloon inflates, so the default costs nothing at steady state. Zeroing the
+/// free-page-reporting path re-dirties pages at churn rate (+3.5G steady-state resident
+/// under FRQ churn) — hence the per-path gate rather than all-paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZeroOnRelease {
     None,
@@ -144,8 +146,8 @@ impl ReleasedRam {
             last_stray: Mutex::new((u64::MAX, 0)),
             zero_on_release: match std::env::var("LIMINA_BALLOON_RELEASE_MEMSET").as_deref() {
                 Ok("1") => ZeroOnRelease::All,
-                Ok("queue") => ZeroOnRelease::InflateQueue,
-                _ => ZeroOnRelease::None,
+                Ok("0") | Ok("none") => ZeroOnRelease::None,
+                _ => ZeroOnRelease::InflateQueue,
             },
         }
     }
