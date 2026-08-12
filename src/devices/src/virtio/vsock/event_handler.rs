@@ -147,6 +147,9 @@ impl Subscriber for Vsock {
                 self.device_state.signal_used_queue();
             }
         } else {
+            // Drain to avoid a level-triggered spurious event busy-spinning the loop while inactive
+            // (e.g. across suspend/resume). See `crate::virtio::drain_eventfd`.
+            crate::virtio::drain_eventfd(source);
             warn!("The device is not yet activated. Spurious event received: {source:?}");
         }
     }
