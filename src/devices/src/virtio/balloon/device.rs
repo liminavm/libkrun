@@ -476,7 +476,7 @@ impl Balloon {
                     // The range is host-page-aligned and every guest page inside it was reported
                     // free in this head, so releasing the whole host page cannot drop live guest
                     // data.
-                    if released_ram.release(gpa, len as u64) {
+                    if released_ram.release(gpa, len as u64, false) {
                         reclaimed.fetch_add(len as u64, Ordering::Relaxed);
                     }
                 }
@@ -562,7 +562,7 @@ impl Balloon {
                         #[cfg(target_os = "macos")]
                         {
                             let gpa_base = guest.0 - (host_addr - base) as u64;
-                            ok = released_ram.release(gpa_base, host_page as u64);
+                            ok = released_ram.release(gpa_base, host_page as u64, true);
                         }
                         #[cfg(not(target_os = "macos"))]
                         {
