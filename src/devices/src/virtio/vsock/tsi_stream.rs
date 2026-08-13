@@ -300,11 +300,13 @@ impl TsiStreamProxy {
                 return RecvPkt::WaitForCredit;
             }
 
-            match recv(
-                self.fd.as_raw_fd(),
-                &mut buf[..max_len],
-                MsgFlags::MSG_DONTWAIT,
-            ) {
+            match super::retry_transient_efault_nix(|| {
+                recv(
+                    self.fd.as_raw_fd(),
+                    &mut buf[..max_len],
+                    MsgFlags::MSG_DONTWAIT,
+                )
+            }) {
                 Ok(cnt) => {
                     debug!("recv cnt={cnt}");
                     if cnt > 0 {
@@ -593,7 +595,7 @@ impl Proxy for TsiStreamProxy {
             #[cfg(target_os = "linux")]
             let flags = MsgFlags::MSG_NOSIGNAL;
 
-            match send(self.fd.as_raw_fd(), buf, flags) {
+            match super::retry_transient_efault_nix(|| send(self.fd.as_raw_fd(), buf, flags)) {
                 Ok(sent) => {
                     if sent != buf.len() {
                         error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);

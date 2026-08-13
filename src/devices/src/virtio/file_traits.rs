@@ -11,6 +11,7 @@ use imago::io_buffers::{IoVector, IoVectorMut};
 use vm_memory::VolatileSlice;
 
 use libc::{c_int, c_void, read, readv, size_t, write, writev};
+use utils::syscall::retry_transient_efault;
 
 use super::bindings::{off64_t, pread64, preadv64, pwrite64, pwritev64};
 #[cfg(feature = "blk")]
@@ -226,13 +227,13 @@ macro_rules! volatile_impl {
             fn read_volatile(&mut self, slice: VolatileSlice) -> Result<usize> {
                 // Safe because only bytes inside the slice are accessed and the kernel is expected
                 // to handle arbitrary memory for I/O.
-                let ret = unsafe {
+                let ret = retry_transient_efault(|| unsafe {
                     read(
                         self.as_raw_fd(),
                         slice.ptr_guard_mut().as_ptr() as *mut c_void,
                         slice.len(),
                     )
-                };
+                });
                 if ret >= 0 {
                     Ok(ret as usize)
                 } else {
@@ -255,7 +256,9 @@ macro_rules! volatile_impl {
 
                 // Safe because only bytes inside the buffers are accessed and the kernel is
                 // expected to handle arbitrary memory for I/O.
-                let ret = unsafe { readv(self.as_raw_fd(), &iovecs[0], iovecs.len() as c_int) };
+                let ret = retry_transient_efault(|| unsafe {
+                    readv(self.as_raw_fd(), &iovecs[0], iovecs.len() as c_int)
+                });
                 if ret >= 0 {
                     Ok(ret as usize)
                 } else {
@@ -266,13 +269,13 @@ macro_rules! volatile_impl {
             fn write_volatile(&mut self, slice: VolatileSlice) -> Result<usize> {
                 // Safe because only bytes inside the slice are accessed and the kernel is expected
                 // to handle arbitrary memory for I/O.
-                let ret = unsafe {
+                let ret = retry_transient_efault(|| unsafe {
                     write(
                         self.as_raw_fd(),
                         slice.ptr_guard().as_ptr() as *const c_void,
                         slice.len(),
                     )
-                };
+                });
                 if ret >= 0 {
                     Ok(ret as usize)
                 } else {
@@ -295,7 +298,9 @@ macro_rules! volatile_impl {
 
                 // Safe because only bytes inside the buffers are accessed and the kernel is
                 // expected to handle arbitrary memory for I/O.
-                let ret = unsafe { writev(self.as_raw_fd(), &iovecs[0], iovecs.len() as c_int) };
+                let ret = retry_transient_efault(|| unsafe {
+                    writev(self.as_raw_fd(), &iovecs[0], iovecs.len() as c_int)
+                });
                 if ret >= 0 {
                     Ok(ret as usize)
                 } else {
@@ -308,14 +313,14 @@ macro_rules! volatile_impl {
             fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
                 // Safe because only bytes inside the slice are accessed and the kernel is expected
                 // to handle arbitrary memory for I/O.
-                let ret = unsafe {
+                let ret = retry_transient_efault(|| unsafe {
                     pread64(
                         self.as_raw_fd(),
                         slice.ptr_guard_mut().as_ptr() as *mut c_void,
                         slice.len(),
                         offset as off64_t,
                     )
-                };
+                });
 
                 if ret >= 0 {
                     Ok(ret as usize)
@@ -343,14 +348,14 @@ macro_rules! volatile_impl {
 
                 // Safe because only bytes inside the buffers are accessed and the kernel is
                 // expected to handle arbitrary memory for I/O.
-                let ret = unsafe {
+                let ret = retry_transient_efault(|| unsafe {
                     preadv64(
                         self.as_raw_fd(),
                         &iovecs[0],
                         iovecs.len() as c_int,
                         offset as off64_t,
                     )
-                };
+                });
                 if ret >= 0 {
                     Ok(ret as usize)
                 } else {
@@ -361,14 +366,14 @@ macro_rules! volatile_impl {
             fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
                 // Safe because only bytes inside the slice are accessed and the kernel is expected
                 // to handle arbitrary memory for I/O.
-                let ret = unsafe {
+                let ret = retry_transient_efault(|| unsafe {
                     pwrite64(
                         self.as_raw_fd(),
                         slice.ptr_guard().as_ptr() as *const c_void,
                         slice.len(),
                         offset as off64_t,
                     )
-                };
+                });
 
                 if ret >= 0 {
                     Ok(ret as usize)
@@ -396,14 +401,14 @@ macro_rules! volatile_impl {
 
                 // Safe because only bytes inside the buffers are accessed and the kernel is
                 // expected to handle arbitrary memory for I/O.
-                let ret = unsafe {
+                let ret = retry_transient_efault(|| unsafe {
                     pwritev64(
                         self.as_raw_fd(),
                         &iovecs[0],
                         iovecs.len() as c_int,
                         offset as off64_t,
                     )
-                };
+                });
                 if ret >= 0 {
                     Ok(ret as usize)
                 } else {

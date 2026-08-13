@@ -27,6 +27,26 @@ pub use self::device::Vsock;
 use bitflags::bitflags;
 use vm_memory::GuestMemoryError;
 
+/// Retry a socket op on guest-RAM buffers while it fails with a transient `EFAULT`: the
+/// ledger settle sweep may hold the buffer's task mapping `PROT_NONE` for microseconds,
+/// during which kernel copyio reports `EFAULT` instead of faulting (see
+/// `utils::syscall::retry_transient_efault`). A genuine `EFAULT` surfaces once the bounded
+/// retries expire.
+pub(crate) fn retry_transient_efault_nix<T>(
+    mut op: impl FnMut() -> nix::Result<T>,
+) -> nix::Result<T> {
+    let mut tries = 0u32;
+    loop {
+        match op() {
+            Err(nix::errno::Errno::EFAULT) if tries < 1000 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            r => return r,
+        }
+    }
+}
+
 mod defs {
     use super::bitflags;
 

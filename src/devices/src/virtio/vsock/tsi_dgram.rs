@@ -167,7 +167,9 @@ impl TsiDgramProxy {
             }
             */
 
-            match recv(self.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
+            match super::retry_transient_efault_nix(|| {
+                recv(self.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty())
+            }) {
                 Ok(cnt) => {
                     debug!("recv cnt={cnt}");
                     if cnt > 0 {
@@ -320,7 +322,7 @@ impl Proxy for TsiDgramProxy {
             #[cfg(target_os = "linux")]
             let flags = MsgFlags::MSG_NOSIGNAL;
 
-            match send(self.fd.as_raw_fd(), buf, flags) {
+            match super::retry_transient_efault_nix(|| send(self.fd.as_raw_fd(), buf, flags)) {
                 Ok(sent) => {
                     self.tx_cnt += Wrapping(sent as u32);
                     sent as i32
@@ -386,7 +388,9 @@ impl Proxy for TsiDgramProxy {
                 #[cfg(target_os = "linux")]
                 let flags = MsgFlags::MSG_NOSIGNAL;
 
-                match sendto(self.fd.as_raw_fd(), buf, &addr, flags) {
+                match super::retry_transient_efault_nix(|| {
+                    sendto(self.fd.as_raw_fd(), buf, &addr, flags)
+                }) {
                     Ok(sent) => {
                         self.tx_cnt += Wrapping(sent as u32);
                     }
