@@ -19,9 +19,11 @@
 //! The released set must be exact: `hv_vm_map` fails on any overlap with a live mapping
 //! (even partial), so the fault handler can only map back precisely what was unmapped.
 
+use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
+use std::time::Instant;
 
 use crate::bindings::*;
 use crate::host_page_size;
@@ -44,6 +46,9 @@ pub struct ReleasedRamStats {
     pub released_bytes: u64,
     pub remapped_bytes: u64,
     pub stray_faults: u64,
+    pub sweeps: u64,
+    pub sweep_debited_bytes: u64,
+    pub sweep_ms: u64,
 }
 
 pub enum FaultOutcome {
@@ -88,6 +93,12 @@ pub struct ReleasedRam {
     last_stray: Mutex<(u64, u32)>,
     /// Which release paths zero the range before marking it REUSABLE (see [`ZeroOnRelease`]).
     zero_on_release: ZeroOnRelease,
+    /// The regions as host-VA ranges, leaked so the sweep fault handler (a signal handler,
+    /// which cannot take locks or allocate) can classify fault addresses.
+    handler_regions: &'static [(u64, u64)],
+    sweeps: AtomicU64,
+    sweep_debited_bytes: AtomicU64,
+    sweep_ms: AtomicU64,
 }
 
 /// `LIMINA_BALLOON_RELEASE_MEMSET` — which release paths zero the range before the
@@ -113,7 +124,7 @@ impl ReleasedRam {
     /// the host page granule are dropped (loudly): release/heal must never round.
     pub fn new(regions: Vec<(u64, u64, u64)>) -> Self {
         let page = host_page_size();
-        let regions = regions
+        let regions: Vec<RamRegion> = regions
             .into_iter()
             .filter(|&(gpa, host, len)| {
                 let ok = gpa % page == 0 && host % page == 0 && len % page == 0;
@@ -135,6 +146,14 @@ impl ReleasedRam {
             .unwrap_or(2);
         let chunk = (chunk_mib << 20).next_power_of_two().max(page);
 
+        let handler_regions: &'static [(u64, u64)] = Box::leak(
+            regions
+                .iter()
+                .map(|r: &RamRegion| (r.host, r.host + r.len))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+
         Self {
             regions,
             released: Mutex::new(BTreeMap::new()),
@@ -149,6 +168,10 @@ impl ReleasedRam {
                 Ok("0") | Ok("none") => ZeroOnRelease::None,
                 _ => ZeroOnRelease::InflateQueue,
             },
+            handler_regions,
+            sweeps: AtomicU64::new(0),
+            sweep_debited_bytes: AtomicU64::new(0),
+            sweep_ms: AtomicU64::new(0),
         }
     }
 
@@ -314,6 +337,9 @@ impl ReleasedRam {
             released_bytes: self.released_bytes.load(Ordering::Relaxed),
             remapped_bytes: self.remapped_bytes.load(Ordering::Relaxed),
             stray_faults: self.stray_faults.load(Ordering::Relaxed),
+            sweeps: self.sweeps.load(Ordering::Relaxed),
+            sweep_debited_bytes: self.sweep_debited_bytes.load(Ordering::Relaxed),
+            sweep_ms: self.sweep_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -356,6 +382,263 @@ impl ReleasedRam {
         }
         self.remapped_bytes.fetch_add(len, Ordering::Relaxed);
         true
+    }
+
+    /// Settle the task-pmap ledger share of live guest RAM.
+    ///
+    /// xnu bills `phys_footprint`/`resident_size` once per pmap, so every page the VMM
+    /// writes through its task mapping AND the guest touches through stage-2 (all disk-fed
+    /// guest memory, by construction) is billed twice — Activity Monitor shows up to 2× the
+    /// VM's real memory. An `mprotect(PROT_NONE)` disconnects the task-pmap PTEs, debiting
+    /// exactly that share; the immediate restore to the mapping's original RW leaves lazy
+    /// re-population to the next host touch. The guest never notices: stage-2 PTEs are
+    /// untouched, and HVF populates missing stage-2 entries in-kernel without consulting
+    /// the task mapping's protection (measured: a 1 GiB guest first-touch pass through an
+    /// open window — zero vCPU exits, same physical pages).
+    ///
+    /// The two actors that CAN trip on an open window are worker threads touching guest
+    /// RAM from userspace (virtqueue rings, GPU transfers — fielded by the sweep fault
+    /// handler, which retries the access once the window closes) and kernel copyio at
+    /// syscalls reading/writing guest buffers (those sites retry transient `EFAULT`).
+    ///
+    /// Sweeps only what is live: released ranges are stage-2 unmapped and REUSABLE — a
+    /// sweep there would fight the heal path — so each chunk's live sub-ranges are computed
+    /// and flipped under the released lock, which also serializes against release/heal.
+    /// Single-flight; concurrent calls are dropped.
+    pub fn settle_sweep(&self) -> Option<SweepReport> {
+        if self.regions.is_empty() {
+            return None;
+        }
+        if SWEEP_ACTIVE.swap(true, Ordering::AcqRel) {
+            warn!("released-ram: settle sweep already running; dropping this request");
+            return None;
+        }
+        install_sweep_fault_handler();
+        SWEEP_REGIONS.store(
+            self.handler_regions as *const [(u64, u64)] as *mut (u64, u64),
+            Ordering::Release,
+        );
+        SWEEP_REGIONS_LEN.store(self.handler_regions.len() as u64, Ordering::Release);
+
+        let started = Instant::now();
+        let before = phys_footprint();
+        let chunk = sweep_chunk_bytes();
+        for region in &self.regions {
+            let region_end = region.gpa + region.len;
+            let mut pos = region.gpa;
+            while pos < region_end {
+                let chunk_end = region_end.min(pos.saturating_add(chunk));
+                let released = self.released.lock().unwrap();
+                for &(start, len) in &live_complement(&released, pos, chunk_end) {
+                    self.flip_window(Self::host_of(region, start), len);
+                }
+                drop(released);
+                pos = chunk_end;
+            }
+        }
+        let debited = before.saturating_sub(phys_footprint());
+        let ms = started.elapsed().as_millis() as u64;
+        SWEEP_ACTIVE.store(false, Ordering::Release);
+
+        let sweeps = self.sweeps.fetch_add(1, Ordering::Relaxed) + 1;
+        self.sweep_debited_bytes.store(debited, Ordering::Relaxed);
+        self.sweep_ms.store(ms, Ordering::Relaxed);
+        info!(
+            "released-ram: settle sweep #{sweeps} debited {} MiB off the task ledger in {ms} ms",
+            debited >> 20
+        );
+        Some(SweepReport {
+            debited_bytes: debited,
+            ms,
+        })
+    }
+
+    /// One NONE→RW protection flip. The window bounds are published for the fault handler
+    /// before the PTEs disconnect and cleared after the restore. A failed disconnect is
+    /// skipped (that range just stays double-billed); a failed restore would leave a
+    /// `PROT_NONE` hole in guest RAM — unsurvivable, so it retries and ultimately panics.
+    fn flip_window(&self, host: u64, len: u64) {
+        let p = host as *mut libc::c_void;
+        SWEEP_WINDOW_START.store(host, Ordering::Release);
+        SWEEP_WINDOW_END.store(host + len, Ordering::Release);
+        if unsafe { libc::mprotect(p, len as usize, libc::PROT_NONE) } != 0 {
+            warn!(
+                "released-ram: sweep mprotect(PROT_NONE) at {host:#x} len={len:#x} failed: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            let mut tries = 0;
+            while unsafe { libc::mprotect(p, len as usize, libc::PROT_READ | libc::PROT_WRITE) }
+                != 0
+            {
+                tries += 1;
+                if tries > 100 {
+                    panic!(
+                        "released-ram: cannot restore guest RAM protection at {host:#x} \
+                         len={len:#x}: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        SWEEP_WINDOW_END.store(0, Ordering::Release);
+        SWEEP_WINDOW_START.store(0, Ordering::Release);
+    }
+}
+
+pub struct SweepReport {
+    pub debited_bytes: u64,
+    pub ms: u64,
+}
+
+static SWEEP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SWEEP_WINDOW_START: AtomicU64 = AtomicU64::new(0);
+static SWEEP_WINDOW_END: AtomicU64 = AtomicU64::new(0);
+/// The sweeping instance's guest-RAM host ranges, for the fault handler. Published as a
+/// raw pointer + length because a signal handler can only do atomic loads.
+static SWEEP_REGIONS: AtomicPtr<(u64, u64)> = AtomicPtr::new(std::ptr::null_mut());
+static SWEEP_REGIONS_LEN: AtomicU64 = AtomicU64::new(0);
+
+fn sweep_chunk_bytes() -> u64 {
+    std::env::var("LIMINA_LEDGER_SWEEP_CHUNK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v << 20)
+        .unwrap_or(256 << 20)
+        .max(host_page_size())
+}
+
+fn phys_footprint() -> u64 {
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V2,
+            &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        )
+    };
+    if rc == 0 { info.ri_phys_footprint } else { 0 }
+}
+
+/// The live complement: sub-ranges of `[start, end)` NOT covered by the released set.
+fn live_complement(map: &BTreeMap<u64, u64>, start: u64, end: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    if let Some((&s, &l)) = map.range(..=start).next_back()
+        && s + l > start
+    {
+        pos = (s + l).min(end);
+    }
+    for (&s, &l) in map.range(start..end) {
+        if s > pos {
+            out.push((pos, s - pos));
+        }
+        pos = (s + l).min(end);
+        if pos >= end {
+            break;
+        }
+    }
+    if pos < end {
+        out.push((pos, end - pos));
+    }
+    out
+}
+
+/// A saved pre-sweep signal action. Written once under [`Once`], read-only afterwards
+/// (including from the signal handler), hence the manual `Sync`.
+struct SavedAction(UnsafeCell<libc::sigaction>);
+unsafe impl Sync for SavedAction {}
+unsafe impl Send for SavedAction {}
+
+static OLD_SIGBUS: OnceLock<SavedAction> = OnceLock::new();
+static OLD_SIGSEGV: OnceLock<SavedAction> = OnceLock::new();
+
+fn install_sweep_fault_handler() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sweep_fault_handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for (sig, slot) in [(libc::SIGBUS, &OLD_SIGBUS), (libc::SIGSEGV, &OLD_SIGSEGV)] {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, &sa, &mut old) != 0 {
+                error!(
+                    "released-ram: sigaction({sig}) for the sweep fault handler failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                continue;
+            }
+            let _ = slot.set(SavedAction(UnsafeCell::new(old)));
+        }
+    });
+}
+
+/// SIGBUS/SIGSEGV handler covering worker-thread touches of guest RAM during a sweep
+/// window. Guest RAM is always mapped read-write outside a window, so ANY fault inside a
+/// guest region while a sweep is active is the sweep's doing: wait out the current window
+/// (it closes in microseconds) and return, retrying the faulting access. Everything else
+/// chains to the previously installed action (e.g. Rust's stack-overflow reporter).
+///
+/// Async-signal-safety: atomic loads and `sched_yield` only.
+unsafe extern "C" fn sweep_fault_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+) {
+    let addr = unsafe { (*info).si_addr } as u64;
+    if SWEEP_ACTIVE.load(Ordering::Acquire) {
+        let ptr = SWEEP_REGIONS.load(Ordering::Acquire);
+        let len = SWEEP_REGIONS_LEN.load(Ordering::Acquire) as usize;
+        if !ptr.is_null() {
+            let regions = unsafe { std::slice::from_raw_parts(ptr, len) };
+            if regions.iter().any(|&(s, e)| addr >= s && addr < e) {
+                while SWEEP_ACTIVE.load(Ordering::Acquire)
+                    && addr >= SWEEP_WINDOW_START.load(Ordering::Acquire)
+                    && addr < SWEEP_WINDOW_END.load(Ordering::Acquire)
+                {
+                    unsafe { libc::sched_yield() };
+                }
+                return;
+            }
+        }
+    }
+
+    let old = match sig {
+        libc::SIGBUS => OLD_SIGBUS.get(),
+        libc::SIGSEGV => OLD_SIGSEGV.get(),
+        _ => None,
+    };
+    let Some(old) = old else {
+        // No saved action (installation failed): fall back to the default disposition so
+        // the crash still surfaces instead of refaulting forever.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+        }
+        return;
+    };
+    let old = unsafe { &*old.0.get() };
+    match old.sa_sigaction {
+        libc::SIG_DFL => {
+            // Restore the default action and return; the refault then produces the real
+            // crash report (right signal, right address) instead of a nested one here.
+            unsafe {
+                libc::sigaction(sig, old, std::ptr::null_mut());
+            }
+        }
+        libc::SIG_IGN => {}
+        handler => unsafe {
+            if old.sa_flags & libc::SA_SIGINFO != 0 {
+                let f: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                    std::mem::transmute(handler);
+                f(sig, info, ctx);
+            } else {
+                let f: unsafe extern "C" fn(libc::c_int) = std::mem::transmute(handler);
+                f(sig);
+            }
+        },
     }
 }
 
@@ -418,7 +701,8 @@ fn contains_point(map: &BTreeMap<u64, u64>, p: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FaultOutcome, ReleasedRam, STRAY_RETRY_CAP, contains_point, insert_range, remove_overlaps,
+        FaultOutcome, ReleasedRam, STRAY_RETRY_CAP, contains_point, insert_range, live_complement,
+        remove_overlaps,
     };
     use std::collections::BTreeMap;
 
@@ -521,5 +805,74 @@ mod tests {
         let got = remove_overlaps(&mut m, 0x8000, 0xc000);
         assert_eq!(got, vec![(0x8000, 0x4000)]);
         assert_eq!(m, set(&[(0x0, 0x8000), (0xc000, 0x14000)]));
+    }
+
+    #[test]
+    fn live_complement_inverts_the_released_set() {
+        // Empty set: the whole window is live.
+        let m = BTreeMap::new();
+        assert_eq!(live_complement(&m, 0x4000, 0x10000), vec![(0x4000, 0xc000)]);
+
+        // A released range straddling the window start, one inside, one straddling the end.
+        let m = set(&[(0x0, 0x8000), (0xc000, 0x4000), (0x14000, 0x8000)]);
+        assert_eq!(
+            live_complement(&m, 0x4000, 0x18000),
+            vec![(0x8000, 0x4000), (0x10000, 0x4000)]
+        );
+
+        // Window fully inside one released range: nothing live.
+        let m = set(&[(0x0, 0x20000)]);
+        assert!(live_complement(&m, 0x8000, 0xc000).is_empty());
+
+        // Released range fully inside the window: live head and tail.
+        let m = set(&[(0x8000, 0x4000)]);
+        assert_eq!(
+            live_complement(&m, 0x0, 0x10000),
+            vec![(0x0, 0x8000), (0xc000, 0x4000)]
+        );
+    }
+
+    /// The sweep must flip only live ranges (skipping released ones — flipping those would
+    /// fight the heal path) and leave the memory readable, writable, and intact. Exercised
+    /// against a real anonymous mapping; no VM is needed because the flip is pure task-side
+    /// mprotect. hv_vm_unmap inside release() fails without a VM, so the released set is
+    /// seeded directly.
+    #[test]
+    fn settle_sweep_flips_live_ranges_and_preserves_content() {
+        let page = crate::host_page_size();
+        let len = 64 * page;
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(host, libc::MAP_FAILED);
+        let host = host as u64;
+        unsafe { std::ptr::write_bytes(host as *mut u8, 0x5a, len as usize) };
+
+        let gpa = 0x8000_0000u64;
+        let rr = ReleasedRam::new(vec![(gpa, host, len)]);
+        super::insert_range(&mut rr.released.lock().unwrap(), gpa + 8 * page, 4 * page);
+
+        let report = rr.settle_sweep().expect("sweep should run");
+        assert_eq!(rr.stats().sweeps, 1);
+        assert_eq!(rr.stats().sweep_ms, report.ms);
+
+        // Every byte survived and the mapping is writable again.
+        let slice = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
+        assert!(slice.iter().all(|&b| b == 0x5a));
+        unsafe { std::ptr::write_bytes(host as *mut u8, 0xa5, len as usize) };
+
+        // A second sweep is fine; a concurrent one would be dropped (single-flight is
+        // covered by the SWEEP_ACTIVE swap, not testable without threads racing).
+        assert!(rr.settle_sweep().is_some());
+        assert_eq!(rr.stats().sweeps, 2);
+
+        unsafe { libc::munmap(host as *mut libc::c_void, len as usize) };
     }
 }
