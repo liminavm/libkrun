@@ -49,6 +49,7 @@ pub struct ReleasedRamStats {
     pub sweeps: u64,
     pub sweep_debited_bytes: u64,
     pub sweep_ms: u64,
+    pub sweep_faults: u64,
 }
 
 pub enum FaultOutcome {
@@ -340,6 +341,7 @@ impl ReleasedRam {
             sweeps: self.sweeps.load(Ordering::Relaxed),
             sweep_debited_bytes: self.sweep_debited_bytes.load(Ordering::Relaxed),
             sweep_ms: self.sweep_ms.load(Ordering::Relaxed),
+            sweep_faults: SWEEP_FAULTS.load(Ordering::Relaxed),
         }
     }
 
@@ -499,6 +501,10 @@ static SWEEP_WINDOW_END: AtomicU64 = AtomicU64::new(0);
 /// raw pointer + length because a signal handler can only do atomic loads.
 static SWEEP_REGIONS: AtomicPtr<(u64, u64)> = AtomicPtr::new(std::ptr::null_mut());
 static SWEEP_REGIONS_LEN: AtomicU64 = AtomicU64::new(0);
+/// Worker-thread touches fielded by the sweep fault handler, cumulative. Global (not per
+/// instance) because a signal handler can only reach statics; there is one guest per
+/// process. This is the field oracle for "something touches guest RAM during windows".
+static SWEEP_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 fn sweep_chunk_bytes() -> u64 {
     std::env::var("LIMINA_LEDGER_SWEEP_CHUNK_MIB")
@@ -577,10 +583,16 @@ fn install_sweep_fault_handler() {
 }
 
 /// SIGBUS/SIGSEGV handler covering worker-thread touches of guest RAM during a sweep
-/// window. Guest RAM is always mapped read-write outside a window, so ANY fault inside a
-/// guest region while a sweep is active is the sweep's doing: wait out the current window
-/// (it closes in microseconds) and return, retrying the faulting access. Everything else
-/// chains to the previously installed action (e.g. Rust's stack-overflow reporter).
+/// window. Guest RAM is always mapped read-write outside a window, so ANY fault at a
+/// guest-region address is the sweep's doing: wait out the current window (it closes in
+/// microseconds) and return, retrying the faulting access. Everything else chains to the
+/// previously installed action (e.g. Rust's stack-overflow reporter).
+///
+/// The guest-region check deliberately does NOT require `SWEEP_ACTIVE`: a fault can land
+/// in the last window of a sweep and reach the handler after the sweep finished, and
+/// chaining it would restore `SIG_DFL` permanently (installation is `Once`) — the next
+/// sweep's first fielded fault would then kill the process. If the fault's window is
+/// already closed, the mapping is back to read-write and the plain return retries fine.
 ///
 /// Async-signal-safety: atomic loads and `sched_yield` only.
 unsafe extern "C" fn sweep_fault_handler(
@@ -589,20 +601,19 @@ unsafe extern "C" fn sweep_fault_handler(
     ctx: *mut libc::c_void,
 ) {
     let addr = unsafe { (*info).si_addr } as u64;
-    if SWEEP_ACTIVE.load(Ordering::Acquire) {
-        let ptr = SWEEP_REGIONS.load(Ordering::Acquire);
-        let len = SWEEP_REGIONS_LEN.load(Ordering::Acquire) as usize;
-        if !ptr.is_null() {
-            let regions = unsafe { std::slice::from_raw_parts(ptr, len) };
-            if regions.iter().any(|&(s, e)| addr >= s && addr < e) {
-                while SWEEP_ACTIVE.load(Ordering::Acquire)
-                    && addr >= SWEEP_WINDOW_START.load(Ordering::Acquire)
-                    && addr < SWEEP_WINDOW_END.load(Ordering::Acquire)
-                {
-                    unsafe { libc::sched_yield() };
-                }
-                return;
+    let ptr = SWEEP_REGIONS.load(Ordering::Acquire);
+    let len = SWEEP_REGIONS_LEN.load(Ordering::Acquire) as usize;
+    if !ptr.is_null() {
+        let regions = unsafe { std::slice::from_raw_parts(ptr, len) };
+        if regions.iter().any(|&(s, e)| addr >= s && addr < e) {
+            SWEEP_FAULTS.fetch_add(1, Ordering::Relaxed);
+            while SWEEP_ACTIVE.load(Ordering::Acquire)
+                && addr >= SWEEP_WINDOW_START.load(Ordering::Acquire)
+                && addr < SWEEP_WINDOW_END.load(Ordering::Acquire)
+            {
+                unsafe { libc::sched_yield() };
             }
+            return;
         }
     }
 
@@ -705,6 +716,12 @@ mod tests {
         remove_overlaps,
     };
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Sweeps are single-flight through the global `SWEEP_ACTIVE`, so tests that sweep
+    /// must not overlap or one of them gets its sweep dropped.
+    static SWEEP_LOCK: Mutex<()> = Mutex::new(());
 
     /// The heal-race stray: a guest-RAM translation fault outside the released set must
     /// RETRY (the racing heal already restored the mapping) — never fall through to MMIO
@@ -839,6 +856,7 @@ mod tests {
     /// seeded directly.
     #[test]
     fn settle_sweep_flips_live_ranges_and_preserves_content() {
+        let _serialize = SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let page = crate::host_page_size();
         let len = 64 * page;
         let host = unsafe {
@@ -873,6 +891,73 @@ mod tests {
         assert!(rr.settle_sweep().is_some());
         assert_eq!(rr.stats().sweeps, 2);
 
+        unsafe { libc::munmap(host as *mut libc::c_void, len as usize) };
+    }
+
+    /// The sweep fault handler must actually FIELD concurrent touches, not merely exist:
+    /// a toucher thread writes every page of the region in a tight loop while sweeps flip
+    /// windows over it. Any write landing in an open window faults; a broken handler kills
+    /// the process on the default disposition, and `sweep_faults` proves collisions really
+    /// happened rather than the timing never producing one. The toucher finishes each full
+    /// pass before checking its stop flag, so afterwards every page must hold the final
+    /// pass's value — a write torn or lost in a window would leave a mismatch.
+    #[test]
+    fn sweep_fault_handler_fields_concurrent_touches() {
+        let _serialize = SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let page = crate::host_page_size();
+        let len = 4096 * page;
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(host, libc::MAP_FAILED);
+        let host = host as u64;
+        let rr = ReleasedRam::new(vec![(0x8000_0000, host, len)]);
+
+        static STOP: AtomicBool = AtomicBool::new(false);
+        STOP.store(false, Ordering::Relaxed);
+        let base = host as usize;
+        let pages = (len / page) as usize;
+        let step = page as usize;
+        let toucher = std::thread::spawn(move || {
+            let mut pass = 1u64;
+            while !STOP.load(Ordering::Relaxed) {
+                for i in 0..pages {
+                    unsafe { std::ptr::write_volatile((base + i * step) as *mut u64, pass) };
+                }
+                pass += 1;
+            }
+            pass
+        });
+
+        let faults0 = rr.stats().sweep_faults;
+        let mut sweeps = 0;
+        while rr.stats().sweep_faults == faults0 && sweeps < 50 {
+            rr.settle_sweep()
+                .expect("nothing else sweeps under the test lock");
+            sweeps += 1;
+        }
+        STOP.store(true, Ordering::Relaxed);
+        let final_pass = toucher.join().unwrap() - 1;
+
+        assert!(
+            rr.stats().sweep_faults > faults0,
+            "no toucher write collided with a sweep window in {sweeps} sweeps \
+             ({final_pass} toucher passes) — the windows never opened under load"
+        );
+        for i in 0..pages {
+            let v = unsafe { std::ptr::read_volatile((base + i * step) as *const u64) };
+            assert_eq!(
+                v, final_pass,
+                "page {i} lost the final pass's write across the sweep windows"
+            );
+        }
         unsafe { libc::munmap(host as *mut libc::c_void, len as usize) };
     }
 }
