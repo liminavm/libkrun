@@ -197,6 +197,8 @@ pub struct BalloonStats {
     pub sweep_debited_bytes: u64,
     /// Wall-clock duration of the last settle sweep (macOS only).
     pub sweep_ms: u64,
+    /// Worker-thread guest-RAM touches fielded by the sweep fault handler (macOS only).
+    pub sweep_faults: u64,
 }
 
 /// limina: a cloneable, thread-safe handle that lets the host push a balloon target into the live
@@ -258,6 +260,7 @@ impl BalloonControlHandle {
             stats.sweeps = rr.sweeps;
             stats.sweep_debited_bytes = rr.sweep_debited_bytes;
             stats.sweep_ms = rr.sweep_ms;
+            stats.sweep_faults = rr.sweep_faults;
         }
         stats
     }
