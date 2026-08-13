@@ -2873,6 +2873,19 @@ impl VirtioGpu {
         vecs: Vec<(GuestAddress, usize)>,
     ) -> VirtioGpuResult {
         let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
+        // limina diagnostic: which guest resources reach the host as an iov backing, and
+        // with how scattered a page list. Answered "does a PRIME-imported foreign dmabuf
+        // arrive here at all?" on 2026-08-13 — it does NOT, which is why a zero-copy
+        // udmabuf import needs guest-kernel work first (roadmap M15 wave 6). Kept because
+        // the same question recurs for every new resource class.
+        if std::env::var_os("LIMINA_TRACE_ATTACH_BACKING").is_some() {
+            let total: usize = rutabaga_iovecs.iter().map(|v| v.len).sum();
+            log::error!(
+                "[ATTACH-BACKING] res {resource_id}: {} iovec(s), {total} bytes, first={:?}",
+                rutabaga_iovecs.len(),
+                rutabaga_iovecs.first().map(|v| (v.base as usize, v.len))
+            );
+        }
         // limina software 2D: keep the backing host pointers; don't involve rutabaga.
         if let Some(sw) = self.sw2d.get_mut(&resource_id) {
             sw.backing = rutabaga_iovecs;
