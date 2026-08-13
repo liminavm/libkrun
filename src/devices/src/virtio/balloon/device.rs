@@ -191,6 +191,12 @@ pub struct BalloonStats {
     /// Stage-2 translation faults in guest RAM outside every released range (macOS only;
     /// should stay zero — nonzero means bookkeeping went wrong).
     pub stray_faults: u64,
+    /// Completed ledger settle sweeps (macOS only). See `ReleasedRam::settle_sweep`.
+    pub sweeps: u64,
+    /// Bytes the last settle sweep debited off the task's phys_footprint (macOS only).
+    pub sweep_debited_bytes: u64,
+    /// Wall-clock duration of the last settle sweep (macOS only).
+    pub sweep_ms: u64,
 }
 
 /// limina: a cloneable, thread-safe handle that lets the host push a balloon target into the live
@@ -249,8 +255,26 @@ impl BalloonControlHandle {
             stats.released_bytes = rr.released_bytes;
             stats.remapped_bytes = rr.remapped_bytes;
             stats.stray_faults = rr.stray_faults;
+            stats.sweeps = rr.sweeps;
+            stats.sweep_debited_bytes = rr.sweep_debited_bytes;
+            stats.sweep_ms = rr.sweep_ms;
         }
         stats
+    }
+
+    /// Run a ledger settle sweep (see `ReleasedRam::settle_sweep`) on its own thread —
+    /// sweeping tens of GiB takes tens of milliseconds and must not stall the caller.
+    /// Overlapping requests are dropped by the sweep's single-flight guard.
+    #[cfg(target_os = "macos")]
+    pub fn settle_sweep(&self) -> bool {
+        let released_ram = self.released_ram.clone();
+        std::thread::Builder::new()
+            .name("ledger-sweep".into())
+            .spawn(move || {
+                released_ram.settle_sweep();
+            })
+            .map_err(|e| error!("balloon: failed to spawn the settle sweep thread: {e}"))
+            .is_ok()
     }
 }
 
