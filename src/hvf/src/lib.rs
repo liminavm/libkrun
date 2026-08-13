@@ -119,7 +119,7 @@ const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
 
 const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
-const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
+const AA64PFR1_EL1_SMEMASK: u64 = 0xf << 24;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -670,29 +670,6 @@ impl HvfVcpu<'_> {
                 return Err(Error::VcpuInitialRegisters);
             }
 
-            // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
-            // break after enabling the MMU. Mask it out.
-            let mut val: u64 = 0;
-            let ret = unsafe {
-                hv_vcpu_get_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &mut val as *mut _,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    val & !AA64PFR1_EL1_SMEMASK,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
@@ -700,6 +677,35 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
+        }
+
+        // Masked on every vCPU, not just the nested ones: a guest that sees SME
+        // will use it, and what it gets is the host's SME without the SVE that
+        // guest userspace assumes comes with it. On an M4 that combination makes
+        // Chrome's SME path issue a non-streaming SVE instruction and take a
+        // SIGILL. Under nested virt the same advertisement breaks the guest
+        // outright once it enables the MMU, which is why this was already here —
+        // it was just in the wrong branch.
+        let mut val: u64 = 0;
+        let ret = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                &mut val as *mut _,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+        let ret = unsafe {
+            hv_vcpu_set_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                val & !AA64PFR1_EL1_SMEMASK,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };
