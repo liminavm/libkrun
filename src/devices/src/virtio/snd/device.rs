@@ -109,6 +109,12 @@ pub struct Snd {
     /// When the starvation counters were last summarised (throttles a ~93 Hz path).
     #[cfg(target_os = "macos")]
     pub(crate) last_stats_log: Option<std::time::Instant>,
+    /// Playback position and wall time at the last observed forward progress, for the
+    /// deadlock watchdog.
+    #[cfg(target_os = "macos")]
+    pub(crate) last_consumed: u64,
+    #[cfg(target_os = "macos")]
+    pub(crate) last_progress: Option<std::time::Instant>,
     /// Starvation counters, owned here so they outlive any single `OutputStream`.
     #[cfg(target_os = "macos")]
     pub(crate) snd_stats: std::sync::Arc<super::audio_macos::AudioStats>,
@@ -170,6 +176,8 @@ impl Snd {
             submitted: 0,
             #[cfg(target_os = "macos")]
             completed_to: 0,
+            last_consumed: 0,
+            last_progress: None,
             #[cfg(target_os = "macos")]
             last_stats_log: None,
             #[cfg(target_os = "macos")]
@@ -379,6 +387,8 @@ impl Snd {
                 self.submitted = 0;
                 self.completed_to = 0;
                 self.reported_submitted = 0;
+                self.last_consumed = 0;
+                self.last_progress = None;
                 if self.audio.is_none() {
                     let channels = if self.params.channels == 0 {
                         2
@@ -421,6 +431,8 @@ impl Snd {
                 self.submitted = 0;
                 self.completed_to = 0;
                 self.reported_submitted = 0;
+                self.last_consumed = 0;
+                self.last_progress = None;
             }
             _ => {}
         }
@@ -636,7 +648,60 @@ impl Snd {
         }
         self.sample_delivery();
         self.log_starvation_stats();
+        self.break_deadlock();
         self.complete_paced()
+    }
+
+    /// Guarantee that a tx descriptor is always completed in bounded time.
+    ///
+    /// Playback completion is paced on `frames_consumed`, and the guest driver can only
+    /// make progress *because* we complete: `virtsnd_pcm_msg_complete` is what schedules
+    /// `snd_pcm_period_elapsed`, which is what wakes the writer, whose `ack` is the only
+    /// thing that posts new I/O messages (`sound/virtio/virtio_pcm_ops.c`). So if
+    /// `frames_consumed` ever stops short of `submitted` with the ring empty, neither side
+    /// can move again and the stream is dead until the VM restarts — no guest-visible
+    /// error, ALSA still reporting RUNNING, every audio client hung. That has been
+    /// observed, and the accounting bug that could cause it is not enough of an answer:
+    /// any future path that loses a frame would silently do the same thing.
+    ///
+    /// So do not rely on never losing one. If playback has not advanced while descriptors
+    /// are owed, write the shortfall off as played. The cost is a skip; the alternative is
+    /// a wedge. The warning carries the numbers needed to find out what lost the frames.
+    #[cfg(target_os = "macos")]
+    fn break_deadlock(&mut self) {
+        const STALL: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let Some(audio) = self.audio.as_ref() else {
+            return;
+        };
+        let consumed = audio.frames_consumed();
+        let now = std::time::Instant::now();
+        if consumed != self.last_consumed || self.in_flight.is_empty() {
+            self.last_consumed = consumed;
+            self.last_progress = Some(now);
+            return;
+        }
+        let Some(since) = self.last_progress.map(|t| now.duration_since(t)) else {
+            self.last_progress = Some(now);
+            return;
+        };
+        if since < STALL {
+            return;
+        }
+        let head_end = self.in_flight.front().expect("not empty").end_frame;
+        let shortfall = head_end.saturating_sub(consumed);
+        log::warn!(
+            "snd: playback stalled {:.0}ms with {} descriptors owed and the ring empty; \
+             writing off {shortfall} frames the sink never played to let the guest run \
+             (consumed={consumed}, submitted={}, completed_to={})",
+            since.as_secs_f64() * 1000.0,
+            self.in_flight.len(),
+            self.submitted,
+            self.completed_to,
+        );
+        audio.account_consumed(shortfall as usize);
+        self.last_consumed = audio.frames_consumed();
+        self.last_progress = Some(now);
     }
 
     /// Sample, at the DAC's own cadence, the two things that tell apart *who* is late when
