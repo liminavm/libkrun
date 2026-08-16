@@ -36,3 +36,5 @@ pub use crate::rutabaga_os::IntoRawDescriptor as RutabagaIntoRawDescriptor;
 pub use crate::rutabaga_os::MappedRegion as RutabagaMappedRegion;
 pub use crate::rutabaga_os::SafeDescriptor as RutabagaDescriptor;
 pub use crate::rutabaga_utils::*;
+#[cfg(all(feature = "virgl_renderer", target_os = "macos"))]
+pub use crate::virgl_renderer::republish_iosurface;
