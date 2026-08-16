@@ -25,6 +25,11 @@ pub(crate) const AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
 #[cfg(target_os = "macos")]
 static LEAD_RAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+/// How often the starvation counters are summarised. Long enough that a persistent fault
+/// does not flood the log, short enough to localise one within a session.
+#[cfg(target_os = "macos")]
+const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 const OUTPUT_STREAM_ID: u32 = 0;
 const CAPTURE_STREAM_ID: u32 = 1;
 
@@ -101,12 +106,20 @@ pub struct Snd {
     /// than moving it backwards, which the guest would read as a buffer wrap.
     #[cfg(target_os = "macos")]
     pub(crate) completed_to: u64,
-    /// When the starvation counters were last logged (throttles a ~93 Hz path to 1 Hz).
+    /// When the starvation counters were last summarised (throttles a ~93 Hz path).
     #[cfg(target_os = "macos")]
     pub(crate) last_stats_log: Option<std::time::Instant>,
     /// Starvation counters, owned here so they outlive any single `OutputStream`.
     #[cfg(target_os = "macos")]
     pub(crate) snd_stats: std::sync::Arc<super::audio_macos::AudioStats>,
+    /// Counter values at the last report, so each line describes its own interval rather
+    /// than a running total nobody can difference by eye.
+    #[cfg(target_os = "macos")]
+    pub(crate) reported_callbacks: u64,
+    #[cfg(target_os = "macos")]
+    pub(crate) reported_underruns: u64,
+    #[cfg(target_os = "macos")]
+    pub(crate) reported_frames_short: u64,
     /// The output device's realtime workgroup, refreshed on each PREPARE.
     #[cfg(target_os = "macos")]
     pub(crate) snd_workgroup: Option<std::sync::Arc<super::audio_macos::AudioWorkgroup>>,
@@ -148,6 +161,12 @@ impl Snd {
             snd_stats: super::audio_macos::AudioStats::new(),
             #[cfg(target_os = "macos")]
             snd_workgroup: None,
+            #[cfg(target_os = "macos")]
+            reported_callbacks: 0,
+            #[cfg(target_os = "macos")]
+            reported_underruns: 0,
+            #[cfg(target_os = "macos")]
+            reported_frames_short: 0,
         })
     }
 
@@ -622,22 +641,45 @@ impl Snd {
             return;
         };
         let now = std::time::Instant::now();
-        if let Some(last) = self.last_stats_log {
-            if now.duration_since(last) < std::time::Duration::from_secs(1) {
-                return;
-            }
+        let since = self.last_stats_log.map(|last| now.duration_since(last));
+        if since.is_some_and(|d| d < REPORT_INTERVAL) {
+            return;
         }
         self.last_stats_log = Some(now);
 
         let (callbacks, underruns, frames_short, min_avail, dropped) = self.snd_stats.snapshot();
         let min_avail = if min_avail == u64::MAX { 0 } else { min_avail };
-        log::info!(
-            "snd: callbacks={callbacks} underruns={underruns} frames_short={frames_short} \
-             min_queued={min_avail}f queued_now={}f dropped={dropped} period={}B buffer={}B",
-            audio.frames_queued(),
-            self.params.period_bytes,
-            self.params.buffer_bytes,
-        );
+        let d_callbacks = callbacks - self.reported_callbacks;
+        let d_underruns = underruns - self.reported_underruns;
+        let d_short = frames_short - self.reported_frames_short;
+        self.reported_callbacks = callbacks;
+        self.reported_underruns = underruns;
+        self.reported_frames_short = frames_short;
+
+        // A starving DAC is a fault, so say so at a level the shipped app actually
+        // records: the worker runs at `warn` unless RUST_LOG says otherwise, and a
+        // counter that only speaks at `info` is silent in exactly the deployment where
+        // someone is trying to find out why the audio is broken.
+        if d_underruns > 0 {
+            let secs = since.unwrap_or(REPORT_INTERVAL).as_secs_f64();
+            log::warn!(
+                "snd: DAC starved — {d_underruns} of {d_callbacks} callbacks short in {secs:.1}s \
+                 ({d_short} frames of silence, {:.0} ms); queued now {}f, low water {min_avail}f; \
+                 guest period={}B buffer={}B (cumulative: {underruns}/{callbacks}, dropped={dropped})",
+                d_short as f64 * 1000.0 / 48_000.0,
+                audio.frames_queued(),
+                self.params.period_bytes,
+                self.params.buffer_bytes,
+            );
+        } else {
+            log::info!(
+                "snd: callbacks={callbacks} underruns={underruns} frames_short={frames_short} \
+                 min_queued={min_avail}f queued_now={}f dropped={dropped} period={}B buffer={}B",
+                audio.frames_queued(),
+                self.params.period_bytes,
+                self.params.buffer_bytes,
+            );
+        }
     }
 
     /// Complete all in-flight tx descriptors with end-frame <= `consumed`.
