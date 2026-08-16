@@ -497,10 +497,14 @@ extern "C" fn render(
         shared
             .frames_consumed
             .fetch_add((got / shared.channels) as u64, Ordering::Release);
-        // Wake the device thread to reap completed tx descriptors. A single
-        // non-blocking pipe write; harmless if it coalesces with earlier kicks.
-        let _ = shared.completion_evt.write(1);
     }
+    // Wake the device thread unconditionally — including, and especially, when this
+    // callback got nothing. A dry ring is exactly when the guest's next period most needs
+    // collecting, so kicking only after a successful pull inverted the priority: the one
+    // case that needed the device thread promptly was the one case that did not wake it,
+    // leaving the refill to wait for the *following* callback a whole period later.
+    // A single non-blocking write; harmless if it coalesces with earlier kicks.
+    let _ = shared.completion_evt.write(1);
     0
 }
 

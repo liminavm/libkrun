@@ -120,6 +120,17 @@ pub struct Snd {
     pub(crate) reported_underruns: u64,
     #[cfg(target_os = "macos")]
     pub(crate) reported_frames_short: u64,
+    /// Delivery-side sampling: when this thread last ran, the longest it went without
+    /// running, the deepest unpicked tx backlog, and how often the DAC was dry while the
+    /// guest had already queued audio for us. See `sample_delivery`.
+    #[cfg(target_os = "macos")]
+    pub(crate) last_pass: Option<std::time::Instant>,
+    #[cfg(target_os = "macos")]
+    pub(crate) max_pass_gap: std::time::Duration,
+    #[cfg(target_os = "macos")]
+    pub(crate) max_tx_backlog: u16,
+    #[cfg(target_os = "macos")]
+    pub(crate) dry_with_backlog: u64,
     /// The output device's realtime workgroup, refreshed on each PREPARE.
     #[cfg(target_os = "macos")]
     pub(crate) snd_workgroup: Option<std::sync::Arc<super::audio_macos::AudioWorkgroup>>,
@@ -167,6 +178,14 @@ impl Snd {
             reported_underruns: 0,
             #[cfg(target_os = "macos")]
             reported_frames_short: 0,
+            #[cfg(target_os = "macos")]
+            last_pass: None,
+            #[cfg(target_os = "macos")]
+            max_pass_gap: std::time::Duration::ZERO,
+            #[cfg(target_os = "macos")]
+            max_tx_backlog: 0,
+            #[cfg(target_os = "macos")]
+            dry_with_backlog: 0,
         })
     }
 
@@ -591,8 +610,51 @@ impl Snd {
         if self.audio.is_none() {
             return false;
         }
+        self.sample_delivery();
         self.log_starvation_stats();
         self.complete_paced()
+    }
+
+    /// Sample, at the DAC's own cadence, the two things that tell apart *who* is late when
+    /// the ring runs dry.
+    ///
+    /// The guest's ALSA `delay` and our ring occupancy measure the same quantity — frames
+    /// submitted but not yet played — so when the guest believes it has audio queued and
+    /// our ring is empty, the difference is frames the guest has made available and this
+    /// device has not collected. `tx_backlog` counts them. `pass_gap` measures how long
+    /// this thread went without running at all: virtio-snd shares the event-manager thread
+    /// with the GPU, block and net devices, so a gap much longer than a host callback means
+    /// the audio starved waiting on *us*, not on the guest.
+    #[cfg(target_os = "macos")]
+    fn sample_delivery(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_pass {
+            let gap = now.duration_since(prev);
+            if gap > self.max_pass_gap {
+                self.max_pass_gap = gap;
+            }
+        }
+        self.last_pass = Some(now);
+
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem.clone(),
+            DeviceState::Inactive => return,
+        };
+        let backlog = self.queues.as_mut().expect("queues exist")[defs::TX_INDEX]
+            .queue
+            .len(&mem);
+        if backlog > self.max_tx_backlog {
+            self.max_tx_backlog = backlog;
+        }
+        // The decisive combination: the DAC had nothing to play while the guest had
+        // already handed us audio we had not picked up.
+        let dry = self
+            .audio
+            .as_ref()
+            .is_some_and(|a| a.frames_queued() == 0);
+        if dry && backlog > 0 {
+            self.dry_with_backlog += 1;
+        }
     }
 
     /// Complete tx descriptors up to one host callback *ahead* of real playback, so the
@@ -665,12 +727,19 @@ impl Snd {
             log::warn!(
                 "snd: DAC starved — {d_underruns} of {d_callbacks} callbacks short in {secs:.1}s \
                  ({d_short} frames of silence, {:.0} ms); queued now {}f, low water {min_avail}f; \
-                 guest period={}B buffer={}B (cumulative: {underruns}/{callbacks}, dropped={dropped})",
+                 guest period={}B buffer={}B; delivery: max thread gap {:.1}ms, max tx backlog {}, \
+                 dry-with-backlog {}; (cumulative: {underruns}/{callbacks}, dropped={dropped})",
                 d_short as f64 * 1000.0 / 48_000.0,
                 audio.frames_queued(),
                 self.params.period_bytes,
                 self.params.buffer_bytes,
+                self.max_pass_gap.as_secs_f64() * 1000.0,
+                self.max_tx_backlog,
+                self.dry_with_backlog,
             );
+            self.max_pass_gap = std::time::Duration::ZERO;
+            self.max_tx_backlog = 0;
+            self.dry_with_backlog = 0;
         } else {
             log::info!(
                 "snd: callbacks={callbacks} underruns={underruns} frames_short={frames_short} \
@@ -679,6 +748,9 @@ impl Snd {
                 self.params.period_bytes,
                 self.params.buffer_bytes,
             );
+            self.max_pass_gap = std::time::Duration::ZERO;
+            self.max_tx_backlog = 0;
+            self.dry_with_backlog = 0;
         }
     }
 
