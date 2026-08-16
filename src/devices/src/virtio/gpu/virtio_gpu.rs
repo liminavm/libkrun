@@ -47,6 +47,18 @@ use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
+/// Hand a scanout IOSurface back to the supervisor after it dropped ours from its bounded store.
+/// Only meaningful on macOS, where the surfaces exist at all.
+#[cfg(target_os = "macos")]
+fn republish_surface(id: u32) -> std::result::Result<(), rutabaga_gfx::RutabagaError> {
+    rutabaga_gfx::republish_iosurface(id)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn republish_surface(_id: u32) -> std::result::Result<(), rutabaga_gfx::RutabagaError> {
+    Err(rutabaga_gfx::RutabagaError::Unsupported)
+}
+
 fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
     mem: &GuestMemoryMmap,
@@ -866,13 +878,39 @@ impl VirtioGpu {
                             for line in std::io::BufReader::new(file).lines() {
                                 let Ok(line) = line else { break };
                                 let mut parts = line.split_whitespace();
-                                if parts.next() == Some("shown") {
-                                    if let Some(id) =
-                                        parts.next().and_then(|s| s.parse::<u32>().ok())
-                                    {
-                                        shown.lock().unwrap().push(id);
-                                        let _ = wake.write(1);
+                                match parts.next() {
+                                    Some("shown") => {
+                                        if let Some(id) =
+                                            parts.next().and_then(|s| s.parse::<u32>().ok())
+                                        {
+                                            shown.lock().unwrap().push(id);
+                                            let _ = wake.write(1);
+                                        }
                                     }
+                                    // The supervisor dropped this surface from its bounded store
+                                    // and the guest is still presenting it. Hand it back: these
+                                    // scanouts are non-global, so only we can mint a Mach port for
+                                    // one, and without this the display stays frozen for that id
+                                    // forever (spikes/scanout-blob-freeze/RESULTS.md). Answered as
+                                    // an ordinary publish on the surface port, which keeps the
+                                    // ordering that makes IOSurface id recycling safe.
+                                    Some("resurface") => {
+                                        if let Some(id) =
+                                            parts.next().and_then(|s| s.parse::<u32>().ok())
+                                        {
+                                            match republish_surface(id) {
+                                                Ok(()) => debug!(
+                                                    "gpu: re-published surface {id} on request"
+                                                ),
+                                                Err(e) => warn!(
+                                                    "gpu: supervisor asked for surface {id} back \
+                                                     but it is not registered ({e:?}) — it is \
+                                                     gone, not merely evicted"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             debug!("gpu shown-ack reader: channel closed");
