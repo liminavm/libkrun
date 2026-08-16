@@ -139,7 +139,10 @@ const K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE: u32 = 2000;
 const K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO: u32 = 2003;
 const K_AUDIO_OUTPUT_UNIT_PROPERTY_SET_INPUT_CALLBACK: u32 = 2005;
 const K_AUDIO_HW_PROP_DEFAULT_INPUT_DEVICE: u32 = u32::from_be_bytes(*b"dIn ");
+const K_AUDIO_HW_PROP_DEFAULT_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"dOut");
+const K_AUDIO_DEVICE_PROP_BUFFER_FRAME_SIZE: u32 = u32::from_be_bytes(*b"fsiz");
 const K_AUDIO_OBJ_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+const K_AUDIO_OBJ_SCOPE_OUTPUT: u32 = u32::from_be_bytes(*b"outp");
 const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
 const CAPTURE_INPUT_BUS: u32 = 1;
 const CAPTURE_MAX_FRAMES: usize = 8192;
@@ -227,11 +230,118 @@ struct AudioShared {
     /// and completes the corresponding tx descriptors.
     completion_evt: Arc<EventFd>,
     channels: usize,
+    /// Starvation telemetry. The callback pads short pulls with silence, which is
+    /// inaudible to every counter in the guest (its `hw_ptr` is paced by frames we
+    /// really consumed, so a dropout looks like the device briefly running slow, not
+    /// like an xrun). These are the only place that fact is observable.
+    ///
+    /// Owned by the device, not by this stream, so that they outlive a RELEASE — a
+    /// fault that makes the guest tear the stream down and rebuild it would otherwise
+    /// destroy its own evidence, and the run would score clean by construction.
+    stats: Arc<AudioStats>,
+}
+
+/// Counters published by the RT callback, read and logged by the device thread.
+#[derive(Default)]
+pub(crate) struct AudioStats {
+    /// Render callbacks serviced.
+    pub callbacks: AtomicU64,
+    /// Callbacks that found fewer frames than they asked for.
+    pub underruns: AtomicU64,
+    /// Total frames of silence padded across all underruns.
+    pub frames_short: AtomicU64,
+    /// Smallest ring occupancy (in frames) seen at callback entry, i.e. how close the
+    /// closest call came. Reset to `u64::MAX` each time it is reported.
+    pub min_avail: AtomicU64,
+    /// Samples the device thread could not fit in the ring (producer overrun). Should
+    /// be zero at a one-second ring; it is the other silent exit path in this device.
+    pub dropped: AtomicU64,
+}
+
+impl AudioStats {
+    pub(crate) fn new() -> Arc<AudioStats> {
+        Arc::new(AudioStats {
+            min_avail: AtomicU64::new(u64::MAX),
+            ..Default::default()
+        })
+    }
+
+    /// Snapshot for logging. `min_avail` is a per-interval gauge and resets; everything
+    /// else is cumulative for the life of the device.
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.callbacks.load(Ordering::Relaxed),
+            self.underruns.load(Ordering::Relaxed),
+            self.frames_short.load(Ordering::Relaxed),
+            self.min_avail.swap(u64::MAX, Ordering::Relaxed),
+            self.dropped.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// One second of stereo f32 at 48 kHz. The guest only keeps `buffer_bytes` in flight,
 /// so real occupancy stays far below this; the slack just avoids overflow.
 const RING_FRAMES: usize = 48_000;
+
+/// Fallback host callback size when CoreAudio will not report one, and the bounds we
+/// trust it within. 512 frames is what Apple silicon built-in output uses.
+const DEFAULT_HOST_PERIOD_FRAMES: u64 = 512;
+const MIN_LEAD_FRAMES: u64 = 256;
+const MAX_LEAD_FRAMES: u64 = 2048;
+
+/// How many frames the host DAC consumes per render callback.
+///
+/// This is the quantum a late guest delivery has to survive: if the ring holds less
+/// than this when the callback fires, the DAC gets silence. It is device-specific
+/// (built-in speakers report 512; Bluetooth output is typically far larger), and it is
+/// information only the host has — the guest cannot discover it through virtio-snd.
+fn host_period_frames() -> u64 {
+    let mut dev: u32 = 0;
+    let mut sz: u32 = 4;
+    let addr = AudioObjectPropertyAddress {
+        selector: K_AUDIO_HW_PROP_DEFAULT_OUTPUT_DEVICE,
+        scope: K_AUDIO_OBJ_SCOPE_GLOBAL,
+        element: 0,
+    };
+    // SAFETY: plain out-parameter reads against the system object, sizes match.
+    let r = unsafe {
+        AudioObjectGetPropertyData(
+            K_AUDIO_OBJECT_SYSTEM_OBJECT,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut sz,
+            &mut dev as *mut _ as *mut c_void,
+        )
+    };
+    if r != 0 || dev == 0 {
+        return DEFAULT_HOST_PERIOD_FRAMES;
+    }
+
+    let mut frames: u32 = 0;
+    let mut sz: u32 = 4;
+    let addr = AudioObjectPropertyAddress {
+        selector: K_AUDIO_DEVICE_PROP_BUFFER_FRAME_SIZE,
+        scope: K_AUDIO_OBJ_SCOPE_OUTPUT,
+        element: 0,
+    };
+    // SAFETY: as above, against the resolved device id.
+    let r = unsafe {
+        AudioObjectGetPropertyData(
+            dev,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut sz,
+            &mut frames as *mut _ as *mut c_void,
+        )
+    };
+    if r != 0 || frames == 0 {
+        DEFAULT_HOST_PERIOD_FRAMES
+    } else {
+        frames as u64
+    }
+}
 
 extern "C" fn render(
     in_ref_con: *mut c_void,
@@ -252,12 +362,23 @@ extern "C" fn render(
     let want = in_number_frames as usize * shared.channels;
     let out = unsafe { std::slice::from_raw_parts_mut(buf.data as *mut f32, want) };
 
+    shared.stats.callbacks.fetch_add(1, Ordering::Relaxed);
+    shared.stats.min_avail.fetch_min(
+        (shared.ring.available() / shared.channels) as u64,
+        Ordering::Relaxed,
+    );
+
     let got = shared.ring.pull(out);
     if got < want {
         // Underrun: pad with silence so the DAC never plays stale samples.
         for s in out.iter_mut().skip(got) {
             *s = 0.0;
         }
+        shared.stats.underruns.fetch_add(1, Ordering::Relaxed);
+        shared
+            .stats
+            .frames_short
+            .fetch_add(((want - got) / shared.channels) as u64, Ordering::Relaxed);
     }
     if got > 0 {
         shared
@@ -275,6 +396,7 @@ pub(crate) struct OutputStream {
     unit: AudioComponentInstance,
     shared: Arc<AudioShared>,
     started: bool,
+    lead_frames: u64,
 }
 
 // SAFETY: the AudioComponentInstance is only ever touched from the device thread
@@ -289,12 +411,14 @@ impl OutputStream {
         sample_rate: f64,
         channels: usize,
         completion_evt: Arc<EventFd>,
+        stats: Arc<AudioStats>,
     ) -> Result<OutputStream, i32> {
         let shared = Arc::new(AudioShared {
             ring: SpscRing::new(RING_FRAMES * channels),
             frames_consumed: AtomicU64::new(0),
             completion_evt,
             channels,
+            stats,
         });
 
         unsafe {
@@ -363,12 +487,49 @@ impl OutputStream {
                 return Err(r);
             }
 
+            // Completing ahead of real playback deepens the host ring and very nearly
+            // eliminates starvation (27% of callbacks -> 0.8%), but it makes the guest's
+            // device clock run ahead of CLOCK_MONOTONIC by the lead, which PipeWire
+            // scores as an xrun and recovers from by re-preparing the stream — audibly
+            // no better than the starvation it cures. **Off by default** for that
+            // reason; `LIMINA_SND_LEAD_FRAMES` re-enables it for experiments, and
+            // `spikes/virtio-snd-static/RESULTS.md` has the measurements.
+            let lead_frames = match std::env::var("LIMINA_SND_LEAD_FRAMES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(0) | None => 0,
+                Some(n) => n.clamp(MIN_LEAD_FRAMES, MAX_LEAD_FRAMES),
+            };
+            log::info!(
+                "snd: host period {} frames; pacing completions {lead_frames} frames ahead",
+                host_period_frames()
+            );
+
             Ok(OutputStream {
                 unit,
                 shared,
                 started: false,
+                lead_frames,
             })
         }
+    }
+
+    /// How far ahead of real playback tx descriptors are completed.
+    ///
+    /// The guest's `hw_ptr` is driven by our completions, so it keeps exactly as much
+    /// audio in flight as we tell it is still unplayed. Completing only on real DAC
+    /// consumption therefore pins the host-side lead to whatever lead the *guest*
+    /// chose — leaving nothing to absorb a late delivery, which is how a guest asking
+    /// for a small buffer turns host scheduling jitter into audible dropouts.
+    ///
+    /// Completing one host callback early makes the guest run that much further ahead,
+    /// and those frames sit in our ring, already across virtio. This is what real
+    /// hardware does: a card's `hw_ptr` advances when the DMA engine has fetched into
+    /// the card's FIFO, not when the DAC clocks the sample out. The cost is that much
+    /// added latency, which the device reports honestly through `latency_bytes`.
+    pub(crate) fn lead_frames(&self) -> u64 {
+        self.lead_frames
     }
 
     pub(crate) fn start(&mut self) {
@@ -394,16 +555,35 @@ impl OutputStream {
     pub(crate) fn reset(&mut self) {
         self.shared.ring.reset();
         self.shared.frames_consumed.store(0, Ordering::Relaxed);
+        // The starvation counters deliberately survive; they belong to the device, not
+        // to this stream.
+        self.shared
+            .stats
+            .min_avail
+            .store(u64::MAX, Ordering::Relaxed);
     }
 
     /// Producer side: append interleaved f32 frames; returns samples actually queued.
     pub(crate) fn push_samples(&self, samples: &[f32]) -> usize {
-        self.shared.ring.push(samples)
+        let n = self.shared.ring.push(samples);
+        if n < samples.len() {
+            self.shared
+                .stats
+                .dropped
+                .fetch_add((samples.len() - n) as u64, Ordering::Relaxed);
+        }
+        n
     }
 
     /// Total real guest frames the DAC has consumed since the last reset.
     pub(crate) fn frames_consumed(&self) -> u64 {
         self.shared.frames_consumed.load(Ordering::Acquire)
+    }
+
+    /// Frames currently queued ahead of the DAC — the host-side lead that a late guest
+    /// delivery has to survive.
+    pub(crate) fn frames_queued(&self) -> u64 {
+        (self.shared.ring.available() / self.shared.channels) as u64
     }
 }
 

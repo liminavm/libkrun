@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use vm_memory::Bytes;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
@@ -20,6 +22,9 @@ pub(crate) const AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
 
 // Stream / chmap identifiers. Playback (output) is always stream 0 / chmap 0; when
 // mic capture is enabled it adds an input stream 1 / chmap 1.
+#[cfg(target_os = "macos")]
+static LEAD_RAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 const OUTPUT_STREAM_ID: u32 = 0;
 const CAPTURE_STREAM_ID: u32 = 1;
 
@@ -45,6 +50,19 @@ impl StreamParams {
         };
         channels * 2
     }
+}
+
+/// A tx descriptor handed to the sink, waiting for its frames to be accounted played.
+///
+/// The status word's guest address is resolved at submit time but *written* at
+/// completion time: the guest reads `latency_bytes` from it then, and a figure computed
+/// at submit time would be stale by the time it is seen. (The address is kept rather
+/// than the `DescriptorChain`, which borrows guest memory and cannot outlive the call.)
+#[cfg(target_os = "macos")]
+pub(crate) struct InFlightTx {
+    index: u16,
+    end_frame: u64,
+    status_addr: Option<vm_memory::GuestAddress>,
 }
 
 pub struct Snd {
@@ -74,10 +92,21 @@ pub struct Snd {
     /// Popped tx descriptors awaiting completion, each tagged with the cumulative
     /// frame count at which it becomes complete (paced by real playback).
     #[cfg(target_os = "macos")]
-    pub(crate) in_flight: std::collections::VecDeque<(u16, u64)>,
+    pub(crate) in_flight: std::collections::VecDeque<InFlightTx>,
     /// Total frames handed to the sink since the last PREPARE.
     #[cfg(target_os = "macos")]
     pub(crate) submitted: u64,
+    /// Highest frame position completed to the guest. Ratchets, so a shrinking lead
+    /// (a host device change) stalls `hw_ptr` until real playback catches up rather
+    /// than moving it backwards, which the guest would read as a buffer wrap.
+    #[cfg(target_os = "macos")]
+    pub(crate) completed_to: u64,
+    /// When the starvation counters were last logged (throttles a ~93 Hz path to 1 Hz).
+    #[cfg(target_os = "macos")]
+    pub(crate) last_stats_log: Option<std::time::Instant>,
+    /// Starvation counters, owned here so they outlive any single `OutputStream`.
+    #[cfg(target_os = "macos")]
+    pub(crate) snd_stats: std::sync::Arc<super::audio_macos::AudioStats>,
 }
 
 impl Snd {
@@ -108,6 +137,12 @@ impl Snd {
             in_flight: std::collections::VecDeque::new(),
             #[cfg(target_os = "macos")]
             submitted: 0,
+            #[cfg(target_os = "macos")]
+            completed_to: 0,
+            #[cfg(target_os = "macos")]
+            last_stats_log: None,
+            #[cfg(target_os = "macos")]
+            snd_stats: super::audio_macos::AudioStats::new(),
         })
     }
 
@@ -274,6 +309,14 @@ impl Snd {
     /// no-op and tx falls back to the immediate null sink.
     #[cfg(target_os = "macos")]
     fn handle_pcm_lifecycle(&mut self, code: u32) {
+        let name = match code {
+            VIRTIO_SND_R_PCM_PREPARE => "PREPARE",
+            VIRTIO_SND_R_PCM_START => "START",
+            VIRTIO_SND_R_PCM_STOP => "STOP",
+            VIRTIO_SND_R_PCM_RELEASE => "RELEASE",
+            _ => "?",
+        };
+        log::info!("snd: playback {name}");
         match code {
             VIRTIO_SND_R_PCM_PREPARE => {
                 // Stop the RT thread, then flush any outstanding tx descriptors back to
@@ -284,6 +327,7 @@ impl Snd {
                 }
                 self.complete_all_in_flight();
                 self.submitted = 0;
+                self.completed_to = 0;
                 if self.audio.is_none() {
                     let channels = if self.params.channels == 0 {
                         2
@@ -294,6 +338,7 @@ impl Snd {
                         48_000.0,
                         channels,
                         self.completion_evt.clone(),
+                        self.snd_stats.clone(),
                     ) {
                         Ok(s) => self.audio = Some(s),
                         Err(e) => error!("snd: CoreAudio output init failed ({e}); silent sink"),
@@ -317,6 +362,7 @@ impl Snd {
                 self.audio = None; // Drop stops + disposes the unit.
                 self.complete_all_in_flight();
                 self.submitted = 0;
+                self.completed_to = 0;
             }
             _ => {}
         }
@@ -378,9 +424,9 @@ impl Snd {
             VIRTIO_SND_R_PCM_RELEASE => {
                 debug!("snd: capture RELEASE — dropping InputStream begin");
                 self.capture = None; // Drop stops + disposes the unit.
-                                     // The Linux virtio_snd driver's PCM release blocks until every posted rx
-                                     // I/O buffer has been returned (msg_count == 0). Return them here, or the
-                                     // guest hangs and the NEXT open times out (device appears wedged).
+                // The Linux virtio_snd driver's PCM release blocks until every posted rx
+                // I/O buffer has been returned (msg_count == 0). Return them here, or the
+                // guest hangs and the NEXT open times out (device appears wedged).
                 self.flush_rx();
                 debug!("snd: capture RELEASE — dropped");
             }
@@ -414,19 +460,28 @@ impl Snd {
                     None => break,
                 };
                 let index = head.index;
+                let status_addr = status_word_addr(&head);
                 let frames = self.enqueue_tx(&mem, &head, bpf);
-                // Status is written now (it is always S_OK); the buffer is made visible
-                // to the guest later, once these frames have actually been played.
+                // The buffer is made visible to the guest later, once these frames are
+                // accounted played; the status word is written then, not now.
                 self.submitted += frames as u64;
-                self.in_flight.push_back((index, self.submitted));
+                self.in_flight.push_back(InFlightTx {
+                    index,
+                    end_frame: self.submitted,
+                    status_addr,
+                });
 
                 // No sink (init failed): fall back to immediate completion.
                 if self.audio.is_none() {
                     self.complete_all_in_flight();
                 }
             }
-            // Completions are signalled from reap_completions, not here.
-            false
+            // Drive the paced completion here too. The RT callback only kicks the
+            // completion eventfd when it consumed something, so a ring that ran dry
+            // would otherwise wait for the *next* callback before the guest learned it
+            // had room — exactly when it is most behind. This also ramps the lead up at
+            // stream start, before the DAC has consumed anything at all.
+            self.complete_paced()
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -490,13 +545,9 @@ impl Snd {
                 }
             }
         }
-        // The device-writable tail is a single status word.
-        if let Ok(mut writer) = Writer::new(mem, head.clone()) {
-            let _ = writer.write_obj(VirtioSndPcmStatus {
-                status: VIRTIO_SND_S_OK,
-                latency_bytes: 0,
-            });
-        }
+        // The device-writable tail is a single status word, written by `complete_up_to`
+        // when the buffer is actually handed back — `latency_bytes` has to be current as
+        // of then, not as of now.
         frames
     }
 
@@ -506,11 +557,75 @@ impl Snd {
     pub fn reap_completions(&mut self) -> bool {
         // Drain the eventfd counter (level is re-kicked by the callback as it consumes).
         let _ = self.completion_evt.read();
-        let consumed = match self.audio.as_ref() {
-            Some(a) => a.frames_consumed(),
-            None => return false,
+        if self.audio.is_none() {
+            return false;
+        }
+        self.log_starvation_stats();
+        self.complete_paced()
+    }
+
+    /// Complete tx descriptors up to one host callback *ahead* of real playback, so the
+    /// guest keeps that much extra audio queued in our ring where host scheduling jitter
+    /// cannot starve the DAC. See [`OutputStream::lead_frames`] for why this is the only
+    /// lever that works and why it is honest.
+    #[cfg(target_os = "macos")]
+    fn complete_paced(&mut self) -> bool {
+        let Some(audio) = self.audio.as_ref() else {
+            return false;
         };
-        self.complete_up_to(consumed)
+        let consumed = audio.frames_consumed();
+        // Ramp the lead in rather than stepping it. Applying it all at once makes hw_ptr
+        // jump by a whole host period at the first completion after PREPARE, which reads
+        // to the guest's clock estimator as a discontinuity: it recovers by re-preparing
+        // the stream, and the fresh PREPARE re-does the jump, so the fault sustains
+        // itself. Growing the lead by one frame per RAMP_PER_FRAME consumed instead makes
+        // the device look very slightly fast for the first couple of seconds, which is
+        // exactly what a clock matcher exists to absorb.
+        // LIMINA_SND_LEAD_RAMP is that divisor; 0 applies the lead as a step.
+        const RAMP_PER_FRAME: u64 = 200; // 0.5% fast; full lead after ~2 s
+        let ramp = *LEAD_RAMP.get_or_init(|| {
+            std::env::var("LIMINA_SND_LEAD_RAMP")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(RAMP_PER_FRAME)
+        });
+        let lead = match ramp {
+            0 => audio.lead_frames(),
+            r => audio.lead_frames().min(consumed / r),
+        };
+        let target = consumed + lead;
+        // Ratchet: hw_ptr must never move backwards.
+        self.completed_to = self.completed_to.max(target);
+        let target = self.completed_to;
+        self.complete_up_to(target)
+    }
+
+    /// Report the sink's starvation counters once a second. Nothing else in the stack
+    /// can see an underrun: the callback pads silence, and the guest's `hw_ptr` only
+    /// advances on frames really consumed, so a dropout reads as a briefly slow device
+    /// rather than an xrun. `queued` is the host-side lead a late delivery must survive.
+    #[cfg(target_os = "macos")]
+    fn log_starvation_stats(&mut self) {
+        let Some(audio) = self.audio.as_ref() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_stats_log {
+            if now.duration_since(last) < std::time::Duration::from_secs(1) {
+                return;
+            }
+        }
+        self.last_stats_log = Some(now);
+
+        let (callbacks, underruns, frames_short, min_avail, dropped) = self.snd_stats.snapshot();
+        let min_avail = if min_avail == u64::MAX { 0 } else { min_avail };
+        log::info!(
+            "snd: callbacks={callbacks} underruns={underruns} frames_short={frames_short} \
+             min_queued={min_avail}f queued_now={}f dropped={dropped} period={}B buffer={}B",
+            audio.frames_queued(),
+            self.params.period_bytes,
+            self.params.buffer_bytes,
+        );
     }
 
     /// Complete all in-flight tx descriptors with end-frame <= `consumed`.
@@ -520,19 +635,40 @@ impl Snd {
             DeviceState::Activated(ref mem, _) => mem.clone(),
             DeviceState::Inactive => return false,
         };
+        // Delay the guest cannot already see for itself. It accounts for everything
+        // between `hw_ptr` and `appl_ptr` on its own, and ALSA adds `runtime->delay` on
+        // top — so this must be *only* the part we hid from it, i.e. how far `hw_ptr` has
+        // been advanced beyond frames the DAC has really played. Reporting whole-ring
+        // occupancy here double-counts the frames that are in the ring but not yet
+        // completed, and makes the figure sawtooth with ring depth instead of tracking
+        // the (smooth) lead.
+        let bpf = self.params.bytes_per_frame() as u64;
+        let latency_bytes = self
+            .audio
+            .as_ref()
+            .map(|a| self.completed_to.saturating_sub(a.frames_consumed()) * bpf)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+
         let mut used_any = false;
-        while let Some(&(index, end)) = self.in_flight.front() {
-            if end > consumed {
+        while let Some(front) = self.in_flight.front() {
+            if front.end_frame > consumed {
                 break;
             }
-            self.in_flight.pop_front();
+            let tx = self.in_flight.pop_front().expect("front exists");
+            let mut written = 0u32;
+            if let Some(addr) = tx.status_addr {
+                let status = VirtioSndPcmStatus {
+                    status: VIRTIO_SND_S_OK,
+                    latency_bytes,
+                };
+                if mem.write_obj(status, addr).is_ok() {
+                    written = std::mem::size_of::<VirtioSndPcmStatus>() as u32;
+                }
+            }
             if let Err(e) = self.queues.as_mut().expect("queues exist")[defs::TX_INDEX]
                 .queue
-                .add_used(
-                    &mem,
-                    index,
-                    std::mem::size_of::<VirtioSndPcmStatus>() as u32,
-                )
+                .add_used(&mem, tx.index, written)
             {
                 error!("snd: failed to add used tx descriptor: {e:?}");
             }
@@ -548,6 +684,7 @@ impl Snd {
     #[cfg(target_os = "macos")]
     fn complete_all_in_flight(&mut self) {
         let end = self.submitted;
+        self.completed_to = self.completed_to.max(end);
         self.complete_up_to(end);
     }
 
@@ -694,6 +831,21 @@ impl Snd {
             debug!("snd: flushed outstanding rx buffers");
         }
     }
+}
+
+/// Guest address of a tx chain's status word: the first device-writable descriptor.
+/// A playback chain is `[xfer header][PCM data…][status]`, so the writable tail is where
+/// the driver expects `virtio_snd_pcm_status`.
+#[cfg(target_os = "macos")]
+fn status_word_addr(head: &DescriptorChain) -> Option<vm_memory::GuestAddress> {
+    let mut desc = Some(head.clone());
+    while let Some(d) = desc {
+        if d.is_write_only() && (d.len as usize) >= std::mem::size_of::<VirtioSndPcmStatus>() {
+            return Some(d.addr);
+        }
+        desc = d.next_descriptor();
+    }
+    None
 }
 
 fn write_status(writer: &mut Writer, code: u32) {
@@ -843,6 +995,8 @@ impl VirtioDevice for Snd {
             self.capture_params = StreamParams::default();
             self.in_flight.clear();
             self.submitted = 0;
+            self.completed_to = 0;
+            self.last_stats_log = None;
         }
         true
     }
