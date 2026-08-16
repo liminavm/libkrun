@@ -120,6 +120,10 @@ pub struct Snd {
     pub(crate) reported_underruns: u64,
     #[cfg(target_os = "macos")]
     pub(crate) reported_frames_short: u64,
+    /// Frames submitted as of the last report, so an interval in which the guest fed the
+    /// device nothing can be told apart from one in which it fed it too slowly.
+    #[cfg(target_os = "macos")]
+    pub(crate) reported_submitted: u64,
     /// Delivery-side sampling: when this thread last ran, the longest it went without
     /// running, the deepest unpicked tx backlog, and how often the DAC was dry while the
     /// guest had already queued audio for us. See `sample_delivery`.
@@ -178,6 +182,8 @@ impl Snd {
             reported_underruns: 0,
             #[cfg(target_os = "macos")]
             reported_frames_short: 0,
+            #[cfg(target_os = "macos")]
+            reported_submitted: 0,
             #[cfg(target_os = "macos")]
             last_pass: None,
             #[cfg(target_os = "macos")]
@@ -372,6 +378,7 @@ impl Snd {
                 self.complete_all_in_flight();
                 self.submitted = 0;
                 self.completed_to = 0;
+                self.reported_submitted = 0;
                 if self.audio.is_none() {
                     let channels = if self.params.channels == 0 {
                         2
@@ -407,6 +414,7 @@ impl Snd {
                 self.complete_all_in_flight();
                 self.submitted = 0;
                 self.completed_to = 0;
+                self.reported_submitted = 0;
             }
             _ => {}
         }
@@ -714,9 +722,28 @@ impl Snd {
         let d_callbacks = callbacks - self.reported_callbacks;
         let d_underruns = underruns - self.reported_underruns;
         let d_short = frames_short - self.reported_frames_short;
+        let d_submitted = self.submitted - self.reported_submitted;
         self.reported_callbacks = callbacks;
         self.reported_underruns = underruns;
         self.reported_frames_short = frames_short;
+        self.reported_submitted = self.submitted;
+
+        // A stream the guest has left open but is not feeding is not a starving DAC — it
+        // is silence, and a game between sounds produces it constantly. Without this the
+        // device reports a flawless 100% starvation for every quiet moment, which buries
+        // the real fault under false alarms.
+        if d_submitted == 0 {
+            if d_underruns > 0 {
+                log::info!(
+                    "snd: stream open but idle — the guest submitted no audio in the last {:.1}s",
+                    since.unwrap_or(REPORT_INTERVAL).as_secs_f64()
+                );
+            }
+            self.max_pass_gap = std::time::Duration::ZERO;
+            self.max_tx_backlog = 0;
+            self.dry_with_backlog = 0;
+            return;
+        }
 
         // A starving DAC is a fault, so say so at a level the shipped app actually
         // records: the worker runs at `warn` unless RUST_LOG says otherwise, and a
