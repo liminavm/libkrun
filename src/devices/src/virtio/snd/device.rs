@@ -408,6 +408,12 @@ impl Snd {
                 if let Some(a) = self.audio.as_mut() {
                     a.stop();
                 }
+                // Deliberately do NOT return the outstanding buffers here. STOP is also how
+                // the driver pauses (`SNDRV_PCM_TRIGGER_PAUSE_PUSH`), and completing them
+                // would discard audio the guest expects to hear on resume while jumping
+                // `hw_ptr` past frames the DAC never played. Nothing waits on them either:
+                // `virtsnd_pcm_sync_stop` sends RELEASE first and waits after that, and
+                // RELEASE does flush.
             }
             VIRTIO_SND_R_PCM_RELEASE => {
                 self.audio = None; // Drop stops + disposes the unit.
@@ -592,6 +598,7 @@ impl Snd {
             frames = pcm_bytes / bpf;
             if pcm_bytes > 0 {
                 let mut data = vec![0u8; pcm_bytes];
+                let mut pushed = false;
                 if reader.read_exact(&mut data).is_ok() {
                     if let Some(a) = self.audio.as_ref() {
                         let samples: Vec<f32> = data
@@ -599,6 +606,15 @@ impl Snd {
                             .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                             .collect();
                         a.push_samples(&samples);
+                        pushed = true;
+                    }
+                }
+                // Frames counted into `submitted` but never handed to the sink can never
+                // be consumed, and completion is paced on consumption — so the descriptor
+                // would wait for them forever, and every descriptor behind it with it.
+                if !pushed {
+                    if let Some(a) = self.audio.as_ref() {
+                        a.account_consumed(frames);
                     }
                 }
             }
@@ -730,13 +746,27 @@ impl Snd {
 
         // A stream the guest has left open but is not feeding is not a starving DAC — it
         // is silence, and a game between sounds produces it constantly. Without this the
-        // device reports a flawless 100% starvation for every quiet moment, which buries
-        // the real fault under false alarms.
+        // device reports a flawless 100% starvation for every quiet moment.
+        //
+        // But silence and a deadlock look identical from the callback's side, and telling
+        // them apart matters more than either: if descriptors are still in flight, the
+        // guest is not quiet, it is *waiting for us*. It cannot submit until we hand those
+        // back, and we hand them back as the DAC consumes — so if the DAC is also idle,
+        // neither side can move again without help. Never file that as silence.
         if d_submitted == 0 {
-            if d_underruns > 0 {
+            let owed = self.in_flight.len();
+            let secs = since.unwrap_or(REPORT_INTERVAL).as_secs_f64();
+            if owed > 0 {
+                log::warn!(
+                    "snd: playback WEDGED — {owed} tx descriptors owed to the guest and nothing \
+                     submitted or played in {secs:.1}s; the guest is blocked waiting for buffers \
+                     this device has not returned (consumed={}, submitted={})",
+                    self.audio.as_ref().map_or(0, |a| a.frames_consumed()),
+                    self.submitted,
+                );
+            } else if d_underruns > 0 {
                 log::info!(
-                    "snd: stream open but idle — the guest submitted no audio in the last {:.1}s",
-                    since.unwrap_or(REPORT_INTERVAL).as_secs_f64()
+                    "snd: stream open but idle — the guest submitted no audio in the last {secs:.1}s"
                 );
             }
             self.max_pass_gap = std::time::Duration::ZERO;

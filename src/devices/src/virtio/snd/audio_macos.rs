@@ -684,12 +684,33 @@ impl OutputStream {
     pub(crate) fn push_samples(&self, samples: &[f32]) -> usize {
         let n = self.shared.ring.push(samples);
         if n < samples.len() {
+            let lost = samples.len() - n;
             self.shared
                 .stats
                 .dropped
-                .fetch_add((samples.len() - n) as u64, Ordering::Relaxed);
+                .fetch_add(lost as u64, Ordering::Relaxed);
+            // Count what the ring refused as consumed. Completion is paced off
+            // `frames_consumed`, so a frame that never enters the ring is a frame the DAC
+            // can never play, and the descriptor carrying it would wait for it forever —
+            // taking every descriptor queued behind it with it, since completion is FIFO.
+            // The guest then blocks for buffers that will never come back and stops
+            // submitting, which stops the DAC, which is a permanent deadlock from one
+            // instant of ring overrun. These frames are lost either way; accounting them
+            // costs the audio nothing and keeps the clock able to catch up.
+            self.shared
+                .frames_consumed
+                .fetch_add((lost / self.shared.channels) as u64, Ordering::Release);
         }
         n
+    }
+
+    /// Account frames the DAC will never see as consumed, so the descriptor carrying them
+    /// can still complete. See [`OutputStream::push_samples`] for why an unconsumable
+    /// frame is a permanent deadlock rather than a dropout.
+    pub(crate) fn account_consumed(&self, frames: usize) {
+        self.shared
+            .frames_consumed
+            .fetch_add(frames as u64, Ordering::Release);
     }
 
     /// Total real guest frames the DAC has consumed since the last reset.
