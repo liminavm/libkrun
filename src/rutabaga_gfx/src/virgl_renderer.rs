@@ -1109,3 +1109,20 @@ impl RutabagaComponent for VirglRenderer {
         Ok(Box::new(VirglRendererContext { ctx_id }))
     }
 }
+
+/// limina: hand a previously-published scanout IOSurface back to the supervisor.
+///
+/// The supervisor's surface store is bounded, so it can drop a surface the guest is still
+/// presenting; because these scanouts are non-global, only the process that created one can mint
+/// a Mach port for it, and the display then stays frozen for that id forever
+/// (`spikes/scanout-blob-freeze/RESULTS.md`). Re-publishing goes out on the surface port like any
+/// other publish, which preserves the ordering that makes IOSurface id recycling safe.
+///
+/// Not resource-keyed and not tied to a `Rutabaga`: virglrenderer's IOSurface registry is
+/// process-global, and the caller holds no component handle.
+#[cfg(target_os = "macos")]
+pub fn republish_iosurface(iosurface_id: u32) -> RutabagaResult<()> {
+    // SAFETY: the registry the call consults is mutex-guarded inside virglrenderer and nothing it
+    // touches is thread-affine, so this is safe off the renderer thread.
+    ret_to_res(unsafe { virgl_renderer_republish_iosurface(iosurface_id) })
+}
