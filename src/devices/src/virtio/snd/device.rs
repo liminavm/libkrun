@@ -418,12 +418,22 @@ impl Snd {
                 if let Some(a) = self.audio.as_mut() {
                     a.stop();
                 }
-                // Deliberately do NOT return the outstanding buffers here. STOP is also how
-                // the driver pauses (`SNDRV_PCM_TRIGGER_PAUSE_PUSH`), and completing them
-                // would discard audio the guest expects to hear on resume while jumping
-                // `hw_ptr` past frames the DAC never played. Nothing waits on them either:
-                // `virtsnd_pcm_sync_stop` sends RELEASE first and waits after that, and
-                // RELEASE does flush.
+                // A stopped unit consumes nothing, so paced completion can never return the
+                // descriptors still in flight — and the guest cannot ask for them back,
+                // because the only thing that wakes its writer is a completion. That is a
+                // permanent deadlock, and it is what wedged the dogfood guest: the ring
+                // and the callbacks stopped with two descriptors owed.
+                //
+                // Return them, and drop the unplayed audio with them. Completing without
+                // discarding would leave `hw_ptr` permanently ahead of real playback by
+                // whatever was still queued, which is the clock skew the lead experiment
+                // was rejected for. STOP is also the driver's pause
+                // (`SNDRV_PCM_TRIGGER_PAUSE_PUSH`), so this costs at most one buffer of
+                // audio on a pause — the same thing a real card does on `snd_pcm_drop`.
+                if let Some(a) = self.audio.as_mut() {
+                    a.discard();
+                }
+                self.complete_all_in_flight();
             }
             VIRTIO_SND_R_PCM_RELEASE => {
                 self.audio = None; // Drop stops + disposes the unit.
@@ -819,7 +829,16 @@ impl Snd {
         // back, and we hand them back as the DAC consumes — so if the DAC is also idle,
         // neither side can move again without help. Never file that as silence.
         if d_submitted == 0 {
-            let owed = self.in_flight.len();
+            // Count what the guest has handed us but we have not popped as owed too. A
+            // buffer stuck in the queue is every bit as blocking as one in flight, and
+            // keying only on `in_flight` made exactly that state report as silence.
+            let queued = match self.device_state {
+                DeviceState::Activated(ref mem, _) => self.queues.as_mut().map_or(0, |q| {
+                    q[defs::TX_INDEX].queue.len(mem) as usize
+                }),
+                DeviceState::Inactive => 0,
+            };
+            let owed = self.in_flight.len() + queued;
             let secs = since.unwrap_or(REPORT_INTERVAL).as_secs_f64();
             if owed > 0 {
                 log::warn!(

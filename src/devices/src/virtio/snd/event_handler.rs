@@ -56,6 +56,15 @@ impl Snd {
     #[cfg(target_os = "macos")]
     fn handle_completion_event(&mut self) {
         self.reap_completions();
+        // Also sweep the tx queue. `process_tx` is otherwise reached only from the queue
+        // kick, so a kick that is lost or suppressed leaves those buffers sitting in the
+        // ring with nothing to re-drive them — and since the guest cannot make progress
+        // until we complete them, the stream stops for good. The sink's tick reaches here
+        // four times a second whatever the DAC is doing, which turns that from permanent
+        // into a quarter-second hiccup.
+        if self.process_tx() {
+            self.device_state.signal_used_queue();
+        }
         if self.capture_enabled {
             self.process_rx();
         }

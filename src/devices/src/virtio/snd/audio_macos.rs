@@ -12,7 +12,7 @@
 //! so the guest `hw_ptr` advances at the host DAC's real rate (no xrun/clock runaway).
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use utils::eventfd::EventFd;
@@ -514,6 +514,8 @@ pub(crate) struct OutputStream {
     shared: Arc<AudioShared>,
     started: bool,
     lead_frames: u64,
+    /// Cleared on drop to retire the tick thread that drives the deadlock breaker.
+    ticker_alive: Arc<AtomicBool>,
 }
 
 // SAFETY: the AudioComponentInstance is only ever touched from the device thread
@@ -623,11 +625,33 @@ impl OutputStream {
                 host_period_frames()
             );
 
+            // Tick the device thread independently of the DAC. Everything that can notice
+            // a stuck stream — the counters, the deadlock breaker — runs off the
+            // completion eventfd, which is kicked by the render callback. If the callback
+            // itself stops, that machinery stops with it and the stream is stuck with
+            // nobody left to say so. A watchdog wired to the thing it watches is not a
+            // watchdog. Four wakeups a second is nothing next to the DAC's ninety.
+            let ticker_alive = Arc::new(AtomicBool::new(true));
+            {
+                let alive = ticker_alive.clone();
+                let evt = shared.completion_evt.clone();
+                std::thread::Builder::new()
+                    .name("snd-tick".into())
+                    .spawn(move || {
+                        while alive.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                            let _ = evt.write(1);
+                        }
+                    })
+                    .map_err(|_| -1)?;
+            }
+
             Ok(OutputStream {
                 unit,
                 shared,
                 started: false,
                 lead_frames,
+                ticker_alive,
             })
         }
     }
@@ -704,6 +728,17 @@ impl OutputStream {
         n
     }
 
+    /// Drop everything queued but unplayed, counting it as consumed. Used when the guest
+    /// stops the stream: the frames are not going to be played, and leaving them in the
+    /// ring would make `hw_ptr` lead real playback by their length forever after — the
+    /// clock skew that makes the guest's estimator declare xruns. Must be called while
+    /// stopped, so the RT thread is idle.
+    pub(crate) fn discard(&mut self) {
+        let queued = self.shared.ring.available();
+        self.shared.ring.reset();
+        self.account_consumed(queued / self.shared.channels);
+    }
+
     /// Account frames the DAC will never see as consumed, so the descriptor carrying them
     /// can still complete. See [`OutputStream::push_samples`] for why an unconsumable
     /// frame is a permanent deadlock rather than a dropout.
@@ -727,6 +762,7 @@ impl OutputStream {
 
 impl Drop for OutputStream {
     fn drop(&mut self) {
+        self.ticker_alive.store(false, Ordering::Relaxed);
         self.stop();
         unsafe {
             AudioUnitUninitialize(self.unit);
