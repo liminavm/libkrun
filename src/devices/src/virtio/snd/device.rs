@@ -107,6 +107,9 @@ pub struct Snd {
     /// Starvation counters, owned here so they outlive any single `OutputStream`.
     #[cfg(target_os = "macos")]
     pub(crate) snd_stats: std::sync::Arc<super::audio_macos::AudioStats>,
+    /// The output device's realtime workgroup, refreshed on each PREPARE.
+    #[cfg(target_os = "macos")]
+    pub(crate) snd_workgroup: Option<std::sync::Arc<super::audio_macos::AudioWorkgroup>>,
 }
 
 impl Snd {
@@ -143,6 +146,8 @@ impl Snd {
             last_stats_log: None,
             #[cfg(target_os = "macos")]
             snd_stats: super::audio_macos::AudioStats::new(),
+            #[cfg(target_os = "macos")]
+            snd_workgroup: None,
         })
     }
 
@@ -319,6 +324,7 @@ impl Snd {
         log::info!("snd: playback {name}");
         match code {
             VIRTIO_SND_R_PCM_PREPARE => {
+                self.snd_workgroup = super::audio_macos::AudioWorkgroup::current();
                 // Stop the RT thread, then flush any outstanding tx descriptors back to
                 // the guest (a re-prepare during xrun recovery discards unplayed audio)
                 // before clearing the frame counters.
@@ -450,6 +456,12 @@ impl Snd {
 
         #[cfg(target_os = "macos")]
         {
+            // Feeding the DAC is part of the audio device's realtime deadline, so run it
+            // enrolled in that device's workgroup. Scoped to this call, not to the thread:
+            // virtio-snd shares the event-manager thread with the GPU, block and net
+            // devices, and their work has no business inside an audio deadline contract.
+            let _wg = self.snd_workgroup.as_ref().and_then(|w| w.join());
+
             let bpf = self.params.bytes_per_frame();
             loop {
                 let head = match self.queues.as_mut().expect("queues exist")[defs::TX_INDEX]

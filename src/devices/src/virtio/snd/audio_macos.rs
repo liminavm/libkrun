@@ -147,6 +147,138 @@ const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
 const CAPTURE_INPUT_BUS: u32 = 1;
 const CAPTURE_MAX_FRAMES: usize = 8192;
 
+// ---- the output device's realtime thread workgroup --------------------------
+
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    fn os_workgroup_join(wg: *mut c_void, token: *mut c_void) -> i32;
+    fn os_workgroup_leave(wg: *mut c_void, token: *mut c_void);
+    fn os_release(object: *mut c_void);
+}
+
+const K_AUDIO_DEVICE_PROP_IO_THREAD_OS_WORKGROUP: u32 = u32::from_be_bytes(*b"oswg");
+
+/// `os_workgroup_join_token_s` is `{ uint32_t sig; char opaque[N] }`, where the header
+/// gives N as 36 or 28 depending on the ABI. Over-allocate rather than pick: the callee
+/// only ever writes within its own idea of the size.
+#[repr(C, align(8))]
+struct JoinToken([u8; 64]);
+
+/// The workgroup the output device's IO thread belongs to.
+///
+/// Work that feeds a realtime audio thread should be scheduled coherently with it — that
+/// is what a workgroup is for. **We join around individual pieces of work rather than for
+/// the life of the thread**, because virtio-snd shares the event-manager thread with every
+/// other device: enrolling that thread outright would put GPU and block work under the
+/// audio deadline contract, which is exactly what a workgroup must not contain.
+pub(crate) struct AudioWorkgroup {
+    wg: *mut c_void,
+}
+
+// SAFETY: os_workgroup_t is an immutable, internally-synchronized os_object; join/leave
+// are per-thread operations taking a caller-owned token.
+unsafe impl Send for AudioWorkgroup {}
+unsafe impl Sync for AudioWorkgroup {}
+
+impl AudioWorkgroup {
+    /// Fetch the default output device's IO workgroup, or `None` when it has none (some
+    /// virtual/aggregate devices) or the caller opted out with `LIMINA_SND_WORKGROUP=0`.
+    fn fetch() -> Option<AudioWorkgroup> {
+        if std::env::var("LIMINA_SND_WORKGROUP").as_deref() == Ok("0") {
+            return None;
+        }
+        let dev = default_output_device()?;
+        let mut wg: *mut c_void = std::ptr::null_mut();
+        let mut sz = std::mem::size_of::<*mut c_void>() as u32;
+        let addr = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROP_IO_THREAD_OS_WORKGROUP,
+            scope: K_AUDIO_OBJ_SCOPE_GLOBAL,
+            element: 0,
+        };
+        // SAFETY: out-parameter read of one pointer against a resolved device id.
+        let r = unsafe {
+            AudioObjectGetPropertyData(
+                dev,
+                &addr,
+                0,
+                std::ptr::null(),
+                &mut sz,
+                &mut wg as *mut _ as *mut c_void,
+            )
+        };
+        if r != 0 || wg.is_null() {
+            log::debug!("snd: output device exposes no IO workgroup (status {r})");
+            return None;
+        }
+        log::info!("snd: joining the output device's realtime workgroup for tx work");
+        Some(AudioWorkgroup { wg })
+    }
+
+    /// Join for the duration of the returned guard. Returns `None` if the join fails, in
+    /// which case the work simply runs unenrolled.
+    pub(crate) fn join(self: &Arc<Self>) -> Option<WorkgroupMembership> {
+        let mut token = JoinToken([0u8; 64]);
+        // SAFETY: `token` lives in the guard, which leaves on the same thread that joined.
+        let r = unsafe { os_workgroup_join(self.wg, &mut token as *mut _ as *mut c_void) };
+        if r != 0 {
+            return None;
+        }
+        Some(WorkgroupMembership {
+            wg: Arc::clone(self),
+            token,
+        })
+    }
+
+    /// The default output device's workgroup, if it has one and the caller has not opted
+    /// out. Re-fetched per PREPARE so a change of output device is picked up.
+    pub(crate) fn current() -> Option<Arc<AudioWorkgroup>> {
+        AudioWorkgroup::fetch().map(Arc::new)
+    }
+}
+
+impl Drop for AudioWorkgroup {
+    fn drop(&mut self) {
+        // SAFETY: we own the +1 from AudioObjectGetPropertyData.
+        unsafe { os_release(self.wg) };
+    }
+}
+
+/// Leaves the workgroup when dropped. Must not outlive the thread that joined.
+pub(crate) struct WorkgroupMembership {
+    wg: Arc<AudioWorkgroup>,
+    token: JoinToken,
+}
+
+impl Drop for WorkgroupMembership {
+    fn drop(&mut self) {
+        // SAFETY: same thread that joined, same token.
+        unsafe { os_workgroup_leave(self.wg.wg, &mut self.token as *mut _ as *mut c_void) };
+    }
+}
+
+/// The system's current default output device, or `None` if it cannot be resolved.
+fn default_output_device() -> Option<u32> {
+    let mut dev: u32 = 0;
+    let mut sz: u32 = 4;
+    let addr = AudioObjectPropertyAddress {
+        selector: K_AUDIO_HW_PROP_DEFAULT_OUTPUT_DEVICE,
+        scope: K_AUDIO_OBJ_SCOPE_GLOBAL,
+        element: 0,
+    };
+    // SAFETY: out-parameter read against the system object.
+    let r = unsafe {
+        AudioObjectGetPropertyData(
+            K_AUDIO_OBJECT_SYSTEM_OBJECT,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut sz,
+            &mut dev as *mut _ as *mut c_void,
+        )
+    };
+    if r != 0 || dev == 0 { None } else { Some(dev) }
+}
+
 // ---- lock-free single-producer / single-consumer f32 ring -------------------
 
 /// Producer = the device's event-manager thread (push in `process_tx`); consumer =
@@ -296,28 +428,9 @@ const MAX_LEAD_FRAMES: u64 = 2048;
 /// (built-in speakers report 512; Bluetooth output is typically far larger), and it is
 /// information only the host has — the guest cannot discover it through virtio-snd.
 fn host_period_frames() -> u64 {
-    let mut dev: u32 = 0;
-    let mut sz: u32 = 4;
-    let addr = AudioObjectPropertyAddress {
-        selector: K_AUDIO_HW_PROP_DEFAULT_OUTPUT_DEVICE,
-        scope: K_AUDIO_OBJ_SCOPE_GLOBAL,
-        element: 0,
-    };
-    // SAFETY: plain out-parameter reads against the system object, sizes match.
-    let r = unsafe {
-        AudioObjectGetPropertyData(
-            K_AUDIO_OBJECT_SYSTEM_OBJECT,
-            &addr,
-            0,
-            std::ptr::null(),
-            &mut sz,
-            &mut dev as *mut _ as *mut c_void,
-        )
-    };
-    if r != 0 || dev == 0 {
+    let Some(dev) = default_output_device() else {
         return DEFAULT_HOST_PERIOD_FRAMES;
-    }
-
+    };
     let mut frames: u32 = 0;
     let mut sz: u32 = 4;
     let addr = AudioObjectPropertyAddress {
@@ -325,7 +438,7 @@ fn host_period_frames() -> u64 {
         scope: K_AUDIO_OBJ_SCOPE_OUTPUT,
         element: 0,
     };
-    // SAFETY: as above, against the resolved device id.
+    // SAFETY: out-parameter read against the resolved device id.
     let r = unsafe {
         AudioObjectGetPropertyData(
             dev,
