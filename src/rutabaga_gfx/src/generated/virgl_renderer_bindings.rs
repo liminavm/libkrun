@@ -413,6 +413,15 @@ unsafe extern "C" {
         iosurface_id: *mut u32,
     ) -> ::std::os::raw::c_int;
 }
+// limina: re-hand an already-published scanout IOSurface to the supervisor, keyed by IOSURFACE id
+// (not resource handle — the supervisor only knows the former, and the resource may be gone while
+// the surface lives). The supervisor's surface store is bounded and evicts; a non-global surface it
+// dropped cannot be recovered from its side, so a guest presenting an evicted id froze the display
+// permanently for that id. See spikes/scanout-blob-freeze/RESULTS.md.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    pub fn virgl_renderer_republish_iosurface(iosurface_id: u32) -> ::std::os::raw::c_int;
+}
 // limina vrend zero-copy scanout: blit a vrend scanout resource's texture into its display
 // IOSurface (GPU-side) and wait. Call on RESOURCE_FLUSH before presenting the id; -EINVAL
 // when the resource has no IOSurface. See docs/design/vrend-iosurface-scanout.md.
