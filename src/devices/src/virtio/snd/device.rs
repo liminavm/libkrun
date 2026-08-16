@@ -408,6 +408,12 @@ impl Snd {
                 if let Some(a) = self.audio.as_mut() {
                     a.stop();
                 }
+                // `virtsnd_pcm_sync_stop` waits for every posted I/O buffer to come back
+                // before it will let the stream be reused, and a stopped unit consumes
+                // nothing — so paced completion would never return them. Same contract the
+                // capture path meets with `flush_rx`. The audio these carry is discarded
+                // by the stop, which is what the guest asked for.
+                self.complete_all_in_flight();
             }
             VIRTIO_SND_R_PCM_RELEASE => {
                 self.audio = None; // Drop stops + disposes the unit.
@@ -730,13 +736,27 @@ impl Snd {
 
         // A stream the guest has left open but is not feeding is not a starving DAC — it
         // is silence, and a game between sounds produces it constantly. Without this the
-        // device reports a flawless 100% starvation for every quiet moment, which buries
-        // the real fault under false alarms.
+        // device reports a flawless 100% starvation for every quiet moment.
+        //
+        // But silence and a deadlock look identical from the callback's side, and telling
+        // them apart matters more than either: if descriptors are still in flight, the
+        // guest is not quiet, it is *waiting for us*. It cannot submit until we hand those
+        // back, and we hand them back as the DAC consumes — so if the DAC is also idle,
+        // neither side can move again without help. Never file that as silence.
         if d_submitted == 0 {
-            if d_underruns > 0 {
+            let owed = self.in_flight.len();
+            let secs = since.unwrap_or(REPORT_INTERVAL).as_secs_f64();
+            if owed > 0 {
+                log::warn!(
+                    "snd: playback WEDGED — {owed} tx descriptors owed to the guest and nothing \
+                     submitted or played in {secs:.1}s; the guest is blocked waiting for buffers \
+                     this device has not returned (consumed={}, submitted={})",
+                    self.audio.as_ref().map_or(0, |a| a.frames_consumed()),
+                    self.submitted,
+                );
+            } else if d_underruns > 0 {
                 log::info!(
-                    "snd: stream open but idle — the guest submitted no audio in the last {:.1}s",
-                    since.unwrap_or(REPORT_INTERVAL).as_secs_f64()
+                    "snd: stream open but idle — the guest submitted no audio in the last {secs:.1}s"
                 );
             }
             self.max_pass_gap = std::time::Duration::ZERO;
