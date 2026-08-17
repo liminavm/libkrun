@@ -111,14 +111,14 @@ fn write_type_1_table(mem: &GuestMemoryMmap, mut current: GuestAddress) -> Resul
     let sysinfo = SystemInfo::new(1, 2);
 
     current = write_obj(mem, sysinfo, current)?;
-    current = write_string(mem, "Libkrun", current)?;
+    current = write_string(mem, "Limina", current)?;
     // Guest VM detection (systemd's dmi_vendor_table, PipeWire's spa cpu.vm.name, and others)
     // prefix-matches product_name against a fixed list of hypervisor names and reads it before
     // sys_vendor. A name absent from those lists leaves the guest indistinguishable from bare
     // metal, so it silently gets bare-metal defaults: PipeWire, for one, then leaves
     // default.clock.min-quantum at 32 and any small-buffer client starves the audio graph.
     // Leading with a recognized name buys correct defaults; the manufacturer above stays honest.
-    current = write_string(mem, "KVM Virtual Machine (libkrun)", current)?;
+    current = write_string(mem, "KVM Virtual Machine (Limina, libkrun)", current)?;
 
     // the set of strings is terminated with an additional null (00h) byte
     current = write_obj(mem, 0u8, current)?;
