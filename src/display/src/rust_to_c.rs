@@ -76,6 +76,17 @@ pub trait DisplayBackendBasicFramebuffer {
     fn release_surface(&mut self, _iosurface_id: u32) -> Result<(), DisplayBackendError> {
         Err(DisplayBackendError::MethodNotSupported)
     }
+
+    /// (Optional, limina) A guest OS driver has taken over the device — the first
+    /// `VIRTIO_GPU_CMD_GET_EDID` of the run, which boot firmware never sends.
+    ///
+    /// The two consumers of the device do not have the same constraints: firmware drivers
+    /// commonly hardcode scanout 0, an OS driver enumerates every scanout and follows hotplug.
+    /// A backend that arranges displays needs to know which one it is talking to. Default:
+    /// unsupported.
+    fn guest_driver_ready(&mut self) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -240,6 +251,12 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             from_rust_result(cast_instance::<I>(instance).release_surface(iosurface_id))
         }
 
+        extern "C" fn guest_driver_ready_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).guest_driver_ready())
+        }
+
         DisplayBackend {
             create_userdata: userdata.map_or(null(), |t| ptr::from_ref(t) as *const c_void),
             create_userdata_lifetime: PhantomData,
@@ -256,6 +273,7 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     move_cursor: Some(move_cursor_fn::<I>),
                     present_surface: Some(present_surface_fn::<I>),
                     release_surface: Some(release_surface_fn::<I>),
+                    guest_driver_ready: Some(guest_driver_ready_fn::<I>),
                 },
             },
         }
