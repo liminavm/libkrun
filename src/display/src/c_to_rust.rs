@@ -184,6 +184,14 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
             }
         }
     }
+
+    fn guest_driver_ready(&mut self) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.guest_driver_ready()
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
