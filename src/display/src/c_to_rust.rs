@@ -138,6 +138,7 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
 
     fn set_cursor(
         &mut self,
+        scanout_id: u32,
         width: u32,
         height: u32,
         hot_x: u32,
@@ -149,15 +150,15 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
         // NULL (e.g. the headless capture backend or a stock GTK backend) — no cursor, fine.
         into_rust_result! {
             method_call!{
-                self.set_cursor(width, height, hot_x, hot_y, format as u32, buffer.as_ptr(), buffer.len())
+                self.set_cursor(scanout_id, width, height, hot_x, hot_y, format as u32, buffer.as_ptr(), buffer.len())
             }
         }
     }
 
-    fn move_cursor(&mut self, x: u32, y: u32) -> Result<(), DisplayBackendError> {
+    fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> Result<(), DisplayBackendError> {
         into_rust_result! {
             method_call!{
-                self.move_cursor(x, y)
+                self.move_cursor(scanout_id, x, y)
             }
         }
     }
