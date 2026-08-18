@@ -154,6 +154,9 @@ typedef int32_t (*krun_display_present_frame_fn)(void *instance, uint32_t scanou
  *
  * Arguments:
  *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id"  - which scanout the cursor belongs to. Load-bearing on a multi-head guest: a
+ *                  compositor enables the cursor plane on only the CRTC the pointer is on and
+ *                  disables the others, so this is the whole signal for which display shows it.
  *  "width"       - cursor image width in pixels (0 to hide)
  *  "height"      - cursor image height in pixels (0 to hide)
  *  "hot_x"       - cursor hotspot x within the image
@@ -166,6 +169,7 @@ typedef int32_t (*krun_display_present_frame_fn)(void *instance, uint32_t scanou
  *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
  */
 typedef int32_t (*krun_display_set_cursor_fn)(void *instance,
+    uint32_t scanout_id,
     uint32_t width,
     uint32_t height,
     uint32_t hot_x,
@@ -182,13 +186,14 @@ typedef int32_t (*krun_display_set_cursor_fn)(void *instance,
  *
  * Arguments:
  *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id"  - which scanout `x`/`y` are relative to
  *  "x"           - cursor x position in scanout pixels
  *  "y"           - cursor y position in scanout pixels
  *
  * Returns:
  *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
  */
-typedef int32_t (*krun_display_move_cursor_fn)(void *instance, uint32_t x, uint32_t y);
+typedef int32_t (*krun_display_move_cursor_fn)(void *instance, uint32_t scanout_id, uint32_t x, uint32_t y);
 
 /**
  * (limina extension, optional) Presents an externally-rendered surface to the display zero-copy.
