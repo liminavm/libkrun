@@ -34,11 +34,17 @@ pub trait DisplayBackendBasicFramebuffer {
         rect: Option<&Rect>,
     ) -> Result<(), DisplayBackendError>;
 
-    /// (Optional, limina) Set the hardware cursor image + hotspot. `width`/`height` of 0 (or an
-    /// empty `buffer`) hides the cursor. Default: unsupported (backends without an overlay
-    /// simply don't get a hardware cursor — the guest keeps its software fallback).
+    /// (Optional, limina) Set the hardware cursor image + hotspot on one scanout. `width`/
+    /// `height` of 0 (or an empty `buffer`) hides the cursor. Default: unsupported (backends
+    /// without an overlay simply don't get a hardware cursor — the guest keeps its software
+    /// fallback).
+    ///
+    /// `scanout_id` is load-bearing on a multi-head guest: a compositor enables the cursor plane
+    /// on only the CRTC the pointer is on and disables the others, so this is the whole signal
+    /// for which display should show the sprite.
     fn set_cursor(
         &mut self,
+        _scanout_id: u32,
         _width: u32,
         _height: u32,
         _hot_x: u32,
@@ -49,9 +55,14 @@ pub trait DisplayBackendBasicFramebuffer {
         Err(DisplayBackendError::MethodNotSupported)
     }
 
-    /// (Optional, limina) Move the hardware cursor to scanout pixel (`x`, `y`). Default:
-    /// unsupported.
-    fn move_cursor(&mut self, _x: u32, _y: u32) -> Result<(), DisplayBackendError> {
+    /// (Optional, limina) Move the hardware cursor to (`x`, `y`) in `scanout_id`'s pixels.
+    /// Default: unsupported.
+    fn move_cursor(
+        &mut self,
+        _scanout_id: u32,
+        _x: u32,
+        _y: u32,
+    ) -> Result<(), DisplayBackendError> {
         Err(DisplayBackendError::MethodNotSupported)
     }
 
@@ -189,6 +200,7 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
         #[allow(clippy::too_many_arguments)]
         extern "C" fn set_cursor_fn<I: DisplayBackendBasicFramebuffer>(
             instance: *mut c_void,
+            scanout_id: u32,
             width: u32,
             height: u32,
             hot_x: u32,
@@ -217,16 +229,17 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             };
             from_rust_result(
                 cast_instance::<I>(instance)
-                    .set_cursor(width, height, hot_x, hot_y, format, pixels),
+                    .set_cursor(scanout_id, width, height, hot_x, hot_y, format, pixels),
             )
         }
 
         extern "C" fn move_cursor_fn<I: DisplayBackendBasicFramebuffer>(
             instance: *mut c_void,
+            scanout_id: u32,
             x: u32,
             y: u32,
         ) -> i32 {
-            from_rust_result(cast_instance::<I>(instance).move_cursor(x, y))
+            from_rust_result(cast_instance::<I>(instance).move_cursor(scanout_id, x, y))
         }
 
         extern "C" fn present_surface_fn<I: DisplayBackendBasicFramebuffer>(
