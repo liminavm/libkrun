@@ -552,7 +552,7 @@ impl Worker {
                         Ok(WorkerCmd::Activate { .. })
                         | Err(std::sync::mpsc::TryRecvError::Empty) => {}
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            return InnerExit::Shutdown
+                            return InnerExit::Shutdown;
                         }
                     }
                 }
@@ -791,8 +791,7 @@ impl Worker {
                             Err(_) => return Err(GpuResponse::ErrUnspec),
                         }
                     }
-                    let backing: Vec<(u64, usize)> =
-                        vecs.iter().map(|(a, l)| (a.0, *l)).collect();
+                    let backing: Vec<(u64, usize)> = vecs.iter().map(|(a, l)| (a.0, *l)).collect();
                     let r = virtio_gpu.attach_backing(info.resource_id, mem, vecs);
                     if r.is_ok() {
                         virtio_gpu
@@ -813,13 +812,16 @@ impl Worker {
                 r
             }
             GpuCommand::UpdateCursor(info) => virtio_gpu.update_cursor(
+                info.pos.scanout_id,
                 info.resource_id,
                 info.hot_x,
                 info.hot_y,
                 info.pos.x,
                 info.pos.y,
             ),
-            GpuCommand::MoveCursor(info) => virtio_gpu.move_cursor(info.pos.x, info.pos.y),
+            GpuCommand::MoveCursor(info) => {
+                virtio_gpu.move_cursor(info.pos.scanout_id, info.pos.x, info.pos.y)
+            }
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id;
                 virtio_gpu.resource_assign_uuid(resource_id)

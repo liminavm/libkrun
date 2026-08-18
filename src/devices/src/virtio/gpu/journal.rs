@@ -16,8 +16,8 @@
 // Recording happens on the worker thread only (the control queue is serial), so
 // no locking; the tick-visible counters go through the shared GpuTraceStats.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::trace::GpuTraceStats;
 
@@ -435,14 +435,14 @@ impl GpuJournal {
 // their bytes live in HOST allocations, not in the guest-RAM dump).
 
 const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
-                                        // v2 (M9.3 P2): + memory_contents — every capturable VkDeviceMemory's raw bytes
-                                        // (not just guest-mapped blobs). v3 (P2.1): + sync_states — per-context opaque
-                                        // vkr sync blobs (fence status + timeline counter values) for the restore-time
-                                        // sync fast-forward. v4 (P3): + cursor — the last cursor-overlay state
-                                        // (UPDATE/MOVE_CURSOR are not journaled ops; without this the restored session
-                                        // shows the default dot cursor until the guest next changes it). Snapshots are
-                                        // single-use against their exact post-suspend disk, so no cross-version parse
-                                        // compatibility is kept.
+// v2 (M9.3 P2): + memory_contents — every capturable VkDeviceMemory's raw bytes
+// (not just guest-mapped blobs). v3 (P2.1): + sync_states — per-context opaque
+// vkr sync blobs (fence status + timeline counter values) for the restore-time
+// sync fast-forward. v4 (P3): + cursor — the last cursor-overlay state
+// (UPDATE/MOVE_CURSOR are not journaled ops; without this the restored session
+// shows the default dot cursor until the guest next changes it). Snapshots are
+// single-use against their exact post-suspend disk, so no cross-version parse
+// compatibility is kept.
 // v5 (task #19): + classic-vrend ops (ResourceCreate3d/2d, AttachBacking,
 // SetScanout, tags 6..=9) and classic contexts' wire journals riding
 // vkr_journals in the same VKJR format — the compositor's GL world.
@@ -507,6 +507,9 @@ pub struct GpuSnapshotPayload {
 /// pixels included (≤ ~64×64×4), so restore needs no resource lookup at all.
 #[derive(Clone)]
 pub struct CursorSnapshot {
+    /// Which scanout the cursor was on. A guest enables the cursor plane on one CRTC at a time,
+    /// so a single snapshot plus its scanout is the whole state.
+    pub scanout_id: u32,
     pub width: u32,
     pub height: u32,
     pub hot_x: u32,
@@ -689,9 +692,15 @@ impl GpuSnapshotPayload {
         }
 
         // v4 cursor section: presence byte + geometry + pixels.
+        //
+        // The presence byte carries the layout: 1 is the original (no scanout id, implicitly 0),
+        // 2 adds it in front. Extending the tag rather than the section's version keeps every
+        // v4-and-later snapshot readable — a cursor is the one piece of state where being wrong
+        // is merely cosmetic, so refusing to restore an older one would cost more than it saves.
         match &self.cursor {
             Some(c) => {
-                buf.push(1);
+                buf.push(2);
+                put_u32(&mut buf, c.scanout_id);
                 for v in [c.width, c.height, c.hot_x, c.hot_y, c.format, c.x, c.y] {
                     put_u32(&mut buf, v);
                 }
@@ -856,7 +865,9 @@ impl GpuSnapshotPayload {
         // v4 cursor section.
         payload.cursor = match *c.take(1)?.first()? {
             0 => None,
-            1 => {
+            tag @ (1 | 2) => {
+                // Tag 1 predates multi-head: its cursor was always scanout 0.
+                let scanout_id = if tag == 2 { c.u32()? } else { 0 };
                 let width = c.u32()?;
                 let height = c.u32()?;
                 let hot_x = c.u32()?;
@@ -866,6 +877,7 @@ impl GpuSnapshotPayload {
                 let y = c.u32()?;
                 let len = c.u64()? as usize;
                 Some(CursorSnapshot {
+                    scanout_id,
                     width,
                     height,
                     hot_x,
@@ -884,7 +896,9 @@ impl GpuSnapshotPayload {
         for _ in 0..n {
             let ctx_id = c.u32()?;
             let len = c.u64()? as usize;
-            payload.classic_contents.push((ctx_id, c.take(len)?.to_vec()));
+            payload
+                .classic_contents
+                .push((ctx_id, c.take(len)?.to_vec()));
         }
 
         Some(payload)
@@ -999,6 +1013,7 @@ mod tests {
             memory_contents: vec![(3, 21, vec![0xc3; 48])],
             sync_states: vec![(3, vec![0x11; 16])],
             cursor: Some(CursorSnapshot {
+                scanout_id: 0,
                 width: 64,
                 height: 64,
                 hot_x: 4,

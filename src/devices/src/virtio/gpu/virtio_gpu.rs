@@ -31,9 +31,8 @@ use rutabaga_gfx::{
 };
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_FLAG_FENCE, RUTABAGA_FLAG_INFO_RING_IDX,
-    RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
-    Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec,
-    Transfer3D,
+    RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder,
+    RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -1209,7 +1208,7 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         mem: &GuestMemoryMmap,
     ) -> bool {
-        use super::journal::{parse_vkr_journal, GpuSnapshotPayload, VKR_KLASS_RING_STREAM};
+        use super::journal::{GpuSnapshotPayload, VKR_KLASS_RING_STREAM, parse_vkr_journal};
         use std::collections::HashMap;
 
         let Some(payload) = GpuSnapshotPayload::from_bytes(data) else {
@@ -1656,7 +1655,9 @@ impl VirtioGpu {
                 }
             }
             if uploads > 0 || flips > 0 {
-                info!("gpu restore: classic content re-uploaded ({uploads} resources), {flips} scanout flips");
+                info!(
+                    "gpu restore: classic content re-uploaded ({uploads} resources), {flips} scanout flips"
+                );
             }
         }
 
@@ -1682,10 +1683,16 @@ impl VirtioGpu {
         if let Some(c) = cursor {
             match ResourceFormat::try_from(c.format) {
                 Ok(format) => {
-                    let _ = self
-                        .display_backend
-                        .set_cursor(c.width, c.height, c.hot_x, c.hot_y, format, &c.pixels);
-                    let _ = self.display_backend.move_cursor(c.x, c.y);
+                    let _ = self.display_backend.set_cursor(
+                        c.scanout_id,
+                        c.width,
+                        c.height,
+                        c.hot_x,
+                        c.hot_y,
+                        format,
+                        &c.pixels,
+                    );
+                    let _ = self.display_backend.move_cursor(c.scanout_id, c.x, c.y);
                     info!(
                         "gpu restore: cursor overlay re-applied ({}x{} at {},{})",
                         c.width, c.height, c.x, c.y
@@ -2031,7 +2038,9 @@ impl VirtioGpu {
             .filter(|&id| id != 0);
         #[cfg(target_os = "macos")]
         if let Some(id) = iosurface_id {
-            log::debug!("SET_SCANOUT scanout={scanout_id} res={resource_id} -> IOSurface {id} (vrend zero-copy)");
+            log::debug!(
+                "SET_SCANOUT scanout={scanout_id} res={resource_id} -> IOSurface {id} (vrend zero-copy)"
+            );
         }
 
         *scanout = Some(VirtioGpuScanout {
@@ -2207,7 +2216,9 @@ impl VirtioGpu {
                     .get(scanout_id as usize)
                     .and_then(|s| s.as_ref())
                     .and_then(|s| s.iosurface_id);
-                log::debug!("[FLUSHDBG] flush res={resource_id} scanout={scanout_id} iosurface_id={dbg_ios:?}");
+                log::debug!(
+                    "[FLUSHDBG] flush res={resource_id} scanout={scanout_id} iosurface_id={dbg_ios:?}"
+                );
             }
             #[cfg(target_os = "macos")]
             if let Some(iosurface_id) = self
@@ -2374,7 +2385,12 @@ impl VirtioGpu {
                 }
                 log::trace!(
                     "[FLUSH2] res={resource_id} scan={scanout_id} rect=({},{},{},{}) dims={}x{} hash={h:016x}",
-                    rect.x, rect.y, rect.width, rect.height, resource.width, resource.height
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    resource.width,
+                    resource.height
                 );
             }
             // limina DIAG (`touch /tmp/limina-dump-staging`): dump the RAW readback (staging,
@@ -2449,12 +2465,14 @@ impl VirtioGpu {
         POLLER.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("gpu fence-toggle".into())
-                .spawn(|| loop {
-                    FORCE_OFF.store(
-                        std::fs::metadata("/tmp/disable-limina-fence-present").is_ok(),
-                        Ordering::Relaxed,
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                .spawn(|| {
+                    loop {
+                        FORCE_OFF.store(
+                            std::fs::metadata("/tmp/disable-limina-fence-present").is_ok(),
+                            Ordering::Relaxed,
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
                 });
         });
         !FORCE_OFF.load(Ordering::Relaxed)
@@ -2618,7 +2636,9 @@ impl VirtioGpu {
                     "virtio-gpu: fence-accurate presents ENGAGED (first deferred present, scanout {scanout_id}, iosurface {iosurface_id})"
                 );
             } else if n % 512 == 0 {
-                log::trace!("[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})");
+                log::trace!(
+                    "[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})"
+                );
             }
             match self
                 .display_backend
@@ -2694,6 +2714,7 @@ impl VirtioGpu {
     /// no-op: the guest keeps whatever software-cursor fallback it had.
     pub fn update_cursor(
         &mut self,
+        scanout_id: u32,
         resource_id: u32,
         hot_x: u32,
         hot_y: u32,
@@ -2703,6 +2724,7 @@ impl VirtioGpu {
         if resource_id == 0 {
             self.cursor_state = None;
             Self::cursor_ok(self.display_backend.set_cursor(
+                scanout_id,
                 0,
                 0,
                 0,
@@ -2737,6 +2759,7 @@ impl VirtioGpu {
             return Err(ErrUnspec);
         };
         Self::cursor_ok(self.display_backend.set_cursor(
+            scanout_id,
             resource.width,
             resource.height,
             hot_x,
@@ -2744,8 +2767,9 @@ impl VirtioGpu {
             format,
             &pixels,
         ))?;
-        Self::cursor_ok(self.display_backend.move_cursor(x, y))?;
+        Self::cursor_ok(self.display_backend.move_cursor(scanout_id, x, y))?;
         self.cursor_state = Some(super::journal::CursorSnapshot {
+            scanout_id,
             width: resource.width,
             height: resource.height,
             hot_x,
@@ -2759,9 +2783,10 @@ impl VirtioGpu {
     }
 
     /// limina: reposition the host cursor overlay (`VIRTIO_GPU_CMD_MOVE_CURSOR`).
-    pub fn move_cursor(&mut self, x: u32, y: u32) -> VirtioGpuResult {
-        Self::cursor_ok(self.display_backend.move_cursor(x, y))?;
+    pub fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
+        Self::cursor_ok(self.display_backend.move_cursor(scanout_id, x, y))?;
         if let Some(c) = &mut self.cursor_state {
+            c.scanout_id = scanout_id;
             c.x = x;
             c.y = y;
         }
@@ -3755,7 +3780,7 @@ mod test {
     // the tier-1 software-2D scanout). This guards mark_fence_completed_sync().
     #[test]
     fn test_software_2d_fence_retires_synchronously() {
-        use super::{mark_fence_completed_sync, FenceState, RutabagaFence, VirtioGpuRing};
+        use super::{FenceState, RutabagaFence, VirtioGpuRing, mark_fence_completed_sync};
         use std::sync::Mutex;
 
         let fence_state = Mutex::new(FenceState::default());
