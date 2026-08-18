@@ -467,6 +467,10 @@ pub struct VirtioGpu {
     vrend_ctx_seen: bool,
     /// limina leak forensics: see [`ScanoutLedger`].
     scanout_ledger: ScanoutLedger,
+    /// Whether a guest OS driver has taken the device over from boot firmware, reported to the
+    /// display backend once per run. The firmware's virtio-gpu driver programs scanout 0 and
+    /// never reads an EDID, so the first `GET_EDID` is the handover.
+    guest_driver_seen: bool,
 }
 
 /// The display path's per-resource ledger, answering one question: does the worker's display
@@ -966,6 +970,7 @@ impl VirtioGpu {
             cursor_state: None,
             vrend_ctx_seen: false,
             scanout_ledger: ScanoutLedger::default(),
+            guest_driver_seen: false,
         }
     }
 
@@ -2790,13 +2795,20 @@ impl VirtioGpu {
         Ok(OkDisplayInfo(display_info))
     }
 
-    pub fn get_edid(&self, scanout_id: u32) -> VirtioGpuResult {
+    pub fn get_edid(&mut self, scanout_id: u32) -> VirtioGpuResult {
         let display = self
             .displays
             .get(scanout_id as usize)
             .ok_or(ErrInvalidScanoutId)?;
+        let edid = display.edid_bytes();
 
-        Ok(OkEdid(display.edid_bytes()))
+        if !self.guest_driver_seen {
+            self.guest_driver_seen = true;
+            debug!("guest OS driver took the GPU over from firmware (first GET_EDID)");
+            let _ = self.display_backend.guest_driver_ready();
+        }
+
+        Ok(OkEdid(edid))
     }
 
     /// limina runtime resize: update a scanout's preferred mode (host window resize). The EDID

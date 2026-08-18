@@ -235,6 +235,28 @@ typedef int32_t (*krun_display_present_surface_fn)(void *instance, uint32_t scan
 typedef int32_t (*krun_display_release_surface_fn)(void *instance, uint32_t iosurface_id);
 
 /**
+ * (limina extension, optional) A guest OS driver has taken over the GPU device.
+ *
+ * Called once per VM run, the first time the guest asks for a display's EDID
+ * (VIRTIO_GPU_CMD_GET_EDID). Boot firmware drives the device before this — it programs scanout 0
+ * and never reads an EDID — so this call is the boundary between the firmware's use of the device
+ * and the operating system's.
+ *
+ * A backend that arranges displays needs that boundary, because the two consumers have different
+ * constraints: firmware drivers commonly hardcode scanout 0 and cannot be given a different one,
+ * while an OS driver enumerates every scanout and follows connector hotplug. Without the signal a
+ * backend must either apply the firmware's constraint forever or guess when it has been lifted.
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise. The device ignores
+ *  the result.
+ */
+typedef int32_t (*krun_display_guest_driver_ready_fn)(void *instance);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -261,6 +283,7 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_move_cursor_fn         move_cursor; // (optional) limina: hardware cursor position
     krun_display_present_surface_fn     present_surface; // (optional) limina: zero-copy IOSurface scanout present
     krun_display_release_surface_fn     release_surface; // (optional) limina: guest unref'd a scanout resource
+    krun_display_guest_driver_ready_fn  guest_driver_ready; // (optional) limina: OS driver took over
 };
 
 union krun_display_vtable {
