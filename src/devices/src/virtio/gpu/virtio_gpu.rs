@@ -1981,12 +1981,10 @@ impl VirtioGpu {
             return Ok(OkNoData);
         }
 
-        // Enable the scanout
         let resource = self
             .resources
-            .get_mut(&resource_id)
+            .get(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
-        resource.scanouts.enable(scanout_id);
 
         let Some(format) = resource.format else {
             warn!("Cannot use resource {resource_id} with unknown format for scanout");
@@ -2006,6 +2004,15 @@ impl VirtioGpu {
             height,
             format,
         )?;
+
+        // Only now does the resource own the scanout. Marking it before the backend accepts
+        // strands the resource on any failure above: unref_resource refuses a resource with
+        // associated scanouts, and nothing ever disables one the backend never configured.
+        self.resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?
+            .scanouts
+            .enable(scanout_id);
 
         // limina vrend zero-copy scanout (docs/design/vrend-iosurface-scanout.md): a plain
         // SET_SCANOUT resource may be IOSurface-backed too (vrend allocates the surface for
@@ -2072,16 +2079,11 @@ impl VirtioGpu {
             return Ok(OkNoData);
         }
 
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(ErrInvalidResourceId)?;
-        resource.scanouts.enable(scanout_id);
-        resource.width = width;
-        resource.height = height;
+        if !self.resources.contains_key(&resource_id) {
+            return Err(ErrInvalidResourceId);
+        }
 
         let res_format = ResourceFormat::try_from(format).unwrap_or(ResourceFormat::BGRA);
-        resource.format = Some(res_format);
 
         let display_info = self
             .displays
@@ -2096,6 +2098,16 @@ impl VirtioGpu {
             height,
             res_format,
         )?;
+
+        // Take the resource only once the backend has accepted the scanout — see set_scanout.
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.scanouts.enable(scanout_id);
+        resource.width = width;
+        resource.height = height;
+        resource.format = Some(res_format);
 
         // Resolve the resource to its backing IOSurface (0/err -> not IOSurface-backed).
         let iosurface_id = self
