@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -59,6 +59,9 @@ pub struct DisplayUpdate {
     pub display_id: u32,
     /// New preferred mode, in pixels.
     pub size: Option<(u32, u32)>,
+    /// New position in the guest's desktop (`DisplayInfo::position` — the arrangement
+    /// relay's suggested-offset source).
+    pub position: Option<(u32, u32)>,
     /// New EDID parameters — identity, mode list and refresh range. Only meaningful for a
     /// display whose EDID is generated (a caller-provided raw blob is left alone).
     pub edid: Option<EdidParams>,
@@ -81,6 +84,9 @@ impl DisplayUpdate {
     fn merge(&mut self, next: DisplayUpdate) {
         if next.size.is_some() {
             self.size = next.size;
+        }
+        if next.position.is_some() {
+            self.position = next.position;
         }
         if next.edid.is_some() {
             self.edid = next.edid;
