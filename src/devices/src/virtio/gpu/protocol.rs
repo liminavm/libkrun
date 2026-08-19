@@ -695,7 +695,7 @@ pub struct GpuResponsePlaneInfo {
 #[derive(Debug)]
 pub enum GpuResponse {
     OkNoData,
-    OkDisplayInfo(Vec<(u32, u32, bool)>),
+    OkDisplayInfo(Vec<((u32, u32), (u32, u32), bool)>),
     OkEdid(Box<[u8]>),
     OkCapsetInfo {
         capset_id: u32,
@@ -818,8 +818,11 @@ impl GpuResponse {
                     hdr,
                     pmodes: Default::default(),
                 };
-                for (disp_mode, &(width, height, enabled)) in disp_info.pmodes.iter_mut().zip(info)
+                for (disp_mode, &((x, y), (width, height), enabled)) in
+                    disp_info.pmodes.iter_mut().zip(info)
                 {
+                    disp_mode.r.x = x;
+                    disp_mode.r.y = y;
                     disp_mode.r.width = width;
                     disp_mode.r.height = height;
                     disp_mode.enabled = enabled as u32;
