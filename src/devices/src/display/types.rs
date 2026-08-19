@@ -108,6 +108,14 @@ pub enum PhysicalSize {
 pub struct DisplayInfo {
     pub width: u32,
     pub height: u32,
+    /// limina (arrangement relay): where this display sits in the guest's desktop, in the
+    /// coordinates the guest compositor lays monitors out in (mutter consumes the DRM
+    /// `suggested X`/`suggested Y` connector properties as *logical* coordinates, verbatim).
+    /// Reported through `GET_DISPLAY_INFO` as the scanout rect's `r.x`/`r.y`, which the
+    /// stock guest driver already stores and ignores — a position-aware driver turns it
+    /// into the suggested-offset properties. (0, 0) when the host has no arrangement to
+    /// suggest.
+    pub position: (u32, u32),
     pub edid: DisplayInfoEdid,
     /// limina: whether the guest sees this scanout as a *connected* display. Reported through
     /// `GET_DISPLAY_INFO`, where the guest driver turns it straight into connector status
@@ -126,6 +134,7 @@ impl DisplayInfo {
         Self {
             width,
             height,
+            position: (0, 0),
             edid: DisplayInfoEdid::Generated(EdidParams::default()),
             connected: true,
         }

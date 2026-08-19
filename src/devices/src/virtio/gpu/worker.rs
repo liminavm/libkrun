@@ -667,6 +667,9 @@ impl Worker {
                         if let Some((w, h)) = update.size {
                             virtio_gpu.set_display_size(id, w, h);
                         }
+                        if let Some((x, y)) = update.position {
+                            virtio_gpu.set_display_position(id, x, y);
+                        }
                         if let Some(params) = update.edid {
                             virtio_gpu.set_display_edid(id, params);
                         }
