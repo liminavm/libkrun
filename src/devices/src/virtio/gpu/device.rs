@@ -18,6 +18,7 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
+use super::protocol::VIRTIO_GPU_EVENT_DISPLAY;
 use super::virtio_gpu::GpuActivation;
 use super::worker::{Worker, WorkerCmd};
 use crate::display::{DisplayInfo, EdidParams};
@@ -437,6 +438,12 @@ impl VirtioDevice for Gpu {
         if offset == EVENTS_CLEAR_OFFSET && data.len() == 4 {
             let clear = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
             self.events_read.fetch_and(!clear, Ordering::SeqCst);
+            // The ack releases the display-update queue: the worker holds further updates
+            // while an unconsumed event is in flight (see the resize handler), so the ack
+            // must wake it back up to deliver whatever queued in the meantime.
+            if clear & VIRTIO_GPU_EVENT_DISPLAY != 0 {
+                let _ = self.resize_evt.write(1);
+            }
             return;
         }
         warn!(
@@ -467,6 +474,14 @@ impl VirtioDevice for Gpu {
         // This is the renderer-singleton fix: `virgl_renderer_init` can't be re-run, so we
         // must never drop+recreate the renderer on reset.
         let thaw = self.thaw_activation;
+        // A fresh driver init can never consume an event raised before it existed (an update
+        // pushed while the guest was still in firmware), and an unacked event HOLDS the
+        // display-update queue — so a stale one would wedge it forever. Drop it and release
+        // the queue. Not on a thaw: there the guest driver survives with the event possibly
+        // still legitimately in flight.
+        if !thaw && self.events_read.swap(0, Ordering::SeqCst) != 0 {
+            let _ = self.resize_evt.write(1);
+        }
         let tx = self.ensure_worker();
 
         // Bind this activation's transport. The worker is in its outer recv() (first activate)
