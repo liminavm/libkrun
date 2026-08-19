@@ -2814,7 +2814,7 @@ impl VirtioGpu {
         let display_info = self
             .displays
             .iter()
-            .map(|d| (d.width, d.height, d.connected))
+            .map(|d| (d.position, (d.width, d.height), d.connected))
             .collect();
 
         Ok(OkDisplayInfo(display_info))
@@ -2848,6 +2848,19 @@ impl VirtioGpu {
                 d.height = height;
             }
             None => error!("set_display_size: invalid display id {display_id}"),
+        }
+    }
+
+    /// limina arrangement relay: update where a scanout sits in the guest's desktop (see
+    /// `DisplayInfo::position`). Takes effect on the next `GET_DISPLAY_INFO`; the caller
+    /// (worker) raises the config-change that makes the guest re-read it.
+    pub fn set_display_position(&mut self, display_id: u32, x: u32, y: u32) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => {
+                debug!("set_display_position: scanout {display_id} -> +{x}+{y}");
+                d.position = (x, y);
+            }
+            None => error!("set_display_position: invalid display id {display_id}"),
         }
     }
 
