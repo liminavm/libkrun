@@ -654,27 +654,53 @@ impl Worker {
                 // re-modesets (the backend reallocates on the resulting SET_SCANOUT geometry).
                 if source == resize_ev_fd {
                     let _ = self.resize_evt.read();
-                    // Exactly one update per wake: a connect/disconnect pair must reach the
-                    // guest as two distinct config-change events, or it would only ever observe
-                    // the final state and never notice the display went away. Anything still
-                    // queued re-kicks the eventfd so the next loop iteration picks it up.
-                    let (pending, more) = {
+                    // The guest acknowledges a config-change event with a read-then-clear, so
+                    // a second event raised between its read and its clear is silently wiped —
+                    // updates split across back-to-back events lose the second one (seen as an
+                    // arrangement move arriving and the connect right behind it never waking
+                    // the guest). Two guards close that race:
+                    //  - while an event is unconsumed, the queue HOLDS; the guest's ack
+                    //    (`events_clear`, see `write_config`) re-kicks this eventfd;
+                    //  - one event carries as many queued updates as can share it, which is
+                    //    safe because the guest only ever reads the final state. The one thing
+                    //    that must NOT coalesce is a second connectivity flip for a display
+                    //    already flipped in this batch — a disconnect+reconnect would collapse
+                    //    into "nothing happened" and the guest would never see the unplug.
+                    //    That case stops the batch and goes out as its own event after the ack.
+                    if self.events_read.load(Ordering::SeqCst) & VIRTIO_GPU_EVENT_DISPLAY != 0 {
+                        continue;
+                    }
+                    let (batch, more) = {
                         let mut queue = self.resize_pending.lock().unwrap();
-                        (queue.pop_front(), !queue.is_empty())
+                        let mut batch = Vec::new();
+                        let mut flipped = std::collections::HashSet::new();
+                        while let Some(next) = queue.front() {
+                            if next.connected.is_some() && flipped.contains(&next.display_id) {
+                                break;
+                            }
+                            let update = queue.pop_front().unwrap();
+                            if update.connected.is_some() {
+                                flipped.insert(update.display_id);
+                            }
+                            batch.push(update);
+                        }
+                        (batch, !queue.is_empty())
                     };
-                    if let Some(update) = pending {
-                        let id = update.display_id;
-                        if let Some((w, h)) = update.size {
-                            virtio_gpu.set_display_size(id, w, h);
-                        }
-                        if let Some((x, y)) = update.position {
-                            virtio_gpu.set_display_position(id, x, y);
-                        }
-                        if let Some(params) = update.edid {
-                            virtio_gpu.set_display_edid(id, params);
-                        }
-                        if let Some(connected) = update.connected {
-                            virtio_gpu.set_display_connected(id, connected);
+                    if !batch.is_empty() {
+                        for update in batch {
+                            let id = update.display_id;
+                            if let Some((w, h)) = update.size {
+                                virtio_gpu.set_display_size(id, w, h);
+                            }
+                            if let Some((x, y)) = update.position {
+                                virtio_gpu.set_display_position(id, x, y);
+                            }
+                            if let Some(params) = update.edid {
+                                virtio_gpu.set_display_edid(id, params);
+                            }
+                            if let Some(connected) = update.connected {
+                                virtio_gpu.set_display_connected(id, connected);
+                            }
                         }
                         self.events_read
                             .fetch_or(VIRTIO_GPU_EVENT_DISPLAY, Ordering::SeqCst);
