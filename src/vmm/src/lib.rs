@@ -508,25 +508,22 @@ impl Vmm {
     /// blob, and guest RAM (skipping the GPU/fs SHM window), then serialize it all to `path`.
     /// On return the vCPUs are parked; the caller tears the worker down (exit "snapshotted").
     #[cfg(target_os = "macos")]
-    /// limina M9.2 quiesce oracle: the virtio-mmio devices whose driver has NOT reset them to `INIT`
-    /// (`device_status != 0`), i.e. the devices still holding un-drained queues. Empirically (see
-    /// `spikes/m9-freeze-trigger/observe-quiesce-status.sh`) an s2idle-suspended guest drives every
-    /// device to `0x0` via its `.suspend` callback, so a non-empty result means the guest has NOT
-    /// fully quiesced and the snapshot would capture a mid-flight machine (→ M9.1 wedge on restore).
-    /// **virtio-gpu (type 16) is excepted** — it has no s2idle PM ops (stays `DRIVER_OK` with live
-    /// queues across suspend), so M9.2 is headless-scoped and the GPU is not a quiesce holdout.
-    /// Returns `(virtio type id, device id, device_status)` for each holdout.
+    /// limina M9.2 quiesce oracle: the virtio-mmio devices a driver is still holding, i.e. the ones
+    /// that could still have queues in flight. Empirically (see
+    /// `spikes/m9-freeze-trigger/observe-quiesce-status.sh`) an s2idle-suspended guest resets every
+    /// device it drives to `INIT` via its `.suspend` callback, so a non-empty result means the guest
+    /// has NOT fully quiesced and the snapshot would capture a mid-flight machine (→ M9.1 wedge on
+    /// restore). Returns `(virtio type id, device id, device_status)` for each holdout.
     #[cfg(target_os = "macos")]
     pub fn quiesce_holdouts(&self) -> Vec<(u32, String, u32)> {
-        const VIRTIO_ID_GPU: u32 = 16;
         self.mmio_device_manager
             .virtio_statuses()
             .into_iter()
-            .filter(|(type_id, _, status)| *type_id != VIRTIO_ID_GPU && *status != 0)
+            .filter(|(type_id, _, status)| is_quiesce_holdout(*type_id, *status))
             .collect()
     }
 
-    /// True once every virtio-mmio device (except virtio-gpu) has quiesced to `INIT`. See
+    /// True once no virtio-mmio device is still driver-owned. See
     /// [`quiesce_holdouts`](Self::quiesce_holdouts).
     #[cfg(target_os = "macos")]
     pub fn is_quiesced(&self) -> bool {
@@ -910,5 +907,76 @@ impl Subscriber for Vmm {
             self.vm_ctl_rx.as_raw_fd() as u64,
         ));
         list
+    }
+}
+
+/// Whether one virtio-mmio device is a quiesce holdout — the predicate behind
+/// [`Vmm::quiesce_holdouts`], separated out because it carries the two exceptions that make the
+/// oracle correct, and both were learned from a guest rather than a spec.
+///
+/// **virtio-gpu (type 16) is excepted by type.** It has no s2idle PM ops, so it stays `DRIVER_OK`
+/// with live queues across suspend; a guest that quiesced everything else is quiesced.
+///
+/// **A device no driver ever took is excepted by status.** The guest's virtio core sets
+/// `ACKNOWLEDGE` on every device it registers, before any driver binds — and only a driver's
+/// `.suspend` writes the status back to `INIT`. So a device the guest has no driver for sits at
+/// `ACKNOWLEDGE` forever, and keying on `status != 0` made the oracle permanently false for any
+/// guest missing a driver for any device we attach: a stock guest could never suspend at all
+/// (seen 2026-08-23 on Debian 13, which has no driver for the virtio-i2c SBS battery). Such a
+/// device has no queues in flight, nothing to drain and nothing to wait for, so it is not a
+/// holdout. What the oracle is really asking is whether any driver still holds a device, which is
+/// exactly `DRIVER_OK`.
+#[cfg(target_os = "macos")]
+fn is_quiesce_holdout(type_id: u32, device_status: u32) -> bool {
+    const VIRTIO_ID_GPU: u32 = 16;
+    const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
+    type_id != VIRTIO_ID_GPU && device_status & VIRTIO_CONFIG_S_DRIVER_OK != 0
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod quiesce_tests {
+    use super::is_quiesce_holdout;
+
+    const BLK: u32 = 2;
+    const GPU: u32 = 16;
+    const I2C: u32 = 34;
+
+    const INIT: u32 = 0;
+    const ACKNOWLEDGE: u32 = 1;
+    const DRIVER_OK: u32 = 1 | 2 | 4 | 8;
+
+    #[test]
+    fn a_driver_owned_device_holds_the_suspend() {
+        assert!(is_quiesce_holdout(BLK, DRIVER_OK));
+    }
+
+    #[test]
+    fn a_reset_device_is_quiesced() {
+        assert!(!is_quiesce_holdout(BLK, INIT));
+    }
+
+    /// The stock-guest floor. A device the guest has no driver for stays at ACKNOWLEDGE for the
+    /// life of the VM, because only a driver's suspend callback writes the status back. Treating
+    /// that as a holdout means the guest can never be observed to quiesce, and suspend fails on
+    /// every attempt — which is what a stock Debian 13 guest did with our virtio-i2c battery
+    /// attached.
+    #[test]
+    fn a_device_no_driver_ever_took_is_not_a_holdout() {
+        assert!(!is_quiesce_holdout(I2C, ACKNOWLEDGE));
+    }
+
+    /// Mid-negotiation is likewise not something to wait for: the driver has not reached
+    /// DRIVER_OK, so it has no queues in flight.
+    #[test]
+    fn a_half_negotiated_device_is_not_a_holdout() {
+        assert!(!is_quiesce_holdout(BLK, 1 | 2)); // ACKNOWLEDGE | DRIVER
+        assert!(!is_quiesce_holdout(BLK, 1 | 2 | 8)); // + FEATURES_OK, still not DRIVER_OK
+    }
+
+    /// virtio-gpu never quiesces (no s2idle PM ops), so it is excepted by type or nothing would
+    /// ever suspend.
+    #[test]
+    fn the_gpu_is_never_a_holdout() {
+        assert!(!is_quiesce_holdout(GPU, DRIVER_OK));
     }
 }
