@@ -8,6 +8,15 @@
 //! limina wires it to the CTAPHID authenticator to present the Touch-ID FIDO key to a stock
 //! guest (`crates/limina-vmm/src/fido_usb.rs`); a future fingerprint reader could reuse it.
 //!
+//! [`HidReportPipe::new_in_only`] builds the **input-device** shape: one interrupt-IN
+//! endpoint and no interrupt-OUT (a keyboard's only host→device report is the LED byte,
+//! which arrives as a SET_REPORT control — an OUT endpoint with no matching Output item in
+//! the report descriptor is a descriptor mismatch). Input reports are also *perishable*: the
+//! FIFO is capped and is emptied when a driver (re)reads the HID report descriptor, so
+//! keystrokes produced while nothing was listening cannot replay into a live console the
+//! instant the guest's driver binds. A data pipe (`new`) keeps the unbounded, never-dropped
+//! FIFO its message framing needs.
+//!
 //! It is [`HidMockDevice`](super::HidMockDevice) generalised: instead of echoing an OUT
 //! report back on the next IN, it forwards each guest→host frame (interrupt-OUT or a
 //! SET_REPORT control) to the [`ReportSink`], and delivers host→guest frames pushed via
@@ -42,6 +51,11 @@ const CLASS_HID: u8 = 0x03;
 const EP_IN_ADDR: u8 = 0x81; // interrupt IN, EP1 (DCI 3)
 const EP_OUT_ADDR: u8 = 0x01; // interrupt OUT, EP1 (DCI 2)
 
+/// FIFO cap for an input-device pipe (see [`HidReportPipe::new_in_only`]). Deep enough to
+/// absorb a typing burst against the 5 ms interrupt interval, shallow enough that a backlog
+/// built up while no driver was polling is bounded rather than replayed wholesale.
+const INPUT_QUEUE_CAP: usize = 32;
+
 /// A sink for guest→host report frames (delivered on the interrupt-OUT endpoint or via a
 /// SET_REPORT control transfer). Invoked with the gadget's state lock released, from the
 /// controller's worker thread. Frames are exactly `report_len` bytes.
@@ -67,6 +81,9 @@ pub struct HidReportPipe {
     report_len: usize,
     state: Mutex<PipeState>,
     out_sink: ReportSink,
+    /// Input-device semantics (see [`HidReportPipe::new_in_only`]): no interrupt-OUT
+    /// endpoint, a capped FIFO, and a flush when a driver reads the report descriptor.
+    input_device: bool,
 }
 
 impl HidReportPipe {
@@ -85,13 +102,59 @@ impl HidReportPipe {
         strings: [&str; 4],
         out_sink: ReportSink,
     ) -> Arc<HidReportPipe> {
-        let descriptors = build_descriptors(vid, pid, &report_descriptor, strings);
+        Self::build(
+            vid,
+            pid,
+            report_descriptor,
+            report_len,
+            strings,
+            out_sink,
+            false,
+        )
+    }
+
+    /// Build an **input-device** pipe: a single interrupt-IN endpoint (no interrupt-OUT),
+    /// a capped host→guest FIFO, and a flush of that FIFO whenever the guest reads the HID
+    /// report descriptor — the moment its driver binds. `out_sink` still receives host→device
+    /// reports, which for an input device arrive only as SET_REPORT controls (a keyboard's
+    /// LED byte). Everything else matches [`HidReportPipe::new`].
+    pub fn new_in_only(
+        vid: u16,
+        pid: u16,
+        report_descriptor: Vec<u8>,
+        report_len: usize,
+        strings: [&str; 4],
+        out_sink: ReportSink,
+    ) -> Arc<HidReportPipe> {
+        Self::build(
+            vid,
+            pid,
+            report_descriptor,
+            report_len,
+            strings,
+            out_sink,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        vid: u16,
+        pid: u16,
+        report_descriptor: Vec<u8>,
+        report_len: usize,
+        strings: [&str; 4],
+        out_sink: ReportSink,
+        input_device: bool,
+    ) -> Arc<HidReportPipe> {
+        let descriptors = build_descriptors(vid, pid, &report_descriptor, strings, input_device);
         Arc::new(HidReportPipe {
             descriptors,
             report_descriptor,
             report_len,
             state: Mutex::new(PipeState::default()),
             out_sink,
+            input_device,
         })
     }
 
@@ -107,6 +170,11 @@ impl HidReportPipe {
             drop(st);
             held.complete_in(frame);
         } else {
+            // An input device's reports are perishable: keep the newest, drop the oldest,
+            // rather than growing a backlog nothing is draining.
+            if self.input_device && st.queued.len() >= INPUT_QUEUE_CAP {
+                st.queued.pop_front();
+            }
             st.queued.push_back(frame);
         }
     }
@@ -125,6 +193,15 @@ impl UsbDeviceModel for HidReportPipe {
         let s = *xfer.setup();
         // GET_DESCRIPTOR(HID report) — a standard request the controller forwards to us.
         if s.kind() == 0 && s.request == 0x06 && (s.value >> 8) as u8 == DT_HID_REPORT {
+            // A driver is binding. Drop anything queued for the previous one: an input
+            // report produced while nobody was listening is stale by the time it would be
+            // delivered, and delivering it types into whatever now holds the console.
+            // (The controller only calls `reset()` on a Reset Device command, which Linux
+            // does not issue during a normal enumeration — this control is the binding
+            // signal a gadget actually sees.)
+            if self.input_device {
+                self.state.lock().unwrap().queued.clear();
+            }
             xfer.complete_in(self.report_descriptor.clone());
             return;
         }
@@ -199,17 +276,19 @@ impl UsbDeviceModel for HidReportPipe {
     }
 }
 
-/// Assemble the device/config/string descriptors for a two-endpoint (interrupt IN + OUT)
-/// HID gadget. Generic plumbing: the caller supplies identity and the report descriptor.
+/// Assemble the device/config/string descriptors for a HID gadget — interrupt IN + OUT, or
+/// interrupt IN alone when `in_only`. Generic plumbing: the caller supplies identity and the
+/// report descriptor.
 fn build_descriptors(
     vid: u16,
     pid: u16,
     report_descriptor: &[u8],
     strings: [&str; 4],
+    in_only: bool,
 ) -> DeviceDescriptors {
     DeviceDescriptors {
         device: device_descriptor(vid, pid),
-        configs: vec![config_descriptor(report_descriptor.len() as u16)],
+        configs: vec![config_descriptor(report_descriptor.len() as u16, in_only)],
         strings: vec![
             vec![0x04, DT_STRING, 0x09, 0x04], // index 0: LANGID 0x0409
             string_descriptor(strings[0]),     // iManufacturer
@@ -244,10 +323,10 @@ fn device_descriptor(vid: u16, pid: u16) -> Vec<u8> {
     ]
 }
 
-/// config + HID interface + HID descriptor + interrupt-IN + interrupt-OUT endpoints.
-/// wTotalLength = 9 + 9 + 9 + 7 + 7 = 41.
-fn config_descriptor(report_len: u16) -> Vec<u8> {
-    let total_len: u16 = 41;
+/// config + HID interface + HID descriptor + interrupt-IN (+ interrupt-OUT unless `in_only`).
+/// wTotalLength = 9 + 9 + 9 + 7 (+ 7) = 34 or 41.
+fn config_descriptor(report_len: u16, in_only: bool) -> Vec<u8> {
+    let total_len: u16 = if in_only { 34 } else { 41 };
     let mut c = vec![
         0x09,
         0x02, // CONFIGURATION
@@ -259,16 +338,21 @@ fn config_descriptor(report_len: u16) -> Vec<u8> {
         0x80,                   // bmAttributes (bus-powered)
         0x32,                   // bMaxPower = 100 mA
     ];
-    // Interface 0: HID, 2 endpoints.
+    // Interface 0: HID, one or two endpoints. bInterfaceSubClass/bInterfaceProtocol stay
+    // 0/0 (report-only, NOT the boot keyboard/mouse protocol): Linux's hid-generic binds on
+    // the class alone, while EDK2's UsbKbDxe binds only boot-protocol keyboards — so a boot
+    // gadget would be aggregated into EFI ConIn alongside VirtioKeyboardDxe and type every
+    // pre-boot keystroke twice.
     c.extend_from_slice(&[
-        0x09, 0x04,      // INTERFACE
-        0x00,      // bInterfaceNumber
-        0x00,      // bAlternateSetting
-        0x02,      // bNumEndpoints
-        CLASS_HID, // bInterfaceClass = HID
-        0x00,      // bInterfaceSubClass (no boot)
-        0x00,      // bInterfaceProtocol
-        0x04,      // iInterface
+        0x09,
+        0x04,                              // INTERFACE
+        0x00,                              // bInterfaceNumber
+        0x00,                              // bAlternateSetting
+        if in_only { 0x01 } else { 0x02 }, // bNumEndpoints
+        CLASS_HID,                         // bInterfaceClass = HID
+        0x00,                              // bInterfaceSubClass (no boot)
+        0x00,                              // bInterfaceProtocol
+        0x04,                              // iInterface
     ]);
     // HID descriptor.
     c.extend_from_slice(&[
@@ -284,8 +368,11 @@ fn config_descriptor(report_len: u16) -> Vec<u8> {
     ]);
     // Interrupt-IN endpoint (0x81), wMaxPacketSize 64, bInterval 5.
     c.extend_from_slice(&[0x07, 0x05, EP_IN_ADDR, 0x03, 0x40, 0x00, 0x05]);
-    // Interrupt-OUT endpoint (0x01), wMaxPacketSize 64, bInterval 5.
-    c.extend_from_slice(&[0x07, 0x05, EP_OUT_ADDR, 0x03, 0x40, 0x00, 0x05]);
+    // Interrupt-OUT endpoint (0x01), wMaxPacketSize 64, bInterval 5 — absent on an input
+    // device, whose only host→device report is a SET_REPORT control.
+    if !in_only {
+        c.extend_from_slice(&[0x07, 0x05, EP_OUT_ADDR, 0x03, 0x40, 0x00, 0x05]);
+    }
     debug_assert_eq!(c.len(), total_len as usize);
     c
 }
@@ -320,6 +407,39 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    const IN_REPORT_LEN: usize = 8;
+
+    /// An input-device pipe (one interrupt-IN endpoint), the keyboard shape.
+    fn in_pipe() -> (Arc<HidReportPipe>, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel();
+        let sink: ReportSink = Arc::new(move |f: Vec<u8>| tx.send(f).unwrap());
+        let rd = vec![0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0xc0];
+        (
+            HidReportPipe::new_in_only(
+                0x1d6b,
+                0x0f1e,
+                rd,
+                IN_REPORT_LEN,
+                ["limina", "kbd", "SN", "iface"],
+                sink,
+            ),
+            rx,
+        )
+    }
+
+    /// GET_DESCRIPTOR(HID report) — what a guest driver issues as it binds.
+    fn read_report_descriptor(p: &HidReportPipe) {
+        let (tx, _rx) = mpsc::channel();
+        let c = Completion::new(move |o| {
+            let _ = tx.send(o);
+        });
+        p.handle_control(ControlTransfer::new(
+            SetupPacket::from_bytes([0x81, 0x06, 0x00, 0x22, 0x00, 0x00, 0xff, 0x00]),
+            Vec::new(),
+            c,
+        ));
     }
 
     fn in_transfer(len: usize) -> (Transfer, mpsc::Receiver<XferOutcome>) {
@@ -458,6 +578,75 @@ mod tests {
             XferOutcome::In(bytes) => assert_eq!(bytes, frame),
             other => panic!("expected In, got {other:?}"),
         }
+    }
+
+    /// The input-device shape: one interrupt-IN endpoint, no interrupt-OUT (its host→device
+    /// report is a SET_REPORT control), and a config block whose wTotalLength matches.
+    #[test]
+    fn an_input_pipe_exposes_a_single_in_endpoint() {
+        let (p, _rx) = in_pipe();
+        let c = &p.descriptors().configs[0];
+        assert_eq!(u16::from_le_bytes([c[2], c[3]]) as usize, c.len());
+        assert_eq!(c.len(), 34, "config + interface + HID + one endpoint");
+        assert_eq!(c[9 + 4], 0x01, "one endpoint");
+        assert_eq!(c[9 + 5], CLASS_HID, "HID class");
+        assert_eq!(
+            c[9 + 6],
+            0x00,
+            "no boot subclass (EFI ConIn must not bind it)"
+        );
+        assert_eq!(c[9 + 7], 0x00, "no boot protocol");
+        // The only endpoint descriptor present is the IN one.
+        let eps: Vec<u8> = c[9 + 9 + 9..]
+            .chunks(7)
+            .map(|e| e[2]) // bEndpointAddress
+            .collect();
+        assert_eq!(eps, vec![EP_IN_ADDR]);
+    }
+
+    /// A keyboard's reports are perishable: with nothing draining the FIFO it keeps the most
+    /// recent [`INPUT_QUEUE_CAP`] and drops the oldest, instead of growing without bound.
+    /// A data pipe (`new`) keeps everything — a CTAPHID response is many framed packets and
+    /// dropping one corrupts the message.
+    #[test]
+    fn an_input_pipe_caps_its_backlog_and_a_data_pipe_does_not() {
+        let (p, _rx) = in_pipe();
+        for i in 0..(INPUT_QUEUE_CAP + 5) {
+            p.push_in(vec![i as u8; IN_REPORT_LEN]);
+        }
+        let st = p.state.lock().unwrap();
+        assert_eq!(st.queued.len(), INPUT_QUEUE_CAP);
+        assert_eq!(st.queued[0][0], 5, "oldest dropped, newest kept");
+        drop(st);
+
+        let (d, _rx) = pipe();
+        for i in 0..(INPUT_QUEUE_CAP + 5) {
+            d.push_in(vec![i as u8; REPORT_LEN]);
+        }
+        assert_eq!(d.state.lock().unwrap().queued.len(), INPUT_QUEUE_CAP + 5);
+    }
+
+    /// The replay guard. Keys pressed before any driver was listening must not be delivered
+    /// to the driver that finally binds — it would type them into whatever now owns the
+    /// console (a LUKS passphrase prompt). The report-descriptor read IS that bind moment:
+    /// the controller only calls `reset()` for a Reset Device command, which Linux does not
+    /// issue during a normal enumeration.
+    #[test]
+    fn reading_the_report_descriptor_flushes_a_stale_input_backlog() {
+        let (p, _rx) = in_pipe();
+        p.push_in(vec![0x04; IN_REPORT_LEN]); // typed while nothing was bound
+        assert_eq!(p.state.lock().unwrap().queued.len(), 1);
+        read_report_descriptor(&p);
+        assert!(
+            p.state.lock().unwrap().queued.is_empty(),
+            "stale input reports dropped when the driver bound"
+        );
+
+        // A data pipe's frames are message-framed, not perishable: the same read keeps them.
+        let (d, _rx) = pipe();
+        d.push_in(vec![0x04; REPORT_LEN]);
+        read_report_descriptor(&d);
+        assert_eq!(d.state.lock().unwrap().queued.len(), 1);
     }
 
     #[test]
