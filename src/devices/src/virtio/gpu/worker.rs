@@ -978,6 +978,8 @@ impl Worker {
                 if reader.available_bytes() != 0 {
                     let num_in_fences = info.num_in_fences as usize;
                     let cmd_size = info.size as usize;
+                    let trace_submit = std::env::var_os("LIMINA_TRACE_SUBMIT3D").is_some();
+                    let avail0 = reader.available_bytes();
                     let mut cmd_buf = vec![0; cmd_size];
                     let mut fence_ids: Vec<u64> = Vec::with_capacity(num_in_fences);
 
@@ -986,13 +988,66 @@ impl Worker {
                             Ok(fence_id) => {
                                 fence_ids.push(fence_id);
                             }
-                            Err(_) => return Err(GpuResponse::ErrUnspec),
+                            Err(e) => {
+                                log::error!(
+                                    "[SUBMIT3D] ctx {} FENCE-READ failed: {e:?} (num_in_fences={num_in_fences}, cmd_size={cmd_size}, avail={avail0})",
+                                    hdr.ctx_id
+                                );
+                                return Err(GpuResponse::ErrUnspec);
+                            }
                         }
                     }
 
+                    let avail1 = reader.available_bytes();
                     if reader.read_exact(&mut cmd_buf[..]).is_ok() {
-                        virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids)
+                        // limina: decode the virgl command stream headers so a guest-side
+                        // divergence (different commands, or different SET_TYPE layout) is
+                        // visible without rebuilding mesa. VIRGL_CMD0 = cmd | obj<<8 | len<<16.
+                        if std::env::var_os("LIMINA_TRACE_CMDSTREAM").is_some() {
+                            let words: Vec<u32> = cmd_buf
+                                .chunks_exact(4)
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect();
+                            let mut i = 0usize;
+                            let mut summary: Vec<String> = Vec::new();
+                            while i < words.len() {
+                                let hdr = words[i];
+                                let cmd = hdr & 0xff;
+                                let obj = (hdr >> 8) & 0xff;
+                                let len = (hdr >> 16) as usize;
+                                if len == 0 && cmd == 0 {
+                                    break;
+                                }
+                                // 49 = VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE, 43 = TRANSFER3D
+                                if (cmd == 49 || cmd == 43) && i + len < words.len() {
+                                    let a: Vec<u32> =
+                                        words[i + 1..=(i + len).min(words.len() - 1)].to_vec();
+                                    summary.push(format!("cmd{cmd}/obj{obj}/len{len}{a:?}"));
+                                } else {
+                                    summary.push(format!("cmd{cmd}/obj{obj}/len{len}"));
+                                }
+                                i += 1 + len;
+                            }
+                            log::error!(
+                                "[CMDSTREAM] ctx {} size={cmd_size} -> {}",
+                                hdr.ctx_id,
+                                summary.join(" ")
+                            );
+                        }
+                        let r = virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids);
+                        if trace_submit || r.is_err() {
+                            log::error!(
+                                "[SUBMIT3D] ctx {} submit_command -> {:?} (cmd_size={cmd_size}, num_in_fences={num_in_fences}, avail_before_fences={avail0}, avail_before_cmd={avail1})",
+                                hdr.ctx_id,
+                                r.as_ref().map(|_| ()).map_err(|e| format!("{e:?}"))
+                            );
+                        }
+                        r
                     } else {
+                        log::error!(
+                            "[SUBMIT3D] ctx {} CMDBUF read_exact failed (cmd_size={cmd_size}, num_in_fences={num_in_fences}, avail_before_fences={avail0}, avail_before_cmd={avail1})",
+                            hdr.ctx_id
+                        );
                         Err(GpuResponse::ErrInvalidParameter)
                     }
                 } else {

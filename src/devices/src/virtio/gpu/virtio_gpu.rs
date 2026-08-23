@@ -2912,10 +2912,23 @@ impl VirtioGpu {
             sw.copy_from_backing();
             return Ok(OkNoData);
         }
-        self.rutabaga
+        if std::env::var_os("LIMINA_TRACE_TRANSFER").is_some() {
+            log::error!(
+                "[XFER-WRITE] ctx {ctx_id} res {resource_id} box=({},{},{})+{}x{}x{} level={} stride={} layer_stride={} offset={}",
+                transfer.x, transfer.y, transfer.z,
+                transfer.w, transfer.h, transfer.d,
+                transfer.level, transfer.stride, transfer.layer_stride, transfer.offset
+            );
+        }
+        let r = self
+            .rutabaga
             .as_mut()
             .ok_or(ErrUnspec)?
-            .transfer_write(ctx_id, resource_id, transfer)?;
+            .transfer_write(ctx_id, resource_id, transfer);
+        if let Err(e) = &r {
+            log::error!("[XFER-WRITE] ctx {ctx_id} res {resource_id} FAILED: {e:?}");
+        }
+        r?;
         Ok(OkNoData)
     }
 
