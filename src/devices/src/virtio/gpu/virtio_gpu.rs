@@ -3344,6 +3344,18 @@ impl VirtioGpu {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
         }
+        if std::env::var_os("LIMINA_TRACE_BLOB").is_some() {
+            let (n, total) = rutabaga_iovecs
+                .as_ref()
+                .map(|v| (v.len(), v.iter().map(|i| i.len).sum::<usize>()))
+                .unwrap_or((0, 0));
+            log::error!(
+                "[BLOB-CREATE] ctx {ctx_id} res {resource_id} blob_mem={} blob_flags={:#x} size={} -> {n} iovec(s), {total} bytes",
+                resource_create_blob.blob_mem,
+                resource_create_blob.blob_flags,
+                resource_create_blob.size
+            );
+        }
 
         self.rutabaga
             .as_mut()
