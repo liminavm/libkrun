@@ -723,6 +723,15 @@ impl Worker {
                     virtio_gpu.renderer_event_poll();
                 }
             }
+            // limina (experiment): vrend's threaded sync creates the poll eventfd. With it
+            // disabled (VIRGL_DISABLE_MT=1) there is no descriptor to register, so nothing
+            // ever pumped virgl_renderer_poll() and no fence was ever retired -- the guest
+            // rendered into frames that never presented and the window froze on the last
+            // pre-desktop frame. Pump on every wake instead; that is what the non-threaded
+            // design expects the client to do.
+            if renderer_poll_fd < 0 {
+                virtio_gpu.renderer_event_poll();
+            }
             if let Some(p) = wake_probe.as_mut() {
                 p.maybe_report();
             }
