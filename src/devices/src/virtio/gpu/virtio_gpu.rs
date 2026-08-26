@@ -257,6 +257,11 @@ struct PresentFenceState {
     ack_active: bool,
     /// Surface ids acked by the supervisor (reader thread -> worker via `event`).
     shown: Arc<Mutex<Vec<u32>>>,
+    /// limina: surface ids the supervisor asked for back that the renderer does not know
+    /// (reader thread -> worker via `event`). The DISPLAY BACKEND owns those — the software-2D
+    /// scanout ring and the cursor images — and only the worker thread may touch it, so the ack
+    /// reader parks the id here instead of answering itself.
+    resurface: Arc<Mutex<Vec<u32>>>,
     /// Presented-but-not-yet-acked frames in apply order: (iosurface_id, cookie).
     /// An ack for id X confirms every entry up to and including the first X —
     /// frames applied before X are certainly off glass once X latched.
@@ -863,6 +868,7 @@ impl VirtioGpu {
             // only ever writes that fd; the supervisor's acks are the only inbound
             // bytes. The reader wakes the worker through the same present eventfd.
             let shown: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let resurface: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
             let ack_active = if let Some(fd) = std::env::var("LIMINA_SHOWN_ACK_FD")
                 .ok()
                 .and_then(|v| v.parse::<i32>().ok())
@@ -871,6 +877,7 @@ impl VirtioGpu {
                 let dup = unsafe { libc::dup(fd) };
                 if dup >= 0 {
                     let shown = shown.clone();
+                    let resurface = resurface.clone();
                     let wake = present_event.try_clone().expect("eventfd clone");
                     std::thread::Builder::new()
                         .name("gpu shown-ack".into())
@@ -905,11 +912,14 @@ impl VirtioGpu {
                                                 Ok(()) => debug!(
                                                     "gpu: re-published surface {id} on request"
                                                 ),
-                                                Err(e) => warn!(
-                                                    "gpu: supervisor asked for surface {id} back \
-                                                     but it is not registered ({e:?}) — it is \
-                                                     gone, not merely evicted"
-                                                ),
+                                                // Not the renderer's: the display backend's own
+                                                // surfaces (the software-2D ring, and every
+                                                // cursor image) live on the worker thread, which
+                                                // answers these on its next wake.
+                                                Err(_) => {
+                                                    resurface.lock().unwrap().push(id);
+                                                    let _ = wake.write(1);
+                                                }
                                             }
                                         }
                                     }
@@ -936,6 +946,7 @@ impl VirtioGpu {
                 latch_delay: std::time::Duration::from_millis(latch_ms),
                 ack_active,
                 shown,
+                resurface,
                 awaiting_shown: std::collections::VecDeque::new(),
                 guest_fence_handler: fence_handler.clone(),
             }
@@ -2547,6 +2558,11 @@ impl VirtioGpu {
         let _ = pf.event.read();
         let cookies = std::mem::take(&mut *pf.retired.lock().unwrap());
         let shown_ids = std::mem::take(&mut *pf.shown.lock().unwrap());
+        // limina: hand back surfaces the supervisor lost. This thread owns the display backend,
+        // which is why the ack reader parks the ids rather than answering them itself. A cursor
+        // image is the one that cannot wait for the guest to redraw: it is republished only on a
+        // shape change (dogfood 2026-08-26 — no pointer for minutes).
+        let wanted = std::mem::take(&mut *pf.resurface.lock().unwrap());
         let mut hits: Vec<(u32, u32, u32, Rect)> = Vec::new();
         for cookie in &cookies {
             if let Some(p) = pf.parked.remove(cookie) {
@@ -2619,6 +2635,18 @@ impl VirtioGpu {
                 }
             }
             pf.guest_holds.push(hold);
+        }
+        // Answer the resurface asks the renderer could not: these name the display backend's
+        // own surfaces. `InvalidParam` means we do not hold it either — it is gone, and saying so
+        // is what stops the supervisor's throttled asks from looking like a silent failure.
+        for id in wanted {
+            match self.display_backend.republish_surface(id) {
+                Ok(()) => debug!("gpu: display backend re-published surface {id} on request"),
+                Err(e) => warn!(
+                    "gpu: supervisor asked for surface {id} back but neither the renderer nor \
+                     the display backend holds it ({e}) — it is gone, not merely dropped"
+                ),
+            }
         }
         for (scanout_id, iosurface_id, resource_id, rect) in hits {
             // Engagement oracle: proves the fence-accurate path is live (a silent

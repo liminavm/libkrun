@@ -240,6 +240,24 @@ typedef int32_t (*krun_display_present_surface_fn)(void *instance, uint32_t scan
 typedef int32_t (*krun_display_release_surface_fn)(void *instance, uint32_t iosurface_id);
 
 /**
+ * (limina extension, optional) Hand a surface the backend still owns to its consumer again.
+ *
+ * A backend that passes surfaces to another process by capability (a Mach port, an fd) has no
+ * global name a lost surface could be looked up by: once the consumer drops it, only the backend
+ * can hand it over again. The consumer asks for one by id when it finds it has no way to resolve
+ * a surface the guest is still using.
+ *
+ * Arguments:
+ *  "instance"     - userdata set by `krun_display_create`, represents this/self argument
+ *  "iosurface_id" - The IOSurface id (IOSurfaceGetID) of the surface to hand over again.
+ *
+ * Returns:
+ *  Zero on success, or a negative error code (KRUN_DISPLAY_ERR_*) — in particular when the
+ *  backend no longer holds that surface, which means it is gone rather than merely dropped.
+ */
+typedef int32_t (*krun_display_republish_surface_fn)(void *instance, uint32_t iosurface_id);
+
+/**
  * (limina extension, optional) A guest OS driver has taken over the GPU device.
  *
  * Called once per VM run, the first time the guest asks for a display's EDID
@@ -288,6 +306,7 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_move_cursor_fn         move_cursor; // (optional) limina: hardware cursor position
     krun_display_present_surface_fn     present_surface; // (optional) limina: zero-copy IOSurface scanout present
     krun_display_release_surface_fn     release_surface; // (optional) limina: guest unref'd a scanout resource
+    krun_display_republish_surface_fn   republish_surface; // (optional) limina: hand a surface over again
     krun_display_guest_driver_ready_fn  guest_driver_ready; // (optional) limina: OS driver took over
 };
 
