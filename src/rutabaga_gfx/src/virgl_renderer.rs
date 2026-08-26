@@ -456,10 +456,12 @@ impl VirglRenderer {
         Ok(map_ptr)
     }
 
-    // limina tier-2: the global IOSurface id backing a scanout resource, or 0 if not
-    // IOSurface-backed. Cached on the RutabagaResource for zero-copy SET_SCANOUT_BLOB present.
+    // limina tier-2: the IOSurface id currently backing a scanout resource, or 0 if not
+    // IOSurface-backed. Asked afresh on every use — virglrenderer zeroes its own copy when the
+    // backing surface is freed, and an IOSurface id is reusable the moment its surface dies, so
+    // anything we cached here could name a stranger's surface.
     #[cfg(target_os = "macos")]
-    fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
+    fn ffi_iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
         let mut iosurface_id = 0;
         let ret =
             unsafe { virgl_renderer_resource_get_iosurface_id(resource_id, &mut iosurface_id) };
@@ -533,6 +535,11 @@ impl Drop for VirglRenderer {
 }
 
 impl RutabagaComponent for VirglRenderer {
+    #[cfg(target_os = "macos")]
+    fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
+        self.ffi_iosurface_id(resource_id)
+    }
+
     fn get_capset_info(&self, capset_id: u32) -> (u32, u32) {
         let mut version = 0;
         let mut size = 0;
@@ -761,11 +768,6 @@ impl RutabagaComponent for VirglRenderer {
             map_info: None,
             #[cfg(target_os = "macos")]
             map_ptr: None,
-            // limina vrend zero-copy scanout: a SCANOUT-bound 3D resource may be
-            // IOSurface-backed (vrend allocates the surface at create) — cache the id
-            // exactly like create_blob does, so plain SET_SCANOUT can resolve it.
-            #[cfg(target_os = "macos")]
-            iosurface_id: self.iosurface_id(resource_id).ok().filter(|&id| id != 0),
             info_2d: None,
             info_3d: self.query(resource_id).ok(),
             vulkan_info: None,
@@ -976,8 +978,6 @@ impl RutabagaComponent for VirglRenderer {
                 map_info: self.map_info(resource_id).ok(),
                 #[cfg(target_os = "macos")]
                 map_ptr: self.map_ptr(resource_id).ok(),
-                #[cfg(target_os = "macos")]
-                iosurface_id: self.iosurface_id(resource_id).ok().filter(|&id| id != 0),
                 info_2d: None,
                 info_3d: self.query(resource_id).ok(),
                 vulkan_info: None,
