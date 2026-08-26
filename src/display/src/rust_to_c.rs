@@ -88,6 +88,15 @@ pub trait DisplayBackendBasicFramebuffer {
         Err(DisplayBackendError::MethodNotSupported)
     }
 
+    /// (Optional, limina) Hand a surface this backend still owns to the consumer again.
+    ///
+    /// Surfaces passed by capability have no global name: once the consumer has dropped one, only
+    /// this backend can hand it over. `InvalidParam` means we do not hold it — it is gone, not
+    /// merely dropped. Default: unsupported.
+    fn republish_surface(&mut self, _iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
     /// (Optional, limina) A guest OS driver has taken over the device — the first
     /// `VIRTIO_GPU_CMD_GET_EDID` of the run, which boot firmware never sends.
     ///
@@ -264,6 +273,13 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             from_rust_result(cast_instance::<I>(instance).release_surface(iosurface_id))
         }
 
+        extern "C" fn republish_surface_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            iosurface_id: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).republish_surface(iosurface_id))
+        }
+
         extern "C" fn guest_driver_ready_fn<I: DisplayBackendBasicFramebuffer>(
             instance: *mut c_void,
         ) -> i32 {
@@ -286,6 +302,7 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     move_cursor: Some(move_cursor_fn::<I>),
                     present_surface: Some(present_surface_fn::<I>),
                     release_surface: Some(release_surface_fn::<I>),
+                    republish_surface: Some(republish_surface_fn::<I>),
                     guest_driver_ready: Some(guest_driver_ready_fn::<I>),
                 },
             },
