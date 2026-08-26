@@ -186,6 +186,14 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
         }
     }
 
+    fn republish_surface(&mut self, iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.republish_surface(iosurface_id)
+            }
+        }
+    }
+
     fn guest_driver_ready(&mut self) -> Result<(), DisplayBackendError> {
         into_rust_result! {
             method_call!{
