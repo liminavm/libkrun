@@ -1078,7 +1078,8 @@ impl Rutabaga {
 
     /// limina tier-2: returns the IOSurface id currently backing a scanout resource, or an error
     /// if it is not IOSurface-backed. Used by SET_SCANOUT/SET_SCANOUT_BLOB to present the surface
-    /// zero-copy instead of reading the SHM carrier, and by RESOURCE_UNREF to release it.
+    /// zero-copy instead of reading the SHM carrier. NOT a release key -- a release undoes a
+    /// publish, so it is keyed on the id that was published (`VirtioGpuResource`).
     ///
     /// Asks the renderer every time, deliberately. This used to answer from an id stamped on the
     /// `RutabagaResource` at create, but the surface's owner (a venus `VkImage`, a vrend resource)

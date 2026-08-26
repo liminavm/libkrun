@@ -187,6 +187,18 @@ struct VirtioGpuResource {
     /// limina (#8): the context that created this resource (blob resources only;
     /// 0 = none). A scanout flush injects its present fence on this context.
     ctx_id: u32,
+    /// limina tier-2 (macOS): the IOSurface id we handed to the display backend for this
+    /// resource, or None if we never handed one over.
+    ///
+    /// This is the release key, deliberately, rather than whatever currently backs the resource.
+    /// A release undoes a PUBLISH, not a backing: the id is recorded at the set_scanout resolve,
+    /// the one moment it is provably alive and provably this resource's, and the receiver's own
+    /// retain then keeps that surface alive -- so the id cannot be recycled out from under us for
+    /// as long as the release is owed. Reading the backing at unref instead is what let a release
+    /// name a stranger's surface: venus frees a scanout image's surface before the guest unrefs
+    /// the resource, so the id read there could already belong to someone else.
+    #[cfg(target_os = "macos")]
+    published_iosurface_id: Option<u32>,
 }
 
 impl VirtioGpuResource {
@@ -209,6 +221,8 @@ impl VirtioGpuResource {
             shmem_offset: None,
             rutabaga_external_mapping: false,
             ctx_id: 0,
+            #[cfg(target_os = "macos")]
+            published_iosurface_id: None,
         }
     }
 }
@@ -1919,26 +1933,39 @@ impl VirtioGpu {
         Ok(self.result_from_query(resource_id))
     }
 
+    /// limina tier-2 (macOS): remember the IOSurface id we are handing to the display backend for
+    /// `resource_id`, so RESOURCE_UNREF can release exactly what was published (see
+    /// [`VirtioGpuResource::published_iosurface_id`]). Releases any id this displaces: a guest
+    /// that re-scans-out the same resource onto a new surface owes the receiver a release for the
+    /// old one, or it holds that framebuffer until its store cap pushes it out.
+    #[cfg(target_os = "macos")]
+    fn note_published(&mut self, resource_id: u32, iosurface_id: Option<u32>) {
+        let Some(resource) = self.resources.get_mut(&resource_id) else {
+            return;
+        };
+        let previous = resource.published_iosurface_id;
+        if previous == iosurface_id {
+            return;
+        }
+        resource.published_iosurface_id = iosurface_id;
+        if let Some(old) = previous {
+            let _ = self.display_backend.release_surface(old);
+        }
+    }
+
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
         // A backend that handed this surface to another process has no other way to learn it is
         // finished with, and on macOS the storage bills to the task that created it, so the
         // holder feels no pressure of its own to let go.
         //
-        // The id is asked of the renderer here, not remembered from create: the surface's owner
-        // (a venus VkImage, a vrend resource) can free it while the resource lives on, and an
-        // IOSurface id is reusable the moment its surface dies. A remembered id could therefore
-        // name a surface that now belongs to someone else -- and a release for a stranger's
-        // surface is unrecoverable on the receiving side, because these surfaces are non-global
-        // and only their creator can hand one over again. A freed surface answers 0, so we send
-        // nothing at all.
-        #[cfg(target_os = "macos")]
-        let iosurface_id = self
-            .rutabaga
-            .as_ref()
-            .and_then(|r| r.iosurface_id(resource_id).ok())
-            .filter(|&id| id != 0);
-
+        // We release what we PUBLISHED for this resource, not whatever backs it now: a release
+        // undoes a publish. Asking the renderer here reads the wrong thing in both directions --
+        // venus frees a scanout image's surface before the guest unrefs the resource, so the
+        // answer is either 0 (and the receiver keeps a framebuffer nobody will ever free) or an
+        // id that has since been recycled to someone else's surface (and we free THEIRS, which
+        // no one can undo: these surfaces are non-global, so only their creator can hand one
+        // over again). A resource we never published for releases nothing at all.
         let resource = self
             .resources
             .remove(&resource_id)
@@ -1958,7 +1985,7 @@ impl VirtioGpu {
         // IOSurface id is reusable the moment its surface dies, so a release sent afterwards
         // could name a surface that already belongs to someone else.
         #[cfg(target_os = "macos")]
-        if let Some(id) = iosurface_id {
+        if let Some(id) = resource.published_iosurface_id {
             let _ = self.display_backend.release_surface(id);
         }
 
@@ -2070,6 +2097,9 @@ impl VirtioGpu {
             iosurface_id,
         });
         self.scanout_ledger.bind(resource_id);
+        // After the scanout borrow ends: this needs `self` to release a displaced id.
+        #[cfg(target_os = "macos")]
+        self.note_published(resource_id, iosurface_id);
         Ok(OkNoData)
     }
 
@@ -2166,6 +2196,8 @@ impl VirtioGpu {
             iosurface_id,
         });
         self.scanout_ledger.bind(resource_id);
+        // After the scanout borrow ends: this needs `self` to release a displaced id.
+        self.note_published(resource_id, iosurface_id);
         Ok(OkNoData)
     }
 
