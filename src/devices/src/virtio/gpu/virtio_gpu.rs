@@ -1924,6 +1924,14 @@ impl VirtioGpu {
         // A backend that handed this surface to another process has no other way to learn it is
         // finished with, and on macOS the storage bills to the task that created it, so the
         // holder feels no pressure of its own to let go.
+        //
+        // The id is asked of the renderer here, not remembered from create: the surface's owner
+        // (a venus VkImage, a vrend resource) can free it while the resource lives on, and an
+        // IOSurface id is reusable the moment its surface dies. A remembered id could therefore
+        // name a surface that now belongs to someone else -- and a release for a stranger's
+        // surface is unrecoverable on the receiving side, because these surfaces are non-global
+        // and only their creator can hand one over again. A freed surface answers 0, so we send
+        // nothing at all.
         #[cfg(target_os = "macos")]
         let iosurface_id = self
             .rutabaga
