@@ -48,10 +48,6 @@ pub struct RutabagaResource {
     pub map_info: Option<u32>,
     #[cfg(target_os = "macos")]
     pub map_ptr: Option<u64>,
-    /// limina tier-2: global IOSurface id backing this scanout resource (0/None = not
-    /// IOSurface-backed), cached at create for zero-copy SET_SCANOUT_BLOB present.
-    #[cfg(target_os = "macos")]
-    pub iosurface_id: Option<u32>,
     pub info_2d: Option<Rutabaga2DInfo>,
     pub info_3d: Option<Resource3DInfo>,
     pub vulkan_info: Option<VulkanInfo>,
@@ -172,8 +168,6 @@ pub trait RutabagaComponent {
             map_info: None,
             #[cfg(target_os = "macos")]
             map_ptr: None,
-            #[cfg(target_os = "macos")]
-            iosurface_id: None,
             info_2d: None,
             info_3d: None,
             vulkan_info: None,
@@ -233,6 +227,13 @@ pub trait RutabagaComponent {
         _dst_stride: u32,
         _height: u32,
     ) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
+    /// limina tier-2 (macOS): the IOSurface id currently backing `resource_id`, or 0 once the
+    /// surface it was created with has been freed. Only virgl implements it.
+    #[cfg(target_os = "macos")]
+    fn iosurface_id(&self, _resource_id: u32) -> RutabagaResult<u32> {
         Err(RutabagaError::Unsupported)
     }
 
@@ -543,8 +544,6 @@ impl Rutabaga {
                     map_info: None,
                     #[cfg(target_os = "macos")]
                     map_ptr: None,
-                    #[cfg(target_os = "macos")]
-                    iosurface_id: None,
                     info_2d: Some(Rutabaga2DInfo {
                         width: s.width,
                         height: s.height,
@@ -1077,19 +1076,24 @@ impl Rutabaga {
             .ok_or(RutabagaError::SpecViolation("no map ptr available"))
     }
 
-    /// limina tier-2: returns the global IOSurface id backing a scanout resource (cached at
-    /// create), or an error if the resource is not IOSurface-backed. Used by SET_SCANOUT_BLOB
-    /// to present the IOSurface zero-copy instead of reading the SHM carrier.
+    /// limina tier-2: returns the IOSurface id currently backing a scanout resource, or an error
+    /// if it is not IOSurface-backed. Used by SET_SCANOUT/SET_SCANOUT_BLOB to present the surface
+    /// zero-copy instead of reading the SHM carrier, and by RESOURCE_UNREF to release it.
+    ///
+    /// Asks the renderer every time, deliberately. This used to answer from an id stamped on the
+    /// `RutabagaResource` at create, but the surface's owner (a venus `VkImage`, a vrend resource)
+    /// can free it while the resource lives on, and an IOSurface id is reusable the moment its
+    /// surface dies -- so a stamped id could name a stranger's surface. virglrenderer zeroes its
+    /// own cached copy when it frees a surface, so this answers 0 exactly then, and every caller
+    /// already treats 0 as "not IOSurface-backed".
     #[cfg(target_os = "macos")]
     pub fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
-        let resource = self
-            .resources
-            .get(&resource_id)
-            .ok_or(RutabagaError::InvalidResourceId)?;
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
 
-        resource
-            .iosurface_id
-            .ok_or(RutabagaError::SpecViolation("not IOSurface-backed"))
+        component.iosurface_id(resource_id)
     }
 
     /// limina: copy a scanout resource's presented IOSurface into `dst` (top-down BGRA,
