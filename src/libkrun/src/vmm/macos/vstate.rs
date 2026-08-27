@@ -21,7 +21,7 @@ use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, ReleasedRam, VcpuExit, VcpuState, Vcpus};
+use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus};
 use utils::eventfd::EventFd;
 use utils::worker_message::RECLAIM_BLOCK_SIZE;
 use vm_memory::{
@@ -162,8 +162,13 @@ pub struct Vm {
 
 impl Vm {
     /// Constructs a new `Vm` using the given `Kvm` instance.
-    pub fn new(arch_mem_info: &mut ArchMemoryInfo, nested_enabled: bool) -> Result<Self> {
-        let hvf_vm = HvfVm::new(arch_mem_info, nested_enabled).map_err(Error::VmSetup)?;
+    pub fn new(
+        arch_mem_info: &mut ArchMemoryInfo,
+        nested_enabled: bool,
+        ipa_granule: Option<IpaGranule>,
+    ) -> Result<Self> {
+        let hvf_vm =
+            HvfVm::new(arch_mem_info, nested_enabled, ipa_granule).map_err(Error::VmSetup)?;
 
         Ok(Vm { hvf_vm })
     }
@@ -1111,7 +1116,8 @@ mod tests {
     fn test_vm() -> MutexGuard<'static, Vm> {
         static VM: LazyLock<Mutex<Vm>> = LazyLock::new(|| {
             Mutex::new(
-                Vm::new(&mut arch::ArchMemoryInfo::default(), false).expect("Cannot create new vm"),
+                Vm::new(&mut arch::ArchMemoryInfo::default(), false, None)
+                    .expect("Cannot create new vm"),
             )
         });
         VM.lock().unwrap_or_else(|e| e.into_inner())

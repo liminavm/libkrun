@@ -44,7 +44,7 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         cases.into_iter().nth(case.parse().unwrap()).unwrap();
 
     let mut arch_memory_info = ArchMemoryInfo::default();
-    let vm = Vm::new(&mut arch_memory_info, false).unwrap();
+    let vm = Vm::new(&mut arch_memory_info, false, None).unwrap();
     let (event_sender, event_receiver) = unbounded();
     let (response_sender, response_receiver) = unbounded();
     let (id_sender, id_receiver) = unbounded();
