@@ -30,6 +30,9 @@ use crate::vmm::vstate::VcpuConfig;
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
 
+#[cfg(target_os = "macos")]
+pub use hvf::IpaGranule;
+
 type Result<E> = std::result::Result<(), E>;
 
 /// Errors encountered when configuring microVM resources.
@@ -116,6 +119,10 @@ pub struct VmResources {
     pub nested_enabled: bool,
     /// The process exit code when the guest resets instead of powering off.
     pub reset_exit_code: Option<u8>,
+    /// Stage-2 translation granule to create the VM with. `None` keeps the host default
+    /// (16 KiB on Apple silicon), which cannot express a 4 KiB-page guest's memory layout.
+    #[cfg(target_os = "macos")]
+    pub ipa_granule: Option<IpaGranule>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to ask for transparent huge pages for guest memory (Linux).
@@ -283,6 +290,8 @@ mod tests {
             smbios_oem_strings: None,
             nested_enabled: false,
             reset_exit_code: None,
+            #[cfg(target_os = "macos")]
+            ipa_granule: None,
             split_irqchip: false,
             #[cfg(target_os = "linux")]
             transparent_huge_pages: false,
