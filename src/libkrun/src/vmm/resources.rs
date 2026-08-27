@@ -30,6 +30,9 @@ use crate::vmm::vstate::VcpuConfig;
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
 
+#[cfg(target_os = "macos")]
+pub use hvf::IpaGranule;
+
 type Result<E> = std::result::Result<(), E>;
 
 /// Errors encountered when configuring microVM resources.
@@ -114,6 +117,10 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// Stage-2 translation granule to create the VM with. `None` keeps the host default
+    /// (16 KiB on Apple silicon), which cannot express a 4 KiB-page guest's memory layout.
+    #[cfg(target_os = "macos")]
+    pub ipa_granule: Option<IpaGranule>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
@@ -274,6 +281,8 @@ mod tests {
             external_kernel: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            #[cfg(target_os = "macos")]
+            ipa_granule: None,
             split_irqchip: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),

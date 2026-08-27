@@ -48,6 +48,8 @@ use devices::legacy::VcpuList;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 use devices::legacy::WhpIoapic;
 #[cfg(target_os = "macos")]
+use hvf::IpaGranule;
+#[cfg(target_os = "macos")]
 use devices::legacy::{GicV3, HvfGicV3};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use devices::legacy::{IoApic, IrqChipT};
@@ -843,6 +845,8 @@ pub fn build_microvm(
         &guest_memory,
         &mut arch_memory_info,
         vm_resources.nested_enabled,
+        #[cfg(target_os = "macos")]
+        vm_resources.ipa_granule,
     )?;
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
@@ -2296,8 +2300,9 @@ pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     arch_mem_info: &mut ArchMemoryInfo,
     nested_enabled: bool,
+    ipa_granule: Option<IpaGranule>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(arch_mem_info, nested_enabled)
+    let mut vm = Vm::new(arch_mem_info, nested_enabled, ipa_granule)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
