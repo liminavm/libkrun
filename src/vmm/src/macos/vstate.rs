@@ -12,9 +12,10 @@ use std::io;
 use std::result;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REBOOT};
+use super::wfi_latency::{self, Wake};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
@@ -638,7 +639,7 @@ impl Vcpu {
                 Ok(VcpuEmulation::WaitForEvent) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu)
                 }
-                Ok(VcpuEmulation::WaitForEventExpired) => (),
+                Ok(VcpuEmulation::WaitForEventExpired) => wfi_latency::record_expired(),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
                 }
@@ -678,19 +679,30 @@ impl Vcpu {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
             return;
         }
-        let paused = if let Some(timeout) = timeout {
+        // Which arm won matters beyond the pause check: a park cut short by an IRQ is early on
+        // purpose, and counting it as punctual would report a healthy timer for a broken one.
+        let measure = wfi_latency::enabled();
+        let started = measure.then(Instant::now);
+        let wake = if let Some(timeout) = timeout {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
-                recv(after(timeout)) -> _ => false,
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); Wake::Irq }
+                recv(self.event_receiver) -> ev => {
+                    if matches!(ev, Ok(VcpuEvent::Pause)) { Wake::Pause } else { Wake::Irq }
+                }
+                recv(after(timeout)) -> _ => Wake::Deadline,
             }
         } else {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); Wake::Irq }
+                recv(self.event_receiver) -> ev => {
+                    if matches!(ev, Ok(VcpuEvent::Pause)) { Wake::Pause } else { Wake::Irq }
+                }
             }
         };
-        if paused {
+        if let (Some(timeout), Some(started)) = (timeout, started) {
+            wfi_latency::record(wake, timeout, started.elapsed());
+        }
+        if wake == Wake::Pause {
             self.pause_and_park(hvf_vcpu);
         }
     }
