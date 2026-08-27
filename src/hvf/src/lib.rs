@@ -22,6 +22,7 @@ use std::cell::Cell;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -41,22 +42,44 @@ fn host_page_size() -> u64 {
     *PAGE
 }
 
-/// Round `size` up to the host page granule.
+/// The granule hv_vm_map/hv_vm_unmap actually enforce for this VM: the one
+/// [`HvfVm::new`] successfully set, or the host page size when it set none.
 ///
-/// Guests whose page size is smaller than the host's (a stock 4 KiB Linux guest on a
-/// 16 KiB Apple Silicon host) produce mappings sized at *their* granularity — e.g. a
-/// 0x21000-byte virtio-gpu blob (33 × 4 KiB, size%16k=4096) — which hv_vm_map/hv_vm_unmap
-/// reject outright. Rounding the size up is safe:
-/// - Host side: mmap'ed regions always occupy whole host pages, so the bytes between the
-///   requested end and the end of its last host page belong to the same host mapping.
-/// - Guest side: a rounded range can only overlap a neighboring mapping whose own start is
-///   NOT host-page-aligned — and any map/unmap of such a neighbor is itself rejected by HVF
-///   before it can touch the first mapping's pages.
-/// Map and unmap must round identically or a successful rounded map would leak its tail
-/// page at unmap time.
-fn round_up_to_host_page(size: u64) -> u64 {
-    let page = host_page_size();
-    size.div_ceil(page).saturating_mul(page)
+/// 0 means "not set", which is also the state of a process that never created a VM.
+static MAP_GRANULE: AtomicU64 = AtomicU64::new(0);
+
+/// What every address and size handed to hv_vm_map must be a multiple of.
+fn map_granule() -> u64 {
+    match MAP_GRANULE.load(Ordering::Relaxed) {
+        0 => host_page_size(),
+        g => g,
+    }
+}
+
+/// Round `size` up to the mapping granule.
+///
+/// A guest whose page size is smaller than the granule produces mappings sized at *its*
+/// granularity — e.g. a 0x21000-byte virtio-gpu blob (33 × 4 KiB, size%16k=4096) on the
+/// 16 KiB granule — which hv_vm_map/hv_vm_unmap reject outright. Rounding the size up is
+/// safe *because the granule is the unit HVF itself refuses below*: the tail can only run
+/// into a neighbour whose own start is not granule-aligned, and mapping such a neighbour is
+/// itself refused before it can reach these bytes. On the host side an mmap'ed region always
+/// occupies whole host pages, and the granule never exceeds one, so the tail belongs to the
+/// same host mapping.
+///
+/// That argument is why this rounds to the GRANULE and not to the host page: under a 4 KiB
+/// granule a neighbouring blob at the next 4 KiB guest address is legal, and rounding to
+/// 16 KiB would map over it — HVF answers an overlapping map with HV_ERROR, and the blob the
+/// guest was promised never arrives.
+///
+/// Map and unmap must round identically or a successful rounded map would leak its tail at
+/// unmap time.
+fn round_up_to_map_granule(size: u64) -> u64 {
+    round_up(size, map_granule())
+}
+
+fn round_up(size: u64, granule: u64) -> u64 {
+    size.div_ceil(granule).saturating_mul(granule)
 }
 
 const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
@@ -347,6 +370,14 @@ impl IpaGranule {
             IpaGranule::SixteenK => 1,
         }
     }
+
+    /// The alignment this granule imposes on every hv_vm_map operand.
+    fn bytes(self) -> u64 {
+        match self {
+            IpaGranule::FourK => 4096,
+            IpaGranule::SixteenK => 16384,
+        }
+    }
 }
 
 pub struct HvfVm {}
@@ -377,6 +408,9 @@ impl HvfVm {
                         error!("hv_vm_config_set_ipa_granule({granule:?}) failed: {ret:?}");
                         return Err(Error::SetIpaGranule);
                     }
+                    // Only now: the rounding in map_memory/unmap_memory must follow what HVF
+                    // is really enforcing, not what we asked for.
+                    MAP_GRANULE.store(granule.bytes(), Ordering::Relaxed);
                     info!("stage-2 IPA granule set to {granule:?}");
                 }
                 Err(_) => {
@@ -418,9 +452,9 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
-        // A 4 KiB guest can request sub-host-page sizes (see round_up_to_host_page);
-        // the addresses are NOT rounded — a misaligned address is a real caller bug.
-        let size = round_up_to_host_page(size);
+        // A guest may request sizes below the granule (see round_up_to_map_granule); the
+        // addresses are NOT rounded — a misaligned address is a real caller bug.
+        let size = round_up_to_map_granule(size);
         let ret = unsafe {
             hv_vm_map(
                 host_start_addr as *mut core::ffi::c_void,
@@ -431,15 +465,17 @@ impl HvfVm {
         };
         if ret != HV_SUCCESS {
             // hv_vm_map rejects any host addr, guest addr, or size that is not a multiple of
-            // the host page size (16 KiB on Apple Silicon) with HV_BAD_ARGUMENT (0xfae94003).
-            // Surface which operand is misaligned to make blob-mapping bugs diagnosable.
-            const HOST_PAGE: u64 = 16384;
+            // the granule with HV_BAD_ARGUMENT (0xfae94003). Surface which operand is
+            // misaligned to make blob-mapping bugs diagnosable — and note that an OVERLAPPING
+            // map answers HV_ERROR (0xfae94001) instead, one digit away and easily misread as
+            // an alignment refusal, so a line here with every remainder 0 means overlap.
+            let granule = map_granule();
             error!(
                 "hv_vm_map failed: ret={ret:#x} host={host_start_addr:#x} guest={guest_start_addr:#x} size={size:#x} \
-                 (host%16k={} guest%16k={} size%16k={})",
-                host_start_addr % HOST_PAGE,
-                guest_start_addr % HOST_PAGE,
-                size % HOST_PAGE,
+                 (granule={granule:#x} host%g={} guest%g={} size%g={})",
+                host_start_addr % granule,
+                guest_start_addr % granule,
+                size % granule,
             );
             Err(Error::MemoryMap)
         } else {
@@ -448,9 +484,9 @@ impl HvfVm {
     }
 
     pub fn unmap_memory(&self, guest_start_addr: u64, size: u64) -> Result<(), Error> {
-        // Mirror map_memory's rounding exactly, or a rounded map's tail page would survive
-        // its unmap.
-        let size = round_up_to_host_page(size);
+        // Mirror map_memory's rounding exactly, or a rounded map's tail would survive its
+        // unmap.
+        let size = round_up_to_map_granule(size);
         let ret = unsafe { hv_vm_unmap(guest_start_addr, size.try_into().unwrap()) };
         if ret != HV_SUCCESS {
             Err(Error::MemoryUnmap)
@@ -1375,26 +1411,41 @@ impl HvfVcpu<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_page_size, round_up_to_host_page};
+    use super::{IpaGranule, map_granule, round_up};
 
-    // The blob-map alignment guard: hv_vm_map/hv_vm_unmap take sizes at host page
+    // The blob-map alignment guard: hv_vm_map/hv_vm_unmap take sizes at granule
     // granularity only, so the wrappers must round sub-granule sizes up (and by exactly
-    // the same amount on both map and unmap). See round_up_to_host_page.
+    // the same amount on both map and unmap). See round_up_to_map_granule.
     #[test]
-    fn sizes_round_up_to_the_host_page_granule() {
-        let page = host_page_size();
+    fn sizes_round_up_to_the_map_granule() {
+        let page = map_granule();
         assert!(page.is_power_of_two() && page >= 4096);
 
-        assert_eq!(round_up_to_host_page(0), 0);
-        assert_eq!(round_up_to_host_page(1), page);
-        assert_eq!(round_up_to_host_page(page), page);
-        assert_eq!(round_up_to_host_page(page + 1), 2 * page);
+        assert_eq!(round_up(0, page), 0);
+        assert_eq!(round_up(1, page), page);
+        assert_eq!(round_up(page, page), page);
+        assert_eq!(round_up(page + 1, page), 2 * page);
 
-        // The signature from the wild: a 4 KiB guest's 0x21000-byte blob on a 16 KiB host.
+        // The signature from the wild: a 4 KiB guest's 0x21000-byte blob.
         let odd = 0x21000u64;
-        let rounded = round_up_to_host_page(odd);
+        let rounded = round_up(odd, page);
         assert!(rounded >= odd);
         assert_eq!(rounded % page, 0);
         assert!(rounded - odd < page);
+    }
+
+    // Under a 4 KiB granule a neighbouring blob at the next 4 KiB guest address is legal, so
+    // rounding a 4 KiB-granular size up to the 16 KiB HOST page would map over it and HVF
+    // would refuse the neighbour. The rounding must follow the granule the VM was created
+    // with, which is the whole reason it is not a function of getpagesize().
+    #[test]
+    fn a_four_k_granule_stops_the_rounding_from_reaching_a_neighbour() {
+        let four_k = IpaGranule::FourK.bytes();
+        assert_eq!(four_k, 4096);
+        assert_eq!(round_up(0x21000, four_k), 0x21000);
+        assert_eq!(round_up(0x21001, four_k), 0x22000);
+        // The same size under the host page granule reaches 12 KiB past the blob, into
+        // guest addresses a 4 KiB guest is entitled to hand its next blob.
+        assert_eq!(round_up(0x21000, IpaGranule::SixteenK.bytes()), 0x24000);
     }
 }
