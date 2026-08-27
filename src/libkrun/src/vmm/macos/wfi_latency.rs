@@ -14,6 +14,16 @@
 //! Off unless `LIMINA_WFI_LATENCY` is set; its value is the report interval in seconds
 //! (default 5). A synthetic version of the same measurement, over every host wait primitive and
 //! thread policy, lives in `spikes/macos-timer-wakeup/`.
+//!
+//! **What it found: on macOS 26.5 / Apple silicon this park never happens.** A guest's WFI does
+//! not trap out to us at all — HVF parks the vCPU inside `hv_vcpu_run`
+//! (`HvCore::Hypervisor::VcpuStateManager::wait_for_interrupt`) and serves the virtual timer from
+//! its own clock thread. Over 30 s of idle desktop the only vCPU exits are MMIO; `WaitForEvent`,
+//! `WaitForEventTimeout` and `VtimerActivated` are all zero. So the code below reports nothing,
+//! and that silence is the result: guest timer lateness is not ours to serve here.
+//!
+//! It is kept because the silence is worth watching. A nonzero report means HVF changed, or a
+//! guest or host configuration reached the trap path — either way, the assumption above is stale.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -47,6 +57,8 @@ struct Stats {
     pause_parks: AtomicU64,
     /// Parks whose deadline had already passed when we went to arm it (`WaitForEventExpired`).
     expired: AtomicU64,
+    /// WFIs that never parked at all because an IRQ was already pending.
+    no_wait: AtomicU64,
     late_us_total: AtomicU64,
     late_us_max: AtomicU64,
 }
@@ -69,6 +81,7 @@ static STATS: Stats = Stats {
     irq_parks: AtomicU64::new(0),
     pause_parks: AtomicU64::new(0),
     expired: AtomicU64::new(0),
+    no_wait: AtomicU64::new(0),
     late_us_total: AtomicU64::new(0),
     late_us_max: AtomicU64::new(0),
 };
@@ -128,6 +141,13 @@ pub fn record(wake: Wake, requested: Duration, observed: Duration) {
     STATS.late_us_max.fetch_max(late_us, Ordering::Relaxed);
 }
 
+/// A WFI that returned without parking: an IRQ was already pending.
+pub fn record_no_wait() {
+    if enabled() {
+        STATS.no_wait.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A park we never armed because the deadline was already behind us.
 pub fn record_expired() {
     if enabled() {
@@ -163,10 +183,11 @@ fn report_and_reset() {
     let irq = STATS.irq_parks.swap(0, Ordering::Relaxed);
     let pause = STATS.pause_parks.swap(0, Ordering::Relaxed);
     let expired = STATS.expired.swap(0, Ordering::Relaxed);
+    let no_wait = STATS.no_wait.swap(0, Ordering::Relaxed);
     let total_us = STATS.late_us_total.swap(0, Ordering::Relaxed);
     let max_us = STATS.late_us_max.swap(0, Ordering::Relaxed);
 
-    if deadline == 0 && irq == 0 && pause == 0 && expired == 0 {
+    if deadline == 0 && irq == 0 && pause == 0 && expired == 0 && no_wait == 0 {
         return;
     }
 
@@ -175,7 +196,8 @@ fn report_and_reset() {
     let over_16ms: u64 = counts[9..].iter().sum();
 
     log::info!(
-        "[WFI-LATE] parks: deadline={deadline} irq={irq} pause={pause} expired={expired} | \
+        "[WFI-LATE] parks: deadline={deadline} irq={irq} pause={pause} expired={expired} \
+         no_wait={no_wait} | \
          lateness p50={} p90={} p99={} max={max_us}us mean={}us | \
          >=8ms {over_8ms} ({:.1}%) >=16ms {over_16ms} ({:.1}%)",
         percentile_edge(&counts, deadline, 0.50),
