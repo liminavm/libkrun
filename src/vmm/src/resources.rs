@@ -38,6 +38,8 @@ use devices::display::DisplayInfo;
 use kbs_types::Tee;
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
+#[cfg(target_os = "macos")]
+pub use hvf::IpaGranule;
 
 type Result<E> = std::result::Result<(), E>;
 
@@ -236,6 +238,10 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// Stage-2 translation granule to create the VM with. `None` keeps the host default
+    /// (16 KiB on Apple silicon), which cannot express a 4 KiB-page guest's memory layout.
+    #[cfg(target_os = "macos")]
+    pub ipa_granule: Option<IpaGranule>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// The console id to use for console= in the kernel cmdline

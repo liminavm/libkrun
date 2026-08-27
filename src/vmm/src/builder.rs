@@ -51,6 +51,8 @@ use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
 use devices::legacy::VcpuList;
 #[cfg(target_os = "macos")]
+use hvf::IpaGranule;
+#[cfg(target_os = "macos")]
 use devices::legacy::{GicV3, HvfGicV3};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::{IoApic, IrqChipT};
@@ -638,7 +640,12 @@ pub fn build_microvm(
 
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    let mut vm = setup_vm(
+        &guest_memory,
+        vm_resources.nested_enabled,
+        #[cfg(target_os = "macos")]
+        vm_resources.ipa_granule,
+    )?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -2059,8 +2066,9 @@ pub(crate) fn setup_vm(
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     nested_enabled: bool,
+    ipa_granule: Option<IpaGranule>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(nested_enabled)
+    let mut vm = Vm::new(nested_enabled, ipa_granule)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
@@ -3175,7 +3183,7 @@ pub mod tests {
 
         let (guest_memory, _arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false).unwrap();
+        let vm = setup_vm(&guest_memory, false, None).unwrap();
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
 
         // Dummy entry_addr, vcpus will not boot.
@@ -3200,7 +3208,7 @@ pub mod tests {
     fn test_create_vcpus_aarch64() {
         let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false).unwrap();
+        let vm = setup_vm(&guest_memory, false, None).unwrap();
         let vcpu_count = 2;
 
         let vcpu_config = VcpuConfig {

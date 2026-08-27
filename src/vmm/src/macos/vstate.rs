@@ -20,7 +20,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, ReleasedRam, VcpuExit, VcpuState, Vcpus};
+use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -100,8 +100,8 @@ pub struct Vm {
 
 impl Vm {
     /// Constructs a new `Vm` using the given `Kvm` instance.
-    pub fn new(nested_enabled: bool) -> Result<Self> {
-        let hvf_vm = HvfVm::new(nested_enabled).map_err(Error::VmSetup)?;
+    pub fn new(nested_enabled: bool, ipa_granule: Option<IpaGranule>) -> Result<Self> {
+        let hvf_vm = HvfVm::new(nested_enabled, ipa_granule).map_err(Error::VmSetup)?;
 
         Ok(Vm { hvf_vm })
     }
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn test_vm_memory_init() {
-        let mut vm = Vm::new(false).expect("Cannot create new vm");
+        let mut vm = Vm::new(false, None).expect("Cannot create new vm");
 
         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
         let gm = GuestMemoryMmap::from_ranges(&[(

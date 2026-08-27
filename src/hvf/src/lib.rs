@@ -139,6 +139,7 @@ const PSCI_RET_NOT_SUPPORTED: u64 = -1i64 as u64;
 #[derive(Debug)]
 pub enum Error {
     EnableEL2,
+    SetIpaGranule,
     FindSymbol(libloading::Error),
     MemoryMap,
     MemoryUnmap,
@@ -171,6 +172,7 @@ impl Display for Error {
 
         match self {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
+            SetIpaGranule => write!(f, "Error setting the HVF stage-2 IPA granule"),
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
@@ -316,6 +318,37 @@ pub fn check_nested_virt() -> Result<bool, Error> {
     Ok(el2_supported)
 }
 
+/// Granule of the stage-2 (guest-physical -> host) translation, chosen at VM creation.
+///
+/// macOS pins this to the host page size unless asked otherwise, and on Apple silicon that is
+/// 16 KiB — so a 4 KiB-page guest cannot express its own memory layout to us. Every guest
+/// physical address, size and offset we are handed has to be a multiple of the granule, and a
+/// guest that packs things at 4 KiB (virtio-gpu host-visible blobs, most visibly) hands us
+/// addresses `hv_vm_map` refuses outright with `HV_BAD_ARGUMENT`.
+///
+/// `HV_IPA_GRANULE_4KB` lifts that. Measured both ways in `spikes/hv-ipa-granule/`: with the
+/// coarse granule a 4 KiB-aligned guest address is refused and two separate host allocations
+/// cannot be presented contiguously across a 4 KiB boundary; with the fine one both work.
+///
+/// Creation-time only — there is no setter for a live VM — so this is a per-boot decision, and
+/// a restored snapshot must use the granule its guest's layout was built under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpaGranule {
+    FourK,
+    SixteenK,
+}
+
+impl IpaGranule {
+    /// The values of Apple's `hv_ipa_granule_t`, verified against the macOS 26.5 SDK rather
+    /// than assumed from declaration order.
+    fn raw(self) -> u32 {
+        match self {
+            IpaGranule::FourK => 0,
+            IpaGranule::SixteenK => 1,
+        }
+    }
+}
+
 pub struct HvfVm {}
 
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
@@ -326,8 +359,35 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 });
 
 impl HvfVm {
-    pub fn new(nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new(nested_enabled: bool, ipa_granule: Option<IpaGranule>) -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
+
+        // macOS 26+. Looked up rather than linked so an older host simply keeps its default
+        // granule instead of failing to start: a VM on the coarse granule still boots, it just
+        // cannot map a 4 KiB-packed guest's blobs.
+        if let Some(granule) = ipa_granule {
+            type SetIpaGranule =
+                libloading::Symbol<'static, unsafe extern "C" fn(hv_vm_config_t, u32) -> hv_return_t>;
+            let set_ipa_granule: Result<SetIpaGranule, libloading::Error> =
+                unsafe { HVF.get(b"hv_vm_config_set_ipa_granule") };
+            match set_ipa_granule {
+                Ok(set) => {
+                    let ret = unsafe { (set)(config, granule.raw()) };
+                    if ret != HV_SUCCESS {
+                        error!("hv_vm_config_set_ipa_granule({granule:?}) failed: {ret:?}");
+                        return Err(Error::SetIpaGranule);
+                    }
+                    info!("stage-2 IPA granule set to {granule:?}");
+                }
+                Err(_) => {
+                    // Not an error: the caller asked for something this macOS cannot express.
+                    // Say so once, loudly enough to explain a later blob-map refusal.
+                    warn!(
+                        "hv_vm_config_set_ipa_granule is unavailable (needs macOS 26);                          keeping the host default granule"
+                    );
+                }
+            }
+        }
         if nested_enabled {
             let set_el2_enabled: libloading::Symbol<
                 'static,
@@ -669,7 +729,6 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
-
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
@@ -1156,7 +1215,7 @@ impl HvfVcpu<'_> {
                 if let Some(released_ram) = &self.released_ram {
                     match released_ram.handle_fault(pa, syndrome & 0x3f) {
                         FaultOutcome::Healed | FaultOutcome::Retry => {
-                            return Ok(VcpuExit::StageTwoHealed)
+                            return Ok(VcpuExit::StageTwoHealed);
                         }
                         FaultOutcome::Fatal => return Err(Error::StageTwoHeal),
                         FaultOutcome::NotHandled => {}
@@ -1197,7 +1256,7 @@ impl HvfVcpu<'_> {
                 if let Some(released_ram) = &self.released_ram {
                     match released_ram.handle_fault(pa, syndrome & 0x3f) {
                         FaultOutcome::Healed | FaultOutcome::Retry => {
-                            return Ok(VcpuExit::StageTwoHealed)
+                            return Ok(VcpuExit::StageTwoHealed);
                         }
                         FaultOutcome::Fatal => return Err(Error::StageTwoHeal),
                         FaultOutcome::NotHandled => {}
