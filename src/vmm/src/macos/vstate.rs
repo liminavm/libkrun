@@ -677,6 +677,7 @@ impl Vcpu {
         hvf_vcpu: &HvfVcpu,
     ) {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
+            wfi_latency::record_no_wait();
             return;
         }
         // Which arm won matters beyond the pause check: a park cut short by an IRQ is early on
