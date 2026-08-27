@@ -510,6 +510,7 @@ mod tests {
             gpu_virgl_flags: None,
             gpu_software_2d: false,
             gpu_shm_size: None,
+            ipa_granule: None,
             #[cfg(feature = "gpu")]
             display_backend: None,
             #[cfg(any(feature = "gpu", feature = "vhost-user"))]
