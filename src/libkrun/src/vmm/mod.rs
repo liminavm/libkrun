@@ -278,6 +278,9 @@ impl Vmm {
     pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let vcpu_count = vcpus.len();
 
+        #[cfg(target_os = "macos")]
+        crate::vmm::macos::wfi_latency::start_reporter();
+
         Vcpu::register_kick_signal_handler();
 
         self.vcpus_handles.reserve(vcpu_count);
