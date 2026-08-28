@@ -26,6 +26,8 @@
 //!   microseconds overrides them.
 //! * `qos` — `QOS_CLASS_USER_INTERACTIVE` instead. No fail-safe to dodge, and no guarantee.
 //! * `+hb` / `+hb<ms>` appended to `rt` arms the heartbeat (default 250 ms).
+//! * `#<n>` appended limits the policy to the first `n` vCPUs, so the cost of banding *every*
+//!   vCPU thread can be separated from the benefit of banding the one that carries the frame.
 //!
 //! `LIMINA_VCPU_RT` is still read as the old spelling of `rt`.
 
@@ -92,12 +94,19 @@ pub enum Band {
     Qos,
 }
 
+/// How many vCPUs the policy applies to. `None` means all of them.
+fn vcpu_limit() -> Option<u64> {
+    let raw = std::env::var("LIMINA_VCPU_SCHED").unwrap_or_default();
+    raw.split_once('#').and_then(|(_, n)| n.trim().parse().ok())
+}
+
 /// The policy and the heartbeat interval, from the environment. `None` for either means off.
 fn requested() -> (Option<Band>, Option<Duration>) {
     let raw = std::env::var("LIMINA_VCPU_SCHED")
         .or_else(|_| std::env::var("LIMINA_VCPU_RT"))
         .unwrap_or_default();
-    let raw = raw.trim();
+    let raw = raw.split('#').next().unwrap_or_default().trim().to_string();
+    let raw = raw.as_str();
     if raw.is_empty() || raw == "0" || raw.eq_ignore_ascii_case("off") {
         return (None, None);
     }
@@ -142,6 +151,9 @@ pub fn heartbeat_interval() -> Option<Duration> {
     *CACHED.get_or_init(|| requested().1)
 }
 
+/// Total forced parks across every vCPU thread, for the log line below.
+static BEATS: AtomicU64 = AtomicU64::new(0);
+
 /// The last time this thread was known to have blocked, in mach absolute units.
 ///
 /// xnu clears `computation_metered` in `thread_unblock()`, so this is a conservative shadow of
@@ -184,12 +196,21 @@ impl Heartbeat {
             mach_wait_until(deadline);
         }
         self.observed_block();
+        // Whether the beat reaches a saturated vCPU at all is the thing to check first when the
+        // band still misbehaves under load, so make it observable without a debugger.
+        let n = BEATS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 200 == 0 {
+            log::info!("[VCPU-RT] heartbeat parks so far: {n}");
+        }
     }
 }
 
 /// Move the *calling* thread into whichever band was asked for. Must run on the vCPU thread
 /// itself, since both policies apply to the current thread.
 pub fn set_realtime_band(vcpuid: u64) {
+    if vcpu_limit().is_some_and(|limit| vcpuid >= limit) {
+        return;
+    }
     let (band, heartbeat) = requested();
     let Some(band) = band else {
         return;
