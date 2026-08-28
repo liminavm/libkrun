@@ -22,7 +22,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus};
+use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus, vcpu_request_exit};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -580,6 +580,26 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
+        // A guest that saturates this vCPU may never leave the guest on its own, so the loop below
+        // would never get to park and the real-time band's fail-safe would demote us. This kick
+        // forces the exit; the loop decides whether a park is actually due.
+        let heartbeat = Arc::new(vcpu_sched::Heartbeat::new());
+        let hb_interval = vcpu_sched::heartbeat_interval();
+        if let Some(interval) = hb_interval {
+            let heartbeat = Arc::clone(&heartbeat);
+            thread::Builder::new()
+                .name(format!("vcpu{}-hb", self.id))
+                .spawn(move || {
+                    loop {
+                        thread::sleep(interval / 2);
+                        if heartbeat.is_stale(interval) {
+                            let _ = vcpu_request_exit(hvf_vcpuid);
+                        }
+                    }
+                })
+                .ok();
+        }
+
         if let Some(state) = self.restore_state.take() {
             // M9 restore: the HVF vCPU now exists with its MPIDR set (a precondition for
             // `hv_gic_set_state`). Wait on the shared gate until the main thread has restored the
@@ -623,6 +643,9 @@ impl Vcpu {
             // guest runs and freeze on this thread, where the HvfVcpu lives.
             // A `Snapshot` saves this vCPU's state on its own thread (HVF register
             // affinity) and then parks the same way.
+            if let Some(interval) = hb_interval {
+                heartbeat.beat(interval);
+            }
             match self.event_receiver.try_recv() {
                 Ok(VcpuEvent::Pause) => self.pause_and_park(&hvf_vcpu),
                 Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(&mut hvf_vcpu, reply),
@@ -640,11 +663,13 @@ impl Vcpu {
                 Ok(VcpuEmulation::CpuOff) => self.handle_offline(&mut hvf_vcpu),
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu)
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu);
+                    heartbeat.observed_block();
                 }
                 Ok(VcpuEmulation::WaitForEventExpired) => wfi_latency::record_expired(),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu);
+                    heartbeat.observed_block();
                 }
                 // The guest halted / powered off (PSCI SYSTEM_OFF).
                 Ok(VcpuEmulation::Stopped) => {
