@@ -22,7 +22,10 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus, vcpu_request_exit};
+use hvf::{
+    HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuPower, VcpuState, Vcpus,
+    vcpu_request_exit,
+};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -628,6 +631,25 @@ impl Vcpu {
                 "vCPU {hvf_vcpuid} resumed from snapshot at pc={:#x}",
                 state.pc
             );
+            // Put a vCPU that was PARKED back into its park. Its saved PC is the instruction
+            // after a PSCI call that does not return on success, so letting it run would make a
+            // secondary return from CPU_OFF (which Linux treats as a BUG) and the boot CPU return
+            // from a SYSTEM_SUSPEND it never took — the guest then executes nothing at all, which
+            // is exactly what a restored deep-suspended guest did before this. Re-parking here
+            // means the restore-path wake finds the same shape it would have found in the
+            // original worker: cpu0 waiting to be re-armed, secondaries waiting for CPU_ON.
+            match state.power {
+                VcpuPower::Running => {}
+                VcpuPower::Offline => {
+                    self.vcpu_list.set_online(hvf_vcpuid, false);
+                    self.handle_offline(&mut hvf_vcpu);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                }
+                VcpuPower::SystemSuspended { entry, context_id } => {
+                    self.handle_system_suspend(&mut hvf_vcpu, &wfe_receiver, entry, context_id);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                }
+            }
         } else {
             let entry_addr = if self.boot_receiver.is_some() {
                 match self.wait_for_boot_entry(&mut hvf_vcpu) {
@@ -831,6 +853,7 @@ impl Vcpu {
         let hvf_vcpuid = hvf_vcpu.id();
         debug!("vCPU {hvf_vcpuid} parked (offlined via PSCI CPU_OFF)");
         self.vcpu_list.set_parked(hvf_vcpuid, true);
+        hvf_vcpu.set_power(VcpuPower::Offline);
         // Clones so the select does not borrow `self` across the pause_and_park/handle_snapshot calls.
         let boot = self.boot_receiver.clone();
         let events = self.event_receiver.clone();
@@ -848,6 +871,7 @@ impl Vcpu {
                 hvf_vcpu
                     .reonline(entry, self.fdt_addr)
                     .unwrap_or_else(|e| panic!("re-online of vCPU {hvf_vcpuid} failed: {e:?}"));
+                hvf_vcpu.set_power(VcpuPower::Running);
                 debug!("vCPU {hvf_vcpuid} re-onlined (PSCI CPU_ON) at entry 0x{entry:x}");
                 return;
             }
@@ -891,6 +915,7 @@ impl Vcpu {
         debug!("vCPU {hvf_vcpuid} parked (PSCI SYSTEM_SUSPEND), resume entry 0x{entry:x}");
         self.vcpu_list.set_parked(hvf_vcpuid, true);
         self.vcpu_list.set_system_suspended(Some(hvf_vcpuid));
+        hvf_vcpu.set_power(VcpuPower::SystemSuspended { entry, context_id });
         // Clone so the select does not borrow `self` across pause_and_park/handle_snapshot.
         let events = self.event_receiver.clone();
         loop {
@@ -927,6 +952,7 @@ impl Vcpu {
                     panic!("system-suspend resume of vCPU {hvf_vcpuid} failed: {e:?}")
                 });
             self.vcpu_list.set_system_suspended(None);
+            hvf_vcpu.set_power(VcpuPower::Running);
             info!("vCPU {hvf_vcpuid} resumed from PSCI SYSTEM_SUSPEND at 0x{entry:x}");
             return;
         }

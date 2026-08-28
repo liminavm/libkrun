@@ -19,7 +19,7 @@ use devices::legacy::GpioState;
 use devices::usb_state::{
     XhciEpState, XhciEventRingState, XhciPortState, XhciSlotState, XhciState,
 };
-use hvf::VcpuState;
+use hvf::{VcpuPower, VcpuState};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 const MAGIC: &[u8; 8] = b"LIMINAS1";
@@ -50,7 +50,13 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // is lost, while the guest resumes believing xHCI's own CSS/CRS save-restore preserved it: it
 // light-resumes, its first command walks a blank controller, and USB dies. See
 // docs/design/usb-xhci-snapshot/ in the limina repo.
-const VERSION: u32 = 7;
+// v8 adds each vCPU's PSCI power state. Deep suspend (PSCI SYSTEM_SUSPEND, which is what
+// `systemctl suspend` means once we advertise PSCI 1.0) offlines every secondary through CPU_OFF
+// and parks the caller in SYSTEM_SUSPEND, so a snapshot taken through the suspend bracket now
+// captures parked vCPUs as a matter of course. Their saved PC is the instruction after a PSCI
+// call that never returns; resuming them there makes a secondary return from CPU_OFF and the boot
+// CPU return from a suspend it did not take, and the guest never executes anything again.
+const VERSION: u32 = 8;
 
 /// v6 RAM chunk size: 4 MiB — large enough to amortize per-frame overhead, small enough to spread
 /// across the worker pool and bound per-worker scratch memory.
@@ -217,6 +223,18 @@ fn encode_vcpu(v: &mut Vec<u8>, s: &VcpuState) {
     v.push(s.vtimer_masked as u8);
     v.push(s.pending_irq as u8);
     v.push(s.pending_fiq as u8);
+    // v8: PSCI power state. Tag 0 = Running, 1 = Offline, 2 = SystemSuspended (+ entry,
+    // context_id). A parked vCPU's saved PC sits after a PSCI call that must not return, so
+    // without this the restore resumes it into a state the architecture forbids.
+    match s.power {
+        VcpuPower::Running => v.push(0),
+        VcpuPower::Offline => v.push(1),
+        VcpuPower::SystemSuspended { entry, context_id } => {
+            v.push(2);
+            put_u64(v, entry);
+            put_u64(v, context_id);
+        }
+    }
 }
 
 fn encode_head(head: &SnapshotHead) -> Vec<u8> {
@@ -592,6 +610,20 @@ fn decode_vcpu(r: &mut Reader) -> io::Result<VcpuState> {
     let vtimer_masked = r.u8()? != 0;
     let pending_irq = r.u8()? != 0;
     let pending_fiq = r.u8()? != 0;
+    let power = match r.u8()? {
+        0 => VcpuPower::Running,
+        1 => VcpuPower::Offline,
+        2 => VcpuPower::SystemSuspended {
+            entry: r.u64()?,
+            context_id: r.u64()?,
+        },
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown vCPU power tag {other}"),
+            ));
+        }
+    };
     Ok(VcpuState {
         x,
         pc,
@@ -605,6 +637,7 @@ fn decode_vcpu(r: &mut Reader) -> io::Result<VcpuState> {
         vtimer_masked,
         pending_irq,
         pending_fiq,
+        power,
     })
 }
 
@@ -1064,6 +1097,17 @@ mod tests {
             vtimer_masked: seed % 2 == 1,
             pending_irq: seed % 2 == 0,
             pending_fiq: seed % 3 == 0,
+            // Vary by seed so the round-trip covers all three encodings, including the
+            // variable-length one (SystemSuspended carries two u64s; the others carry none, so a
+            // mis-sized tag would desync every field after it).
+            power: match seed % 3 {
+                0 => VcpuPower::Running,
+                1 => VcpuPower::Offline,
+                _ => VcpuPower::SystemSuspended {
+                    entry: seed + 600,
+                    context_id: seed + 700,
+                },
+            },
         }
     }
 
@@ -1264,6 +1308,18 @@ mod tests {
         assert_eq!(head.vcpus[0].sysregs, want.vcpus[0].sysregs);
         assert_eq!(head.vcpus[1].icc, want.vcpus[1].icc);
         assert_eq!(head.vcpus[0].pending_irq, want.vcpus[0].pending_irq);
+        // The power tag is variable-length (SystemSuspended carries two u64s, the others none),
+        // so a wrong tag desyncs every field decoded after it. seed 1 is Offline, seed 2 is
+        // SystemSuspended: both encodings, and the pair pins that the second vCPU decodes
+        // correctly after the first one's shorter tag.
+        assert_eq!(head.vcpus[0].power, VcpuPower::Offline);
+        assert_eq!(
+            head.vcpus[1].power,
+            VcpuPower::SystemSuspended {
+                entry: 2 + 600,
+                context_id: 2 + 700
+            }
+        );
         assert_eq!(head.gic, want.gic);
         let gpio = head.gpio.as_ref().expect("gpio present");
         assert_eq!(gpio.im, 0x78);

@@ -589,6 +589,24 @@ struct MmioRead {
     srt: u32,
 }
 
+/// A vCPU's PSCI power state at snapshot time.
+///
+/// Without this the restore is architecturally incoherent, not merely imprecise: every vCPU
+/// resumes at its saved PC, and for a parked one that PC is the instruction after the PSCI call
+/// it never returned from. A secondary then returns from `CPU_OFF` — which Linux requires never
+/// to return — and the boot CPU returns from a `SYSTEM_SUSPEND` it did not take. Deep suspend
+/// puts every secondary in `Offline` and the caller in `SystemSuspended`, so this is the normal
+/// state of any snapshot taken through the suspend bracket, not a corner case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcpuPower {
+    /// Executing guest code (or in a WFx wait, which resumes on its own).
+    Running,
+    /// Powered off via PSCI `CPU_OFF`; resumes only on a `CPU_ON` naming it.
+    Offline,
+    /// Parked in PSCI `SYSTEM_SUSPEND`, to be re-armed at `entry` on wake.
+    SystemSuspended { entry: u64, context_id: u64 },
+}
+
 /// A full snapshot of one vCPU's architectural state (M9 suspend/resume). Everything HVF
 /// exposes that a resumed guest needs: the general-purpose registers + PC + PSTATE, the SIMD/FP
 /// bank, the EL1/EL0 system-register set ([`SNAPSHOT_SYS_REGS`], values in the same order), the
@@ -618,6 +636,8 @@ pub struct VcpuState {
     pub vtimer_masked: bool,
     pub pending_irq: bool,
     pub pending_fiq: bool,
+    /// The PSCI power state this vCPU was in. See [`VcpuPower`].
+    pub power: VcpuPower,
 }
 
 /// The per-vCPU GIC CPU-interface (`ICC_*_EL1`) registers captured in a [`VcpuState`], in
@@ -709,6 +729,8 @@ pub struct HvfVcpu<'a> {
     pending_advance_pc: bool,
     vtimer_masked: bool,
     nested_enabled: bool,
+    /// This vCPU's PSCI power state, maintained by the park sites so a snapshot can record it.
+    power: VcpuPower,
     // Cached copy of the HVF vtimer offset (0 until a live pause advances it),
     // so the WFE deadline check doesn't issue a syscall on every wait.
     vtimer_offset: Cell<u64>,
@@ -763,6 +785,7 @@ impl HvfVcpu<'_> {
             pending_advance_pc: false,
             vtimer_masked: false,
             nested_enabled,
+            power: VcpuPower::Running,
             vtimer_offset: Cell::new(0),
             released_ram: None,
         })
@@ -1073,6 +1096,9 @@ impl HvfVcpu<'_> {
             vtimer_masked: self.read_vtimer_mask()?,
             pending_irq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
             pending_fiq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
+            // The register file alone cannot say this: a parked vCPU looks exactly like one that
+            // is about to return from a PSCI call. The park sites set it (see `set_power`).
+            power: self.power,
         })
     }
 
@@ -1163,6 +1189,12 @@ impl HvfVcpu<'_> {
         let sctlr = self.read_sys_reg(sctlr_reg)?;
         self.write_sys_reg(sctlr_reg, sctlr & !(SCTLR_M | SCTLR_C | SCTLR_I))?;
         self.set_initial_state(entry_addr, fdt_addr)
+    }
+
+    /// Record this vCPU's PSCI power state, so a snapshot taken while it is parked restores it
+    /// into the same park rather than into a return from a call that never returns.
+    pub fn set_power(&mut self, power: VcpuPower) {
+        self.power = power;
     }
 
     /// Re-arm this vCPU after a PSCI `SYSTEM_SUSPEND`, at the resume entry point the guest gave us.
