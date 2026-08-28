@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use devices::legacy::VcpuList;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
@@ -256,6 +257,7 @@ impl MMIODeviceManager {
         suspend_efd: EventFd,
         restart_efd: EventFd,
         wake_efd: EventFd,
+        vcpu_list: Arc<VcpuList>,
     ) -> Result<()> {
         // Attaching the GPIO device.
         let gpio_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
@@ -265,6 +267,7 @@ impl MMIODeviceManager {
             restart_efd,
             wake_efd,
             gpio_evt.try_clone().map_err(Error::EventFd)?,
+            vcpu_list,
         )));
 
         event_manager.add_subscriber(gpio.clone()).unwrap();
@@ -414,8 +417,8 @@ impl MMIODeviceManager {
     /// exception (no PM ops → stays `DRIVER_OK`). Only virtio-mmio transports are inspected (the
     /// legacy PL0xx devices carry no virtio status).
     pub fn virtio_statuses(&self) -> Vec<(u32, String, u32)> {
-        use devices::virtio::MmioTransport;
         use devices::BusDevice;
+        use devices::virtio::MmioTransport;
         let mut out = Vec::new();
         for (dtype, id) in self.id_to_dev_info.keys() {
             if let DeviceType::Virtio(type_id) = *dtype {
@@ -441,8 +444,8 @@ impl MMIODeviceManager {
     /// can fail closed on a layout mismatch.
     pub fn capture_transport_states(&self) -> Vec<crate::snapshot::DeviceTransportState> {
         use crate::snapshot::{DeviceTransportState, QueueRegs};
-        use devices::virtio::MmioTransport;
         use devices::BusDevice;
+        use devices::virtio::MmioTransport;
         let mut out = Vec::new();
         for ((dtype, id), dev_info) in self.id_to_dev_info.iter() {
             let DeviceType::Virtio(type_id) = *dtype else {

@@ -51,8 +51,6 @@ use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
 use devices::legacy::VcpuList;
 #[cfg(target_os = "macos")]
-use hvf::IpaGranule;
-#[cfg(target_os = "macos")]
 use devices::legacy::{GicV3, HvfGicV3};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::{IoApic, IrqChipT};
@@ -62,6 +60,8 @@ use devices::legacy::{KvmGicV2, KvmGicV3};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::passthrough::PermissionSemantics;
 use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, Vsock, port_io};
+#[cfg(target_os = "macos")]
+use hvf::IpaGranule;
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -982,6 +982,7 @@ pub fn build_microvm(
             _suspend_efd,
             _restart_efd,
             _wake_efd,
+            vcpu_list.clone(),
         )?;
 
         // limina: emulated xHCI USB controller (opt-in). Registered after the legacy
@@ -2179,6 +2180,7 @@ fn attach_legacy_devices(
     suspend_efd: Option<EventFd>,
     restart_efd: Option<EventFd>,
     wake_efd: Option<EventFd>,
+    vcpu_list: Arc<VcpuList>,
 ) -> Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2221,6 +2223,7 @@ fn attach_legacy_devices(
                 suspend_efd,
                 restart_efd,
                 wake_efd,
+                vcpu_list,
             )
             .map_err(Error::RegisterMMIODevice)
             .map_err(StartMicrovmError::Internal)?;

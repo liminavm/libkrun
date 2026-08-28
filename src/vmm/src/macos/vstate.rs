@@ -679,7 +679,7 @@ impl Vcpu {
                 // for CPU_OFF, but wake on the host's `SystemWake` instead of a guest CPU_ON —
                 // a system-suspended guest has no other vCPU left to issue one.
                 Ok(VcpuEmulation::SystemSuspend { entry, context_id }) => {
-                    self.handle_system_suspend(&mut hvf_vcpu, entry, context_id);
+                    self.handle_system_suspend(&mut hvf_vcpu, &wfe_receiver, entry, context_id);
                     self.vcpu_list.set_parked(hvf_vcpuid, false);
                 }
                 // Wait for an external event.
@@ -867,10 +867,11 @@ impl Vcpu {
     /// vCPU — the last one still running — until the host sends [`VcpuEvent::SystemWake`], then
     /// re-arm it at the resume entry point the guest handed us and return to the run loop.
     ///
-    /// Waking is host-driven by construction. A system-suspended guest has no vCPU left to take
-    /// an interrupt, so the GPIO wake-key pulse that wakes an s2idle guest cannot reach this one:
-    /// the only way back is the VMM resetting this vCPU. That is why the wake API is part of the
-    /// same change as the exit — advertising SYSTEM_SUSPEND without it strands the guest.
+    /// Two things wake it, and both must, because both are real: a **wakeup-source IRQ** (the
+    /// `KEY_WAKEUP` GPIO — PSCI defines SYSTEM_SUSPEND as resuming on a wakeup event, so this is
+    /// the architectural path and the one every existing in-place wake already uses), and the
+    /// host's explicit [`VcpuEvent::SystemWake`]. Supporting only the latter silently strands
+    /// every caller that pulses the wake key, which is what the in-place s2idle tests do.
     ///
     /// The re-arm is the CPU_ON reset shape ([`HvfVcpu::reonline`]): entry is a PHYSICAL address
     /// with the MMU and caches off, which is exactly the contract arm64's `cpu_resume` expects
@@ -879,29 +880,55 @@ impl Vcpu {
     ///
     /// Pause/Snapshot arriving while system-suspended are serviced in place, as in
     /// [`Self::handle_offline`], so the M9 bracket never hangs waiting for this vCPU.
-    fn handle_system_suspend(&mut self, hvf_vcpu: &mut HvfVcpu, entry: u64, context_id: u64) {
+    fn handle_system_suspend(
+        &mut self,
+        hvf_vcpu: &mut HvfVcpu,
+        wfe_receiver: &Receiver<u32>,
+        entry: u64,
+        context_id: u64,
+    ) {
         let hvf_vcpuid = hvf_vcpu.id();
         debug!("vCPU {hvf_vcpuid} parked (PSCI SYSTEM_SUSPEND), resume entry 0x{entry:x}");
         self.vcpu_list.set_parked(hvf_vcpuid, true);
         self.vcpu_list.set_system_suspended(Some(hvf_vcpuid));
+        // Clone so the select does not borrow `self` across pause_and_park/handle_snapshot.
         let events = self.event_receiver.clone();
         loop {
-            match events.recv() {
-                Ok(VcpuEvent::SystemWake) => {
-                    hvf_vcpu
-                        .resume_from_system_suspend(entry, self.fdt_addr, context_id)
-                        .unwrap_or_else(|e| {
-                            panic!("system-suspend resume of vCPU {hvf_vcpuid} failed: {e:?}")
-                        });
-                    self.vcpu_list.set_system_suspended(None);
-                    info!("vCPU {hvf_vcpuid} resumed from PSCI SYSTEM_SUSPEND at 0x{entry:x}");
-                    return;
+            // Mark this vCPU WFx-waiting so a device IRQ arrives over the wfe channel: it is
+            // parked in a `recv`, not in `hv_vcpu_run`, so the `hv_vcpus_exit` kick a running
+            // vCPU gets would reach nobody. `should_wait` returning false means an IRQ is
+            // already pending — a wakeup event that beat us here, so resume immediately.
+            let wake = if !self.vcpu_list.should_wait(hvf_vcpuid) {
+                true
+            } else {
+                select! {
+                    recv(wfe_receiver) -> r => {
+                        r.expect("WFE channel closed unexpectedly");
+                        true
+                    }
+                    recv(events) -> ev => match ev {
+                        Ok(VcpuEvent::SystemWake) => true,
+                        Ok(VcpuEvent::Pause) => { self.pause_and_park(hvf_vcpu); false }
+                        Ok(VcpuEvent::Snapshot(reply)) => {
+                            self.handle_snapshot(hvf_vcpu, reply);
+                            false
+                        }
+                        Ok(VcpuEvent::Resume(_)) => false, // stale resume with no pause: ignore
+                        Err(_) => return,                  // channel dropped: tearing down
+                    },
                 }
-                Ok(VcpuEvent::Pause) => self.pause_and_park(hvf_vcpu),
-                Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(hvf_vcpu, reply),
-                Ok(VcpuEvent::Resume(_)) => {} // stale resume with no pause: ignore
-                Err(_) => return,              // channel dropped: process tearing down
+            };
+            if !wake {
+                continue;
             }
+            hvf_vcpu
+                .resume_from_system_suspend(entry, self.fdt_addr, context_id)
+                .unwrap_or_else(|e| {
+                    panic!("system-suspend resume of vCPU {hvf_vcpuid} failed: {e:?}")
+                });
+            self.vcpu_list.set_system_suspended(None);
+            info!("vCPU {hvf_vcpuid} resumed from PSCI SYSTEM_SUSPEND at 0x{entry:x}");
+            return;
         }
     }
 
@@ -1062,7 +1089,10 @@ enum VcpuEmulation {
     CpuOff,
     /// The guest asked firmware to suspend the whole system (PSCI `SYSTEM_SUSPEND`) — park this
     /// vCPU until the host wakes it, then re-arm at `entry`.
-    SystemSuspend { entry: u64, context_id: u64 },
+    SystemSuspend {
+        entry: u64,
+        context_id: u64,
+    },
     WaitForEvent,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
