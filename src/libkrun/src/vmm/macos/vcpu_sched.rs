@@ -31,8 +31,8 @@
 //!
 //! `LIMINA_VCPU_RT` is still read as the old spelling of `rt`.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
@@ -61,6 +61,7 @@ struct MachTimebaseInfo {
 
 unsafe extern "C" {
     fn mach_thread_self() -> u32;
+    fn thread_info(thread: u32, flavor: u32, info: *mut u32, count: *mut u32) -> i32;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
     fn thread_policy_set(thread: u32, flavor: u32, policy: *mut u32, count: u32) -> i32;
     fn mach_absolute_time() -> u64;
@@ -71,7 +72,19 @@ unsafe extern "C" {
 /// `QOS_CLASS_USER_INTERACTIVE` from `sys/qos.h`.
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
+const THREAD_EXTENDED_POLICY: u32 = 1;
+const THREAD_BASIC_INFO: u32 = 3;
+/// `thread_basic_info_data_t` is ten `natural_t`s.
+const THREAD_BASIC_INFO_COUNT: u32 = 10;
+
 const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(250);
+
+/// How often the dynamic sampler looks at each vCPU thread's CPU share.
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+/// Arm below this share of a core, disarm above the upper one. The gap is the hysteresis that
+/// keeps a thread hovering at the boundary from flapping between policies every sample.
+const ARM_BELOW: f64 = 0.35;
+const DISARM_ABOVE: f64 = 0.60;
 /// Long enough that the thread really parks — a deadline already behind us returns without ever
 /// entering `TH_WAIT`, and then nothing is cleared.
 const HEARTBEAT_PARK: Duration = Duration::from_micros(100);
@@ -100,12 +113,25 @@ fn vcpu_limit() -> Option<u64> {
     raw.split_once('#').and_then(|(_, n)| n.trim().parse().ok())
 }
 
+/// Whether the policy is applied dynamically, per vCPU, from that thread's own CPU share.
+fn dynamic() -> bool {
+    std::env::var("LIMINA_VCPU_SCHED")
+        .map(|v| v.contains("+dyn"))
+        .unwrap_or(false)
+}
+
 /// The policy and the heartbeat interval, from the environment. `None` for either means off.
 fn requested() -> (Option<Band>, Option<Duration>) {
     let raw = std::env::var("LIMINA_VCPU_SCHED")
         .or_else(|_| std::env::var("LIMINA_VCPU_RT"))
         .unwrap_or_default();
-    let raw = raw.split('#').next().unwrap_or_default().trim().to_string();
+    let raw = raw
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .replace("+dyn", "")
+        .trim()
+        .to_string();
     let raw = raw.as_str();
     if raw.is_empty() || raw == "0" || raw.eq_ignore_ascii_case("off") {
         return (None, None);
@@ -205,6 +231,115 @@ impl Heartbeat {
     }
 }
 
+/// One banded thread's mach port and the CPU time it had at the last sample.
+struct Sampled {
+    vcpuid: u64,
+    port: u32,
+    cpu_us: u64,
+    armed: bool,
+}
+
+static REGISTRY: Mutex<Vec<Sampled>> = Mutex::new(Vec::new());
+
+/// Total CPU time this thread has used, from `THREAD_BASIC_INFO`.
+fn thread_cpu_us(port: u32) -> Option<u64> {
+    let mut info = [0u32; THREAD_BASIC_INFO_COUNT as usize];
+    let mut count = THREAD_BASIC_INFO_COUNT;
+    if unsafe { thread_info(port, THREAD_BASIC_INFO, info.as_mut_ptr(), &mut count) } != 0 {
+        return None;
+    }
+    // user_time then system_time, each a `time_value_t` of {seconds, microseconds}.
+    let secs = u64::from(info[0]) + u64::from(info[2]);
+    let usecs = u64::from(info[1]) + u64::from(info[3]);
+    Some(secs * 1_000_000 + usecs)
+}
+
+/// Take `port` back out of the real-time band and return it to ordinary timeshare scheduling.
+fn set_timeshare(port: u32) -> bool {
+    let mut timeshare: u32 = 1;
+    unsafe { thread_policy_set(port, THREAD_EXTENDED_POLICY, &mut timeshare, 1) == 0 }
+}
+
+/// Apply the band to another thread by port. Same policy as [`set_realtime_band`], which applies
+/// it to the calling thread at startup.
+fn set_band_on(port: u32, band: Band) -> bool {
+    let Band::RealTime(period, computation, constraint) = band else {
+        return false;
+    };
+    let mut policy = ThreadTimeConstraintPolicy {
+        period: ns_to_abs(period.as_nanos() as u64),
+        computation: ns_to_abs(computation.as_nanos() as u64),
+        constraint: ns_to_abs(constraint.as_nanos() as u64),
+        preemptible: 1,
+    };
+    let count = (size_of::<ThreadTimeConstraintPolicy>() / size_of::<u32>()) as u32;
+    unsafe {
+        thread_policy_set(
+            port,
+            THREAD_TIME_CONSTRAINT_POLICY,
+            &mut policy as *mut _ as *mut u32,
+            count,
+        ) == 0
+    }
+}
+
+/// Whether an armed thread should give its core back, or a disarmed one may take the band.
+///
+/// The band is a *reservation*: a banded thread preempts the host's own work, and every vCPU
+/// thread banded at once leaves the present path nothing to run on. A vCPU that is mostly idle is
+/// exactly the one that needs a punctual timer wake and the one that costs nothing to promise, so
+/// arming follows each thread's own share of a core rather than a global switch.
+fn next_state(armed: bool, share: f64) -> bool {
+    if armed {
+        share <= DISARM_ABOVE
+    } else {
+        share < ARM_BELOW
+    }
+}
+
+/// Start the sampler that arms and disarms each registered vCPU thread. Idempotent.
+fn start_sampler(band: Band) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("vcpu-band-sampler".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(SAMPLE_INTERVAL);
+                let mut threads = REGISTRY.lock().unwrap();
+                for t in threads.iter_mut() {
+                    let Some(now_us) = thread_cpu_us(t.port) else {
+                        continue;
+                    };
+                    let share = (now_us.saturating_sub(t.cpu_us)) as f64
+                        / SAMPLE_INTERVAL.as_micros() as f64;
+                    t.cpu_us = now_us;
+                    let want = next_state(t.armed, share);
+                    if want == t.armed {
+                        continue;
+                    }
+                    let ok = if want {
+                        set_band_on(t.port, band)
+                    } else {
+                        set_timeshare(t.port)
+                    };
+                    if ok {
+                        t.armed = want;
+                        log::debug!(
+                            "[VCPU-RT] vCPU {} {} the band (share {:.0}%)",
+                            t.vcpuid,
+                            if want { "took" } else { "gave back" },
+                            share * 100.0
+                        );
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
 /// Move the *calling* thread into whichever band was asked for. Must run on the vCPU thread
 /// itself, since both policies apply to the current thread.
 pub fn set_realtime_band(vcpuid: u64) {
@@ -227,6 +362,24 @@ pub fn set_realtime_band(vcpuid: u64) {
         }
         Band::RealTime(p, c, k) => (p, c, k),
     };
+
+    if dynamic() {
+        // Register and let the sampler decide: a vCPU that is running guest code flat out must not
+        // hold a real-time reservation, whatever it is doing right now.
+        let port = unsafe { mach_thread_self() };
+        REGISTRY.lock().unwrap().push(Sampled {
+            vcpuid,
+            port,
+            cpu_us: thread_cpu_us(port).unwrap_or(0),
+            armed: false,
+        });
+        start_sampler(band);
+        log::info!(
+            "[VCPU-RT] vCPU {vcpuid} joins the dynamic band (period={period:?} \
+             computation={computation:?} constraint={constraint:?})"
+        );
+        return;
+    }
     let mut policy = ThreadTimeConstraintPolicy {
         period: ns_to_abs(period.as_nanos() as u64),
         computation: ns_to_abs(computation.as_nanos() as u64),
@@ -269,6 +422,22 @@ mod tests {
             back.abs_diff(ns as u128) < 100,
             "round-tripped to {back} ns"
         );
+    }
+
+    #[test]
+    fn arming_has_a_gap_a_thread_can_sit_in() {
+        // Without hysteresis a vCPU hovering at the threshold changes policy every sample, and a
+        // policy change is exactly the moment the present path can lose its core.
+        assert!(ARM_BELOW < DISARM_ABOVE);
+        // Idle: takes the band and keeps it.
+        assert!(next_state(false, 0.02));
+        assert!(next_state(true, 0.02));
+        // In the gap: whatever it was, it stays.
+        assert!(!next_state(false, 0.5));
+        assert!(next_state(true, 0.5));
+        // Running flat out: gives the core back and does not take it again.
+        assert!(!next_state(true, 0.99));
+        assert!(!next_state(false, 0.99));
     }
 
     #[test]
