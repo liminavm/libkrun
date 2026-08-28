@@ -191,6 +191,27 @@ impl VcpuList {
         }
     }
 
+    /// Wake a vCPU parked in PSCI `SYSTEM_SUSPEND`, if the guest is suspended to RAM. Returns
+    /// whether one was woken.
+    ///
+    /// The wake-key IRQ cannot do this job. A guest in suspend-to-RAM has handed wakeup duty to
+    /// firmware and torn its own interrupt state down on the way out (`GPIOMIS = istate & im`
+    /// never fires for a line the guest masked in its PL061 suspend), so the button press it
+    /// would normally see reaches nobody. Firmware — us — resumes the core; the guest then
+    /// re-arms its GIC and sees the button afterwards, which is the same order real hardware
+    /// produces.
+    pub fn wake_system_suspended(&self) -> bool {
+        match self.system_suspended() {
+            Some(vcpuid) => {
+                if let Some(vcpu) = self.vcpus.get(vcpuid as usize) {
+                    vcpu.lock().unwrap().kick();
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The vcpuids still executing guest instructions. Empty iff [`Self::all_parked`].
     pub fn park_holdouts(&self) -> Vec<u64> {
         self.vcpus
