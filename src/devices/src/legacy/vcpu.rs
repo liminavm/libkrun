@@ -1,6 +1,7 @@
 use crossbeam_channel::Sender;
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use arch::aarch64::layout::VTIMER_IRQ;
 use arch::aarch64::sysreg::*;
@@ -104,6 +105,11 @@ impl PerCPUInterruptControllerState {
 pub struct VcpuList {
     cpu_count: u64,
     vcpus: Vec<Mutex<PerCPUInterruptControllerState>>,
+    /// The vCPU currently parked in PSCI `SYSTEM_SUSPEND` (suspend-to-RAM), or -1 when the guest
+    /// is not system-suspended. At most one vCPU can be here: the call is only accepted from the
+    /// last core still online. Read by the VMM to decide whether the guest needs a host-driven
+    /// wake (there is no vCPU left to take a wake interrupt) and which vCPU to send it to.
+    system_suspended: AtomicI64,
 }
 
 impl VcpuList {
@@ -120,7 +126,11 @@ impl VcpuList {
             }));
         }
 
-        Self { cpu_count, vcpus }
+        Self {
+            cpu_count,
+            vcpus,
+            system_suspended: AtomicI64::new(-1),
+        }
     }
 
     pub fn get_cpu_count(&self) -> u64 {
@@ -165,6 +175,20 @@ impl VcpuList {
     /// accounting elapsed time as running time.
     pub fn all_parked(&self) -> bool {
         self.park_holdouts().is_empty()
+    }
+
+    /// Record that `vcpuid` has parked in PSCI `SYSTEM_SUSPEND`, or clear it on resume.
+    pub fn set_system_suspended(&self, vcpuid: Option<u64>) {
+        self.system_suspended
+            .store(vcpuid.map(|v| v as i64).unwrap_or(-1), Ordering::SeqCst);
+    }
+
+    /// The vCPU parked in PSCI `SYSTEM_SUSPEND`, if the guest is suspended to RAM.
+    pub fn system_suspended(&self) -> Option<u64> {
+        match self.system_suspended.load(Ordering::SeqCst) {
+            -1 => None,
+            v => Some(v as u64),
+        }
     }
 
     /// The vcpuids still executing guest instructions. Empty iff [`Self::all_parked`].
@@ -218,6 +242,14 @@ impl Vcpus for VcpuList {
             .get(vcpuid as usize)
             .map(|v| v.lock().unwrap().online)
             .unwrap_or(false)
+    }
+
+    fn others_all_offline(&self, vcpuid: u64) -> bool {
+        self.vcpus
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i as u64 != vcpuid)
+            .all(|(_, v)| !v.lock().unwrap().online)
     }
 
     fn set_parked(&self, vcpuid: u64, parked: bool) {
