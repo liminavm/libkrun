@@ -159,6 +159,18 @@ const EC_AA64_BKPT: u64 = 0x3c;
 /// probes an optional function (e.g. PSCI_FEATURES) keeps running instead of crashing the VMM.
 const PSCI_RET_NOT_SUPPORTED: u64 = -1i64 as u64;
 
+/// PSCI standard return: the request is understood but refused in the current state (Arm DEN 0022,
+/// value -3). Returned for a `SYSTEM_SUSPEND` issued while another vCPU is still online.
+const PSCI_RET_DENIED: u64 = -3i64 as u64;
+
+/// The PSCI version we report: 1.0, encoded major<<16 | minor (Arm DEN 0022).
+///
+/// Reporting >= 1.0 is what makes Linux probe the 1.0 function set at all — `psci_probe()` only
+/// calls `psci_init_system_suspend()` when the major version is >= 1 (`drivers/firmware/psci/psci.c`).
+/// It also costs a handful of extra probe SMCs at boot (SMCCC_VERSION, CPU_SUSPEND features,
+/// the KVM vendor-hypervisor UID), all of which we answer NOT_SUPPORTED.
+const PSCI_VERSION_1_0: u64 = 0x0001_0000;
+
 #[derive(Debug)]
 pub enum Error {
     EnableEL2,
@@ -246,6 +258,10 @@ pub trait Vcpus {
     fn set_online(&self, vcpuid: u64, online: bool);
     /// This vCPU's PSCI power state. Out-of-range vcpuids report offline (safe default).
     fn is_online(&self, vcpuid: u64) -> bool;
+    /// Are all vCPUs other than `vcpuid` powered off (PSCI `CPU_OFF`)? Gates `SYSTEM_SUSPEND`,
+    /// which the spec allows only when the caller is the last core standing; anything else must
+    /// be refused with `DENIED`.
+    fn others_all_offline(&self, vcpuid: u64) -> bool;
     /// Record whether this vCPU is blocked in a WFx wait. Set around the wait, so a
     /// caller can tell a guest that has genuinely stopped executing from one that is
     /// merely not taking vmexits.
@@ -522,6 +538,19 @@ pub enum VcpuExit<'a> {
     /// re-mapped). The PC was deliberately NOT advanced: re-running the vCPU retries the faulting
     /// access against the restored mapping. (limina addition — the FRQ/balloon unmap fix.)
     StageTwoHealed,
+    /// PSCI `SYSTEM_SUSPEND` — the guest's LAST running vCPU asked firmware to suspend the whole
+    /// system (suspend-to-RAM). Carries the resume `entry_point_address` and `context_id` the
+    /// guest passed; the vmm must park this vCPU and later re-arm it at `entry` (the same reset
+    /// shape as [`Self::CpuOn`]) to resume the guest. (limina addition.)
+    ///
+    /// This is the exact, race-free quiesce signal the GPIO-pulse-and-poll bracket could only
+    /// approximate: Linux issues it from `syscore_suspend()`, i.e. AFTER every secondary vCPU has
+    /// gone through `CPU_OFF` and AFTER `timekeeping_suspend()`, so on arrival the guest is
+    /// provably stopped and its clock baseline is already recorded.
+    SystemSuspend {
+        entry: u64,
+        context_id: u64,
+    },
     SystemRegister,
     VtimerActivated,
     WaitForEvent,
@@ -1111,11 +1140,68 @@ impl HvfVcpu<'_> {
         self.set_initial_state(entry_addr, fdt_addr)
     }
 
+    /// Re-arm this vCPU after a PSCI `SYSTEM_SUSPEND`, at the resume entry point the guest gave us.
+    ///
+    /// Same reset shape as [`Self::reonline`] (physical entry, MMU/caches off — what arm64's
+    /// `cpu_resume` expects), then X0 = `context_id` as the PSCI spec requires. Linux's
+    /// `cpu_resume` zeroes X0 before using it, so the value is ceremony for Linux, but a guest
+    /// that does honour it gets the right one.
+    pub fn resume_from_system_suspend(
+        &mut self,
+        entry_addr: u64,
+        fdt_addr: u64,
+        context_id: u64,
+    ) -> Result<(), Error> {
+        self.reonline(entry_addr, fdt_addr)?;
+        self.write_reg(hv_reg_t_HV_REG_X0, context_id)
+    }
+
     fn handle_psci_request(&self, vcpu_list: &Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
         match self.read_reg(hv_reg_t_HV_REG_X0)? {
-            0x8400_0000 /* QEMU_PSCI_0_2_FN_PSCI_VERSION */ => {
-                self.write_reg(hv_reg_t_HV_REG_X0, 2)?;
+            0x8400_0000 /* PSCI_0_2_FN_PSCI_VERSION */ => {
+                self.write_reg(hv_reg_t_HV_REG_X0, PSCI_VERSION_1_0)?;
                 Ok(VcpuExit::PsciHandled)
+            },
+            0x8400_000a /* PSCI_1_0_FN_PSCI_FEATURES */ => {
+                // Feature discovery (1.0+). SUCCESS (0) = implemented with no optional flags;
+                // NOT_SUPPORTED for everything else. Only the functions we actually dispatch may
+                // be advertised: Linux takes a non-NOT_SUPPORTED answer as a promise, and
+                // `psci_init_system_suspend()` registers its suspend ops on the strength of it.
+                let queried = self.read_reg(hv_reg_t_HV_REG_X1)?;
+                let supported = matches!(
+                    queried,
+                    0x8400_0000 /* PSCI_VERSION */
+                    | 0x8400_0002 /* CPU_OFF */
+                    | 0x8400_0004 | 0xc400_0004 /* AFFINITY_INFO */
+                    | 0x8400_0006 /* MIGRATE_INFO_TYPE */
+                    | 0x8400_0008 /* SYSTEM_OFF */
+                    | 0x8400_0009 /* SYSTEM_RESET */
+                    | 0x8400_000a /* PSCI_FEATURES */
+                    | 0xc400_0003 /* CPU_ON */
+                    | 0xc400_000e /* SYSTEM_SUSPEND */
+                );
+                let ret = if supported { 0 } else { PSCI_RET_NOT_SUPPORTED };
+                self.write_reg(hv_reg_t_HV_REG_X0, ret)?;
+                Ok(VcpuExit::PsciHandled)
+            },
+            0xc400_000e /* PSCI_1_0_FN64_SYSTEM_SUSPEND */ => {
+                // Suspend-to-RAM for the whole VM. The spec requires the caller to be the only
+                // core still on; Linux guarantees it (`pm_sleep_disable_secondary_cpus()` runs
+                // before `syscore_suspend()`), but a guest that gets it wrong must be refused
+                // rather than silently parked — a DENIED return unwinds cleanly in the guest's
+                // `cpu_suspend()`, which treats any non-zero result as a failed suspend.
+                if !vcpu_list.others_all_offline(self.vcpuid) {
+                    warn!(
+                        "vCPU {} asked for PSCI SYSTEM_SUSPEND while another vCPU is still online; \
+                         refusing with DENIED",
+                        self.vcpuid
+                    );
+                    self.write_reg(hv_reg_t_HV_REG_X0, PSCI_RET_DENIED)?;
+                    return Ok(VcpuExit::PsciHandled);
+                }
+                let entry = self.read_reg(hv_reg_t_HV_REG_X1)?;
+                let context_id = self.read_reg(hv_reg_t_HV_REG_X2)?;
+                Ok(VcpuExit::SystemSuspend { entry, context_id })
             },
             0x8400_0002 /* QEMU_PSCI_0_2_FN_CPU_OFF */ => {
                 // The guest is offlining THIS vCPU (CPU hotplug down). Record it OFF so the
@@ -1157,9 +1243,27 @@ impl HvfVcpu<'_> {
             val => {
                 // An unmodeled PSCI/SMC function. Standard PSCI behaviour is to return
                 // NOT_SUPPORTED rather than fault — a stock guest probing an optional function
-                // (PSCI_FEATURES, SYSTEM_RESET2, …) then degrades gracefully instead of taking
+                // (SYSTEM_RESET2, STAT_COUNT, …) then degrades gracefully instead of taking
                 // the whole VMM down.
-                warn!("unhandled PSCI/SMC function 0x{val:x}; returning NOT_SUPPORTED");
+                //
+                // Reporting PSCI 1.0 makes Linux probe a fixed set of optional calls on every
+                // boot (SMCCC_VERSION and ARCH_* in the 0x8000_xxxx range, the KVM vendor
+                // hypervisor UID at 0x8600_xxxx, CPU_SUSPEND, and the debugfs feature table).
+                // Those are routine discovery, not anomalies, so they log at debug; anything
+                // outside the known probe ranges still warns.
+                let routine_probe = matches!(val & 0xbfff_ffff,
+                    0x8000_0000..=0x8000_ffff /* SMCCC_VERSION / ARCH_FEATURES / ARCH_WORKAROUND */
+                    | 0x8400_0001 /* CPU_SUSPEND */
+                    | 0x8400_0005 /* MIGRATE */
+                    | 0x8400_0007 /* MIGRATE_INFO_UP_CPU */
+                    | 0x8400_000b..=0x8400_0015 /* CPU_FREEZE … SYSTEM_OFF2 */
+                    | 0x8600_0000..=0x8600_ffff /* vendor hypervisor service range */
+                );
+                if routine_probe {
+                    debug!("PSCI/SMC probe 0x{val:x}; returning NOT_SUPPORTED");
+                } else {
+                    warn!("unhandled PSCI/SMC function 0x{val:x}; returning NOT_SUPPORTED");
+                }
                 self.write_reg(hv_reg_t_HV_REG_X0, PSCI_RET_NOT_SUPPORTED)?;
                 Ok(VcpuExit::PsciHandled)
             }

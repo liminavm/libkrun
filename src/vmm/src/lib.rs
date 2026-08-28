@@ -575,6 +575,40 @@ impl Vmm {
         self.vcpu_list.park_holdouts()
     }
 
+    /// Is the guest suspended to RAM via PSCI `SYSTEM_SUSPEND`?
+    ///
+    /// This is the strongest quiesce state there is: the guest asked firmware to suspend it, so
+    /// every secondary vCPU has already been powered off and `timekeeping_suspend()` has already
+    /// run. Unlike a WFx park it cannot be lost to a wakeup — the guest stays here until
+    /// [`Self::wake_from_system_suspend`].
+    #[cfg(target_os = "macos")]
+    pub fn system_suspended(&self) -> bool {
+        self.vcpu_list.system_suspended().is_some()
+    }
+
+    /// Resume a guest suspended via PSCI `SYSTEM_SUSPEND`, re-arming the suspending vCPU at the
+    /// resume entry point it gave us.
+    ///
+    /// This is the ONLY way back: a system-suspended guest has no vCPU left to take an interrupt,
+    /// so the GPIO wake-key pulse that wakes an s2idle guest does nothing here. Returns whether a
+    /// wake was actually sent (false = the guest was not system-suspended).
+    #[cfg(target_os = "macos")]
+    pub fn wake_from_system_suspend(&mut self) -> std::result::Result<bool, String> {
+        use crate::vstate::VcpuEvent;
+        let Some(vcpuid) = self.vcpu_list.system_suspended() else {
+            return Ok(false);
+        };
+        let handle = self
+            .vcpus_handles
+            .iter()
+            .find(|h| h.hvf_id() == vcpuid)
+            .ok_or_else(|| format!("no handle for system-suspended vCPU {vcpuid}"))?;
+        handle
+            .send_event(VcpuEvent::SystemWake)
+            .map_err(|e| format!("vcpu system-wake event: {e:?}"))?;
+        Ok(true)
+    }
+
     pub fn save_snapshot(&mut self, path: &std::path::Path) -> Result<()> {
         // limina M9.2: log every virtio-mmio device's status at snapshot time — the ground truth for
         // the quiesce oracle, and a durable record of what the captured machine's devices looked like.
