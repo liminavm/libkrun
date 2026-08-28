@@ -8,6 +8,9 @@
 //!
 
 use std::fmt;
+use std::sync::Arc;
+
+use crate::legacy::VcpuList;
 use std::os::fd::AsRawFd;
 use std::result;
 
@@ -111,6 +114,8 @@ pub struct Gpio {
     suspend_efd: EventFd,
     restart_efd: EventFd,
     wake_efd: EventFd,
+    /// Consulted on a wake pulse so suspend-to-RAM guests can be resumed, not just s2idle ones.
+    vcpu_list: Arc<VcpuList>,
 }
 
 impl Gpio {
@@ -121,6 +126,7 @@ impl Gpio {
         restart_efd: EventFd,
         wake_efd: EventFd,
         interrupt_evt: EventFd,
+        vcpu_list: Arc<VcpuList>,
     ) -> Self {
         Self {
             data: 0,
@@ -138,6 +144,7 @@ impl Gpio {
             suspend_efd,
             restart_efd,
             wake_efd,
+            vcpu_list,
         }
     }
 
@@ -359,6 +366,11 @@ impl Subscriber for Gpio {
             }
             _ if source == self.wake_efd.as_raw_fd() => {
                 _ = self.wake_efd.read();
+                // A guest in PSCI SYSTEM_SUSPEND cannot be woken by the button: it has no vCPU
+                // left to take the IRQ, and it masked the line on its way into suspend. Resume
+                // the core first (the firmware half of a wakeup event), then deliver the press
+                // so the guest sees it once its own interrupt state is back.
+                self.vcpu_list.wake_system_suspended();
                 // Send a wake (KEY_WAKEUP) key press event — brings the guest out of s2idle.
                 self.trigger_wake_key(true);
             }
