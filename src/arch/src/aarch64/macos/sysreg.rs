@@ -32,6 +32,7 @@ arm64_sys_reg!(
 arm64_sys_reg!(SYSREG_MDCCINT_EL1, 2, 0, 0, 0, 2);
 
 arm64_sys_reg!(SYSREG_OSLAR_EL1, 2, 0, 4, 1, 0);
+arm64_sys_reg!(SYSREG_OSLSR_EL1, 2, 0, 4, 1, 1);
 arm64_sys_reg!(SYSREG_OSDLR_EL1, 2, 0, 4, 1, 3);
 
 arm64_sys_reg!(SYSREG_ICC_AP0R0_EL1, 3, 0, 4, 12, 8);
@@ -102,6 +103,10 @@ pub fn sys_reg_name(addr: u32) -> Option<&'static str> {
         SYSREG_ICC_PMR_EL1 => Some("SYSREG_ICC_PMR_EL1"),
         SYSREG_ICC_SGI1R_EL1 => Some("SYSREG_ICC_SGI1R_EL1"),
         SYSREG_ICC_SRE_EL1 => Some("SYSREG_ICC_SRE_EL1"),
+
+        SYSREG_OSLAR_EL1 => Some("SYSREG_OSLAR_EL1"),
+        SYSREG_OSLSR_EL1 => Some("SYSREG_OSLSR_EL1"),
+        SYSREG_OSDLR_EL1 => Some("SYSREG_OSDLR_EL1"),
 
         SYSREG_CNTVOFF_EL2 => Some("SYSREG_CNTVOFF_EL2"),
         SYSREG_CNTHCTL_EL2 => Some("SYSREG_CNTHCTL_EL2"),

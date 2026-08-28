@@ -281,6 +281,16 @@ impl Vcpus for VcpuList {
                     .get_pending_irq() as u64,
             ),
             SYSREG_ICC_PMR_EL1 => Some(0),
+            // The OS lock / OS double lock status, read by arm64's `cpu_do_suspend`
+            // (arch/arm64/mm/proc.S) on its way into suspend-to-RAM and written straight back by
+            // `cpu_do_resume`. Nothing else in the kernel reads them, and we ignore the matching
+            // OSLAR_EL1/OSDLR_EL1 writes, so reporting "no lock held" is consistent: resume
+            // restores exactly the zero it saved.
+            //
+            // Unhandled here, these STOP THE VM — the sysreg trap has no NOT_SUPPORTED to fall
+            // back on, unlike the PSCI path. Advertising SYSTEM_SUSPEND without them turned
+            // `systemctl suspend` into a guest kill.
+            SYSREG_OSLSR_EL1 | SYSREG_OSDLR_EL1 => Some(0),
             SYSREG_ICC_CTLR_EL1 => Some(
                 (1 << ICC_CTLR_EL1_RSS_SHIFT)
                     | (1 << ICC_CTLR_EL1_A3V_SHIFT)
