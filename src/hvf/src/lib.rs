@@ -163,6 +163,28 @@ const PSCI_RET_NOT_SUPPORTED: u64 = -1i64 as u64;
 /// value -3). Returned for a `SYSTEM_SUSPEND` issued while another vCPU is still online.
 const PSCI_RET_DENIED: u64 = -3i64 as u64;
 
+/// Whether to offer the guest PSCI 1.0 and `SYSTEM_SUSPEND`. On unless
+/// `LIMINA_PSCI_SYSTEM_SUSPEND` is `0`/`off`/empty.
+///
+/// The kill switch for the whole feature, in the shape `LIMINA_VCPU_SCHED` established: read
+/// here, once, so a worker inherits it with no plumbing and a bad dogfood run is bisectable
+/// without a rebuild. Off, we report 0.2 exactly as before and refuse SYSTEM_SUSPEND, so the
+/// guest never registers `psci_suspend_ops` and every suspend stays on the s2idle path —
+/// guest-visible behaviour identical to a build without this code.
+///
+/// It needs a kill switch because advertising the call IS the rollout: Linux's
+/// `mem_sleep_default` is `PM_SUSPEND_MAX`, so the moment PM_SUSPEND_MEM becomes valid a plain
+/// `systemctl suspend` switches from s2idle to deep with no guest configuration at all.
+fn system_suspend_offered() -> bool {
+    static OFFERED: LazyLock<bool> = LazyLock::new(|| {
+        !matches!(
+            std::env::var("LIMINA_PSCI_SYSTEM_SUSPEND").as_deref(),
+            Ok("0") | Ok("off") | Ok("")
+        )
+    });
+    *OFFERED
+}
+
 /// The PSCI version we report: 1.0, encoded major<<16 | minor (Arm DEN 0022).
 ///
 /// Reporting >= 1.0 is what makes Linux probe the 1.0 function set at all — `psci_probe()` only
@@ -170,6 +192,9 @@ const PSCI_RET_DENIED: u64 = -3i64 as u64;
 /// It also costs a handful of extra probe SMCs at boot (SMCCC_VERSION, CPU_SUSPEND features,
 /// the KVM vendor-hypervisor UID), all of which we answer NOT_SUPPORTED.
 const PSCI_VERSION_1_0: u64 = 0x0001_0000;
+
+/// The PSCI version we reported before `SYSTEM_SUSPEND` existed, and still do when it is off.
+const PSCI_VERSION_0_2: u64 = 0x0000_0002;
 
 #[derive(Debug)]
 pub enum Error {
@@ -1159,7 +1184,15 @@ impl HvfVcpu<'_> {
     fn handle_psci_request(&self, vcpu_list: &Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
         match self.read_reg(hv_reg_t_HV_REG_X0)? {
             0x8400_0000 /* PSCI_0_2_FN_PSCI_VERSION */ => {
-                self.write_reg(hv_reg_t_HV_REG_X0, PSCI_VERSION_1_0)?;
+                // 0.2 when SYSTEM_SUSPEND is not offered: Linux only probes the 1.0 function set
+                // when the major version is >= 1, so this alone takes the guest back to the
+                // s2idle-only world.
+                let version = if system_suspend_offered() {
+                    PSCI_VERSION_1_0
+                } else {
+                    PSCI_VERSION_0_2
+                };
+                self.write_reg(hv_reg_t_HV_REG_X0, version)?;
                 Ok(VcpuExit::PsciHandled)
             },
             0x8400_000a /* PSCI_1_0_FN_PSCI_FEATURES */ => {
@@ -1179,7 +1212,7 @@ impl HvfVcpu<'_> {
                     | 0x8400_000a /* PSCI_FEATURES */
                     | 0xc400_0003 /* CPU_ON */
                     | 0xc400_000e /* SYSTEM_SUSPEND */
-                );
+                ) && (queried != 0xc400_000e || system_suspend_offered());
                 let ret = if supported { 0 } else { PSCI_RET_NOT_SUPPORTED };
                 self.write_reg(hv_reg_t_HV_REG_X0, ret)?;
                 Ok(VcpuExit::PsciHandled)
@@ -1190,6 +1223,10 @@ impl HvfVcpu<'_> {
                 // before `syscore_suspend()`), but a guest that gets it wrong must be refused
                 // rather than silently parked — a DENIED return unwinds cleanly in the guest's
                 // `cpu_suspend()`, which treats any non-zero result as a failed suspend.
+                if !system_suspend_offered() {
+                    self.write_reg(hv_reg_t_HV_REG_X0, PSCI_RET_NOT_SUPPORTED)?;
+                    return Ok(VcpuExit::PsciHandled);
+                }
                 if !vcpu_list.others_all_offline(self.vcpuid) {
                     warn!(
                         "vCPU {} asked for PSCI SYSTEM_SUSPEND while another vCPU is still online; \
