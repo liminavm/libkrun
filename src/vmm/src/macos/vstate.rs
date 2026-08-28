@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REBOOT};
+use super::vcpu_sched;
 use super::wfi_latency::{self, Wake};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
@@ -561,6 +562,8 @@ impl Vcpu {
 
     /// Main loop of the vCPU thread.
     pub fn run(&mut self, init_tls_sender: Sender<u64>) {
+        // On this thread, before it ever enters the guest: the band applies to mach_thread_self().
+        vcpu_sched::set_realtime_band(self.id as u64);
         let mut hvf_vcpu =
             HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
         if let Some(released_ram) = self.released_ram.take() {
