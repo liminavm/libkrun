@@ -625,7 +625,11 @@ impl Vcpu {
         } else {
             let entry_addr = if self.boot_receiver.is_some() {
                 match self.wait_for_boot_entry(&mut hvf_vcpu) {
-                    Some(entry) => entry,
+                    Some(entry) => {
+                        // Onlined: executing again from here until the next WFx wait.
+                        self.vcpu_list.set_parked(hvf_vcpu.id(), false);
+                        entry
+                    }
                     None => return, // channels dropped: process tearing down
                 }
             } else {
@@ -660,15 +664,25 @@ impl Vcpu {
                 // The guest offlined this vCPU (PSCI CPU_OFF). Park the thread cleanly until a
                 // matching CPU_ON re-onlines it — zero host CPU/wakeups, vs the busy-spin + VM
                 // wedge of leaving CPU_OFF unmodeled.
-                Ok(VcpuEmulation::CpuOff) => self.handle_offline(&mut hvf_vcpu),
+                Ok(VcpuEmulation::CpuOff) => {
+                    self.handle_offline(&mut hvf_vcpu);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                }
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
+                    // Parked around the wait, not just "quiet": the host-sleep bracket needs
+                    // to tell a guest that has finished entering s2idle (every vCPU in WFx)
+                    // from one still executing, and a busy vCPU takes no vmexits either.
+                    self.vcpu_list.set_parked(hvf_vcpuid, true);
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
                     heartbeat.observed_block();
                 }
                 Ok(VcpuEmulation::WaitForEventExpired) => wfi_latency::record_expired(),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
+                    self.vcpu_list.set_parked(hvf_vcpuid, true);
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
                     heartbeat.observed_block();
                 }
                 // The guest halted / powered off (PSCI SYSTEM_OFF).
@@ -748,6 +762,10 @@ impl Vcpu {
     /// fidelity for not-currently-online vCPUs is the documented task #41 limitation (see
     /// `handle_offline`) — this wait only guarantees the save side completes.
     fn wait_for_boot_entry(&mut self, hvf_vcpu: &mut HvfVcpu) -> Option<u64> {
+        // A vCPU the guest has not onlined yet (maxcpus=, or a suspend before SMP bring-up)
+        // executes nothing, so it counts as parked — otherwise `all_parked` could never be
+        // true on such a guest and the host-sleep bracket would always take its backstop.
+        self.vcpu_list.set_parked(hvf_vcpu.id(), true);
         // Clones so the select does not borrow `self` across the pause_and_park/handle_snapshot
         // calls (same shape as handle_offline).
         let boot = self.boot_receiver.clone().unwrap();
@@ -797,6 +815,7 @@ impl Vcpu {
     fn handle_offline(&mut self, hvf_vcpu: &mut HvfVcpu) {
         let hvf_vcpuid = hvf_vcpu.id();
         debug!("vCPU {hvf_vcpuid} parked (offlined via PSCI CPU_OFF)");
+        self.vcpu_list.set_parked(hvf_vcpuid, true);
         // Clones so the select does not borrow `self` across the pause_and_park/handle_snapshot calls.
         let boot = self.boot_receiver.clone();
         let events = self.event_receiver.clone();

@@ -246,6 +246,10 @@ pub trait Vcpus {
     fn set_online(&self, vcpuid: u64, online: bool);
     /// This vCPU's PSCI power state. Out-of-range vcpuids report offline (safe default).
     fn is_online(&self, vcpuid: u64) -> bool;
+    /// Record whether this vCPU is blocked in a WFx wait. Set around the wait, so a
+    /// caller can tell a guest that has genuinely stopped executing from one that is
+    /// merely not taking vmexits.
+    fn set_parked(&self, vcpuid: u64, parked: bool);
 }
 
 /// Save the in-kernel GICv3 **distributor + redistributor** state (VM-wide) as an opaque,

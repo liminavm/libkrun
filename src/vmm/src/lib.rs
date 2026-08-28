@@ -442,11 +442,33 @@ impl Vmm {
     /// no-op.
     #[cfg(target_os = "macos")]
     pub fn resume(&mut self) -> std::result::Result<(), String> {
+        self.resume_inner(true)
+    }
+
+    /// Resume without advancing the vtimer offset, so the guest's counter reflects the
+    /// **real** time that passed while it was paused.
+    ///
+    /// [`Self::resume`] hides the paused interval, which is right for a live pause the
+    /// guest must not notice. It is wrong once the guest has entered s2idle: there,
+    /// `timekeeping_resume()` derives the sleep it injects into CLOCK_REALTIME/BOOTTIME
+    /// from exactly this counter delta, so hiding the interval leaves the guest's wall
+    /// clock behind by however long the host was away.
+    #[cfg(target_os = "macos")]
+    pub fn resume_keeping_counter(&mut self) -> std::result::Result<(), String> {
+        self.resume_inner(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resume_inner(&mut self, hide_paused_time: bool) -> std::result::Result<(), String> {
         use crate::vstate::{VcpuEvent, VcpuResponse};
         if !self.paused {
             return Ok(());
         }
-        let paused_ticks = unsafe { hvf::mach_absolute_time() }.saturating_sub(self.paused_at);
+        let paused_ticks = if hide_paused_time {
+            unsafe { hvf::mach_absolute_time() }.saturating_sub(self.paused_at)
+        } else {
+            0
+        };
         for h in &self.vcpus_handles {
             h.send_event(VcpuEvent::Resume(paused_ticks))
                 .map_err(|e| format!("vcpu resume event: {e:?}"))?;
@@ -531,6 +553,26 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn is_quiesced(&self) -> bool {
         self.quiesce_holdouts().is_empty()
+    }
+
+    /// True once every vCPU is blocked in a WFx wait (or parked offline).
+    ///
+    /// [`Self::is_quiesced`] and this answer different questions, and a caller that needs
+    /// the guest to be *stopped* wants both, in this order. Device status reaches `INIT`
+    /// during `dpm_suspend()`; the guest then still has `dpm_suspend_late`/`_noirq` and the
+    /// `s2idle_enter` rendezvous — in which every vCPU must be scheduled to reach
+    /// `tick_freeze()` — before `timekeeping_suspend()` runs. Only after that does the
+    /// guest stop counting elapsed time as running time, and only this predicate can see
+    /// it happen from the host.
+    #[cfg(target_os = "macos")]
+    pub fn all_vcpus_parked(&self) -> bool {
+        self.vcpu_list.all_parked()
+    }
+
+    /// The vcpuids still executing. See [`Self::all_vcpus_parked`].
+    #[cfg(target_os = "macos")]
+    pub fn park_holdouts(&self) -> Vec<u64> {
+        self.vcpu_list.park_holdouts()
     }
 
     pub fn save_snapshot(&mut self, path: &std::path::Path) -> Result<()> {
