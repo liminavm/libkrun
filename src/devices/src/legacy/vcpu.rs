@@ -27,6 +27,10 @@ struct PerCPUInterruptControllerState {
     /// Read by AFFINITY_INFO so the guest's offline reaper sees the CPU report OFF. All vCPUs
     /// start ON (the boot model brings every vCPU up).
     online: bool,
+    /// True while this vCPU is blocked in a WFx wait (or parked offline): it is executing
+    /// no guest instructions and is not going to until something wakes it. Distinct from
+    /// "no recent vmexits", which a vCPU spinning in guest code also satisfies.
+    parked: bool,
 }
 
 impl PerCPUInterruptControllerState {
@@ -112,6 +116,7 @@ impl VcpuList {
                 pending_irqs: VecDeque::new(),
                 wfe_sender: None,
                 online: true,
+                parked: false,
             }));
         }
 
@@ -152,6 +157,28 @@ impl VcpuList {
             vcpu.lock().unwrap().kick();
         }
     }
+
+    /// True when every vCPU is blocked in a WFx wait (or parked offline) — the guest is
+    /// executing no instructions on any CPU. This is the signal that an s2idle entry has
+    /// actually completed: the `s2idle_enter` rendezvous needs every vCPU to be scheduled
+    /// to reach `tick_freeze()`, and only once the last one has does the guest stop
+    /// accounting elapsed time as running time.
+    pub fn all_parked(&self) -> bool {
+        self.park_holdouts().is_empty()
+    }
+
+    /// The vcpuids still executing guest instructions. Empty iff [`Self::all_parked`].
+    pub fn park_holdouts(&self) -> Vec<u64> {
+        self.vcpus
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                let v = v.lock().unwrap();
+                !(v.parked || !v.online)
+            })
+            .map(|(i, _)| i as u64)
+            .collect()
+    }
 }
 
 impl Vcpus for VcpuList {
@@ -191,6 +218,12 @@ impl Vcpus for VcpuList {
             .get(vcpuid as usize)
             .map(|v| v.lock().unwrap().online)
             .unwrap_or(false)
+    }
+
+    fn set_parked(&self, vcpuid: u64, parked: bool) {
+        if let Some(vcpu) = self.vcpus.get(vcpuid as usize) {
+            vcpu.lock().unwrap().parked = parked;
+        }
     }
 
     fn get_pending_irq(&self, vcpuid: u64) -> u32 {
