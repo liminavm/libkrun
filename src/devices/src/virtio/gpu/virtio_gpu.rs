@@ -1257,7 +1257,19 @@ impl VirtioGpu {
         // scanouts exactly as it left them (sizes, arrangement, EDID identity, connectedness).
         // Anything else is a monitor change to the guest's compositor, which rescales and
         // re-constrains every window before the host's own display push can land.
+        // RED lever for the L2 landmark gate (l2_desktop_restore_landmarks): with
+        // LIMINA_RESTORE_SKIP_DISPLAYS=1 the restored device keeps its DEFAULTS, which is the
+        // pre-fix behaviour — the guest re-probes onto virtio's 10" EDID, its compositor
+        // rescales, and every window is displaced. A test for a fixed bug is worth only as
+        // much as its ability to fail, and this is how that is demonstrated.
+        let skip_displays = std::env::var_os("LIMINA_RESTORE_SKIP_DISPLAYS").is_some();
+        if skip_displays {
+            warn!("gpu restore: LIMINA_RESTORE_SKIP_DISPLAYS set — leaving device defaults");
+        }
         for (i, d) in displays.iter().enumerate() {
+            if skip_displays {
+                break;
+            }
             match self.displays.get_mut(i) {
                 Some(slot) => *slot = d.clone(),
                 None => warn!("gpu restore: snapshot has display {i}, device has no such scanout"),
