@@ -1622,6 +1622,7 @@ impl VirtioGpu {
                 })
                 .collect();
             let mut uploads = 0u32;
+            let mut upload_failures = 0u32;
             for e in &ops {
                 let (resource_id, w, h, d) = match &e.op {
                     GpuJournalOp::ResourceCreate3d {
@@ -1655,6 +1656,13 @@ impl VirtioGpu {
                     offset: 0,
                 };
                 if self.transfer_write(0, resource_id, transfer).is_err() {
+                    // Counted, not just logged. vrend refuses a transfer whose box does not
+                    // fit the resource or whose IOV does not match the backing
+                    // (`resource_contains_box` / `check_iov_bounds`), and the resource then
+                    // comes back with NO content — a window blank until something repaints
+                    // it. Reporting only `uploads` made a restore that lost hundreds of
+                    // textures read as a clean one, on both a dev poke VM and the dogfood Mac.
+                    upload_failures += 1;
                     debug!("gpu restore: content transfer for classic res {resource_id} failed");
                 } else {
                     uploads += 1;
@@ -1671,6 +1679,7 @@ impl VirtioGpu {
                     .as_ref()
                     .is_some_and(|r| r.limina_classic_content_restore(*ctx_id, blob))
                 {
+                    upload_failures += 1;
                     warn!(
                         "gpu restore: classic content restore failed for ctx {ctx_id} ({} bytes)",
                         blob.len()
@@ -1705,9 +1714,16 @@ impl VirtioGpu {
                     flips += 1;
                 }
             }
-            if uploads > 0 || flips > 0 {
+            if upload_failures > 0 {
+                warn!(
+                    "gpu restore: classic content re-upload FAILED for {upload_failures} \
+                     resource(s) — each comes back with no content until something repaints it"
+                );
+            }
+            if uploads > 0 || flips > 0 || upload_failures > 0 {
                 info!(
-                    "gpu restore: classic content re-uploaded ({uploads} resources), {flips} scanout flips"
+                    "gpu restore: classic content re-uploaded ({uploads} resources, \
+                     {upload_failures} failed), {flips} scanout flips"
                 );
             }
         }
