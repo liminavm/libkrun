@@ -461,7 +461,15 @@ const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
 // default 10" panel, picks a 250% scale for it, and constrains every window to
 // the resulting tiny logical screen — geometry the guest keeps after the host's
 // real EDID lands a moment later.
-const PAYLOAD_VERSION: u32 = 7;
+// v8: + scanout_frames — the pixels the host was actually presenting for each
+// enabled scanout. A Vulkan compositor's framebuffers are device-local, so
+// `vkr_device_memory_content_copy`'s vkMapMemory refuses them and the snapshot
+// carries no copy of the screen; the guest then resumes with a damage-tracking
+// compositor that has no reason to repaint, and the desktop stays blank until
+// something unrelated forces a full recomposite. These are the one copy of those
+// pixels that certainly exists — the host is displaying them — and they need no
+// guest cooperation to capture or to put back.
+const PAYLOAD_VERSION: u32 = 8;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -541,6 +549,21 @@ pub struct GpuSnapshotPayload {
     /// in force at snapshot, re-applied to the restored device before the guest
     /// resumes and re-probes.
     pub displays: Vec<DisplayInfo>,
+    /// v8: the frame the host was presenting on each enabled scanout, re-presented
+    /// after the restore's scanout flips so the first frame the user sees is the
+    /// desktop they left rather than whatever the fresh renderer starts with.
+    pub scanout_frames: Vec<ScanoutFrame>,
+}
+
+/// One scanout's presented pixels, tightly packed BGRA/RGBA at `width * 4` stride —
+/// whatever the display backend's staging buffer holds, copied verbatim, because it
+/// goes straight back into that same buffer on restore.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ScanoutFrame {
+    pub scanout_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 
 /// The rendered cursor-overlay state as last handed to the display backend —
@@ -764,6 +787,16 @@ impl GpuSnapshotPayload {
             put_display(&mut buf, d);
         }
 
+        // v8 scanout-frames section.
+        put_u32(&mut buf, self.scanout_frames.len() as u32);
+        for f in &self.scanout_frames {
+            put_u32(&mut buf, f.scanout_id);
+            put_u32(&mut buf, f.width);
+            put_u32(&mut buf, f.height);
+            put_u64(&mut buf, f.pixels.len() as u64);
+            buf.extend_from_slice(&f.pixels);
+        }
+
         buf
     }
 
@@ -951,6 +984,22 @@ impl GpuSnapshotPayload {
         let n = c.u32()?;
         for _ in 0..n {
             payload.displays.push(get_display(&mut c)?);
+        }
+
+        // v8 scanout-frames section.
+        let n = c.u32()?;
+        for _ in 0..n {
+            let scanout_id = c.u32()?;
+            let width = c.u32()?;
+            let height = c.u32()?;
+            let len = c.u64()? as usize;
+            let pixels = c.take(len)?.to_vec();
+            payload.scanout_frames.push(ScanoutFrame {
+                scanout_id,
+                width,
+                height,
+                pixels,
+            });
         }
 
         Some(payload)
@@ -1224,6 +1273,12 @@ mod tests {
                 pixels: vec![0x7e; 64 * 64 * 4],
             }),
             classic_contents: vec![(9, vec![0x42; 32])],
+            scanout_frames: vec![ScanoutFrame {
+                scanout_id: 1,
+                width: 3,
+                height: 2,
+                pixels: (0..24u8).collect(),
+            }],
             displays: vec![
                 DisplayInfo {
                     width: 2560,
@@ -1316,6 +1371,9 @@ mod tests {
         assert_eq!((cur.format, cur.x, cur.y), (2, 800, 450));
         assert_eq!(cur.pixels, vec![0x7e; 64 * 64 * 4]);
         assert_eq!(got.classic_contents, vec![(9, vec![0x42; 32])]);
+        // v8: the presented pixels are the only copy of a Vulkan compositor's screen, so a
+        // silent truncation here is a blank desktop on restore, not a smaller payload.
+        assert_eq!(got.scanout_frames, payload.scanout_frames);
 
         assert_eq!(got.displays.len(), 2);
         let d0 = &got.displays[0];
