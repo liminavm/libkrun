@@ -24,6 +24,34 @@ mod protocol;
 pub use self::defs::uapi::VIRTIO_ID_SOUND as TYPE_SND;
 pub use self::device::Snd;
 
+/// Which PCM lifecycle transition the guest just asked for.
+///
+/// These are the four `VIRTIO_SND_R_PCM_*` control requests that move a stream, reported
+/// verbatim: the device says what the guest did and takes no view on what it means. An
+/// embedder that wants "is the VM playing" builds that from these, including any hold-off it
+/// needs — a driver reopening a stream between tracks is indistinguishable from one closing
+/// it for good at this layer, and the device is the wrong place to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmEvent {
+    Prepare,
+    Start,
+    Stop,
+    Release,
+}
+
+/// A PCM stream state change, as reported to an embedder-supplied callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcmStreamState {
+    /// The guest's stream id, unfiltered. Stream 0 is playback and stream 1 is capture in
+    /// this device, but the callback reports whichever the guest addressed.
+    pub stream_id: u32,
+    pub event: PcmEvent,
+}
+
+/// Callback invoked on every accepted PCM lifecycle request. Runs on the device thread, so
+/// it must not block: hand the state somewhere else and return.
+pub type PcmStateFn = std::sync::Arc<dyn Fn(PcmStreamState) + Send + Sync>;
+
 mod defs {
     use crate::virtio::QueueConfig;
 

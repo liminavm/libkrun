@@ -1108,6 +1108,7 @@ pub fn build_microvm(
             event_manager,
             intc.clone(),
             vm_resources.snd_capture,
+            vm_resources.snd_state_cb.clone(),
         )?;
     }
     #[cfg(not(feature = "tee"))]
@@ -3012,12 +3013,15 @@ fn attach_snd_device(
     event_manager: &mut EventManager,
     intc: IrqChip,
     capture_enabled: bool,
+    state_cb: Option<devices::virtio::PcmStateFn>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let snd = Arc::new(Mutex::new(
-        devices::virtio::Snd::new(capture_enabled).unwrap(),
-    ));
+    let mut dev = devices::virtio::Snd::new(capture_enabled).unwrap();
+    if let Some(cb) = state_cb {
+        dev.set_pcm_state_callback(cb);
+    }
+    let snd = Arc::new(Mutex::new(dev));
 
     event_manager
         .add_subscriber(snd.clone())

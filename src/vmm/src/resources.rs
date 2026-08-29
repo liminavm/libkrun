@@ -261,6 +261,13 @@ pub struct VmResources {
     /// `snd` is also set. Enabling it lets the guest capture the host microphone
     /// (and triggers the macOS mic TCC prompt on first PREPARE).
     pub snd_capture: bool,
+    /// limina: optional hook told about every PCM stream lifecycle transition the guest
+    /// makes on the virtio-snd device. Mechanism only — the device reports what the guest
+    /// did and takes no view on what it means. limina uses it to know when the VM is
+    /// holding its audio device open, which is what makes it a media player as far as the
+    /// host desktop is concerned. Ignored unless `snd` is set and the `snd` feature is on.
+    #[cfg(feature = "snd")]
+    pub snd_state_cb: Option<devices::virtio::PcmStateFn>,
     /// limina: attach the emulated xHCI USB controller (platform `generic-xhci`).
     /// A plain bool so callers need no `usb`-feature cfg; the builder only acts on
     /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
@@ -528,6 +535,8 @@ mod tests {
             dhcp_client: false,
             snd: false,
             snd_capture: false,
+            #[cfg(feature = "snd")]
+            snd_state_cb: None,
             balloon_free_page_reporting: false,
             balloon_deflate_on_oom: false,
             usb: false,
