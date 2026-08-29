@@ -1103,6 +1103,7 @@ impl VirtioGpu {
             sync_states: Vec::new(),
             cursor: self.cursor_state.clone(),
             classic_contents: Vec::new(),
+            displays: self.displays.to_vec(),
         };
 
         let mut ctxs: Vec<(u32, u32)> = Vec::new();
@@ -1248,7 +1249,20 @@ impl VirtioGpu {
             sync_states,
             cursor,
             classic_contents,
+            displays,
         } = payload;
+
+        // The restored device was built with the default display configuration, but the guest
+        // driver is already running and re-probes the moment it resumes — so it must find the
+        // scanouts exactly as it left them (sizes, arrangement, EDID identity, connectedness).
+        // Anything else is a monitor change to the guest's compositor, which rescales and
+        // re-constrains every window before the host's own display push can land.
+        for (i, d) in displays.iter().enumerate() {
+            match self.displays.get_mut(i) {
+                Some(slot) => *slot = d.clone(),
+                None => warn!("gpu restore: snapshot has display {i}, device has no such scanout"),
+            }
+        }
 
         let mut wire: HashMap<u32, (Vec<super::journal::VkrWireEntry>, usize)> = HashMap::new();
         for (ctx_id, bytes) in &vkr_journals {
@@ -3755,6 +3769,7 @@ mod test {
             latch_delay: std::time::Duration::from_millis(35),
             ack_active: true,
             shown: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            resurface: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             awaiting_shown: std::collections::VecDeque::new(),
             guest_fence_handler: rutabaga_gfx::RutabagaFenceHandler::new(|_| {}),
         }
