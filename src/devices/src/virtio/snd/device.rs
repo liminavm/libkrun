@@ -78,6 +78,10 @@ pub struct Snd {
     /// Total frames handed to the sink since the last PREPARE.
     #[cfg(target_os = "macos")]
     pub(crate) submitted: u64,
+    /// Optional embedder hook, told about every accepted PCM lifecycle request. The device
+    /// itself does nothing with stream state beyond driving the host sink; this exists so a
+    /// VMM can know when the guest is holding its audio device open.
+    pub(crate) pcm_state_cb: Option<super::PcmStateFn>,
 }
 
 impl Snd {
@@ -108,7 +112,14 @@ impl Snd {
             in_flight: std::collections::VecDeque::new(),
             #[cfg(target_os = "macos")]
             submitted: 0,
+            pcm_state_cb: None,
         })
+    }
+
+    /// Report every accepted PCM lifecycle request to `cb`. Mechanism only: the device does
+    /// not filter by stream, debounce, or interpret. Set before the device is activated.
+    pub fn set_pcm_state_callback(&mut self, cb: super::PcmStateFn) {
+        self.pcm_state_cb = Some(cb);
     }
 
     pub fn id(&self) -> &str {
@@ -259,6 +270,11 @@ impl Snd {
                 } else {
                     VIRTIO_SND_S_BAD_MSG
                 };
+                // Only announce transitions we accepted: a request for a stream that does not
+                // exist moved nothing, and reporting it would invent state.
+                if status == VIRTIO_SND_S_OK {
+                    self.report_pcm_state(h.stream_id, code);
+                }
                 write_status(&mut writer, status);
             }
             other => {
@@ -268,6 +284,22 @@ impl Snd {
         }
 
         writer.bytes_written() as u32
+    }
+
+    /// Tell the embedder's hook, if any, that a stream moved. Host-independent by design:
+    /// the guest's stream lifetime is a virtio fact, not a CoreAudio one.
+    fn report_pcm_state(&self, stream_id: u32, code: u32) {
+        let Some(cb) = self.pcm_state_cb.as_ref() else {
+            return;
+        };
+        let event = match code {
+            VIRTIO_SND_R_PCM_PREPARE => super::PcmEvent::Prepare,
+            VIRTIO_SND_R_PCM_START => super::PcmEvent::Start,
+            VIRTIO_SND_R_PCM_STOP => super::PcmEvent::Stop,
+            VIRTIO_SND_R_PCM_RELEASE => super::PcmEvent::Release,
+            _ => return,
+        };
+        cb(super::PcmStreamState { stream_id, event });
     }
 
     /// Drive the host sink through the PCM lifecycle (macOS). On other hosts this is a
