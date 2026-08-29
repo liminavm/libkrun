@@ -1794,15 +1794,24 @@ impl VirtioGpu {
                         warn!("gpu restore: SET_SCANOUT scanout {scanout_id} failed");
                         continue;
                     }
-                    let _ = self.flush_resource(
-                        *resource_id,
-                        Rect {
-                            x: 0,
-                            y: 0,
-                            width: *width,
-                            height: *height,
-                        },
-                    );
+                    // Re-BIND the scanout, but only PRESENT it when nothing better follows.
+                    // On a guest whose desktop is Vulkan, the last classic SET_SCANOUT in
+                    // the journal is the early-boot console: flushing it puts the boot text
+                    // on screen for the moment before the saved frame lands — the flash on
+                    // every resume. The saved frame is the better first picture wherever it
+                    // exists, so leave the presenting to it.
+                    let have_saved = scanout_frames.iter().any(|f| f.scanout_id == *scanout_id);
+                    if !have_saved {
+                        let _ = self.flush_resource(
+                            *resource_id,
+                            Rect {
+                                x: 0,
+                                y: 0,
+                                width: *width,
+                                height: *height,
+                            },
+                        );
+                    }
                     flips += 1;
                 }
             }
