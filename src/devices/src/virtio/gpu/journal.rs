@@ -20,6 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::trace::GpuTraceStats;
+use crate::display::{
+    DetailedMode, DisplayInfo, DisplayInfoEdid, EdidIdentity, EdidParams, PhysicalSize,
+    RefreshRange, StandardTiming, StandardTimings,
+};
 
 // The op payloads and `entries()` are consumed by the P1 snapshot serializer;
 // until it lands, only the census reads them.
@@ -450,13 +454,32 @@ const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
 // host-side resource content blob (icon atlases, glyph caches: textures whose
 // only copy lives in the host GL object; the guest-shadow re-upload can't
 // restore those).
-const PAYLOAD_VERSION: u32 = 6;
+// v7: + displays — the scanout/EDID configuration the device was answering
+// GET_DISPLAY_INFO/GET_EDID with at snapshot. The restored worker builds its
+// virtio-gpu with the default display config, and the already-running guest
+// re-probes as soon as it resumes: without this it briefly sees virtio's
+// default 10" panel, picks a 250% scale for it, and constrains every window to
+// the resulting tiny logical screen — geometry the guest keeps after the host's
+// real EDID lands a moment later.
+const PAYLOAD_VERSION: u32 = 7;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn put_opt<T>(buf: &mut Vec<u8>, v: &Option<T>, f: impl FnOnce(&mut Vec<u8>, &T)) {
+    match v {
+        Some(v) => {
+            buf.push(1);
+            f(buf, v);
+        }
+        None => buf.push(0),
+    }
 }
 
 struct Cursor<'a> {
@@ -475,6 +498,19 @@ impl<'a> Cursor<'a> {
     }
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(*self.take(1)?.first()?)
+    }
+    fn opt<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<Option<T>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(f(self)?)),
+            _ => None,
+        }
     }
 }
 
@@ -501,6 +537,10 @@ pub struct GpuSnapshotPayload {
     /// (virgl_renderer_limina_classic_content_export), uploaded back after the
     /// context's wire replay.
     pub classic_contents: Vec<(u32, Vec<u8>)>,
+    /// v7: the per-scanout display configuration (size, position, EDID, connected)
+    /// in force at snapshot, re-applied to the restored device before the guest
+    /// resumes and re-probes.
+    pub displays: Vec<DisplayInfo>,
 }
 
 /// The rendered cursor-overlay state as last handed to the display backend —
@@ -718,6 +758,12 @@ impl GpuSnapshotPayload {
             buf.extend_from_slice(bytes);
         }
 
+        // v7 displays section.
+        put_u32(&mut buf, self.displays.len() as u32);
+        for d in &self.displays {
+            put_display(&mut buf, d);
+        }
+
         buf
     }
 
@@ -901,8 +947,162 @@ impl GpuSnapshotPayload {
                 .push((ctx_id, c.take(len)?.to_vec()));
         }
 
+        // v7 displays section.
+        let n = c.u32()?;
+        for _ in 0..n {
+            payload.displays.push(get_display(&mut c)?);
+        }
+
         Some(payload)
     }
+}
+
+fn put_display(buf: &mut Vec<u8>, d: &DisplayInfo) {
+    put_u32(buf, d.width);
+    put_u32(buf, d.height);
+    put_u32(buf, d.position.0);
+    put_u32(buf, d.position.1);
+    buf.push(d.connected as u8);
+    match &d.edid {
+        DisplayInfoEdid::Generated(p) => {
+            buf.push(0);
+            put_edid_params(buf, p);
+        }
+        DisplayInfoEdid::Provided(bytes) => {
+            buf.push(1);
+            put_u64(buf, bytes.len() as u64);
+            buf.extend_from_slice(bytes);
+        }
+    }
+}
+
+fn put_edid_params(buf: &mut Vec<u8>, p: &EdidParams) {
+    put_u32(buf, p.refresh_rate);
+    match p.physical_size {
+        PhysicalSize::Dpi(dpi) => {
+            buf.push(0);
+            put_u32(buf, dpi);
+        }
+        PhysicalSize::DimensionsMillimeters(w, h) => {
+            buf.push(1);
+            put_u16(buf, w);
+            put_u16(buf, h);
+        }
+    }
+    put_opt(buf, &p.identity, |buf, id| {
+        buf.extend_from_slice(&id.manufacturer);
+        put_u16(buf, id.product_id);
+        put_u32(buf, id.serial);
+        buf.extend_from_slice(&id.product_name);
+        put_opt(buf, &id.serial_string, |buf, s| buf.extend_from_slice(s));
+    });
+    put_opt(buf, &p.range, |buf, r| {
+        buf.push(r.min_vertical_hz);
+        buf.push(r.max_vertical_hz);
+        put_u16(buf, r.min_horizontal_khz);
+        put_u16(buf, r.max_horizontal_khz);
+        put_u32(buf, r.max_pixel_clock_mhz);
+    });
+    put_opt(buf, &p.standard_timings, |buf, timings| {
+        for t in timings.iter() {
+            put_opt(buf, t, |buf, t| {
+                put_u16(buf, t.width);
+                put_u16(buf, t.height);
+                put_u16(buf, t.refresh_hz);
+            });
+        }
+    });
+    put_opt(buf, &p.alt_mode, |buf, m| {
+        put_u32(buf, m.width);
+        put_u32(buf, m.height);
+        put_u32(buf, m.refresh_hz);
+    });
+}
+
+fn get_display(c: &mut Cursor) -> Option<DisplayInfo> {
+    let width = c.u32()?;
+    let height = c.u32()?;
+    let position = (c.u32()?, c.u32()?);
+    let connected = match c.u8()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let edid = match c.u8()? {
+        0 => DisplayInfoEdid::Generated(get_edid_params(c)?),
+        1 => {
+            let len = c.u64()? as usize;
+            DisplayInfoEdid::Provided(c.take(len)?.to_vec().into_boxed_slice())
+        }
+        _ => return None,
+    };
+    Some(DisplayInfo {
+        width,
+        height,
+        position,
+        edid,
+        connected,
+    })
+}
+
+fn get_edid_params(c: &mut Cursor) -> Option<EdidParams> {
+    let refresh_rate = c.u32()?;
+    let physical_size = match c.u8()? {
+        0 => PhysicalSize::Dpi(c.u32()?),
+        1 => PhysicalSize::DimensionsMillimeters(c.u16()?, c.u16()?),
+        _ => return None,
+    };
+    let identity = c.opt(|c| {
+        let manufacturer: [u8; 3] = c.take(3)?.try_into().unwrap();
+        let product_id = c.u16()?;
+        let serial = c.u32()?;
+        let product_name: [u8; 13] = c.take(13)?.try_into().unwrap();
+        let serial_string = c.opt(|c| Some(<[u8; 13]>::try_from(c.take(13)?).unwrap()))?;
+        Some(EdidIdentity {
+            manufacturer,
+            product_id,
+            serial,
+            product_name,
+            serial_string,
+        })
+    })?;
+    let range = c.opt(|c| {
+        Some(RefreshRange {
+            min_vertical_hz: c.u8()?,
+            max_vertical_hz: c.u8()?,
+            min_horizontal_khz: c.u16()?,
+            max_horizontal_khz: c.u16()?,
+            max_pixel_clock_mhz: c.u32()?,
+        })
+    })?;
+    let standard_timings = c.opt(|c| {
+        let mut timings: StandardTimings = [None; 8];
+        for slot in timings.iter_mut() {
+            *slot = c.opt(|c| {
+                Some(StandardTiming {
+                    width: c.u16()?,
+                    height: c.u16()?,
+                    refresh_hz: c.u16()?,
+                })
+            })?;
+        }
+        Some(timings)
+    })?;
+    let alt_mode = c.opt(|c| {
+        Some(DetailedMode {
+            width: c.u32()?,
+            height: c.u32()?,
+            refresh_hz: c.u32()?,
+        })
+    })?;
+    Some(EdidParams {
+        refresh_rate,
+        physical_size,
+        identity,
+        range,
+        standard_timings,
+        alt_mode,
+    })
 }
 
 /// One parsed entry of a serialized vkr wire journal (virglrenderer's VKJR
@@ -1024,6 +1224,62 @@ mod tests {
                 pixels: vec![0x7e; 64 * 64 * 4],
             }),
             classic_contents: vec![(9, vec![0x42; 32])],
+            displays: vec![
+                DisplayInfo {
+                    width: 2560,
+                    height: 1440,
+                    position: (100, 200),
+                    edid: DisplayInfoEdid::Generated(EdidParams {
+                        refresh_rate: 120,
+                        physical_size: PhysicalSize::DimensionsMillimeters(600, 340),
+                        identity: Some(EdidIdentity {
+                            manufacturer: *b"LMN",
+                            product_id: 0x1234,
+                            serial: 0xdead_beef,
+                            product_name: *b"BenQ LCD\n    ",
+                            serial_string: Some(*b"SN0123456789\n"),
+                        }),
+                        range: Some(RefreshRange {
+                            min_vertical_hz: 48,
+                            max_vertical_hz: 120,
+                            min_horizontal_khz: 30,
+                            max_horizontal_khz: 300,
+                            max_pixel_clock_mhz: 650,
+                        }),
+                        standard_timings: Some([
+                            Some(StandardTiming {
+                                width: 1920,
+                                height: 1080,
+                                refresh_hz: 60,
+                            }),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(StandardTiming {
+                                width: 1280,
+                                height: 720,
+                                refresh_hz: 75,
+                            }),
+                        ]),
+                        alt_mode: Some(DetailedMode {
+                            width: 2560,
+                            height: 1440,
+                            refresh_hz: 60,
+                        }),
+                    }),
+                    connected: true,
+                },
+                DisplayInfo {
+                    width: 800,
+                    height: 600,
+                    position: (0, 0),
+                    edid: DisplayInfoEdid::Provided(vec![0x9c; 128].into_boxed_slice()),
+                    connected: false,
+                },
+            ],
         };
         let bytes = payload.to_bytes();
         let got = GpuSnapshotPayload::from_bytes(&bytes).expect("parse");
@@ -1060,6 +1316,26 @@ mod tests {
         assert_eq!((cur.format, cur.x, cur.y), (2, 800, 450));
         assert_eq!(cur.pixels, vec![0x7e; 64 * 64 * 4]);
         assert_eq!(got.classic_contents, vec![(9, vec![0x42; 32])]);
+
+        assert_eq!(got.displays.len(), 2);
+        let d0 = &got.displays[0];
+        assert_eq!(
+            (d0.width, d0.height, d0.position, d0.connected),
+            (2560, 1440, (100, 200), true)
+        );
+        let DisplayInfoEdid::Generated(p0) = &d0.edid else {
+            panic!("display 0 lost its generated EDID params")
+        };
+        let DisplayInfoEdid::Generated(want) = &payload.displays[0].edid else {
+            unreachable!()
+        };
+        assert_eq!(p0, want);
+        let d1 = &got.displays[1];
+        assert_eq!((d1.width, d1.height, d1.connected), (800, 600, false));
+        let DisplayInfoEdid::Provided(bytes) = &d1.edid else {
+            panic!("display 1 lost its provided EDID blob")
+        };
+        assert_eq!(&bytes[..], &[0x9c; 128][..]);
     }
 
     #[test]
