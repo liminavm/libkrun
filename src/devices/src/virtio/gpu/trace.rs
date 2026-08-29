@@ -13,8 +13,8 @@
 //
 // Counting is always on (uncontended atomic increments). Reporting is opt-in:
 // `LIMINA_GPU_TRACE=1` starts a reporter thread that logs one aggregate line per
-// tick (2s). Independently of the env, the FIRST unknown-context event requests a
-// one-shot renderer state dump (serviced on the worker thread, which owns the
+// tick (2s). Independently of the env, the FIRST command error of any class requests
+// a one-shot renderer state dump (serviced on the worker thread, which owns the
 // renderer singleton) so a wedged run is never silent about the cause.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,7 +39,7 @@ pub struct GpuTraceStats {
     pub fences_requested: AtomicU64,
     /// Guest fence descriptors retired (signaled or completed-at-creation).
     pub fences_retired: AtomicU64,
-    /// Set on the first unknown-ctx event (and periodically by the reporter when
+    /// Set on the first unknown-ctx or other-error event (and periodically by the reporter when
     /// `LIMINA_GPU_TRACE_VKR=1`); the worker thread services it by dumping the
     /// renderer's context table, then clears it. Only the worker thread may call
     /// into the renderer, so this is a request flag, not a direct call.
@@ -66,8 +66,15 @@ impl GpuTraceStats {
             | GpuResponse::ErrInvalidResourceId => {
                 self.unknown_resource.fetch_add(1, Ordering::Relaxed);
             }
+            // A context the renderer still HAS can be just as dead as one it lost: a
+            // replayed entry that poisons vrend's sticky in_error leaves every later
+            // submit rejected as EINVAL (ComponentError(22)), which lands here and not
+            // in unknown_ctx. Arming the dump only on the latter made the one restore
+            // failure mode we shipped a dump for the one it could not describe.
             _ => {
-                self.errors_other.fetch_add(1, Ordering::Relaxed);
+                if self.errors_other.fetch_add(1, Ordering::Relaxed) == 0 {
+                    self.dump_requested.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
