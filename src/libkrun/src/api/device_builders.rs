@@ -1214,6 +1214,7 @@ impl<'a> AttachDevice<'a> for I2cBatteryDevice {
 #[derive(Default)]
 pub struct SndDevice {
     capture: bool,
+    state_cb: Option<devices::virtio::PcmStateFn>,
 }
 
 #[cfg(feature = "snd")]
@@ -1229,13 +1230,25 @@ impl SndDevice {
         self.capture = enabled;
         self
     }
+
+    /// An optional hook told about every PCM stream lifecycle transition the guest makes on the
+    /// device. Mechanism only — the device reports what the guest did and takes no view on what
+    /// it means. limina uses it to know when the VM is holding its audio device open, which is
+    /// what makes it a media player as far as the host desktop is concerned.
+    pub fn pcm_state_callback(mut self, cb: devices::virtio::PcmStateFn) -> Self {
+        self.state_cb = Some(cb);
+        self
+    }
 }
 
 #[cfg(feature = "snd")]
 impl<'a> AttachDevice<'a> for SndDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        let snd =
-            devices::virtio::Snd::new(self.capture).map_err(|e| VmmError::Internal(format!("snd: {e:?}")))?;
+        let mut snd = devices::virtio::Snd::new(self.capture)
+            .map_err(|e| VmmError::Internal(format!("snd: {e:?}")))?;
+        if let Some(cb) = self.state_cb {
+            snd.set_pcm_state_callback(cb);
+        }
         let inner = Arc::new(Mutex::new(snd));
         ctx.subscribe_events(inner.clone())?;
         let id = inner.lock().unwrap().id().to_string();
