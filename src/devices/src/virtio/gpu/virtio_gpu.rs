@@ -1812,8 +1812,21 @@ impl VirtioGpu {
             // repaint a screen it believes is already correct. So the first frame the user
             // sees comes from here or it does not come at all until something unrelated
             // damages the screen. Runs after the flips so it lands in the configured buffer.
+            // RED lever: with LIMINA_RESTORE_SKIP_SCANOUT set, do not put the saved picture
+            // back. The screen then shows what the GUEST actually has after a restore, which
+            // is the only way to observe a client whose own buffers did not survive — the
+            // re-present is otherwise indistinguishable from a healthy restore, and any damage
+            // generated to look past it is also what repaints the client and heals it.
+            let skip_scanout = std::env::var_os("LIMINA_RESTORE_SKIP_SCANOUT").is_some();
+            if skip_scanout && !scanout_frames.is_empty() {
+                warn!(
+                    "gpu restore: LIMINA_RESTORE_SKIP_SCANOUT set — {} saved frame(s) NOT \
+                     re-presented",
+                    scanout_frames.len()
+                );
+            }
             let mut restored_frames = 0u32;
-            for f in &scanout_frames {
+            for f in scanout_frames.iter().filter(|_| !skip_scanout) {
                 let expect = f.width as usize * 4 * f.height as usize;
                 if f.pixels.len() != expect {
                     warn!(
