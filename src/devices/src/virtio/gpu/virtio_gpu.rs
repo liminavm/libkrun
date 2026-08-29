@@ -1698,80 +1698,32 @@ impl VirtioGpu {
             );
         }
 
-        // Task #19 phase C (classic content + scanout): the wire replay above re-created
-        // the vrend object world; now re-upload every backed classic resource's content
-        // from its guest backing store (which is in the restored RAM — the canonical
-        // storage classic transfers sync FROM), then re-bind the classic scanouts so the
-        // first presented frame shows restored pixels. Level-0/full-box only: mip chains
-        // re-fill on the guest's next upload, render targets on its next frame.
+        // Task #19 phase C (classic content + scanout): the wire replay above re-created the
+        // vrend object world; now put the classic pixels back (P2, below) and re-bind the
+        // classic scanouts.
+        //
+        // There used to be a guest-shadow re-upload here as well: a full-box transfer_write
+        // per backed classic resource, from the guest backing store in restored RAM. P2
+        // superseded it and it was doing harm on its own — the box comes from the resource's
+        // CREATE dimensions, so vrend refuses every resource whose backing does not span the
+        // whole surface (`resource_contains_box` / `check_iov_bounds`), 61-97 per restore on a
+        // poke VM and 244 on the dogfood Mac. Those refusals were counted as lost content,
+        // which is what the loss ledger is for, so a healthy restore reported hundreds of
+        // blank resources. Measured: P2 exports 194 resources and skips 0, restores 194 and
+        // drops 0, across 7 contexts — it is the account, and this loop was noise on top of it.
         {
-            use std::collections::HashSet;
-            let backed: HashSet<u32> = ops
-                .iter()
-                .filter_map(|e| match &e.op {
-                    GpuJournalOp::AttachBacking { resource_id, .. } => Some(*resource_id),
-                    _ => None,
-                })
-                .collect();
-            let mut uploads = 0u32;
-            let mut upload_failures = 0u32;
-            for e in &ops {
-                let (resource_id, w, h, d) = match &e.op {
-                    GpuJournalOp::ResourceCreate3d {
-                        resource_id,
-                        width,
-                        height,
-                        depth,
-                        ..
-                    } => (*resource_id, *width, *height, (*depth).max(1)),
-                    GpuJournalOp::ResourceCreate2d {
-                        resource_id,
-                        width,
-                        height,
-                        ..
-                    } => (*resource_id, *width, *height, 1),
-                    _ => continue,
-                };
-                if !backed.contains(&resource_id) {
-                    continue;
-                }
-                let transfer = Transfer3D {
-                    x: 0,
-                    y: 0,
-                    z: 0,
-                    w,
-                    h: h.max(1),
-                    d,
-                    level: 0,
-                    stride: 0,
-                    layer_stride: 0,
-                    offset: 0,
-                };
-                if self.transfer_write(0, resource_id, transfer).is_err() {
-                    // Counted, not just logged. vrend refuses a transfer whose box does not
-                    // fit the resource or whose IOV does not match the backing
-                    // (`resource_contains_box` / `check_iov_bounds`), and the resource then
-                    // comes back with NO content — a window blank until something repaints
-                    // it. Reporting only `uploads` made a restore that lost hundreds of
-                    // textures read as a clean one, on both a dev poke VM and the dogfood Mac.
-                    upload_failures += 1;
-                    debug!("gpu restore: content transfer for classic res {resource_id} failed");
-                } else {
-                    uploads += 1;
-                }
-            }
-            // P2: host-side content on top of the guest-shadow uploads above — the
-            // authoritative bytes for textures whose only copy lived in the host GL
-            // object (icon atlases, glyph caches, corner masks: the gray-blocks
-            // class). Runs BEFORE the scanout flips so the first presented frame
-            // composites from restored content.
+            let mut p2_failures = 0u32;
+            // P2: the authoritative classic bytes, read back from the host GL objects at
+            // snapshot — including the textures whose only copy lived there (icon atlases,
+            // glyph caches, corner masks: the gray-blocks class). Runs BEFORE the scanout
+            // flips so the first presented frame composites from restored content.
             for (ctx_id, blob) in &classic_contents {
                 if !self
                     .rutabaga
                     .as_ref()
                     .is_some_and(|r| r.limina_classic_content_restore(*ctx_id, blob))
                 {
-                    upload_failures += 1;
+                    p2_failures += 1;
                     warn!(
                         "gpu restore: classic content restore failed for ctx {ctx_id} ({} bytes)",
                         blob.len()
@@ -1874,16 +1826,17 @@ impl VirtioGpu {
                 info!("gpu restore: re-presented {restored_frames} saved scanout frame(s)");
             }
 
-            if upload_failures > 0 {
+            if p2_failures > 0 {
                 warn!(
-                    "gpu restore: classic content re-upload FAILED for {upload_failures} \
-                     resource(s) — each comes back with no content until something repaints it"
+                    "gpu restore: classic content restore FAILED for {p2_failures} context(s) — \
+                     their resources come back with no content until something repaints them"
                 );
             }
-            if uploads > 0 || flips > 0 || upload_failures > 0 {
+            if flips > 0 || !classic_contents.is_empty() {
                 info!(
-                    "gpu restore: classic content re-uploaded ({uploads} resources, \
-                     {upload_failures} failed), {flips} scanout flips"
+                    "gpu restore: classic content restored ({} contexts, {p2_failures} failed), \
+                     {flips} scanout flips",
+                    classic_contents.len()
                 );
             }
         }
