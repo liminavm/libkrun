@@ -1089,6 +1089,96 @@ impl VirtioGpu {
 
     /// limina M9.3 P1 snapshot: assemble the GPU section — the rutabaga journal,
     /// each venus context's vkr wire journal, and every guest-mapped blob's raw
+    /// The pixels the host is presenting on each enabled scanout, for the v8 payload.
+    ///
+    /// This is the one copy of the screen that certainly exists at snapshot time. The venus
+    /// capture cannot reach a Vulkan compositor's framebuffers — they are device-local, so
+    /// `vkMapMemory` refuses them — and a damage-tracking compositor has no reason to repaint
+    /// after a restore, so without this the desktop comes back blank and stays blank until
+    /// something unrelated forces a full recomposite.
+    ///
+    /// Read the same two ways `flush_resource` does, and for the same reason: a software-2D
+    /// scanout's pixels are already in a host buffer, and a venus scanout's live in the
+    /// IOSurface being displayed. A classic vrend scanout needs neither — its resource content
+    /// is captured by the classic content dump — so it is left alone here.
+    fn capture_scanout_frames(&mut self) -> Vec<super::journal::ScanoutFrame> {
+        use super::journal::ScanoutFrame;
+        let mut frames = Vec::new();
+        for scanout_id in 0..VIRTIO_GPU_MAX_SCANOUTS {
+            let Some(scanout) = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+            else {
+                continue;
+            };
+            let (resource_id, width, height) = (scanout.resource_id, scanout.width, scanout.height);
+            #[cfg(target_os = "macos")]
+            let iosurface_id = scanout.iosurface_id;
+            #[cfg(not(target_os = "macos"))]
+            let iosurface_id: Option<u32> = None;
+
+            let stride = width as usize * 4;
+            let Some(len) = stride.checked_mul(height as usize) else {
+                continue;
+            };
+            let mut pixels = vec![0u8; len];
+
+            // The backing resource can be WIDER than the scanout rect (a padded framebuffer),
+            // so a software-2D read has to walk it at the RESOURCE's stride and extract this
+            // rect — a flat copy shears, exactly as it does in `flush_resource`.
+            let src_stride = self
+                .resources
+                .get(&resource_id)
+                .map(|r| r.width as usize * ResourceFormat::BYTES_PER_PIXEL)
+                .unwrap_or(stride);
+
+            let read = if let Some(sw) = self.sw2d.get(&resource_id) {
+                blit_scanout_rect(&mut pixels, stride, &sw.host, src_stride, height as usize);
+                true
+            } else if iosurface_id.is_some() {
+                match self.rutabaga.as_ref() {
+                    Some(r) => {
+                        // `dst_stride` is BYTES, not pixels. Passing the pixel width puts a
+                        // quarter-width image on screen four times over, squashed 4x
+                        // vertically — which is what the first version of this did.
+                        match r.read_iosurface(resource_id, &mut pixels, stride as u32, height) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!(
+                                    "gpu snapshot: scanout {scanout_id} (res {resource_id}) \
+                                     pixels unreadable: {e} — this desktop will come back blank \
+                                     until something repaints it"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                // Classic vrend scanout: its content rides the classic dump.
+                false
+            };
+
+            if read {
+                frames.push(ScanoutFrame {
+                    scanout_id,
+                    width,
+                    height,
+                    pixels,
+                });
+            }
+        }
+        if !frames.is_empty() {
+            info!(
+                "gpu snapshot: captured {} presented scanout frame(s)",
+                frames.len()
+            );
+        }
+        frames
+    }
+
     /// bytes (host allocations, invisible to the guest-RAM dump). Worker thread.
     pub fn snapshot_gpu_payload(&mut self) -> Option<Vec<u8>> {
         if self.rutabaga.is_none() || self.journal.entries().is_empty() {
@@ -1104,6 +1194,7 @@ impl VirtioGpu {
             cursor: self.cursor_state.clone(),
             classic_contents: Vec::new(),
             displays: self.displays.to_vec(),
+            scanout_frames: self.capture_scanout_frames(),
         };
 
         let mut ctxs: Vec<(u32, u32)> = Vec::new();
@@ -1250,6 +1341,7 @@ impl VirtioGpu {
             cursor,
             classic_contents,
             displays,
+            scanout_frames,
         } = payload;
 
         // The restored device was built with the default display configuration, but the guest
@@ -1714,6 +1806,52 @@ impl VirtioGpu {
                     flips += 1;
                 }
             }
+            // v8: put the pre-suspend picture back on screen. The flips above re-bound the
+            // scanouts, but nothing has DRAWN into them — a Vulkan compositor's framebuffer
+            // content could not be captured, and the guest, tracking damage, has no reason to
+            // repaint a screen it believes is already correct. So the first frame the user
+            // sees comes from here or it does not come at all until something unrelated
+            // damages the screen. Runs after the flips so it lands in the configured buffer.
+            let mut restored_frames = 0u32;
+            for f in &scanout_frames {
+                let expect = f.width as usize * 4 * f.height as usize;
+                if f.pixels.len() != expect {
+                    warn!(
+                        "gpu restore: scanout {} frame is {} bytes, expected {expect} — not \
+                         re-presenting it",
+                        f.scanout_id,
+                        f.pixels.len()
+                    );
+                    continue;
+                }
+                match self.display_backend.alloc_frame(f.scanout_id) {
+                    Ok((frame_id, buffer)) => {
+                        let n = buffer.len().min(f.pixels.len());
+                        buffer[..n].copy_from_slice(&f.pixels[..n]);
+                        if self
+                            .display_backend
+                            .present_frame(f.scanout_id, frame_id, None)
+                            .is_err()
+                        {
+                            warn!(
+                                "gpu restore: presenting the saved frame for scanout {} failed",
+                                f.scanout_id
+                            );
+                        } else {
+                            restored_frames += 1;
+                        }
+                    }
+                    Err(e) => warn!(
+                        "gpu restore: no frame buffer for scanout {}: {e:?} — the saved picture \
+                         cannot be put back",
+                        f.scanout_id
+                    ),
+                }
+            }
+            if restored_frames > 0 {
+                info!("gpu restore: re-presented {restored_frames} saved scanout frame(s)");
+            }
+
             if upload_failures > 0 {
                 warn!(
                     "gpu restore: classic content re-upload FAILED for {upload_failures} \
@@ -3025,16 +3163,23 @@ impl VirtioGpu {
         if std::env::var_os("LIMINA_TRACE_TRANSFER").is_some() {
             log::error!(
                 "[XFER-WRITE] ctx {ctx_id} res {resource_id} box=({},{},{})+{}x{}x{} level={} stride={} layer_stride={} offset={}",
-                transfer.x, transfer.y, transfer.z,
-                transfer.w, transfer.h, transfer.d,
-                transfer.level, transfer.stride, transfer.layer_stride, transfer.offset
+                transfer.x,
+                transfer.y,
+                transfer.z,
+                transfer.w,
+                transfer.h,
+                transfer.d,
+                transfer.level,
+                transfer.stride,
+                transfer.layer_stride,
+                transfer.offset
             );
         }
-        let r = self
-            .rutabaga
-            .as_mut()
-            .ok_or(ErrUnspec)?
-            .transfer_write(ctx_id, resource_id, transfer);
+        let r =
+            self.rutabaga
+                .as_mut()
+                .ok_or(ErrUnspec)?
+                .transfer_write(ctx_id, resource_id, transfer);
         if let Err(e) = &r {
             log::error!("[XFER-WRITE] ctx {ctx_id} res {resource_id} FAILED: {e:?}");
         }
