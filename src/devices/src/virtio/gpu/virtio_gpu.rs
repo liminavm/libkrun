@@ -1162,6 +1162,14 @@ impl VirtioGpu {
             };
 
             if read {
+                // Count the ink. A read that succeeds and returns an all-zero buffer looks
+                // identical in the ledger to one that captured the desktop, and the difference
+                // is the whole point of the frame.
+                let ink = pixels.iter().filter(|b| **b != 0).count();
+                info!(
+                    "gpu snapshot: scanout {scanout_id} (res {resource_id}) captured \
+                     {width}x{height}, {ink} non-zero byte(s) of {len}"
+                );
                 frames.push(ScanoutFrame {
                     scanout_id,
                     width,
@@ -1802,6 +1810,15 @@ impl VirtioGpu {
                     Ok((frame_id, buffer)) => {
                         let n = buffer.len().min(f.pixels.len());
                         buffer[..n].copy_from_slice(&f.pixels[..n]);
+                        info!(
+                            "gpu restore: scanout {} re-presenting {}x{}, {} non-zero byte(s) \
+                             into a {}-byte buffer",
+                            f.scanout_id,
+                            f.width,
+                            f.height,
+                            f.pixels.iter().filter(|b| **b != 0).count(),
+                            buffer.len()
+                        );
                         if self
                             .display_backend
                             .present_frame(f.scanout_id, frame_id, None)
