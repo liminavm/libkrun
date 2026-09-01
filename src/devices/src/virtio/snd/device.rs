@@ -78,10 +78,156 @@ pub struct Snd {
     /// Total frames handed to the sink since the last PREPARE.
     #[cfg(target_os = "macos")]
     pub(crate) submitted: u64,
+    /// Per-second tx trace, present only when `LIMINA_SND_TRACE=1`.
+    #[cfg(target_os = "macos")]
+    pub(crate) tx_trace: Option<TxTrace>,
+    /// Audibility edge reporting, present only when an embedder asked for it.
+    #[cfg(target_os = "macos")]
+    audibility: Option<Audibility>,
     /// Optional embedder hook, told about every accepted PCM lifecycle request. The device
     /// itself does nothing with stream state beyond driving the host sink; this exists so a
     /// VMM can know when the guest is holding its audio device open.
     pub(crate) pcm_state_cb: Option<super::PcmStateFn>,
+}
+
+/// Whether the playback stream is carrying sound, and the edges between.
+///
+/// A pause is a run of bit-exact zero frames; sound returning is a single frame that is not.
+/// The run is counted in frames rather than buffers because the guest picks the period size and
+/// that is not a unit the host should inherit — the same 500 ms means the same thing whatever
+/// the guest asked for.
+#[cfg(target_os = "macos")]
+struct Audibility {
+    cb: super::PcmAudibilityFn,
+    /// How many consecutive zero-filled frames make a pause, from the embedder's threshold.
+    silent_after_frames: u64,
+    /// The zero run in progress.
+    zero_frames: u64,
+    /// What we last told the embedder. `None` after a lifecycle transition: the stream is a new
+    /// thing then, and the next edge has to be reported even if it repeats the last one.
+    reported: Option<super::PcmAudibility>,
+}
+
+#[cfg(target_os = "macos")]
+impl Audibility {
+    /// Account one tx buffer and report an edge if it crossed one.
+    fn buffer(&mut self, stream_id: u32, frames: u64, all_zero: bool) {
+        let edge = if all_zero {
+            self.zero_frames += frames;
+            if self.zero_frames < self.silent_after_frames {
+                return;
+            }
+            super::PcmAudibility::Silent
+        } else {
+            self.zero_frames = 0;
+            super::PcmAudibility::Audible
+        };
+        if self.reported == Some(edge) {
+            return;
+        }
+        self.reported = Some(edge);
+        (self.cb)(stream_id, edge);
+    }
+
+    /// The guest moved the stream. Forget the run and the reported state: whatever comes next
+    /// is news, including a repeat of what we last said.
+    fn reset(&mut self) {
+        self.zero_frames = 0;
+        self.reported = None;
+    }
+}
+
+/// A per-second trace of the tx queue, gated on `LIMINA_SND_TRACE=1`.
+///
+/// It exists to answer one question that no other vantage point can: when the guest pauses
+/// playback but keeps its PCM stream open, does it stop submitting buffers, or keep submitting
+/// silent ones? The host's "is the guest playing" detector has to be built differently for each,
+/// and the guest's PCM lifecycle only reports the pause ~5s later, once PipeWire suspends the node.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(crate) struct TxTrace {
+    window_start: std::time::Instant,
+    last_buffer: Option<std::time::Instant>,
+    buffers: u64,
+    frames: u64,
+    peak: f32,
+    max_gap_us: u128,
+    /// Buffers in the window that were entirely zero samples.
+    zeros: u64,
+    /// The run of consecutive all-zero buffers in progress, carried across windows.
+    zero_run: u64,
+    /// The longest such run seen in this window.
+    zero_run_max: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl TxTrace {
+    fn new_if_enabled() -> Option<Self> {
+        if std::env::var("LIMINA_SND_TRACE").as_deref() != Ok("1") {
+            return None;
+        }
+        Some(TxTrace {
+            window_start: std::time::Instant::now(),
+            last_buffer: None,
+            buffers: 0,
+            frames: 0,
+            peak: 0.0,
+            max_gap_us: 0,
+            zeros: 0,
+            zero_run: 0,
+            zero_run_max: 0,
+        })
+    }
+
+    /// Account one tx buffer: its frame count and the largest absolute sample in it.
+    fn buffer(&mut self, frames: usize, peak: f32) {
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_buffer {
+            self.max_gap_us = self.max_gap_us.max(now.duration_since(prev).as_micros());
+        }
+        self.last_buffer = Some(now);
+        self.buffers += 1;
+        self.frames += frames as u64;
+        self.peak = self.peak.max(peak);
+        if peak == 0.0 {
+            self.zeros += 1;
+            self.zero_run += 1;
+            self.zero_run_max = self.zero_run_max.max(self.zero_run);
+        } else {
+            self.zero_run = 0;
+        }
+    }
+
+    /// Emit a line once a second. Called from the tx path and from the completion reaper, so
+    /// the line keeps coming while the sink is alive even when the guest submits nothing —
+    /// which is exactly the state under investigation.
+    fn flush(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.window_start) < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let idle_ms = match self.last_buffer {
+            Some(t) => now.duration_since(t).as_millis() as i64,
+            None => -1,
+        };
+        info!(
+            "snd trace: buffers={} frames={} peak={:.5} zeros={} zero_run_max={} max_gap_ms={:.1} idle_ms={}",
+            self.buffers,
+            self.frames,
+            self.peak,
+            self.zeros,
+            self.zero_run_max,
+            self.max_gap_us as f64 / 1000.0,
+            idle_ms
+        );
+        self.window_start = now;
+        self.buffers = 0;
+        self.frames = 0;
+        self.peak = 0.0;
+        self.max_gap_us = 0;
+        self.zeros = 0;
+        self.zero_run_max = self.zero_run;
+    }
 }
 
 impl Snd {
@@ -112,6 +258,10 @@ impl Snd {
             in_flight: std::collections::VecDeque::new(),
             #[cfg(target_os = "macos")]
             submitted: 0,
+            #[cfg(target_os = "macos")]
+            tx_trace: TxTrace::new_if_enabled(),
+            #[cfg(target_os = "macos")]
+            audibility: None,
             pcm_state_cb: None,
         })
     }
@@ -120,6 +270,26 @@ impl Snd {
     /// not filter by stream, debounce, or interpret. Set before the device is activated.
     pub fn set_pcm_state_callback(&mut self, cb: super::PcmStateFn) {
         self.pcm_state_cb = Some(cb);
+    }
+
+    /// Report to `cb` when the playback stream crosses between sound and silence, `silence`
+    /// being how long a run of bit-exact zero frames has to last before it counts as a pause.
+    /// Set before the device is activated.
+    ///
+    /// The conversion to frames uses 48 kHz, the only rate this device advertises
+    /// (`output_pcm_info`); if that ever grows, this has to follow the negotiated rate.
+    #[cfg(target_os = "macos")]
+    pub fn set_pcm_audibility_callback(
+        &mut self,
+        silence: std::time::Duration,
+        cb: super::PcmAudibilityFn,
+    ) {
+        self.audibility = Some(Audibility {
+            cb,
+            silent_after_frames: (silence.as_secs_f64() * 48_000.0) as u64,
+            zero_frames: 0,
+            reported: None,
+        });
     }
 
     pub fn id(&self) -> &str {
@@ -306,6 +476,11 @@ impl Snd {
     /// no-op and tx falls back to the immediate null sink.
     #[cfg(target_os = "macos")]
     fn handle_pcm_lifecycle(&mut self, code: u32) {
+        // Whatever the guest just did, the stream it left behind is a different one: a
+        // re-prepare discards unplayed audio and a start begins from nothing.
+        if let Some(a) = self.audibility.as_mut() {
+            a.reset();
+        }
         match code {
             VIRTIO_SND_R_PCM_PREPARE => {
                 // Stop the RT thread, then flush any outstanding tx descriptors back to
@@ -457,6 +632,9 @@ impl Snd {
                     self.complete_all_in_flight();
                 }
             }
+            if let Some(t) = self.tx_trace.as_mut() {
+                t.flush();
+            }
             // Completions are signalled from reap_completions, not here.
             false
         }
@@ -512,6 +690,19 @@ impl Snd {
             if pcm_bytes > 0 {
                 let mut data = vec![0u8; pcm_bytes];
                 if reader.read_exact(&mut data).is_ok() {
+                    if self.tx_trace.is_some() || self.audibility.is_some() {
+                        let peak = data
+                            .chunks_exact(2)
+                            .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
+                            .max()
+                            .unwrap_or(0);
+                        if let Some(t) = self.tx_trace.as_mut() {
+                            t.buffer(frames, f32::from(peak) / 32768.0);
+                        }
+                        if let Some(a) = self.audibility.as_mut() {
+                            a.buffer(OUTPUT_STREAM_ID, frames as u64, peak == 0);
+                        }
+                    }
                     if let Some(a) = self.audio.as_ref() {
                         let samples: Vec<f32> = data
                             .chunks_exact(2)
@@ -538,6 +729,9 @@ impl Snd {
     pub fn reap_completions(&mut self) -> bool {
         // Drain the eventfd counter (level is re-kicked by the callback as it consumes).
         let _ = self.completion_evt.read();
+        if let Some(t) = self.tx_trace.as_mut() {
+            t.flush();
+        }
         let consumed = match self.audio.as_ref() {
             Some(a) => a.frames_consumed(),
             None => return false,

@@ -268,6 +268,11 @@ pub struct VmResources {
     /// host desktop is concerned. Ignored unless `snd` is set and the `snd` feature is on.
     #[cfg(feature = "snd")]
     pub snd_state_cb: Option<devices::virtio::PcmStateFn>,
+    /// Told when the guest's playback stream crosses between sound and silence, with how long a
+    /// run of silence counts as a pause. The threshold is the embedder's: the device has no view
+    /// on what a pause is.
+    #[cfg(feature = "snd")]
+    pub snd_audibility_cb: Option<(std::time::Duration, devices::virtio::PcmAudibilityFn)>,
     /// limina: attach the emulated xHCI USB controller (platform `generic-xhci`).
     /// A plain bool so callers need no `usb`-feature cfg; the builder only acts on
     /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
@@ -537,6 +542,8 @@ mod tests {
             snd_capture: false,
             #[cfg(feature = "snd")]
             snd_state_cb: None,
+            #[cfg(feature = "snd")]
+            snd_audibility_cb: None,
             balloon_free_page_reporting: false,
             balloon_deflate_on_oom: false,
             usb: false,

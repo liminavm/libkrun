@@ -1109,6 +1109,7 @@ pub fn build_microvm(
             intc.clone(),
             vm_resources.snd_capture,
             vm_resources.snd_state_cb.clone(),
+            vm_resources.snd_audibility_cb.clone(),
         )?;
     }
     #[cfg(not(feature = "tee"))]
@@ -3014,6 +3015,7 @@ fn attach_snd_device(
     intc: IrqChip,
     capture_enabled: bool,
     state_cb: Option<devices::virtio::PcmStateFn>,
+    audibility_cb: Option<(std::time::Duration, devices::virtio::PcmAudibilityFn)>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
@@ -3021,6 +3023,12 @@ fn attach_snd_device(
     if let Some(cb) = state_cb {
         dev.set_pcm_state_callback(cb);
     }
+    #[cfg(target_os = "macos")]
+    if let Some((silence, cb)) = audibility_cb {
+        dev.set_pcm_audibility_callback(silence, cb);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = audibility_cb;
     let snd = Arc::new(Mutex::new(dev));
 
     event_manager
