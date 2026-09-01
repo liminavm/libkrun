@@ -48,6 +48,28 @@ pub struct PcmStreamState {
     pub event: PcmEvent,
 }
 
+/// What the playback stream is *carrying*, as opposed to whether it is open.
+///
+/// The lifecycle above tells an embedder whether the guest holds the audio device. This tells it
+/// whether what the guest is writing into it is anything at all: a guest desktop that pauses
+/// playback keeps its stream running and goes on submitting buffers of bit-exact digital silence
+/// for seconds before its audio server suspends the node, so `Stop` arrives long after the user's
+/// click. Encoded content is never bit-exact silent — even an inaudibly quiet passage carries
+/// dither — so a sustained run of zero-filled frames is a pause, not a quiet moment.
+///
+/// Mechanism only, as with [`PcmEvent`]: the device reports the edges and takes no view. How long
+/// a run of silence has to be before it counts is the embedder's to choose, and is passed to
+/// [`Snd::set_pcm_audibility_callback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmAudibility {
+    Audible,
+    Silent,
+}
+
+/// Callback invoked when the playback stream crosses between carrying sound and carrying
+/// silence. Runs on the device thread, so it must not block.
+pub type PcmAudibilityFn = std::sync::Arc<dyn Fn(u32, PcmAudibility) + Send + Sync>;
+
 /// Callback invoked on every accepted PCM lifecycle request. Runs on the device thread, so
 /// it must not block: hand the state somewhere else and return.
 pub type PcmStateFn = std::sync::Arc<dyn Fn(PcmStreamState) + Send + Sync>;
