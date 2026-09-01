@@ -1215,6 +1215,7 @@ impl<'a> AttachDevice<'a> for I2cBatteryDevice {
 pub struct SndDevice {
     capture: bool,
     state_cb: Option<devices::virtio::PcmStateFn>,
+    audibility_cb: Option<(std::time::Duration, devices::virtio::PcmAudibilityFn)>,
 }
 
 #[cfg(feature = "snd")]
@@ -1239,6 +1240,18 @@ impl SndDevice {
         self.state_cb = Some(cb);
         self
     }
+
+    /// Told when the guest's playback stream crosses between sound and silence, with how long a
+    /// run of silence counts as a pause. The threshold is the embedder's: the device has no view
+    /// on what a pause is.
+    pub fn pcm_audibility_callback(
+        mut self,
+        silence: std::time::Duration,
+        cb: devices::virtio::PcmAudibilityFn,
+    ) -> Self {
+        self.audibility_cb = Some((silence, cb));
+        self
+    }
 }
 
 #[cfg(feature = "snd")]
@@ -1248,6 +1261,10 @@ impl<'a> AttachDevice<'a> for SndDevice {
             .map_err(|e| VmmError::Internal(format!("snd: {e:?}")))?;
         if let Some(cb) = self.state_cb {
             snd.set_pcm_state_callback(cb);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some((silence, cb)) = self.audibility_cb {
+            snd.set_pcm_audibility_callback(silence, cb);
         }
         let inner = Arc::new(Mutex::new(snd));
         ctx.subscribe_events(inner.clone())?;
