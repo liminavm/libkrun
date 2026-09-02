@@ -1006,16 +1006,14 @@ pub fn build_microvm(
         // device, because it takes no IRQ of its own — putting it here means switching it on
         // cannot shift any other device's interrupt line.
         if vm_resources.cpufreq {
-            let per_cpu = (0..vm_resources.vm_config().vcpu_count.unwrap_or(1))
-                .map(|_| devices::legacy::VcpuPerfDomain {
-                    // A plausible ladder; the values matter only as ratios, since the guest
-                    // derives its frequency-invariance scale from cur/max.
-                    freqs: vec![600_000, 1_200_000, 1_800_000, 2_400_000, 3_200_000],
-                    // One shared domain for now: every vCPU is interchangeable until the
-                    // asymmetric-capacity work gives them different ones.
-                    domain: 0,
-                })
-                .collect();
+            let num_cpus = vm_resources.vm_config().vcpu_count.unwrap_or(1) as usize;
+            let little = vm_resources.little_vcpus.min(num_cpus as u32);
+            let per_cpu = devices::legacy::VcpuPerfDomain::topology(num_cpus, little as usize);
+            // The host half of the asymmetry: the same vCPUs the guest is told are slow get a
+            // QoS class macOS serves on an efficiency core. Without this the capacities are a
+            // fiction and EAS packs work onto CPUs that are not actually cheaper.
+            #[cfg(target_os = "macos")]
+            crate::macos::vcpu_sched::set_topology(num_cpus as u64, little as u64);
             mmio_device_manager
                 .register_mmio_cpufreq(per_cpu)
                 .map_err(Error::RegisterMMIODevice)

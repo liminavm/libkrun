@@ -283,6 +283,13 @@ pub struct VmResources {
     /// exists so the guest gains cpufreq policies and a frequency-invariance source, which are
     /// two of the preconditions for Energy Aware Scheduling (see devices::legacy::VirtCpuFreq).
     pub cpufreq: bool,
+    /// limina: how many of the vCPUs are "little" — advertised to the guest with a lower
+    /// `capacity-dmips-mhz` and their own perf domain, and backed on the host by a vCPU thread
+    /// at a macOS QoS class that lands it on an efficiency core. The last `little_vcpus` vCPUs
+    /// are the little ones; CPU0 is never one. Ignored unless `cpufreq` is on, since the
+    /// asymmetry is only useful to a guest that also has cpufreq policies. Default 0 —
+    /// a uniform machine.
+    pub little_vcpus: u32,
     /// limina: software-defined USB devices cold-plugged to the emulated xHCI
     /// controller's root ports (one per port, in order) before boot. Set by the
     /// caller (`limina-vmm`); the controller enumerates them once `usb` is on.
@@ -553,6 +560,7 @@ mod tests {
             balloon_deflate_on_oom: false,
             usb: false,
             cpufreq: false,
+            little_vcpus: 0,
             #[cfg(feature = "usb")]
             usb_devices: Vec::new(),
             #[cfg(not(feature = "tee"))]

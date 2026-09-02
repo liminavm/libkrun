@@ -831,6 +831,7 @@ impl Vmm {
                 self.mmio_device_manager.get_device_info(),
                 _intc,
                 initrd,
+                self.mmio_device_manager.vcpu_capacities(),
             )
             .map_err(Error::SetupFDT)?;
         }
