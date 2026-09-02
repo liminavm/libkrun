@@ -138,6 +138,11 @@ pub struct VmResources {
     /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
     /// a stock guest without it simply has no USB bus.
     pub usb: bool,
+    /// limina: expose the virtual cpufreq controller (`qemu,virtual-cpufreq`) to the guest.
+    /// Default off. It carries no interrupt and does not change how fast anything runs; it
+    /// exists so the guest gains cpufreq policies and a frequency-invariance source, which are
+    /// two of the preconditions for Energy Aware Scheduling (see devices::legacy::VirtCpuFreq).
+    pub cpufreq: bool,
     /// limina: software-defined USB devices cold-plugged to the emulated xHCI
     /// controller's root ports (one per port, in order) before boot. Set by the
     /// caller (`limina-vmm`); the controller enumerates them once `usb` is on.
@@ -293,6 +298,7 @@ mod tests {
             #[cfg(target_arch = "riscv64")]
             riscv_isa_info: None,
             usb: false,
+            cpufreq: false,
             #[cfg(feature = "usb")]
             usb_devices: Vec::new(),
         }
