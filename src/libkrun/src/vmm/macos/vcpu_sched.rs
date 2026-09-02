@@ -71,6 +71,47 @@ unsafe extern "C" {
 
 /// `QOS_CLASS_USER_INTERACTIVE` from `sys/qos.h`.
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+/// `QOS_CLASS_UTILITY` and `QOS_CLASS_BACKGROUND`, likewise.
+///
+/// Background is what a little vCPU gets, and utility is kept only as a comparison point:
+/// **utility produces no asymmetry whatsoever.** An identical pinned loop in the guest ran in
+/// ~1385 ms on both a big and a "little" vCPU under utility, and ~5200 ms on the little one
+/// under background. Utility *prefers* an efficiency core; only background confines to one —
+/// and throttles besides, which is where the extra slowdown comes from.
+///
+/// The cost of background is that a little vCPU holding a guest spinlock releases it ~4x
+/// slower. That is a real hazard under host contention, and the reason the little count
+/// defaults to zero rather than to something clever.
+const QOS_CLASS_UTILITY: u32 = 0x11;
+const QOS_CLASS_BACKGROUND: u32 = 0x09;
+
+/// The vCPU topology, set once by the builder before any vCPU thread starts: `(num_cpus,
+/// little)`. The last `little` vCPUs are the little ones — the same split the guest is told
+/// about through `capacity-dmips-mhz` and the perf domains.
+static TOPOLOGY: OnceLock<(u64, u64)> = OnceLock::new();
+
+/// Declare which vCPUs are little. Call before starting the vCPU threads; later calls are
+/// ignored, since a thread that has already picked its band will not revisit it.
+pub fn set_topology(num_cpus: u64, little: u64) {
+    let _ = TOPOLOGY.set((num_cpus, little.min(num_cpus)));
+}
+
+/// Whether this vCPU is one of the little ones.
+pub fn is_little(vcpuid: u64) -> bool {
+    match TOPOLOGY.get() {
+        Some(&(num_cpus, little)) if little > 0 => vcpuid >= num_cpus - little,
+        _ => false,
+    }
+}
+
+/// The QoS class a little vCPU's thread runs at. `LIMINA_VCPU_LITTLE_QOS=utility` picks the
+/// shallower class, which is useful for showing that it changes nothing.
+fn little_qos() -> (u32, &'static str) {
+    match std::env::var("LIMINA_VCPU_LITTLE_QOS") {
+        Ok(v) if v.eq_ignore_ascii_case("utility") => (QOS_CLASS_UTILITY, "UTILITY"),
+        _ => (QOS_CLASS_BACKGROUND, "BACKGROUND"),
+    }
+}
 
 const THREAD_EXTENDED_POLICY: u32 = 1;
 const THREAD_BASIC_INFO: u32 = 3;
@@ -343,6 +384,20 @@ fn start_sampler(band: Band) {
 /// Move the *calling* thread into whichever band was asked for. Must run on the vCPU thread
 /// itself, since both policies apply to the current thread.
 pub fn set_realtime_band(vcpuid: u64) {
+    // A little vCPU takes the low QoS class instead, and never the real-time band. The two are
+    // not compatible in either direction: xnu does not serve a time-constraint thread on an
+    // efficiency core, so banding a little vCPU would quietly undo the asymmetry the guest was
+    // told about — and the guest, believing the CPU is slow, would keep packing work onto it.
+    if is_little(vcpuid) {
+        let (class, name) = little_qos();
+        let ret = unsafe { pthread_set_qos_class_self_np(class, 0) };
+        if ret == 0 {
+            log::info!("[VCPU-RT] vCPU {vcpuid} is little: QOS_CLASS_{name}");
+        } else {
+            log::warn!("[VCPU-RT] vCPU {vcpuid}: little qos class refused (errno={ret})");
+        }
+        return;
+    }
     if vcpu_limit().is_some_and(|limit| vcpuid >= limit) {
         return;
     }

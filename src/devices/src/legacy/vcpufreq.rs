@@ -59,6 +59,62 @@ pub struct VcpuPerfDomain {
     pub freqs: Vec<u32>,
     /// Performance-domain id. The driver puts every CPU reporting the same value into one policy.
     pub domain: u32,
+    /// `capacity-dmips-mhz` for this vCPU, relative to a 1024 maximum. **Not read by this
+    /// device** — the FDT emits it on the CPU node — but it lives here because the kernel
+    /// requires the two to agree: `em_dev_register_perf_domain()` refuses a perf domain whose
+    /// CPUs do not all report the same `arch_scale_cpu_capacity`, so a capacity split that does
+    /// not follow a domain split silently costs us the energy model, and with it EAS.
+    pub capacity: u32,
+}
+
+/// The `capacity-dmips-mhz` a vCPU gets when every vCPU is the same. Any value works — the
+/// kernel normalises against the largest — but 1024 is the normalised maximum, so using it
+/// keeps the emitted numbers and the guest's `cpu_capacity` readings identical.
+pub const CAPACITY_UNIFORM: u32 = 1024;
+
+/// The `capacity-dmips-mhz` of a "little" vCPU, as a fraction of [`CAPACITY_UNIFORM`].
+///
+/// **Measured, not derived from the E-core/P-core ratio.** An identical CPU-bound loop pinned
+/// inside the guest takes ~1385 ms on a big vCPU and ~5200 ms on a little one (M1 Max, 4 vCPUs,
+/// steady state) — 3.75x, which is well past the ~2.3x that efficiency-core placement alone
+/// would explain, because `QOS_CLASS_BACKGROUND` throttles as well as relocates.
+///
+/// The number has to be honest or the whole exercise backfires: EAS decides what fits on a CPU
+/// from exactly this capacity, so overstating it makes the scheduler pack work onto a vCPU that
+/// cannot carry it.
+pub const CAPACITY_LITTLE: u32 = 1024 * 100 / 375;
+
+/// The frequency ladder every vCPU advertises. The absolute numbers do not matter — nothing on
+/// the host acts on a request — but the *ratios* do, because the guest derives its
+/// frequency-invariance scale from `cur / max`.
+pub const DEFAULT_FREQS_KHZ: [u32; 5] = [600_000, 1_200_000, 1_800_000, 2_400_000, 3_200_000];
+
+impl VcpuPerfDomain {
+    /// The per-vCPU topology for `num_cpus` vCPUs of which the **last** `little` are little.
+    ///
+    /// Little vCPUs come last so that CPU0 — which takes the boot path and the GIC's default
+    /// interrupt affinity — stays big. `little == 0` gives a uniform machine: one domain, one
+    /// capacity, and no asymmetry for the scheduler to find.
+    ///
+    /// The domain split always follows the capacity split, which is not a style choice: see
+    /// [`VcpuPerfDomain::capacity`].
+    pub fn topology(num_cpus: usize, little: usize) -> Vec<VcpuPerfDomain> {
+        let little = little.min(num_cpus);
+        (0..num_cpus)
+            .map(|i| {
+                let is_little = i >= num_cpus - little;
+                VcpuPerfDomain {
+                    freqs: DEFAULT_FREQS_KHZ.to_vec(),
+                    domain: u32::from(is_little),
+                    capacity: if is_little {
+                        CAPACITY_LITTLE
+                    } else {
+                        CAPACITY_UNIFORM
+                    },
+                }
+            })
+            .collect()
+    }
 }
 
 /// Per-CPU register state.
@@ -178,6 +234,7 @@ mod tests {
                 .map(|i| VcpuPerfDomain {
                     freqs: vec![600_000, 1_200_000, 2_400_000],
                     domain: (i / 2) as u32,
+                    capacity: CAPACITY_UNIFORM,
                 })
                 .collect(),
         )
@@ -226,6 +283,7 @@ mod tests {
         let mut d = VirtCpuFreq::new(vec![VcpuPerfDomain {
             freqs: vec![2_400_000, 600_000, 1_200_000, 600_000],
             domain: 0,
+            capacity: CAPACITY_UNIFORM,
         }]);
         assert_eq!(read32(&mut d, 0, REG_PERFTBL_LEN), 3);
         let got: Vec<u32> = (0..3)
@@ -270,5 +328,43 @@ mod tests {
         let mut byte = [0u8; 1];
         d.read(0, REG_CUR_PERF_STATE, &mut byte);
         assert_eq!(byte, [0]);
+    }
+    /// Every CPU in a perf domain must report the same capacity, or the guest's energy model
+    /// refuses to register and EAS never turns on. The two splits are one split.
+    #[test]
+    fn the_domain_split_follows_the_capacity_split() {
+        for (num, little) in [(4, 0), (4, 2), (8, 2), (2, 1), (3, 5), (1, 0)] {
+            let topo = VcpuPerfDomain::topology(num, little);
+            assert_eq!(topo.len(), num);
+            let mut by_domain: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+            for t in &topo {
+                by_domain.entry(t.domain).or_default().push(t.capacity);
+            }
+            for (domain, caps) in by_domain {
+                assert!(
+                    caps.windows(2).all(|w| w[0] == w[1]),
+                    "domain {domain} of {num}/{little} mixes capacities: {caps:?}"
+                );
+            }
+        }
+    }
+
+    /// CPU0 stays big: it takes the boot path and the GIC's default interrupt affinity.
+    #[test]
+    fn cpu0_is_never_little() {
+        for little in 0..=8 {
+            let topo = VcpuPerfDomain::topology(8, little);
+            if little < 8 {
+                assert_eq!(topo[0].capacity, CAPACITY_UNIFORM, "little={little}");
+            }
+        }
+    }
+
+    /// A uniform machine has exactly one domain and one capacity — nothing for EAS to find.
+    #[test]
+    fn no_littles_means_no_asymmetry() {
+        let topo = VcpuPerfDomain::topology(4, 0);
+        assert!(topo.iter().all(|t| t.domain == 0));
+        assert!(topo.iter().all(|t| t.capacity == CAPACITY_UNIFORM));
     }
 }
