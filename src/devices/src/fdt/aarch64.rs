@@ -23,6 +23,9 @@ const GIC_PHANDLE: u32 = 1;
 const CLOCK_PHANDLE: u32 = 2;
 // This is a value for uniquely identifying the FDT node containing the gpio controller.
 const GPIO_PHANDLE: u32 = 4;
+/// Phandles for the CPU nodes, referenced from `/cpus/cpu-map`. Well clear of the handful of
+/// small ids above so adding one there cannot collide with a vCPU.
+const CPU_PHANDLE_BASE: u32 = 0x100;
 // Read the documentation specified when appending the root node to the FDT.
 const ADDRESS_CELLS: u32 = 0x2;
 const SIZE_CELLS: u32 = 0x2;
@@ -89,6 +92,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     gic_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    vcpu_capacities: &[u32],
 ) -> Result<Vec<u8>> {
     // Alocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -107,7 +111,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // This is not mandatory but we use it to point the root node to the node
     // containing description of the interrupt controller for this VM.
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
-    create_cpu_nodes(&mut fdt, &vcpu_mpidr)?;
+    create_cpu_nodes(&mut fdt, &vcpu_mpidr, vcpu_capacities)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
     create_gic_node(&mut fdt, gic_device)?;
@@ -157,7 +161,16 @@ fn generate_prop64(cells: &[u64]) -> Vec<u8> {
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
+/// `vcpu_capacities` is either empty (a uniform machine: emit nothing) or holds one
+/// `capacity-dmips-mhz` per vCPU. It is all-or-nothing on purpose —
+/// `topology_parse_cpu_capacity()` treats a single CPU node missing the property as
+/// "partial information" and throws away every capacity it has already parsed, falling the
+/// whole machine back to a flat 1024.
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    vcpu_mpidr: &[u64],
+    vcpu_capacities: &[u32],
+) -> Result<()> {
     // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/arm/cpus.yaml.
     let cpu_node = fdt.begin_node("cpus")?;
     // As per documentation, on ARM v8 64-bit systems value should be set to 2.
@@ -177,9 +190,47 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
         // Set the field to first 24 bits of the MPIDR - Multiprocessor Affinity Register.
         // See http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0488c/BABHBJCI.html.
         fdt.property_u64("reg", mpidr & 0x7FFFFF)?;
+        if let Some(&capacity) = vcpu_capacities.get(index) {
+            fdt.property_u32("capacity-dmips-mhz", capacity)?;
+            fdt.property_u32("phandle", CPU_PHANDLE_BASE + index as u32)?;
+        }
         fdt.end_node(cpu_name_node)?;
     }
+    if !vcpu_capacities.is_empty() {
+        create_cpu_map_node(fdt, vcpu_capacities)?;
+    }
     fdt.end_node(cpu_node)?;
+    Ok(())
+}
+
+/// `/cpus/cpu-map`, one cluster per run of equal-capacity CPUs.
+///
+/// This node is what makes the capacities *reach* the kernel: `parse_dt_topology()` returns
+/// early when `/cpus/cpu-map` is absent, and `topology_parse_cpu_capacity()` is only ever
+/// called from underneath it. `capacity-dmips-mhz` on the CPU nodes alone is read by nobody —
+/// the properties are present, the guest reports a flat 1024, and nothing says why.
+///
+/// Emitted only for an asymmetric machine, so a default VM's device tree keeps exactly the
+/// shape it has always had.
+fn create_cpu_map_node(fdt: &mut FdtWriter, vcpu_capacities: &[u32]) -> Result<()> {
+    let map = fdt.begin_node("cpu-map")?;
+    let mut cluster = 0;
+    let mut index = 0;
+    while index < vcpu_capacities.len() {
+        let capacity = vcpu_capacities[index];
+        let cluster_node = fdt.begin_node(&format!("cluster{cluster}"))?;
+        let mut core = 0;
+        while index < vcpu_capacities.len() && vcpu_capacities[index] == capacity {
+            let core_node = fdt.begin_node(&format!("core{core}"))?;
+            fdt.property_u32("cpu", CPU_PHANDLE_BASE + index as u32)?;
+            fdt.end_node(core_node)?;
+            core += 1;
+            index += 1;
+        }
+        fdt.end_node(cluster_node)?;
+        cluster += 1;
+    }
+    fdt.end_node(map)?;
     Ok(())
 }
 
