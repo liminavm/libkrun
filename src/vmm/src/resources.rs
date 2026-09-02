@@ -34,12 +34,12 @@ use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use devices::display::DisplayInfo;
+#[cfg(target_os = "macos")]
+pub use hvf::IpaGranule;
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
-#[cfg(target_os = "macos")]
-pub use hvf::IpaGranule;
 
 type Result<E> = std::result::Result<(), E>;
 
@@ -278,6 +278,11 @@ pub struct VmResources {
     /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
     /// a stock guest without it simply has no USB bus.
     pub usb: bool,
+    /// limina: expose the virtual cpufreq controller (`qemu,virtual-cpufreq`) to the guest.
+    /// Default off. It carries no interrupt and does not change how fast anything runs; it
+    /// exists so the guest gains cpufreq policies and a frequency-invariance source, which are
+    /// two of the preconditions for Energy Aware Scheduling (see devices::legacy::VirtCpuFreq).
+    pub cpufreq: bool,
     /// limina: software-defined USB devices cold-plugged to the emulated xHCI
     /// controller's root ports (one per port, in order) before boot. Set by the
     /// caller (`limina-vmm`); the controller enumerates them once `usb` is on.
@@ -547,6 +552,7 @@ mod tests {
             balloon_free_page_reporting: false,
             balloon_deflate_on_oom: false,
             usb: false,
+            cpufreq: false,
             #[cfg(feature = "usb")]
             usb_devices: Vec::new(),
             #[cfg(not(feature = "tee"))]

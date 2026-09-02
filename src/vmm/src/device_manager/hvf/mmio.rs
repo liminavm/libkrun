@@ -371,6 +371,43 @@ impl MMIODeviceManager {
     }
 
     #[cfg(target_arch = "aarch64")]
+    /// Register the virtual cpufreq device (`qemu,virtual-cpufreq`).
+    ///
+    /// Claims one 4 KiB window per vCPU rather than the flat `MMIO_LEN`, because the guest
+    /// driver indexes the region by logical CPU number. Takes **no interrupt**: the whole
+    /// interface is polled registers, and the guest is never notified of anything.
+    ///
+    /// Registered last, after every interrupt-carrying device, so that turning it on cannot
+    /// shift another device's IRQ line.
+    pub fn register_mmio_cpufreq(
+        &mut self,
+        per_cpu: Vec<devices::legacy::VcpuPerfDomain>,
+    ) -> Result<()> {
+        let len = devices::legacy::VirtCpuFreq::mmio_len(per_cpu.len());
+        let dev = Arc::new(Mutex::new(devices::legacy::VirtCpuFreq::new(per_cpu)));
+
+        self.bus
+            .insert(dev, self.mmio_base, len)
+            .map_err(Error::BusError)?;
+
+        let ret = self.mmio_base;
+        self.id_to_dev_info.insert(
+            (DeviceType::CpuFreq, "cpufreq".to_string()),
+            MMIODeviceInfo {
+                addr: ret,
+                len,
+                // No interrupt line. `create_fdt` must not emit an `interrupts` property for
+                // this node — the binding has none, and a stray one makes the guest's OF core
+                // fail the probe.
+                irq: 0,
+            },
+        );
+
+        self.mmio_base += len;
+
+        Ok(())
+    }
+
     /// Register a MMIO GIC device.
     pub fn register_mmio_gic(&mut self, _vm: &Vm, intc: IrqChip) -> Result<()> {
         let (mmio_addr, mmio_size) = {

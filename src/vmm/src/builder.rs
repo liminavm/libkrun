@@ -1001,6 +1001,26 @@ pub fn build_microvm(
                 .map_err(Error::RegisterMMIODevice)
                 .map_err(StartMicrovmError::Internal)?;
         }
+
+        // limina: virtual cpufreq (opt-in). Registered LAST, after every interrupt-carrying
+        // device, because it takes no IRQ of its own — putting it here means switching it on
+        // cannot shift any other device's interrupt line.
+        if vm_resources.cpufreq {
+            let per_cpu = (0..vm_resources.vm_config().vcpu_count.unwrap_or(1))
+                .map(|_| devices::legacy::VcpuPerfDomain {
+                    // A plausible ladder; the values matter only as ratios, since the guest
+                    // derives its frequency-invariance scale from cur/max.
+                    freqs: vec![600_000, 1_200_000, 1_800_000, 2_400_000, 3_200_000],
+                    // One shared domain for now: every vCPU is interchangeable until the
+                    // asymmetric-capacity work gives them different ones.
+                    domain: 0,
+                })
+                .collect();
+            mmio_device_manager
+                .register_mmio_cpufreq(per_cpu)
+                .map_err(Error::RegisterMMIODevice)
+                .map_err(StartMicrovmError::Internal)?;
+        }
     }
 
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]

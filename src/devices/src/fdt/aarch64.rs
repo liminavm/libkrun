@@ -517,6 +517,23 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(())
 }
 
+/// The virtual cpufreq controller (`Documentation/devicetree/bindings/cpufreq/
+/// qemu,virtual-cpufreq.yaml`): compatible + reg, and deliberately nothing else. The binding
+/// declares `additionalProperties: false` and takes no interrupt, so anything extra here — an
+/// `interrupts` property copied from a neighbouring device, say — makes the guest reject the node
+/// rather than bind it.
+fn create_cpufreq_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
+    let node = fdt.begin_node(&format!("cpufreq@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "qemu,virtual-cpufreq")?;
+    fdt.property("reg", &reg_prop)?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
 fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &HashMap<(DeviceType, String), T>,
@@ -530,6 +547,7 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
             DeviceType::RTC => create_rtc_node(fdt, info)?,
             DeviceType::Serial => create_serial_node(fdt, info)?,
             DeviceType::Xhci => create_xhci_node(fdt, info)?,
+            DeviceType::CpuFreq => create_cpufreq_node(fdt, info)?,
             DeviceType::Virtio(virtio_type) => {
                 ordered_virtio_device.push((info, *virtio_type));
             }

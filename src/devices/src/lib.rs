@@ -58,6 +58,9 @@ pub enum DeviceType {
     /// Device Type: USB xHCI controller (platform `generic-xhci`).
     #[cfg(target_arch = "aarch64")]
     Xhci,
+    /// Device Type: virtual cpufreq (`qemu,virtual-cpufreq`).
+    #[cfg(target_arch = "aarch64")]
+    CpuFreq,
 }
 
 impl fmt::Display for DeviceType {
