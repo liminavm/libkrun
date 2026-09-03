@@ -10,7 +10,7 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
 };
 use super::protocol::*;
-use super::{defs, defs::uapi, SndError};
+use super::{SndError, defs, defs::uapi};
 use crate::virtio::descriptor_utils::{Reader, Writer};
 use crate::virtio::{DescriptorChain, InterruptTransport};
 
@@ -78,6 +78,15 @@ pub struct Snd {
     /// Total frames handed to the sink since the last PREPARE.
     #[cfg(target_os = "macos")]
     pub(crate) submitted: u64,
+    /// Frames the host DAC still owes after our render callback returns, reported to the
+    /// guest as `latency_bytes` so its `runtime->delay` covers the whole path. Re-read on
+    /// a slow cadence, because the user can switch to a Bluetooth device mid-stream and
+    /// change it by an order of magnitude.
+    #[cfg(target_os = "macos")]
+    pub(crate) host_latency_frames: u32,
+    /// When `host_latency_frames` was last read from CoreAudio.
+    #[cfg(target_os = "macos")]
+    pub(crate) host_latency_read_at: Option<std::time::Instant>,
     /// Per-second tx trace, present only when `LIMINA_SND_TRACE=1`.
     #[cfg(target_os = "macos")]
     pub(crate) tx_trace: Option<TxTrace>,
@@ -258,6 +267,10 @@ impl Snd {
             in_flight: std::collections::VecDeque::new(),
             #[cfg(target_os = "macos")]
             submitted: 0,
+            #[cfg(target_os = "macos")]
+            host_latency_frames: 0,
+            #[cfg(target_os = "macos")]
+            host_latency_read_at: None,
             #[cfg(target_os = "macos")]
             tx_trace: TxTrace::new_if_enabled(),
             #[cfg(target_os = "macos")]
@@ -585,9 +598,9 @@ impl Snd {
             VIRTIO_SND_R_PCM_RELEASE => {
                 debug!("snd: capture RELEASE — dropping InputStream begin");
                 self.capture = None; // Drop stops + disposes the unit.
-                                     // The Linux virtio_snd driver's PCM release blocks until every posted rx
-                                     // I/O buffer has been returned (msg_count == 0). Return them here, or the
-                                     // guest hangs and the NEXT open times out (device appears wedged).
+                // The Linux virtio_snd driver's PCM release blocks until every posted rx
+                // I/O buffer has been returned (msg_count == 0). Return them here, or the
+                // guest hangs and the NEXT open times out (device appears wedged).
                 self.flush_rx();
                 debug!("snd: capture RELEASE — dropped");
             }
@@ -612,6 +625,7 @@ impl Snd {
         #[cfg(target_os = "macos")]
         {
             let bpf = self.params.bytes_per_frame();
+            self.refresh_host_latency();
             loop {
                 let head = match self.queues.as_mut().expect("queues exist")[defs::TX_INDEX]
                     .queue
@@ -713,14 +727,47 @@ impl Snd {
                 }
             }
         }
-        // The device-writable tail is a single status word.
+        // The device-writable tail is a single status word. `latency_bytes` is what the
+        // host still owes downstream of us; the guest driver feeds it straight into
+        // `runtime->delay`, which is how an application learns when its audio is audible.
         if let Ok(mut writer) = Writer::new(mem, head.clone()) {
             let _ = writer.write_obj(VirtioSndPcmStatus {
                 status: VIRTIO_SND_S_OK,
-                latency_bytes: 0,
+                latency_bytes: self.host_latency_frames.saturating_mul(bpf as u32),
             });
         }
         frames
+    }
+
+    /// Re-read the host's output latency, at most once a second.
+    ///
+    /// Frames already in our ring or the virtqueue are deliberately *not* counted: a tx
+    /// descriptor is completed only once the render callback has consumed its frames, so
+    /// the guest's own `appl_ptr - hw_ptr` covers everything up to that point. Counting
+    /// them here as well would double the reported delay.
+    #[cfg(target_os = "macos")]
+    fn refresh_host_latency(&mut self) {
+        const REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+        if self.audio.is_none() {
+            self.host_latency_frames = 0;
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .host_latency_read_at
+            .is_some_and(|t| now.duration_since(t) < REFRESH)
+        {
+            return;
+        }
+        self.host_latency_read_at = Some(now);
+        let frames = super::audio_macos::default_output_latency_frames();
+        if frames != self.host_latency_frames {
+            info!(
+                "snd: host output latency {frames} frames ({:.1} ms at 48 kHz)",
+                f64::from(frames) * 1000.0 / 48_000.0
+            );
+            self.host_latency_frames = frames;
+        }
     }
 
     /// Complete every tx descriptor whose frames the sink has now played, advancing the
