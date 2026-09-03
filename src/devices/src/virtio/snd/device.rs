@@ -760,7 +760,13 @@ impl Snd {
             return;
         }
         self.host_latency_read_at = Some(now);
-        let frames = super::audio_macos::default_output_latency_frames();
+        // Diagnostic escape hatch: report 0 as the device did before this was filled in, so the
+        // effect on an application's own latency figure can be A/B'd inside one boot.
+        let frames = if std::env::var("LIMINA_SND_ZERO_LATENCY").as_deref() == Ok("1") {
+            0
+        } else {
+            super::audio_macos::default_output_latency_frames()
+        };
         if frames != self.host_latency_frames {
             info!(
                 "snd: host output latency {frames} frames ({:.1} ms at 48 kHz)",
