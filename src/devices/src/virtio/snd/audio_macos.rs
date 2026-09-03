@@ -12,8 +12,8 @@
 //! so the guest `hw_ptr` advances at the host DAC's real rate (no xrun/clock runaway).
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use utils::eventfd::EventFd;
 
@@ -119,6 +119,13 @@ unsafe extern "C" {
         io_data_size: *mut u32,
         out_data: *mut c_void,
     ) -> i32;
+    fn AudioObjectGetPropertyDataSize(
+        in_object: u32,
+        in_address: *const AudioObjectPropertyAddress,
+        in_qualifier_size: u32,
+        in_qualifier: *const c_void,
+        out_data_size: *mut u32,
+    ) -> i32;
 }
 
 const K_AUDIO_UNIT_TYPE_OUTPUT: u32 = u32::from_be_bytes(*b"auou");
@@ -139,10 +146,107 @@ const K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE: u32 = 2000;
 const K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO: u32 = 2003;
 const K_AUDIO_OUTPUT_UNIT_PROPERTY_SET_INPUT_CALLBACK: u32 = 2005;
 const K_AUDIO_HW_PROP_DEFAULT_INPUT_DEVICE: u32 = u32::from_be_bytes(*b"dIn ");
+const K_AUDIO_HW_PROP_DEFAULT_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"dOut");
+const K_AUDIO_DEV_PROP_LATENCY: u32 = u32::from_be_bytes(*b"ltnc");
+const K_AUDIO_DEV_PROP_SAFETY_OFFSET: u32 = u32::from_be_bytes(*b"saft");
+const K_AUDIO_DEV_PROP_BUFFER_FRAME_SIZE: u32 = u32::from_be_bytes(*b"fsiz");
+const K_AUDIO_DEV_PROP_STREAMS: u32 = u32::from_be_bytes(*b"stm#");
+const K_AUDIO_OBJ_SCOPE_OUTPUT: u32 = u32::from_be_bytes(*b"outp");
 const K_AUDIO_OBJ_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
 const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
 const CAPTURE_INPUT_BUS: u32 = 1;
 const CAPTURE_MAX_FRAMES: usize = 8192;
+
+// ---- host output latency ----------------------------------------------------
+
+/// Read one `u32` device/stream property, or `None` if the HAL refuses it.
+fn object_u32(object: u32, selector: u32, scope: u32) -> Option<u32> {
+    let addr = AudioObjectPropertyAddress {
+        selector,
+        scope,
+        element: 0,
+    };
+    let mut value: u32 = 0;
+    let mut size: u32 = 4;
+    // SAFETY: `addr` and `value` outlive the call; the HAL writes at most `size` bytes.
+    let r = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut value as *mut _ as *mut c_void,
+        )
+    };
+    (r == 0).then_some(value)
+}
+
+/// Frames the default output device still owes after the render callback returns:
+/// the IO buffer it was just handed, plus the device's own pipeline, safety offset
+/// and stream latency.
+///
+/// This is exactly the part of the audio path the guest cannot infer. Everything
+/// upstream of the callback — the SPSC ring and the virtqueue — is already visible to
+/// it, because a tx descriptor is only completed once the callback has consumed its
+/// frames, so `appl_ptr - hw_ptr` covers it. Bluetooth output is why this matters:
+/// the link latency lands in `kAudioDevicePropertyLatency` and runs to a couple of
+/// hundred milliseconds, against ~28 ms for built-in speakers.
+pub(crate) fn default_output_latency_frames() -> u32 {
+    let Some(device) = object_u32(
+        K_AUDIO_OBJECT_SYSTEM_OBJECT,
+        K_AUDIO_HW_PROP_DEFAULT_OUTPUT_DEVICE,
+        K_AUDIO_OBJ_SCOPE_GLOBAL,
+    ) else {
+        return 0;
+    };
+
+    let device_latency = object_u32(device, K_AUDIO_DEV_PROP_LATENCY, K_AUDIO_OBJ_SCOPE_OUTPUT);
+    let safety = object_u32(device, K_AUDIO_DEV_PROP_SAFETY_OFFSET, K_AUDIO_OBJ_SCOPE_OUTPUT);
+    let buffer = object_u32(
+        device,
+        K_AUDIO_DEV_PROP_BUFFER_FRAME_SIZE,
+        K_AUDIO_OBJ_SCOPE_OUTPUT,
+    );
+
+    // The stream carries its own latency, and it is not folded into the device's.
+    let stream_latency = first_output_stream(device)
+        .and_then(|s| object_u32(s, K_AUDIO_DEV_PROP_LATENCY, K_AUDIO_OBJ_SCOPE_GLOBAL));
+
+    device_latency
+        .unwrap_or(0)
+        .saturating_add(safety.unwrap_or(0))
+        .saturating_add(buffer.unwrap_or(0))
+        .saturating_add(stream_latency.unwrap_or(0))
+}
+
+/// The first output stream of `device`, whose latency the device property omits.
+fn first_output_stream(device: u32) -> Option<u32> {
+    let addr = AudioObjectPropertyAddress {
+        selector: K_AUDIO_DEV_PROP_STREAMS,
+        scope: K_AUDIO_OBJ_SCOPE_OUTPUT,
+        element: 0,
+    };
+    let mut size: u32 = 0;
+    // SAFETY: `addr` outlives the call; only `size` is written.
+    let r = unsafe { AudioObjectGetPropertyDataSize(device, &addr, 0, std::ptr::null(), &mut size) };
+    if r != 0 || size < 4 {
+        return None;
+    }
+    let mut streams = vec![0u32; (size / 4) as usize];
+    // SAFETY: `streams` has room for `size` bytes, which is what we ask the HAL for.
+    let r = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            streams.as_mut_ptr() as *mut c_void,
+        )
+    };
+    (r == 0).then(|| streams.first().copied()).flatten()
+}
 
 // ---- lock-free single-producer / single-consumer f32 ring -------------------
 
