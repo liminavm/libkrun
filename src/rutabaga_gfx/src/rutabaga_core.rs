@@ -100,6 +100,16 @@ pub trait RutabagaComponent {
     fn limina_replay_begin(&self, _ctx_id: u32) -> bool {
         false
     }
+    /// Hand a context its whole journal, opaque. Stored, not replayed: the fences below say
+    /// how far to get, because what the entries name is created on the VMM's side.
+    fn limina_journal_restore(&self, _ctx_id: u32, _blob: &[u8]) -> bool {
+        false
+    }
+    /// Advance a restored journal to `upto` (u64::MAX = to the end). False means the feed
+    /// could not run; entries the renderer could not rebuild are its own to name and report.
+    fn limina_journal_replay_upto(&self, _ctx_id: u32, _upto: u64) -> bool {
+        false
+    }
     fn limina_replay_submit(&self, _ctx_id: u32, _cmd: &mut [u8]) -> bool {
         false
     }
@@ -673,6 +683,16 @@ impl Rutabaga {
             .unwrap_or(0)
     }
 
+    pub fn limina_journal_restore(&self, ctx_id: u32, blob: &[u8]) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_journal_restore(ctx_id, blob))
+    }
+    pub fn limina_journal_replay_upto(&self, ctx_id: u32, upto: u64) -> bool {
+        self.components
+            .get(&self.default_component)
+            .is_some_and(|c| c.limina_journal_replay_upto(ctx_id, upto))
+    }
     pub fn limina_replay_begin(&self, ctx_id: u32) -> bool {
         self.components
             .get(&self.default_component)
