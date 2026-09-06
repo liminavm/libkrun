@@ -1333,7 +1333,7 @@ impl VirtioGpu {
         shm_region: &VirtioShmRegion,
         mem: &GuestMemoryMmap,
     ) -> bool {
-        use super::journal::{GpuSnapshotPayload, VKR_KLASS_RING_STREAM, parse_vkr_journal};
+        use super::journal::GpuSnapshotPayload;
         use std::collections::HashMap;
 
         let Some(payload) = GpuSnapshotPayload::from_bytes(data) else {
@@ -1376,74 +1376,40 @@ impl VirtioGpu {
             }
         }
 
-        let mut wire: HashMap<u32, (Vec<super::journal::VkrWireEntry>, usize)> = HashMap::new();
-        for (ctx_id, bytes) in &vkr_journals {
-            match parse_vkr_journal(bytes) {
-                Some(entries) => {
-                    wire.insert(*ctx_id, (entries, 0));
-                }
-                None => {
-                    error!("gpu restore: unparseable vkr journal for ctx {ctx_id}");
-                    return false;
-                }
-            }
-        }
+        // The journal is the renderer's, and opaque here: we hold the bytes, hand them back at
+        // replay_begin, and say how far to get. Its format, its per-command classes and the
+        // routing of a ring-stream entry to its ring are all facts about a renderer this layer
+        // does not otherwise model, and the classic and venus journals do not even share a
+        // format. Parsing it here meant re-deciding all of that on every renderer change, and
+        // deciding it WRONG was indistinguishable from a stale reference (see the drop histogram
+        // this replaced: it sorted losses into classes libkrun was not positioned to judge).
+        let journaled: HashMap<u32, &[u8]> = vkr_journals
+            .iter()
+            .map(|(c, b)| (*c, b.as_slice()))
+            .collect();
         let contents: HashMap<u32, &Vec<u8>> =
             blob_contents.iter().map(|(id, b)| (*id, b)).collect();
 
-        // Two failure classes: a wire entry can fail RECOVERABLY (a retained command
-        // referencing an object destroyed pre-snapshot — its stale write is dropped, virgl
-        // clears the context FATAL, replay continues), while a structural rutabaga failure
-        // (context/blob/mapping) leaves guest-visible state missing and fails the replay.
-        let mut wire_failed = 0u32;
+        // A structural rutabaga failure (context/blob/mapping) leaves guest-visible state
+        // missing and fails the replay. Journal drops are not that: the renderer absorbs and
+        // names each one itself, and reports the set at replay_end — so a fed call failing here
+        // means the feed could not run at all, never that an entry was lost.
         let mut op_failed = 0u32;
-        // Per-class drop histogram (klass 0..=8), reported in the completion log so a
-        // failing run says exactly which entry classes it lost.
-        let mut drops_by_klass = [0u32; 9];
-        // Feed ctx's wire entries with seq <= fence (0 = none pending). Ring-stream
-        // entries go to the target ring's decoder; everything else to the context.
-        macro_rules! replay_wire_upto {
+        // Advance ctx's journal to `fence` (u64::MAX = to the end). The renderer holds the
+        // cursor, because it holds the journal.
+        macro_rules! journal_upto {
             ($ctx:expr, $fence:expr) => {
-                if let Some((entries, pos)) = wire.get_mut(&$ctx) {
-                    while *pos < entries.len()
-                        && ($fence == u64::MAX || entries[*pos].seq <= $fence)
-                    {
-                        let e = &mut entries[*pos];
-                        let ok = if e.klass == VKR_KLASS_RING_STREAM && e.ring_key != 0 {
-                            self.rutabaga.as_ref().is_some_and(|r| {
-                                r.limina_replay_ring_cmd($ctx, e.ring_key, &mut e.bytes)
-                            })
-                        } else {
-                            self.rutabaga
-                                .as_ref()
-                                .is_some_and(|r| r.limina_replay_submit($ctx, &mut e.bytes))
-                        };
-                        if !ok {
-                            wire_failed += 1;
-                            *drops_by_klass
-                                .get_mut(e.klass.min(8) as usize)
-                                .unwrap() += 1;
-                            // Class matters: TRANSIENT..NOTED drops are the benign
-                            // stale-reference kind (a retained vkUpdateDescriptorSets /
-                            // vkBind*Memory naming an object destroyed pre-snapshot — its
-                            // write was dangling before and stays unwritten after). A
-                            // dropped RING class (create/destroy/stream) is load-bearing:
-                            // it can skew the ring's command/reply stream and corrupt the
-                            // live session after resume.
-                            if e.klass >= 6 {
-                                warn!(
-                                    "gpu restore: dropped LOAD-BEARING ring entry ctx={} seq={} klass={} cmd={} ring={:#x} size={}",
-                                    $ctx, e.seq, e.klass, e.cmd_type, e.ring_key, e.bytes.len()
-                                );
-                            } else {
-                                debug!(
-                                    "gpu restore: dropped stale wire entry ctx={} seq={} klass={} cmd={} size={}",
-                                    $ctx, e.seq, e.klass, e.cmd_type, e.bytes.len()
-                                );
-                            }
-                        }
-                        *pos += 1;
-                    }
+                if journaled.contains_key(&$ctx)
+                    && !self
+                        .rutabaga
+                        .as_ref()
+                        .is_some_and(|r| r.limina_journal_replay_upto($ctx, $fence))
+                {
+                    error!(
+                        "gpu restore: journal_replay_upto ctx={} fence={} failed",
+                        $ctx, $fence
+                    );
+                    op_failed += 1;
                 }
             };
         }
@@ -1477,7 +1443,7 @@ impl VirtioGpu {
                     // The create is proxied to the (same-process) render-server thread and
                     // applies asynchronously, so the vkr context may not exist yet — poll.
                     // Each FFI call takes/releases the renderer lock, letting the server in.
-                    if wire.contains_key(ctx_id) {
+                    if let Some(bytes) = journaled.get(ctx_id) {
                         let mut began = false;
                         for _ in 0..2000 {
                             if self
@@ -1494,6 +1460,20 @@ impl VirtioGpu {
                             error!("gpu restore: replay_begin {ctx_id} failed (2s timeout)");
                             return false;
                         }
+                        // Hand the renderer its own journal back. It is stored, not replayed:
+                        // nothing is fed until a fence below says how far to go, because what
+                        // the entries name is created on THIS side as the loop walks on.
+                        if !self
+                            .rutabaga
+                            .as_ref()
+                            .is_some_and(|r| r.limina_journal_restore(*ctx_id, bytes))
+                        {
+                            error!(
+                                "gpu restore: journal_restore {ctx_id} refused ({} bytes)",
+                                bytes.len()
+                            );
+                            return false;
+                        }
                     }
                 }
                 GpuJournalOp::CreateBlob {
@@ -1505,18 +1485,10 @@ impl VirtioGpu {
                     size,
                     backing,
                 } => {
-                    let fed_before = wire.get(ctx_id).map(|(_, p)| *p).unwrap_or(0);
-                    replay_wire_upto!(*ctx_id, entry.vkr_seq);
-                    let fed_after = wire.get(ctx_id).map(|(_, p)| *p).unwrap_or(0);
+                    journal_upto!(*ctx_id, entry.vkr_seq);
                     debug!(
-                        "gpu restore: CREATE_BLOB res {} ctx {} blob_id {} fence {} fed {} wire entries (pos {} of {})",
-                        resource_id,
-                        ctx_id,
-                        blob_id,
-                        entry.vkr_seq,
-                        fed_after - fed_before,
-                        fed_after,
-                        wire.get(ctx_id).map(|(e, _)| e.len()).unwrap_or(0)
+                        "gpu restore: CREATE_BLOB res {resource_id} ctx {ctx_id} blob_id {blob_id} fence {}",
+                        entry.vkr_seq
                     );
                     let create = ResourceCreateBlob {
                         blob_mem: *blob_mem,
@@ -1531,8 +1503,8 @@ impl VirtioGpu {
                     // Rebase the fence into the new journal's epoch (see the loop head):
                     // journal_vkr_seq is the new journal's last-assigned seq — everything
                     // this fence fed has just re-recorded, so this IS the old fence's
-                    // position translated. Venus contexts only (others have no journal).
-                    if wire.contains_key(ctx_id) {
+                    // position translated. Journaled contexts only.
+                    if journaled.contains_key(ctx_id) {
                         rebased_fence = Some(self.journal_vkr_seq(*ctx_id));
                     }
                     if self
@@ -1653,13 +1625,13 @@ impl VirtioGpu {
         // Drain each context's remaining wire entries, restore its device-memory
         // contents (the allocs exist now, and the rings — which consume parked
         // commands the moment they start — haven't started yet), then start the
-        // rings. A failed content write is recoverable in the same sense as a
-        // dropped stale wire entry: the memory whose alloc replay was dropped is
+        // rings. A failed content write is recoverable in the same sense as a journal
+        // entry the renderer could not rebuild: the memory whose alloc was dropped is
         // garbage-if-accessed either way.
-        let ctxs: Vec<u32> = wire.keys().copied().collect();
+        let ctxs: Vec<u32> = journaled.keys().copied().collect();
         let mut content_failed = 0u32;
         for ctx_id in ctxs {
-            replay_wire_upto!(ctx_id, u64::MAX);
+            journal_upto!(ctx_id, u64::MAX);
             for (mem_ctx, mem_id, bytes) in &memory_contents {
                 if *mem_ctx != ctx_id {
                     continue;
@@ -1859,18 +1831,13 @@ impl VirtioGpu {
         }
 
         if op_failed > 0 {
-            error!(
-                "gpu restore: replay FAILED — {op_failed} structural failures ({wire_failed} wire entries also failed)"
-            );
+            error!("gpu restore: replay FAILED — {op_failed} structural failures");
             return false;
         }
-        if wire_failed > 0 {
-            warn!(
-                "gpu restore: replay complete with {wire_failed} dropped wire entries (stale references); drops by class [transient,create,recording,noted,free,pool-reset,ring-create,ring-destroy,ring-stream] = {drops_by_klass:?}"
-            );
-        } else {
-            info!("gpu restore: replay complete (session state re-created)");
-        }
+        // What the journal could not rebuild is named by the renderer at replay_end, in its own
+        // log and in its own vocabulary. Counting it a second time here, in classes this layer
+        // guesses at, is how a recorder gap came to read as a benign stale reference.
+        info!("gpu restore: replay complete (session state re-created)");
         // The re-created world is the payload's world (minus dropped stale writes); adopt
         // its journal so the next suspend records from a warm, accurate baseline.
         self.journal.restore_entries(ops);

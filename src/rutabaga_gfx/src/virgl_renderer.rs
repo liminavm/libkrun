@@ -58,6 +58,8 @@ unsafe extern "C" {
     fn virgl_renderer_limina_journal_seq(ctx_id: u32) -> u64;
     fn virgl_renderer_limina_journal_unpin(ctx_id: u32, key: u64);
     fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> i32;
+    fn virgl_renderer_limina_journal_restore(ctx_id: u32, data: *const c_void, size: u64) -> i32;
+    fn virgl_renderer_limina_journal_replay_upto(ctx_id: u32, upto: u64) -> i32;
     fn virgl_renderer_limina_replay_submit(ctx_id: u32, cmd: *mut c_void, size: u32) -> i32;
     fn virgl_renderer_limina_replay_ring_cmd(
         ctx_id: u32,
@@ -596,6 +598,23 @@ impl RutabagaComponent for VirglRenderer {
 
     fn limina_replay_begin(&self, ctx_id: u32) -> bool {
         unsafe { virgl_renderer_limina_replay_begin(ctx_id) == 0 }
+    }
+
+    fn limina_journal_restore(&self, ctx_id: u32, blob: &[u8]) -> bool {
+        // Safe: the pointer and length come from one slice, so they cannot disagree, and
+        // virglrenderer only reads through it for the duration of the call.
+        unsafe {
+            virgl_renderer_limina_journal_restore(
+                ctx_id,
+                blob.as_ptr() as *const c_void,
+                blob.len() as u64,
+            ) == 0
+        }
+    }
+
+    fn limina_journal_replay_upto(&self, ctx_id: u32, upto: u64) -> bool {
+        // Safe: scalars only; the caller contract puts us on the renderer thread.
+        unsafe { virgl_renderer_limina_journal_replay_upto(ctx_id, upto) == 0 }
     }
 
     fn limina_replay_submit(&self, ctx_id: u32, cmd: &mut [u8]) -> bool {
