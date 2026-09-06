@@ -525,7 +525,8 @@ impl<'a> Cursor<'a> {
 #[derive(Default)]
 pub struct GpuSnapshotPayload {
     pub ops: Vec<GpuJournalEntry>,
-    /// per venus context: (ctx_id, serialized vkr journal — VKJR format)
+    /// per journaled context: (ctx_id, the renderer's serialized journal — opaque here,
+    /// and not one format: the classic and venus renderers each write their own)
     pub vkr_journals: Vec<(u32, Vec<u8>)>,
     /// per guest-mapped blob: (resource_id, raw bytes at snapshot)
     pub blob_contents: Vec<(u32, Vec<u8>)>,
@@ -1154,51 +1155,6 @@ fn get_edid_params(c: &mut Cursor) -> Option<EdidParams> {
     })
 }
 
-/// One parsed entry of a serialized vkr wire journal (virglrenderer's VKJR
-/// format — see vkr_journal.h in the fork).
-pub struct VkrWireEntry {
-    pub seq: u64,
-    pub cmd_type: u32,
-    pub klass: u8,
-    pub ring_key: u64,
-    pub bytes: Vec<u8>,
-}
-
-/// vkr_journal.h: klass value of ring-scoped reply-stream entries, which must
-/// replay on the target ring's own decoder.
-pub const VKR_KLASS_RING_STREAM: u8 = 8;
-
-const VKJR_MAGIC: u32 = 0x524a_4b56; // 'VKJR' LE
-
-pub fn parse_vkr_journal(data: &[u8]) -> Option<Vec<VkrWireEntry>> {
-    let mut c = Cursor { data, pos: 0 };
-    if c.u32()? != VKJR_MAGIC || c.u32()? != 1 {
-        return None;
-    }
-    let count = c.u32()?;
-    let _reserved = c.u32()?;
-    let mut entries = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let seq = c.u64()?;
-        let cmd_type = c.u32()?;
-        let klass = *c.take(1)?.first()?;
-        c.take(3)?; // pad
-        let ring_key = c.u64()?;
-        let size = c.u32()? as usize;
-        let bytes = c.take(size)?.to_vec();
-        let padding = (4 - (size % 4)) % 4;
-        c.take(padding)?;
-        entries.push(VkrWireEntry {
-            seq,
-            cmd_type,
-            klass,
-            ring_key,
-            bytes,
-        });
-    }
-    Some(entries)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1413,41 +1369,5 @@ mod tests {
         }
         .to_bytes();
         assert!(GpuSnapshotPayload::from_bytes(&bytes[..bytes.len() - 3]).is_none());
-    }
-
-    #[test]
-    fn vkr_journal_parses_padded_entries() {
-        // Hand-build a 2-entry VKJR blob: sizes 6 (pad 2) and 8 (pad 0), one ring-stream.
-        let mut v = Vec::new();
-        v.extend_from_slice(&VKJR_MAGIC.to_le_bytes());
-        v.extend_from_slice(&1u32.to_le_bytes()); // version
-        v.extend_from_slice(&2u32.to_le_bytes()); // count
-        v.extend_from_slice(&0u32.to_le_bytes()); // reserved
-
-        // entry 1: seq=5, cmd_type=17, klass=1 (CREATE), ring 0, 6 bytes + 2 pad
-        v.extend_from_slice(&5u64.to_le_bytes());
-        v.extend_from_slice(&17u32.to_le_bytes());
-        v.push(1);
-        v.extend_from_slice(&[0; 3]);
-        v.extend_from_slice(&0u64.to_le_bytes());
-        v.extend_from_slice(&6u32.to_le_bytes());
-        v.extend_from_slice(&[1, 2, 3, 4, 5, 6, 0, 0]);
-        // entry 2: seq=6, cmd_type=99, klass=8 (RING_STREAM), ring key, 8 bytes
-        v.extend_from_slice(&6u64.to_le_bytes());
-        v.extend_from_slice(&99u32.to_le_bytes());
-        v.push(VKR_KLASS_RING_STREAM);
-        v.extend_from_slice(&[0; 3]);
-        v.extend_from_slice(&0xdead_beefu64.to_le_bytes());
-        v.extend_from_slice(&8u32.to_le_bytes());
-        v.extend_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
-
-        let entries = parse_vkr_journal(&v).expect("parse");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].seq, 5);
-        assert_eq!(entries[0].bytes, vec![1, 2, 3, 4, 5, 6]);
-        assert_eq!(entries[1].klass, VKR_KLASS_RING_STREAM);
-        assert_eq!(entries[1].ring_key, 0xdead_beef);
-        assert_eq!(entries[1].bytes.len(), 8);
-        assert!(parse_vkr_journal(&v[..v.len() - 1]).is_none());
     }
 }
