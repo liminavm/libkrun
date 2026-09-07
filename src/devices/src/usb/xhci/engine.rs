@@ -17,15 +17,15 @@ use super::super::model::{
     Completion, ControlTransfer, EpAddr, SetupPacket, Transfer, UsbDeviceModel, XferOutcome,
 };
 use super::context::{
-    dcbaa_entry, ep_state, ep_tr_dequeue, ep_type, input_add_flags, input_drop_flags,
-    input_ep_offset, output_ep_offset, set_ep_state, set_slot_address, set_slot_state,
-    slot_root_hub_port, Ctx32, INPUT_SLOT_OFFSET,
+    Ctx32, INPUT_SLOT_OFFSET, dcbaa_entry, ep_state, ep_tr_dequeue, ep_type, input_add_flags,
+    input_drop_flags, input_ep_offset, output_ep_offset, set_ep_state, set_slot_address,
+    set_slot_state, slot_root_hub_port,
 };
-use super::device::{EpRing, SlotCtx, XhciDevice, NUM_PORTS};
+use super::device::{EpRing, NUM_PORTS, SlotCtx, XhciDevice};
 use super::trb::{
-    cc, command_completion_event, port_status_change_event, transfer_event, trb_type, EventRing,
-    RingError, RingWalker, Trb, CTRL_BSR, CTRL_CHAIN, CTRL_DC, CTRL_DIR_IN, CTRL_IDT, CTRL_IOC,
-    MAX_TD_TRBS,
+    CTRL_BSR, CTRL_CHAIN, CTRL_DC, CTRL_DIR_IN, CTRL_IDT, CTRL_IOC, EventRing, MAX_TD_TRBS,
+    RingError, RingWalker, Trb, cc, command_completion_event, port_status_change_event,
+    transfer_event, trb_type,
 };
 
 /// A gadget call the worker makes with the controller lock **released**.
@@ -1407,10 +1407,10 @@ fn read_out_data(mem: &GuestMemoryMmap, segs: &[(u64, u32)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BusDevice;
     use crate::usb::mock::MockUsbDevice;
     use crate::usb::xhci::context::slot_state;
     use crate::usb::xhci::trb::{CTRL_CYCLE, CTRL_IDT};
-    use crate::BusDevice;
     use utils::eventfd::EventFd;
 
     fn mem() -> GuestMemoryMmap {
@@ -2272,9 +2272,9 @@ mod tests {
             }
             // Finally the state a running guest leaves USBCMD in.
             d.write(0, 0x20, &(1u32 | 4).to_le_bytes()); // RS | INTE
-                                                         // An in-flight CRCR stop (the guest's command watchdog), and work the worker has not
-                                                         // drained yet — a snapshot is taken from the vcpu thread, so all of this can genuinely
-                                                         // be pending at capture.
+            // An in-flight CRCR stop (the guest's command watchdog), and work the worker has not
+            // drained yet — a snapshot is taken from the vcpu thread, so all of this can genuinely
+            // be pending at capture.
             d.write(0, 0x20 + 0x18, &0x2u64.to_le_bytes()); // CRCR.CS
             d.work.cmd_doorbell = true;
             d.work.cmd_abort = true;
