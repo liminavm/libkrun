@@ -10,6 +10,10 @@ use crate::rutabaga_utils::RutabagaError;
 use crate::rutabaga_utils::RutabagaFenceHandler;
 use crate::rutabaga_utils::RutabagaResult;
 
+// The remaining users of this module are all gfxstream's, and gfxstream is behind a feature:
+// with it off, nothing here is reachable. virgl_renderer no longer uses any of it — it talks to
+// virglrs's Rust API, where a box is a Box3 and a refusal is an error, not an errno.
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct VirglBox {
@@ -21,6 +25,7 @@ pub struct VirglBox {
     pub d: u32,
 }
 
+#[allow(dead_code)]
 pub fn ret_to_res(ret: i32) -> RutabagaResult<()> {
     match ret {
         0 => Ok(()),
