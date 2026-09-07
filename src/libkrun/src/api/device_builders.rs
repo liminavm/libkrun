@@ -1336,7 +1336,7 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
             #[cfg(target_os = "macos")]
             ctx.vmm.released_ram.clone(),
         )
-            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         #[cfg(target_os = "macos")]
         {
             balloon.set_free_page_reporting_mode(self.free_page_reporting_mode);

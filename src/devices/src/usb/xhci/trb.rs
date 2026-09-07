@@ -458,7 +458,7 @@ mod tests {
         // single enqueue fits before the producer would collide with the consumer.
         let erdp = 0x9000 + 2 * 16;
         er.enqueue(&m, port_status_change_event(1), erdp).unwrap(); // idx0 -> next idx1
-                                                                    // Next enqueue's next index (2) equals the dequeue index -> full.
+        // Next enqueue's next index (2) equals the dequeue index -> full.
         assert!(er.enqueue(&m, port_status_change_event(1), erdp).is_err());
     }
 
