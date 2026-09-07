@@ -34,9 +34,9 @@ use utils::eventfd::EventFd;
 
 use super::super::model::UsbDeviceModel;
 use super::trb::{EventRing, RingWalker};
+use crate::BusDevice;
 use crate::legacy::IrqChip;
 use crate::usb_state::{XhciEpState, XhciPortState, XhciSlotState, XhciState};
-use crate::BusDevice;
 
 // ---- controller geometry ----------------------------------------------------
 
@@ -717,11 +717,7 @@ impl XhciDevice {
             // per-port registers read as zero).
             _ if self.port_index(off).is_some() => {
                 let (idx, sub) = self.port_index(off).unwrap();
-                if sub == 0 {
-                    self.ports[idx]
-                } else {
-                    0
-                }
+                if sub == 0 { self.ports[idx] } else { 0 }
             }
 
             // Doorbell array and everything else read as zero.
