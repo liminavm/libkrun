@@ -442,8 +442,10 @@ impl HvfVm {
         // granule instead of failing to start: a VM on the coarse granule still boots, it just
         // cannot map a 4 KiB-packed guest's blobs.
         if let Some(granule) = ipa_granule {
-            type SetIpaGranule =
-                libloading::Symbol<'static, unsafe extern "C" fn(hv_vm_config_t, u32) -> hv_return_t>;
+            type SetIpaGranule = libloading::Symbol<
+                'static,
+                unsafe extern "C" fn(hv_vm_config_t, u32) -> hv_return_t,
+            >;
             let set_ipa_granule: Result<SetIpaGranule, libloading::Error> =
                 unsafe { HVF.get(b"hv_vm_config_set_ipa_granule") };
             match set_ipa_granule {

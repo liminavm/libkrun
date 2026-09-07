@@ -1276,9 +1276,11 @@ mod tests {
         assert_eq!(ext[5], 0x22, "DATA_BLOCK_2_TYPE_7_DETAILED_TIMING");
         assert_eq!(ext[7], 20, "one 20-byte timing");
         // Everything past the structure and before the EDID extension checksum is padding.
-        assert!(ext[1 + DISPLAYID_HEADER_LEN + ext[2] as usize + 1..127]
-            .iter()
-            .all(|b| *b == 0));
+        assert!(
+            ext[1 + DISPLAYID_HEADER_LEN + ext[2] as usize + 1..127]
+                .iter()
+                .all(|b| *b == 0)
+        );
     }
 
     /// A horizontal rate past 255 kHz — a 4K panel at 120 Hz — must ride the EDID 1.4 "+255"

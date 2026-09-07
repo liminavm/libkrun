@@ -202,7 +202,11 @@ pub(crate) fn default_output_latency_frames() -> u32 {
     };
 
     let device_latency = object_u32(device, K_AUDIO_DEV_PROP_LATENCY, K_AUDIO_OBJ_SCOPE_OUTPUT);
-    let safety = object_u32(device, K_AUDIO_DEV_PROP_SAFETY_OFFSET, K_AUDIO_OBJ_SCOPE_OUTPUT);
+    let safety = object_u32(
+        device,
+        K_AUDIO_DEV_PROP_SAFETY_OFFSET,
+        K_AUDIO_OBJ_SCOPE_OUTPUT,
+    );
     let buffer = object_u32(
         device,
         K_AUDIO_DEV_PROP_BUFFER_FRAME_SIZE,
@@ -229,7 +233,8 @@ fn first_output_stream(device: u32) -> Option<u32> {
     };
     let mut size: u32 = 0;
     // SAFETY: `addr` outlives the call; only `size` is written.
-    let r = unsafe { AudioObjectGetPropertyDataSize(device, &addr, 0, std::ptr::null(), &mut size) };
+    let r =
+        unsafe { AudioObjectGetPropertyDataSize(device, &addr, 0, std::ptr::null(), &mut size) };
     if r != 0 || size < 4 {
         return None;
     }

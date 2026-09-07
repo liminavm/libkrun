@@ -21,7 +21,7 @@ use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;

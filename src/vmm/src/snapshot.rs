@@ -11,9 +11,9 @@ use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
-use std::sync::Mutex;
 
 use devices::legacy::GpioState;
 use devices::usb_state::{

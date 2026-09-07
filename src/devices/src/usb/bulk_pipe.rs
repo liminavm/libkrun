@@ -394,7 +394,7 @@ mod tests {
             },
             moc_in,
         ); // held on 0x84
-           // A frame for 0x83 must not touch the 0x84 hold.
+        // A frame for 0x83 must not touch the 0x84 hold.
         p.push_in(0x83, vec![0x40, 0x03]);
         assert!(
             moc_rx.try_recv().is_err(),

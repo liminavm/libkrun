@@ -25,4 +25,4 @@ pub use self::model::{
     XferOutcome,
 };
 pub use self::report_pipe::{HidReportPipe, ReportSink};
-pub use self::xhci::{spawn_worker, XhciDevice, XHCI_MMIO_LEN};
+pub use self::xhci::{XHCI_MMIO_LEN, XhciDevice, spawn_worker};
