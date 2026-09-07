@@ -29,6 +29,11 @@ zerocopy = { version = "0.8.26", features = ["derive"] }
 log = "0.4"
 vmm-sys-util = "0.15"
 
+# The renderer itself, as a Rust crate rather than a dylib behind a C ABI. The path is the
+# virglrenderer checkout beside limina's; `LIMINA_VIRGL_PREFIX` no longer chooses the renderer for
+# the worker, because there is nothing left to choose at link time.
+virglrenderer = { package = "virglrs", path = "../../../../../virglrenderer/virglrs" }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["event", "feature", "fs", "mman", "socket", "uio", "ioctl"] }
 
