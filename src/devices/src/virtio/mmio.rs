@@ -416,7 +416,10 @@ impl MmioTransport {
             let used_idx = match mem.read_obj::<u16>(GuestAddress(r.used + 2)) {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!("{}: queue {i} re-arm: used.idx read failed ({e:?}); leaving queue un-ready", self.trace_name);
+                    warn!(
+                        "{}: queue {i} re-arm: used.idx read failed ({e:?}); leaving queue un-ready",
+                        self.trace_name
+                    );
                     q.ready = false;
                     continue;
                 }

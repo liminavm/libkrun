@@ -14,7 +14,7 @@ use crate::virtio::{
 };
 
 use super::backend::{NetBackend, ReadError, WriteError};
-use super::worker::{connect_backend, NetWorker};
+use super::worker::{NetWorker, connect_backend};
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -25,7 +25,7 @@ use std::cmp;
 use std::io::Write;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};

@@ -82,7 +82,7 @@ pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
 #[cfg(target_arch = "aarch64")]
-pub use self::vcpufreq::{VcpuPerfDomain, VirtCpuFreq, PER_CPU_OFFSET as VCPUFREQ_PER_CPU_OFFSET};
+pub use self::vcpufreq::{PER_CPU_OFFSET as VCPUFREQ_PER_CPU_OFFSET, VcpuPerfDomain, VirtCpuFreq};
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
