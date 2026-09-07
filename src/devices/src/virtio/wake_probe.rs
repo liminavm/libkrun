@@ -19,8 +19,8 @@
 // load that never matches.
 
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 static WATCHED_FD: AtomicI32 = AtomicI32::new(-1);
 static KICK_NS: AtomicU64 = AtomicU64::new(0);
@@ -335,11 +335,7 @@ static CMD_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Start timing one virtio-gpu command. Returns 0 (and costs one relaxed load) when off.
 pub fn cmd_start() -> u64 {
-    if enabled() {
-        now_ns()
-    } else {
-        0
-    }
+    if enabled() { now_ns() } else { 0 }
 }
 
 /// Finish timing one virtio-gpu command, keeping the worst of the current drain.
