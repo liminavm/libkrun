@@ -16,5 +16,5 @@ mod engine;
 mod trb;
 mod worker;
 
-pub use self::device::{XhciDevice, XHCI_MMIO_LEN};
+pub use self::device::{XHCI_MMIO_LEN, XhciDevice};
 pub use self::worker::spawn as spawn_worker;
