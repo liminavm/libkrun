@@ -1171,6 +1171,25 @@ mod tests {
         assert_eq!((large[21], large[22]), (50, 33));
     }
 
+    /// The default identity has to describe a monitor a desktop mode could plausibly belong to.
+    ///
+    /// A caller that never sets a physical size gets this, and a guest compositor takes it at its
+    /// word: at 300 dpi a 2560x1440 display measured 8.5 x 4.8 inches, so mutter read a ~10"
+    /// retina panel and laid a seated desktop out at scale 2. Only window-driven boots escaped
+    /// it, by replacing the identity with the host screen's — every headless or capture boot kept
+    /// the phantom panel for the life of the VM.
+    #[test]
+    fn the_default_physical_size_is_a_desktop_panel_not_a_phone() {
+        let edid = build(2560, 1440, &EdidParams::default());
+        let (cm_w, cm_h) = (edid[21] as f32, edid[22] as f32);
+        let diagonal_inches = (cm_w * cm_w + cm_h * cm_h).sqrt() / 2.54;
+        assert!(
+            (24.0..=34.0).contains(&diagonal_inches),
+            "2560x1440 with no identity set should read as a desktop monitor, got \
+             {diagonal_inches:.1}\" ({cm_w}x{cm_h} cm)"
+        );
+    }
+
     /// A mode the base block cannot express gets an honest copy in a DisplayID type VII block:
     /// 3024x1964 @ 120 Hz needs an 866 MHz pixel clock, 1.3x the 655.35 MHz the base detailed
     /// timing tops out at. Without this the guest is told 90 Hz and can never select 120.
