@@ -308,7 +308,8 @@ impl VirtioDevice for Net {
                 self.id(),
                 reused
             );
-            let worker = NetWorker::new(rx_q, tx_q, interrupt.clone(), mem.clone(), backend, stop_fd);
+            let worker =
+                NetWorker::new(rx_q, tx_q, interrupt.clone(), mem.clone(), backend, stop_fd);
             self.worker_thread = Some(worker.run());
             self.device_state = DeviceState::Activated(mem, interrupt);
             Ok(())

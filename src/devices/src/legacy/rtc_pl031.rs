@@ -20,8 +20,8 @@ use utils::byte_order;
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 
-use crate::legacy::IrqChip;
 use crate::BusDevice;
+use crate::legacy::IrqChip;
 //use bus::Error;
 
 // As you can see in https://static.docs.arm.com/ddi0224/c/real_time_clock_pl031_r1p3_technical_reference_manual_DDI0224C.pdf
