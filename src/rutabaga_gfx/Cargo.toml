@@ -29,10 +29,14 @@ zerocopy = { version = "0.8.26", features = ["derive"] }
 log = "0.4"
 vmm-sys-util = "0.15"
 
-# The renderer itself, as a Rust crate rather than a dylib behind a C ABI. The path is the
-# virglrenderer checkout beside limina's; `LIMINA_VIRGL_PREFIX` no longer chooses the renderer for
-# the worker, because there is nothing left to choose at link time.
-virglrenderer = { package = "virglrs", path = "../../../../../virglrenderer/virglrs" }
+# The renderer itself, as a Rust crate rather than a dylib behind a C ABI: nothing chooses it at
+# link time any more, because there is nothing left to choose.
+#
+# A path and not a git dependency, and that is forced rather than preferred: virglrs generates its
+# format tables and its venus wire from a C tree its own scripts/vendor.sh materializes, and a
+# cargo git checkout has no step that could run it. So the crate is vendored like every other
+# fork — `cargo xtask vendor`, pinned in third_party/manifest.toml.
+virglrenderer = { package = "virglrs", path = "../../../virglrs" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["event", "feature", "fs", "mman", "socket", "uio", "ioctl"] }
