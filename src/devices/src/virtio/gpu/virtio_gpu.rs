@@ -361,6 +361,19 @@ pub struct VirtioGpuScanout {
     /// `present_surface` instead of the readback + `present_frame` path.
     #[cfg(target_os = "macos")]
     iosurface_id: Option<u32>,
+    /// limina: consecutive `sync_iosurface` failures on this scanout, and whether the last flush
+    /// took the zero-copy path or the readback fallback.
+    ///
+    /// State, not an event, and deliberately so. The fallback is entered by clearing
+    /// `iosurface_id`, which the next `SET_SCANOUT` re-arms — and `SET_SCANOUT` arrives once per
+    /// page-flip, so a warning at the moment of the switch would print at flip rate while
+    /// telling a reader who arrives later nothing at all. Logging the transitions and keeping
+    /// the count makes "is this scanout on the fallback, and how often did it get there" a
+    /// question that can be asked after the fact.
+    #[cfg(target_os = "macos")]
+    sync_failures: u64,
+    #[cfg(target_os = "macos")]
+    on_readback_fallback: bool,
 }
 
 /// A host-side software 2D resource (limina patch).
@@ -2228,12 +2241,23 @@ impl VirtioGpu {
             );
         }
 
+        // Carried across the re-declaration, not reset by it: SET_SCANOUT arrives once per
+        // page-flip, so a counter rebuilt here would read zero forever no matter how often the
+        // zero-copy path failed.
+        #[cfg(target_os = "macos")]
+        let (sync_failures, on_readback_fallback) = scanout
+            .as_ref()
+            .map_or((0, false), |s| (s.sync_failures, s.on_readback_fallback));
         *scanout = Some(VirtioGpuScanout {
             resource_id,
             width,
             height,
             #[cfg(target_os = "macos")]
             iosurface_id,
+            #[cfg(target_os = "macos")]
+            sync_failures,
+            #[cfg(target_os = "macos")]
+            on_readback_fallback,
         });
         self.scanout_ledger.bind(resource_id);
         // After the scanout borrow ends: this needs `self` to release a displaced id.
@@ -2328,11 +2352,17 @@ impl VirtioGpu {
             );
         }
 
+        // See the counterpart in `set_scanout`: carried across, because this runs per flip.
+        let (sync_failures, on_readback_fallback) = scanout
+            .as_ref()
+            .map_or((0, false), |s| (s.sync_failures, s.on_readback_fallback));
         *scanout = Some(VirtioGpuScanout {
             resource_id,
             width,
             height,
             iosurface_id,
+            sync_failures,
+            on_readback_fallback,
         });
         self.scanout_ledger.bind(resource_id);
         // After the scanout borrow ends: this needs `self` to release a displaced id.
@@ -2429,15 +2459,38 @@ impl VirtioGpu {
                         .ok_or(ErrUnspec)
                         .and_then(|r| r.sync_iosurface(resource_id).map_err(|_| ErrUnspec))
                     {
-                        log::warn!(
-                            "vrend iosurface sync failed for res {resource_id} ({e:?}); \
-                             falling back to readback"
-                        );
                         if let Some(Some(s)) = self.scanouts.get_mut(scanout_id as usize) {
                             s.iosurface_id = None;
+                            s.sync_failures += 1;
+                            // Only the transition is logged. The next SET_SCANOUT re-arms
+                            // `iosurface_id`, and SET_SCANOUT arrives per page-flip, so a failure
+                            // that persists would otherwise warn at 60 Hz and bury every other
+                            // line in the log.
+                            if !s.on_readback_fallback {
+                                s.on_readback_fallback = true;
+                                log::warn!(
+                                    "vrend iosurface sync failed for res {resource_id} ({e:?}); \
+                                     scanout {scanout_id} is now on the readback fallback \
+                                     (failure {} on this scanout)",
+                                    s.sync_failures
+                                );
+                            }
                         }
                         // fall through to the readback path below
                     } else {
+                        // The other transition: a scanout that was on the fallback and is now
+                        // syncing again. Without it the log says how a scanout got into the
+                        // fallback and never that it left, which reads as still-broken.
+                        if let Some(Some(s)) = self.scanouts.get_mut(scanout_id as usize)
+                            && s.on_readback_fallback
+                        {
+                            s.on_readback_fallback = false;
+                            log::warn!(
+                                "vrend iosurface sync recovered for res {resource_id}; scanout \
+                                 {scanout_id} is back on zero-copy after {} failure(s)",
+                                s.sync_failures
+                            );
+                        }
                         match self.display_backend.present_surface(
                             scanout_id,
                             iosurface_id,
