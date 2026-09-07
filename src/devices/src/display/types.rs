@@ -31,11 +31,25 @@ pub struct EdidParams {
     pub alt_mode: Option<DetailedMode>,
 }
 
+/// Density the default EDID claims, and therefore what a guest that is never given a real
+/// identity computes its scale from.
+///
+/// A desktop density, because the physical size tracks the mode: at 300 the generator described
+/// a 2560x1440 display as 8.5 x 4.8 inches — a ~10" retina panel that does not exist — and every
+/// guest compositor that trusts the EDID picked a HiDPI scale for it. A window-driven boot never
+/// saw this, because the supervisor replaces the identity with the host screen's on the first
+/// poll after a frame; a boot with no window keeps it for the life of the VM, which is how a
+/// seated 2560x1440 desktop ended up laid out at scale 2 on a phantom 10" monitor.
+///
+/// 96 is the density a monitor of unknown size is conventionally assumed to have, and it is what
+/// limina's own pushed identities use to mean "an ordinary desktop panel".
+const DEFAULT_DPI: u32 = 96;
+
 impl Default for EdidParams {
     fn default() -> Self {
         EdidParams {
             refresh_rate: 60,
-            physical_size: PhysicalSize::Dpi(300),
+            physical_size: PhysicalSize::Dpi(DEFAULT_DPI),
             identity: None,
             range: None,
             standard_timings: None,
