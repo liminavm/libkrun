@@ -536,10 +536,15 @@ impl RutabagaComponent for VirglRenderer {
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
-        self.r
-            .lock()
-            .unwrap()
-            .create_fence(ClientFenceId(fence.fence_id as u32));
+        // ctx_id names the context whose work this fence is for. The renderer takes its GL sync on
+        // that context, so dropping it here would leave it syncing on whichever context happened
+        // to be current -- right by luck, and wrong whenever the last thing the worker did was a
+        // ctx0 operation. Zero is the global ring naming no context, which the renderer answers by
+        // finishing everything instead.
+        self.r.lock().unwrap().create_fence(
+            ClientFenceId(fence.fence_id as u32),
+            ContextId::new(fence.ctx_id),
+        );
         Ok(())
     }
 
