@@ -271,7 +271,10 @@ impl VirglRenderer {
             video: flags & virglrenderer::abi::USE_VIDEO != 0,
         };
 
-        match Renderer::new(Box::new(Fences(fence_handler)), config) {
+        // No context factory: limina has no GL of its own to lend, so vrend opens the renderer's
+        // own surfaceless display. The factory arm is for an embedder that draws the scanout
+        // itself and needs the texture names to be names in its own share group.
+        match Renderer::new(Box::new(Fences(fence_handler)), config, None) {
             Ok(r) => Ok(Box::new(VirglRenderer {
                 r: std::sync::Arc::new(Mutex::new(r)),
             })),
@@ -327,11 +330,28 @@ impl RutabagaComponent for VirglRenderer {
             .ok_or(RutabagaError::Unsupported)
     }
 
+    /// The version and size the guest sizes its capset buffer from.
+    ///
+    /// Asked of the renderer, not of `Capset::layout`. A layout exists for every capset this
+    /// build can name, served or not, and this answer has to agree with `get_capset` below --
+    /// which hands back an empty vec for a capset no renderer is behind. Advertising VIRGL2 at
+    /// 1408 bytes in a venus-only configuration and then filling none of them would give the
+    /// guest whatever was in that buffer as a capset. Two values that must agree are one value:
+    /// both come from the blob `get_capset` returns.
+    ///
+    /// Diverging from virglrs's own C shim here is deliberate, not an oversight. That shim
+    /// answers from `Capset::layout` because QEMU calls `virgl_renderer_get_cap_set` before
+    /// `virgl_renderer_init`, when there is no renderer to ask -- and it zeroes the buffer it
+    /// will not fill, which is what makes answering from a layout safe there. rutabaga
+    /// constructs the component before anything asks, so there is always a renderer, and there
+    /// is no fill on this path to do the zeroing. Should a before-init caller ever appear here,
+    /// the fix is `layout` AND the zeroing together, never `layout` alone.
     fn get_capset_info(&self, capset_id: u32) -> (u32, u32) {
         self.r
             .lock()
             .unwrap()
-            .capset_max(CapsetId::from_raw((capset_id & 0xff) as u8))
+            .capset(CapsetId::from_raw((capset_id & 0xff) as u8))
+            .map(|c| (c.version(), c.as_bytes().len() as u32))
             .unwrap_or((0, 0))
     }
 
