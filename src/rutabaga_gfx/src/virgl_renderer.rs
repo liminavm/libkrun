@@ -269,6 +269,17 @@ impl VirglRenderer {
             vrend: flags & virglrenderer::abi::NO_VIRGL == 0,
             guest_vram: flags & virglrenderer::abi::USE_GUEST_VRAM != 0,
             video: flags & virglrenderer::abi::USE_VIDEO != 0,
+            // limina ships its own Mesa, and that Mesa takes a fence with PIPE_FLUSH_ASYNC on a
+            // shared context instead of draining the threaded context's call queue. So the
+            // renderer is told to stop flushing behind its fences: the flush would re-drain what
+            // the fence no longer does, since _mesa_flush goes synchronous for any share group
+            // holding an externally shared image and every scanout IOSurface is one.
+            //
+            // Not derived from anything the guest or the flag word says -- it is a claim about the
+            // driver this binary is built and shipped against. A build of libkrun carrying a stock
+            // Mesa must not set it: the flush is what submits the work the fence covers, and
+            // without either, a fence never retires.
+            gl_fences_without_draining: true,
         };
 
         // No context factory: limina has no GL of its own to lend, so vrend opens the renderer's
