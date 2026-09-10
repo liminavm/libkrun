@@ -2448,11 +2448,36 @@ impl VirtioGpu {
                 .and_then(|s| s.iosurface_id)
             {
                 // limina vrend zero-copy scanout: non-blob (ctx_id == 0) scanouts are vrend
-                // textures — unlike venus blobs they don't render INTO the surface, so blit
-                // the current frame into it (GPU-side, sync) before presenting. On failure
-                // (vrend poisons the surface and keeps the resource alive) clear the cached
-                // id and take the readback path from now on.
+                // textures. Their renders still have to complete before the surface is
+                // presented; what differs from a venus blob is only that the resource itself
+                // names no context to fence. On failure (vrend poisons the surface and keeps
+                // the resource alive) clear the cached id and take the readback path from now on.
                 if resource.ctx_id == 0 {
+                    // The same wait, off this thread, when the renderer can name one context
+                    // whose completion the contents depend on. `sync_iosurface` below blocks the
+                    // thread that services virtio-gpu for every guest context, so one surface's
+                    // GPU completion stalls all of them -- measured at about 12.6 ms per present,
+                    // 30-60 times a second, and 55% of that thread under a frame-paced workload.
+                    //
+                    // An error from `present_waits_on` is not a failure: it says this present
+                    // cannot be answered by a single fence (no surface, nothing attached, or
+                    // several contexts attached, any of which would have the frame presented while
+                    // someone's renders were still outstanding), so the blocking path is correct
+                    // for it and is what runs.
+                    if let Some(ctx_id) = self
+                        .rutabaga
+                        .as_ref()
+                        .and_then(|r| r.present_waits_on(resource_id).ok())
+                        && self.try_park_present(
+                            scanout_id,
+                            iosurface_id,
+                            resource_id,
+                            &rect,
+                            ctx_id,
+                        )
+                    {
+                        continue;
+                    }
                     if let Err(e) = self
                         .rutabaga
                         .as_ref()
