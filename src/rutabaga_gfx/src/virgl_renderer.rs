@@ -707,6 +707,22 @@ impl RutabagaComponent for VirglRenderer {
         }
     }
 
+    /// limina vrend zero-copy scanout: which context's completion the surface's contents wait on.
+    ///
+    /// `EINVAL` is not a failure. It is the renderer saying this present cannot be answered by one
+    /// fence -- no surface, nothing attached, or several contexts attached -- and the caller should
+    /// use `sync_iosurface`.
+    #[cfg(target_os = "macos")]
+    fn present_waits_on(&self, resource_id: u32) -> RutabagaResult<u32> {
+        let handle = res(resource_id)?;
+        self.r
+            .lock()
+            .unwrap()
+            .resource_present_waits_on(handle)
+            .map(|ctx| ctx.get())
+            .ok_or(RutabagaError::ComponentError(-libc::EINVAL))
+    }
+
     fn transfer_read(
         &self,
         ctx_id: u32,
