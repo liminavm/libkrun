@@ -247,10 +247,17 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
-    /// limina vrend zero-copy scanout: blit the resource's current texture into its display
-    /// IOSurface (GPU-side) and wait — the pre-present step for vrend scanouts, which unlike
-    /// venus blobs do not render into the surface directly. Only virgl implements it.
+    /// limina vrend zero-copy scanout: complete what was rendered into the resource's display
+    /// IOSurface before it is presented, and wait for it here. Only virgl implements it.
     fn sync_iosurface(&self, _resource_id: u32) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
+    /// limina vrend zero-copy scanout: the context whose completion the surface's contents wait
+    /// on, so the caller can fence it instead of blocking in `sync_iosurface`. An error is "wait
+    /// here after all". Only virgl implements it.
+    #[cfg(target_os = "macos")]
+    fn present_waits_on(&self, _resource_id: u32) -> RutabagaResult<u32> {
         Err(RutabagaError::Unsupported)
     }
 
@@ -1136,10 +1143,13 @@ impl Rutabaga {
         component.read_iosurface(resource_id, dst, dst_stride, height)
     }
 
-    /// limina vrend zero-copy scanout: blit a vrend scanout's texture into its IOSurface and
-    /// wait (GPU-side readpixels through the pinned PBO). Call before presenting the id for a
-    /// scanout that needs the sync (plain SET_SCANOUT resources — venus blobs render into the
-    /// surface directly and never need it).
+    /// limina vrend zero-copy scanout: complete a vrend scanout's renders, waiting here. Call
+    /// before presenting the id for a scanout that needs it (plain SET_SCANOUT resources — venus
+    /// blobs render into the surface directly and never need it).
+    ///
+    /// This waits on the thread that calls it, which is the one servicing virtio-gpu for every
+    /// guest context. Prefer `present_waits_on` where the frame can be parked: same wait, another
+    /// thread.
     #[cfg(target_os = "macos")]
     pub fn sync_iosurface(&self, resource_id: u32) -> RutabagaResult<()> {
         let component = self
@@ -1148,6 +1158,21 @@ impl Rutabaga {
             .ok_or(RutabagaError::InvalidComponent)?;
 
         component.sync_iosurface(resource_id)
+    }
+
+    /// limina vrend zero-copy scanout: the context whose completion a scanout's contents wait on.
+    ///
+    /// Fence that context, present when the fence retires, and the same work is waited for without
+    /// this thread stopping. An error means it cannot be done that way for this resource and
+    /// `sync_iosurface` is the answer.
+    #[cfg(target_os = "macos")]
+    pub fn present_waits_on(&self, resource_id: u32) -> RutabagaResult<u32> {
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+
+        component.present_waits_on(resource_id)
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device
