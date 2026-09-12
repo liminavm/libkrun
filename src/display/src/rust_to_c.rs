@@ -107,6 +107,14 @@ pub trait DisplayBackendBasicFramebuffer {
     fn guest_driver_ready(&mut self) -> Result<(), DisplayBackendError> {
         Err(DisplayBackendError::MethodNotSupported)
     }
+
+    /// (Optional, limina) Whether the guest is held off `scanout_id`'s presented buffers. A
+    /// guest whose scanout flushes carry no fence cannot be, and may draw into a buffer the
+    /// consumer is still showing; a consumer should then show a copy. Called when the answer
+    /// changes. Default: unsupported.
+    fn scanout_held(&mut self, _scanout_id: u32, _held: bool) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -286,6 +294,14 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             from_rust_result(cast_instance::<I>(instance).guest_driver_ready())
         }
 
+        extern "C" fn scanout_held_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            held: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).scanout_held(scanout_id, held != 0))
+        }
+
         DisplayBackend {
             create_userdata: userdata.map_or(null(), |t| ptr::from_ref(t) as *const c_void),
             create_userdata_lifetime: PhantomData,
@@ -304,6 +320,7 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     release_surface: Some(release_surface_fn::<I>),
                     republish_surface: Some(republish_surface_fn::<I>),
                     guest_driver_ready: Some(guest_driver_ready_fn::<I>),
+                    scanout_held: Some(scanout_held_fn::<I>),
                 },
             },
         }
