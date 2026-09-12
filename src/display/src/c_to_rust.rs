@@ -201,6 +201,14 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
             }
         }
     }
+
+    fn scanout_held(&mut self, scanout_id: u32, held: bool) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.scanout_held(scanout_id, u32::from(held))
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
