@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::io::IoSliceMut;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -353,6 +353,57 @@ struct ParkedFlush {
     rect: Rect,
     /// When the flush parked, so a present that waited long for its fence says how long.
     parked_at: std::time::Instant,
+    /// Where this flush stands in [`PresentOrder`].
+    seq: u64,
+}
+
+/// Which flush each scanout last put on glass, so a present that would show an older frame over a
+/// newer one says so.
+///
+/// A flush is presented down one of two roads -- parked on a fence and shown when it retires, or
+/// shown at once -- and a frame on the quick road can land while an older one still waits on the
+/// slow one. That older frame then goes up on top: the window steps back a frame.
+#[derive(Default)]
+struct PresentOrder {
+    next: u64,
+    shown: HashMap<u32, u64>,
+    backwards: u64,
+    overtakes: u64,
+}
+
+impl PresentOrder {
+    #[cfg(target_os = "macos")]
+    fn stamp(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    fn shown(&mut self, scanout_id: u32, seq: u64, iosurface_id: u32, road: &str) {
+        let last = self.shown.entry(scanout_id).or_default();
+        if seq < *last {
+            self.backwards += 1;
+            warn!(
+                "virtio-gpu: scanout {scanout_id} stepped back: flush #{seq} (iosurface \
+                 {iosurface_id}, {road}) shown after flush #{last} ({} so far)",
+                self.backwards
+            );
+        } else {
+            *last = seq;
+        }
+    }
+
+    /// A present about to go straight up while older frames of the same scanout are still parked.
+    #[cfg(target_os = "macos")]
+    fn overtaking(&mut self, scanout_id: u32, parked: usize, why: &str) {
+        self.overtakes += 1;
+        if self.overtakes == 1 || self.overtakes.is_multiple_of(100) {
+            warn!(
+                "virtio-gpu: scanout {scanout_id} presents at once past {parked} parked frame(s) \
+                 ({why}; {} such presents so far)",
+                self.overtakes
+            );
+        }
+    }
 }
 
 /// The reserved vkr fence ring for present fences (mirrors VKR_LIMINA_PRESENT_RING in
@@ -511,6 +562,7 @@ pub struct VirtioGpu {
     vrend_ctx_seen: bool,
     /// limina leak forensics: see [`ScanoutLedger`].
     scanout_ledger: ScanoutLedger,
+    present_order: PresentOrder,
     /// Whether a guest OS driver has taken the device over from boot firmware, reported to the
     /// display backend once per run. The firmware's virtio-gpu driver programs scanout 0 and
     /// never reads an EDID, so the first `GET_EDID` is the handover.
@@ -1021,6 +1073,7 @@ impl VirtioGpu {
             cursor_state: None,
             vrend_ctx_seen: false,
             scanout_ledger: ScanoutLedger::default(),
+            present_order: PresentOrder::default(),
             guest_driver_seen: false,
         }
     }
@@ -2478,20 +2531,31 @@ impl VirtioGpu {
                     // several contexts attached, any of which would have the frame presented while
                     // someone's renders were still outstanding), so the blocking path is correct
                     // for it and is what runs.
-                    if let Some(ctx_id) = self
+                    let seq = self.present_order.stamp();
+                    let waits_on = self
                         .rutabaga
                         .as_ref()
-                        .and_then(|r| r.present_waits_on(resource_id).ok())
+                        .and_then(|r| r.present_waits_on(resource_id).ok());
+                    if let Some(ctx_id) = waits_on
                         && self.try_park_present(
                             scanout_id,
                             iosurface_id,
                             resource_id,
                             &rect,
                             ctx_id,
+                            seq,
                         )
                     {
                         continue;
                     }
+                    self.note_overtake(
+                        scanout_id,
+                        if waits_on.is_none() {
+                            "no single context to fence"
+                        } else {
+                            "parking refused"
+                        },
+                    );
                     if let Err(e) = self
                         .rutabaga
                         .as_ref()
@@ -2537,6 +2601,8 @@ impl VirtioGpu {
                         ) {
                             Ok(()) => {
                                 self.scanout_ledger.present();
+                                self.present_order
+                                    .shown(scanout_id, seq, iosurface_id, "at once");
                                 continue;
                             }
                             Err(DisplayBackendError::MethodNotSupported) => {}
@@ -2551,15 +2617,18 @@ impl VirtioGpu {
                     // present fence on the rendering context; the worker presents when it
                     // retires (true GPU completion). Falls through to the immediate
                     // present if parking isn't possible.
+                    let seq = self.present_order.stamp();
                     if self.try_park_present(
                         scanout_id,
                         iosurface_id,
                         resource_id,
                         &rect,
                         resource.ctx_id,
+                        seq,
                     ) {
                         continue;
                     }
+                    self.note_overtake(scanout_id, "parking refused");
                     match self.display_backend.present_surface(
                         scanout_id,
                         iosurface_id,
@@ -2567,6 +2636,8 @@ impl VirtioGpu {
                     ) {
                         Ok(()) => {
                             self.scanout_ledger.present();
+                            self.present_order
+                                .shown(scanout_id, seq, iosurface_id, "at once");
                             continue;
                         }
                         Err(DisplayBackendError::MethodNotSupported) => {
@@ -2772,6 +2843,7 @@ impl VirtioGpu {
         resource_id: u32,
         rect: &Rect,
         ctx_id: u32,
+        seq: u64,
     ) -> bool {
         if ctx_id == 0 || !Self::fence_present_enabled() {
             return false;
@@ -2791,6 +2863,7 @@ impl VirtioGpu {
                 resource_id,
                 rect: *rect,
                 parked_at: std::time::Instant::now(),
+                seq,
             },
         );
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
@@ -2817,6 +2890,21 @@ impl VirtioGpu {
             return false;
         }
         true
+    }
+
+    /// Tell [`PresentOrder`] when a present is about to skip past frames still parked for its
+    /// scanout.
+    #[cfg(target_os = "macos")]
+    fn note_overtake(&mut self, scanout_id: u32, why: &str) {
+        let parked = self.present_fence.as_ref().map_or(0, |pf| {
+            pf.parked
+                .values()
+                .filter(|p| p.scanout_id == scanout_id)
+                .count()
+        });
+        if parked > 0 {
+            self.present_order.overtaking(scanout_id, parked, why);
+        }
     }
 
     /// limina (#8): drain retired present-fence cookies and present their parked
@@ -2857,7 +2945,7 @@ impl VirtioGpu {
         // image is the one that cannot wait for the guest to redraw: it is republished only on a
         // shape change (dogfood 2026-08-26 — no pointer for minutes).
         let wanted = std::mem::take(&mut *pf.resurface.lock().unwrap());
-        let mut hits: Vec<(u32, u32, u32, Rect)> = Vec::new();
+        let mut hits: Vec<(u32, u32, u32, Rect, u64)> = Vec::new();
         for (cookie, retired_at) in &cookies {
             if let Some(p) = pf.parked.remove(cookie) {
                 // A frame that waited this long is a visible freeze. Said at warn with the split
@@ -2875,7 +2963,7 @@ impl VirtioGpu {
                         pf.parked.len()
                     );
                 }
-                hits.push((p.scanout_id, p.iosurface_id, p.resource_id, p.rect));
+                hits.push((p.scanout_id, p.iosurface_id, p.resource_id, p.rect, p.seq));
                 // limina (#8 half 2): the frame presents below (this same thread, before
                 // anything sleeps). With acks: confirmation comes from the supervisor's
                 // "shown"; without: presenting IS the confirmation (the open-loop latch
@@ -2962,7 +3050,7 @@ impl VirtioGpu {
                 ),
             }
         }
-        for (scanout_id, iosurface_id, resource_id, rect) in hits {
+        for (scanout_id, iosurface_id, resource_id, rect, seq) in hits {
             // Engagement oracle: proves the fence-accurate path is live (a silent
             // fallback to immediate presents would otherwise look identical). The FIRST
             // deferred present logs at INFO — one line per boot, so a production log
@@ -2986,7 +3074,11 @@ impl VirtioGpu {
                 .display_backend
                 .present_surface(scanout_id, iosurface_id, Some(&rect))
             {
-                Ok(()) => self.scanout_ledger.present(),
+                Ok(()) => {
+                    self.scanout_ledger.present();
+                    self.present_order
+                        .shown(scanout_id, seq, iosurface_id, "parked on a fence");
+                }
                 // A sink without zero-copy (headless capture): read the pixels back and
                 // present them as a software frame — the deferred twin of the immediate
                 // path's fallback in `flush_resource`. Before this, arming fence-present
@@ -4079,6 +4171,7 @@ mod test {
                     height: 1,
                 },
                 parked_at: std::time::Instant::now(),
+                seq: 1,
             },
         );
         assert!(!pf.quiescent());
@@ -4093,6 +4186,21 @@ mod test {
     // A control-queue drain presents mid-drain only when one of the three hand-off lists holds
     // something, and reads nothing else: a retired cookie, a shown ack and a resurface ask each
     // have to wake it on their own, or a drain that runs for seconds starves that one.
+    #[test]
+    fn a_frame_shown_after_a_newer_one_is_a_step_back() {
+        let mut order = super::PresentOrder::default();
+        let (older, newer) = (order.stamp(), order.stamp());
+        order.shown(0, newer, 2, "at once");
+        order.shown(0, older, 1, "parked on a fence");
+        assert_eq!(order.backwards, 1);
+        // Another scanout keeps its own order.
+        order.shown(1, older, 3, "at once");
+        assert_eq!(order.backwards, 1);
+        // And the step back did not move the mark: the next frame is judged against the newest.
+        order.shown(0, order.next, 4, "at once");
+        assert_eq!(order.backwards, 1);
+    }
+
     #[test]
     fn present_work_is_seen_on_every_hand_off_list() {
         let pf = bare_present_fence_state();
