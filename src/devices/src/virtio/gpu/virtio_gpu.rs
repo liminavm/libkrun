@@ -254,9 +254,9 @@ struct PresentFenceState {
     /// latch window passed, then retire it via the regular fence handler — giving
     /// the guest honest flip pacing and race-free buffer reuse.
     ///
-    /// Cookies parked by the currently-executing flush command (consumed by the
-    /// flush's trailing FLAG_FENCE, cleared on every flush).
-    flush_parked_cookies: Vec<u64>,
+    /// Cookies parked by the currently-executing flush command, each with its scanout
+    /// (consumed by the flush's trailing FLAG_FENCE, cleared on every flush).
+    flush_parked_cookies: Vec<(u64, u32)>,
     /// Held guest fences, each waiting for its flush's cookies to present (+latch).
     guest_holds: Vec<GuestFlushHold>,
     /// Completes held fences after a delay (clone of the rutabaga fence handler —
@@ -420,6 +420,23 @@ impl PresentOrder {
     }
 }
 
+/// Whether the guest is held off each scanout's presented buffers, as last told to the display.
+///
+/// A fenced scanout flush that parked frames becomes a [`GuestFlushHold`]: the guest waits on it
+/// until the frames are on glass, so it cannot draw into a buffer the display still shows. A
+/// flush whose parked frames get no fence -- a stock guest kernel's -- leaves the guest free to
+/// reuse them at once, and a display sampling the surface zero-copy then shows frames out of
+/// order. The display is told only when a scanout's answer changes.
+#[derive(Default)]
+struct ScanoutHolds(HashMap<u32, bool>);
+
+impl ScanoutHolds {
+    /// Record `held` for `scanout_id`; true when that is news.
+    fn note(&mut self, scanout_id: u32, held: bool) -> bool {
+        self.0.insert(scanout_id, held) != Some(held)
+    }
+}
+
 /// The reserved vkr fence ring for present fences (mirrors VKR_LIMINA_PRESENT_RING in
 /// our virglrenderer fork). Guest fences never use it — a guest process would need
 /// 63 concurrent VkQueues.
@@ -577,6 +594,7 @@ pub struct VirtioGpu {
     /// limina leak forensics: see [`ScanoutLedger`].
     scanout_ledger: ScanoutLedger,
     present_order: PresentOrder,
+    held_scanouts: ScanoutHolds,
     /// Whether a guest OS driver has taken the device over from boot firmware, reported to the
     /// display backend once per run. The firmware's virtio-gpu driver programs scanout 0 and
     /// never reads an EDID, so the first `GET_EDID` is the handover.
@@ -1088,6 +1106,7 @@ impl VirtioGpu {
             vrend_ctx_seen: false,
             scanout_ledger: ScanoutLedger::default(),
             present_order: PresentOrder::default(),
+            held_scanouts: ScanoutHolds::default(),
             guest_driver_seen: false,
         }
     }
@@ -2007,6 +2026,8 @@ impl VirtioGpu {
         // The ledger's live ids belonged to the dropped session; the running totals stay so a
         // reboot mid-investigation doesn't hide what came before.
         self.scanout_ledger.live.clear();
+        // The next session may run another kernel; its first flushes report afresh.
+        self.held_scanouts = ScanoutHolds::default();
         {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
@@ -2495,11 +2516,16 @@ impl VirtioGpu {
     pub fn flush_resource(&mut self, resource_id: u32, rect: Rect) -> VirtioGpuResult {
         // limina (#8 half 2): the parked-cookie list is per flush command — it feeds the
         // flush's own trailing FLAG_FENCE and must never leak into a later command.
-        if let Some(pf) = self.present_fence.as_mut()
-            && !pf.flush_parked_cookies.is_empty()
-        {
-            pf.flush_parked_cookies.clear();
+        let unfenced: Vec<u32> = self
+            .present_fence
+            .as_mut()
+            .map(|pf| pf.flush_parked_cookies.drain(..).map(|(_, s)| s).collect())
+            .unwrap_or_default();
+        if !unfenced.is_empty() {
             self.present_order.unfenced_flush();
+            for scanout_id in unfenced {
+                self.note_scanout_held(scanout_id, false);
+            }
         }
         if resource_id == 0 {
             return Ok(OkNoData);
@@ -2884,7 +2910,7 @@ impl VirtioGpu {
             },
         );
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
-        pf.flush_parked_cookies.push(cookie);
+        pf.flush_parked_cookies.push((cookie, scanout_id));
 
         let fence = RutabagaFence {
             flags: RUTABAGA_FLAG_FENCE | RUTABAGA_FLAG_INFO_RING_IDX,
@@ -2903,10 +2929,27 @@ impl VirtioGpu {
             // every frame.
             let pf = self.present_fence.as_mut().unwrap();
             pf.parked.remove(&cookie);
-            pf.flush_parked_cookies.retain(|c| *c != cookie);
+            pf.flush_parked_cookies.retain(|(c, _)| *c != cookie);
             return false;
         }
         true
+    }
+
+    /// Tell the display whether the guest is held off `scanout_id`'s presented buffers, when
+    /// that changes.
+    fn note_scanout_held(&mut self, scanout_id: u32, held: bool) {
+        if !self.held_scanouts.note(scanout_id, held) {
+            return;
+        }
+        info!(
+            "virtio-gpu: scanout {scanout_id} {}",
+            if held {
+                "flushes are fenced; the guest is held off buffers on glass"
+            } else {
+                "flushes carry no fence; nothing holds the guest off buffers on glass"
+            }
+        );
+        let _ = self.display_backend.scanout_held(scanout_id, held);
     }
 
     /// Tell [`PresentOrder`] when a present is about to skip past frames still parked for its
@@ -3632,7 +3675,10 @@ impl VirtioGpu {
             if let Some(pf) = self.present_fence.as_mut() {
                 if !pf.flush_parked_cookies.is_empty() {
                     let cookies = std::mem::take(&mut pf.flush_parked_cookies);
-                    let set: std::collections::BTreeSet<u64> = cookies.into_iter().collect();
+                    let set: std::collections::BTreeSet<u64> =
+                        cookies.iter().map(|(c, _)| *c).collect();
+                    let scanouts: std::collections::BTreeSet<u32> =
+                        cookies.iter().map(|(_, s)| *s).collect();
                     let now = std::time::Instant::now();
                     // Wedge-proof ceiling: whatever happens to the parked frames
                     // (lost ack, dead context, any future leak class), the guest's
@@ -3649,6 +3695,9 @@ impl VirtioGpu {
                         fallback_at: None,
                         created_at: now,
                     });
+                    for scanout_id in scanouts {
+                        self.note_scanout_held(scanout_id, true);
+                    }
                     return Ok(OkNoData);
                 }
             }
@@ -4161,7 +4210,7 @@ mod test {
     #[test]
     fn stale_present_bookkeeping_does_not_block_quiescence() {
         let mut pf = bare_present_fence_state();
-        pf.flush_parked_cookies.push(7);
+        pf.flush_parked_cookies.push((7, 0));
         pf.awaiting_shown.push_back((42, 7));
         assert!(
             pf.quiescent(),
@@ -4204,6 +4253,19 @@ mod test {
     // something, and reads nothing else: a retired cookie, a shown ack and a resurface ask each
     // have to wake it on their own, or a drain that runs for seconds starves that one.
     #[test]
+    fn a_scanout_hold_is_reported_only_when_it_changes() {
+        let mut holds = super::ScanoutHolds::default();
+        assert!(holds.note(0, false), "the first answer is news");
+        assert!(!holds.note(0, false), "the same answer again is not");
+        assert!(holds.note(1, false), "another scanout keeps its own answer");
+        assert!(
+            holds.note(0, true),
+            "a fenced flush holding the guest again is news"
+        );
+        assert!(!holds.note(0, true));
+    }
+
+    #[test]
     fn a_frame_shown_after_a_newer_one_is_a_step_back() {
         let mut order = super::PresentOrder::default();
         let (older, newer) = (order.stamp(), order.stamp());
@@ -4242,7 +4304,7 @@ mod test {
     #[test]
     fn take_stale_bookkeeping_drains_and_counts() {
         let mut pf = bare_present_fence_state();
-        pf.flush_parked_cookies.push(7);
+        pf.flush_parked_cookies.push((7, 0));
         pf.awaiting_shown.push_back((42, 7));
         pf.awaiting_shown.push_back((43, 8));
         assert_eq!(pf.take_stale_bookkeeping(), (1, 2));
