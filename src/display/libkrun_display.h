@@ -280,6 +280,30 @@ typedef int32_t (*krun_display_republish_surface_fn)(void *instance, uint32_t io
 typedef int32_t (*krun_display_guest_driver_ready_fn)(void *instance);
 
 /**
+ * (limina extension, optional) Whether the guest is held off a scanout's presented buffers.
+ *
+ * A zero-copy present hands the consumer a surface the guest still owns. When the guest fences
+ * its scanout flushes, the device holds that fence until the frame is on glass, so the guest
+ * cannot draw into a buffer the consumer is still showing. A guest whose flushes carry no fence
+ * cannot be held: it may reuse a presented buffer at once, and a consumer that keeps sampling
+ * the surface will show frames out of order. Such a consumer should show a copy instead.
+ *
+ * Called when the answer changes, per scanout: `held` = 0 on the first flush that arrived
+ * without its fence, 1 when a fenced flush holds the guest again. A device reset forgets the
+ * answer, so the next flush reports afresh.
+ *
+ * Arguments:
+ *  "instance"   - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id" - The scanout the answer is about.
+ *  "held"       - 1 when the guest is held off the scanout's presented buffers, 0 otherwise.
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise. The device ignores
+ *  the result.
+ */
+typedef int32_t (*krun_display_scanout_held_fn)(void *instance, uint32_t scanout_id, uint32_t held);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -308,6 +332,7 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_release_surface_fn     release_surface; // (optional) limina: guest unref'd a scanout resource
     krun_display_republish_surface_fn   republish_surface; // (optional) limina: hand a surface over again
     krun_display_guest_driver_ready_fn  guest_driver_ready; // (optional) limina: OS driver took over
+    krun_display_scanout_held_fn        scanout_held; // (optional) limina: guest held off presented buffers
 };
 
 union krun_display_vtable {
