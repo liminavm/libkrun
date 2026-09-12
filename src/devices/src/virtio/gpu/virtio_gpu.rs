@@ -2599,6 +2599,8 @@ impl VirtioGpu {
                             "parking refused"
                         },
                     );
+                    // Presented at once, so no hold can form on this flush.
+                    self.note_scanout_held(scanout_id, false);
                     if let Err(e) = self
                         .rutabaga
                         .as_ref()
@@ -2672,6 +2674,7 @@ impl VirtioGpu {
                         continue;
                     }
                     self.note_overtake(scanout_id, "parking refused");
+                    self.note_scanout_held(scanout_id, false);
                     match self.display_backend.present_surface(
                         scanout_id,
                         iosurface_id,
