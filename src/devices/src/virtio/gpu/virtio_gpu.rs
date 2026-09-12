@@ -369,6 +369,7 @@ struct PresentOrder {
     shown: HashMap<u32, u64>,
     backwards: u64,
     overtakes: u64,
+    unfenced: u64,
 }
 
 impl PresentOrder {
@@ -401,6 +402,19 @@ impl PresentOrder {
                 "virtio-gpu: scanout {scanout_id} presents at once past {parked} parked frame(s) \
                  ({why}; {} such presents so far)",
                 self.overtakes
+            );
+        }
+    }
+
+    /// A flush that parked frames arrived without a trailing fence, so nothing holds the guest
+    /// off the buffers it presented.
+    fn unfenced_flush(&mut self) {
+        self.unfenced += 1;
+        if self.unfenced == 1 || self.unfenced.is_multiple_of(1000) {
+            warn!(
+                "virtio-gpu: a scanout flush parked frames without a fence to hold the guest \
+                 off their buffers ({} such flushes so far)",
+                self.unfenced
             );
         }
     }
@@ -2481,8 +2495,11 @@ impl VirtioGpu {
     pub fn flush_resource(&mut self, resource_id: u32, rect: Rect) -> VirtioGpuResult {
         // limina (#8 half 2): the parked-cookie list is per flush command — it feeds the
         // flush's own trailing FLAG_FENCE and must never leak into a later command.
-        if let Some(pf) = self.present_fence.as_mut() {
+        if let Some(pf) = self.present_fence.as_mut()
+            && !pf.flush_parked_cookies.is_empty()
+        {
             pf.flush_parked_cookies.clear();
+            self.present_order.unfenced_flush();
         }
         if resource_id == 0 {
             return Ok(OkNoData);
