@@ -579,7 +579,13 @@ impl Worker {
                     if let (Some(p), None) = (wake_probe.as_mut(), kick_ns) {
                         p.record_no_kick();
                     }
+                    // Nothing else on this thread runs until the drain below returns -- retired
+                    // presents included -- so a long one is a frozen window. Measured here, where
+                    // the time goes, rather than inferred from the presents it delays.
+                    let drain_began = std::time::Instant::now();
+                    let mut drain_passes = 0u32;
                     loop {
+                        drain_passes += 1;
                         let _ = control_queue.lock().unwrap().disable_notification(mem);
                         let used_any = self.process_queue(virtio_gpu, control_queue, mem);
                         let drained_ns = probe_pass.map(|_| crate::virtio::wake_probe::now_ns());
@@ -617,6 +623,14 @@ impl Worker {
                                 break;
                             }
                         }
+                    }
+                    let drained = drain_began.elapsed();
+                    if drained >= std::time::Duration::from_millis(100) {
+                        warn!(
+                            "virtio-gpu: control queue drain ran {} ms over {drain_passes} pass(es); \
+                             nothing else on the worker ran meanwhile",
+                            drained.as_millis()
+                        );
                     }
                 }
                 if source == cursor_ev_fd {
@@ -1193,6 +1207,10 @@ impl Worker {
             virtio_gpu.dump_renderer_state();
         }
 
+        // How long a drain may run before it stops to present what has retired: well inside a
+        // frame, and coarse enough that the check costs one clock read per command.
+        const PRESENT_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(2);
+        let mut last_present_pump = std::time::Instant::now();
         loop {
             let head = control_queue.lock().unwrap().pop(&mem);
 
@@ -1303,6 +1321,13 @@ impl Worker {
                         error!("failed to add used elements to the queue: {e:?}");
                     }
                     used_any = true;
+                }
+
+                // This drain can outlast many frames, and nothing else on this thread runs until
+                // it ends -- retired presents included. See `process_retired_presents_mid_drain`.
+                if last_present_pump.elapsed() >= PRESENT_PUMP_EVERY {
+                    last_present_pump = std::time::Instant::now();
+                    virtio_gpu.process_retired_presents_mid_drain();
                 }
             } else {
                 break;

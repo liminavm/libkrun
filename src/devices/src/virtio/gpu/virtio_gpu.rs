@@ -238,7 +238,9 @@ impl VirtioGpuResource {
 /// the display forever.
 struct PresentFenceState {
     /// Cookies retired by the fence handler (vkr sync threads) awaiting present.
-    retired: Arc<Mutex<Vec<u64>>>,
+    /// Retired cookies, with when the fence retired: the gap to the present that takes them is
+    /// time the worker spent elsewhere.
+    retired: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
     /// Wakes the worker epoll when `retired` gains entries.
     event: utils::eventfd::EventFd,
     next_cookie: u64,
@@ -302,6 +304,15 @@ impl PresentFenceState {
             && self.retired.lock().unwrap().is_empty()
     }
 
+    /// Whether the fence handler or the ack reader has left the worker something to present or
+    /// answer. Asked between commands of a long control-queue drain, so it reads the three
+    /// hand-off lists and nothing else -- no eventfd, which a drain must never block on.
+    fn has_work(&self) -> bool {
+        !self.retired.lock().unwrap().is_empty()
+            || !self.shown.lock().unwrap().is_empty()
+            || !self.resurface.lock().unwrap().is_empty()
+    }
+
     /// Drain the forward-looking bookkeeping a device reset strands: cookies whose
     /// trailing flush fence the guest's freeze-time reset dropped, and shown-ack
     /// entries whose ack cannot arrive during a reset. Left behind, a stale cookie
@@ -340,6 +351,8 @@ struct ParkedFlush {
     /// without zero-copy reads the IOSurface's pixels back via the resource).
     resource_id: u32,
     rect: Rect,
+    /// When the flush parked, so a present that waited long for its fence says how long.
+    parked_at: std::time::Instant,
 }
 
 /// The reserved vkr fence ring for present fences (mirrors VKR_LIMINA_PRESENT_RING in
@@ -601,7 +614,7 @@ impl VirtioGpu {
     fn create_fence_handler(
         active: Arc<Mutex<Option<GpuActivation>>>,
         fence_state: Arc<Mutex<FenceState>>,
-        present_retired: Arc<Mutex<Vec<u64>>>,
+        present_retired: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
         present_event: utils::eventfd::EventFd,
         trace: Arc<GpuTraceStats>,
     ) -> RutabagaFenceHandler {
@@ -628,7 +641,7 @@ impl VirtioGpu {
                 present_retired
                     .lock()
                     .unwrap()
-                    .push(completed_fence.fence_id);
+                    .push((completed_fence.fence_id, std::time::Instant::now()));
                 if let Err(e) = present_event.write(1) {
                     error!("present fence eventfd write failed: {e}");
                 }
@@ -833,7 +846,8 @@ impl VirtioGpu {
 
         // limina (#8): present-fence plumbing — built up front because the fence handler
         // needs its endpoints.
-        let present_retired: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let present_retired: Arc<Mutex<Vec<(u64, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let present_event = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK)
             .expect("failed to create present-fence eventfd");
 
@@ -2776,6 +2790,7 @@ impl VirtioGpu {
                 iosurface_id,
                 resource_id,
                 rect: *rect,
+                parked_at: std::time::Instant::now(),
             },
         );
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
@@ -2807,12 +2822,34 @@ impl VirtioGpu {
     /// limina (#8): drain retired present-fence cookies and present their parked
     /// frames. Runs on the worker thread (epoll on the present eventfd).
     pub fn process_retired_presents(&mut self) {
+        self.take_retired_presents(true);
+    }
+
+    /// Present what has retired from inside a control-queue drain, if anything has.
+    ///
+    /// A drain runs until the guest stops refilling the queue, and a client submitting faster than
+    /// it is decoded keeps one going for seconds; the present eventfd is only read once it ends.
+    /// Measured at 15k aquarium fish: fences retired within 18 ms, and their frames then waited up
+    /// to 25 s for the drain to finish -- a window frozen on a GPU that had long since finished.
+    /// Taking them here, between commands, leaves a backlog delaying the guest's work but never the
+    /// frames it already rendered.
+    pub fn process_retired_presents_mid_drain(&mut self) {
+        if self.present_fence.as_ref().is_some_and(|pf| pf.has_work()) {
+            // The eventfd is left for the worker's epoll: reading it here could block, and the
+            // count it still holds costs one wake that finds nothing to do.
+            self.take_retired_presents(false);
+        }
+    }
+
+    fn take_retired_presents(&mut self, drain_event: bool) {
         let Some(pf) = self.present_fence.as_mut() else {
             return;
         };
         // Drain the eventfd (level cleared) before the cookies so a cookie pushed
         // after the swap re-raises the event rather than getting lost.
-        let _ = pf.event.read();
+        if drain_event {
+            let _ = pf.event.read();
+        }
         let cookies = std::mem::take(&mut *pf.retired.lock().unwrap());
         let shown_ids = std::mem::take(&mut *pf.shown.lock().unwrap());
         // limina: hand back surfaces the supervisor lost. This thread owns the display backend,
@@ -2821,8 +2858,23 @@ impl VirtioGpu {
         // shape change (dogfood 2026-08-26 — no pointer for minutes).
         let wanted = std::mem::take(&mut *pf.resurface.lock().unwrap());
         let mut hits: Vec<(u32, u32, u32, Rect)> = Vec::new();
-        for cookie in &cookies {
+        for (cookie, retired_at) in &cookies {
             if let Some(p) = pf.parked.remove(cookie) {
+                // A frame that waited this long is a visible freeze. Said at warn with the split
+                // and the backlog behind it: the fence retiring late and the worker taking the
+                // retirement late are different faults that freeze the window identically.
+                let waited = p.parked_at.elapsed();
+                if waited >= std::time::Duration::from_millis(100) {
+                    warn!(
+                        "virtio-gpu: parked present of iosurface {} waited {} ms: {} ms for its \
+                         fence, {} ms for the worker to take it ({} more still parked)",
+                        p.iosurface_id,
+                        waited.as_millis(),
+                        retired_at.duration_since(p.parked_at).as_millis(),
+                        retired_at.elapsed().as_millis(),
+                        pf.parked.len()
+                    );
+                }
                 hits.push((p.scanout_id, p.iosurface_id, p.resource_id, p.rect));
                 // limina (#8 half 2): the frame presents below (this same thread, before
                 // anything sleeps). With acks: confirmation comes from the supervisor's
@@ -2863,6 +2915,11 @@ impl VirtioGpu {
             // fence unconditionally — drop the hold (covers frames that can never
             // present, e.g. the owning context died while its buffer was on scanout).
             if now > hold.created_at + std::time::Duration::from_millis(500) {
+                warn!(
+                    "virtio-gpu: guest flush fence released by the 500 ms ceiling with {} frame(s) \
+                     not yet presented",
+                    hold.unpresented.len()
+                );
                 continue;
             }
             if hold.unconfirmed.is_empty() {
@@ -4021,12 +4078,36 @@ mod test {
                     width: 1,
                     height: 1,
                 },
+                parked_at: std::time::Instant::now(),
             },
         );
         assert!(!pf.quiescent());
         pf.parked.clear();
-        pf.retired.lock().unwrap().push(1);
+        pf.retired
+            .lock()
+            .unwrap()
+            .push((1, std::time::Instant::now()));
         assert!(!pf.quiescent());
+    }
+
+    // A control-queue drain presents mid-drain only when one of the three hand-off lists holds
+    // something, and reads nothing else: a retired cookie, a shown ack and a resurface ask each
+    // have to wake it on their own, or a drain that runs for seconds starves that one.
+    #[test]
+    fn present_work_is_seen_on_every_hand_off_list() {
+        let pf = bare_present_fence_state();
+        assert!(!pf.has_work(), "an empty state has nothing to present");
+        pf.retired
+            .lock()
+            .unwrap()
+            .push((1, std::time::Instant::now()));
+        assert!(pf.has_work(), "a retired present fence is work");
+        pf.retired.lock().unwrap().clear();
+        pf.shown.lock().unwrap().push(9);
+        assert!(pf.has_work(), "a shown ack is work");
+        pf.shown.lock().unwrap().clear();
+        pf.resurface.lock().unwrap().push(9);
+        assert!(pf.has_work(), "a resurface ask is work");
     }
 
     // Parking a session across a reset must DISCARD the stranded bookkeeping: a stale
