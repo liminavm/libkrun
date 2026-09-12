@@ -103,6 +103,10 @@ pub struct Worker {
     /// limina M9.3: flipped true (+ notify) once the staged replay finished; the device's
     /// `activate` blocks the guest's DRIVER_OK on it (see `Gpu::restore_done`).
     restore_done: Arc<(Mutex<bool>, Condvar)>,
+    /// Whether the guest has kicked this activation's cursor queue. Only then does a long
+    /// control-queue drain service it: a driver that never uses the queue (the firmware's) may
+    /// leave it unconfigured, and servicing one writes to wherever its rings point.
+    cursor_kicked: bool,
 }
 
 impl Worker {
@@ -141,6 +145,7 @@ impl Worker {
             resize_pending,
             pending_restore,
             restore_done,
+            cursor_kicked: false,
         }
     }
 
@@ -230,6 +235,7 @@ impl Worker {
             let cursor_evt = cursor_q.event.try_clone().unwrap();
             let control_queue = Arc::new(Mutex::new(control_q.queue));
             let cursor_queue = Arc::new(Mutex::new(cursor_q.queue));
+            self.cursor_kicked = false;
             *self.active.lock().unwrap() = Some(GpuActivation {
                 mem: mem.clone(),
                 control_queue: control_queue.clone(),
@@ -644,6 +650,7 @@ impl Worker {
                         error!("Failed to read cursor_evt: {e:?}");
                         continue;
                     }
+                    self.cursor_kicked = true;
                     self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, mem);
                 }
                 // limina runtime resize: the host pushed a new display size. Apply it to the
@@ -1318,7 +1325,9 @@ impl Worker {
                 if last_present_pump.elapsed() >= PRESENT_PUMP_EVERY {
                     last_present_pump = std::time::Instant::now();
                     virtio_gpu.process_retired_presents_mid_drain();
-                    self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, &mem);
+                    if self.cursor_kicked {
+                        self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, &mem);
+                    }
                 }
             } else {
                 break;
@@ -1352,9 +1361,14 @@ impl Worker {
             {
                 error!("Error signaling cursor queue: {e:?}");
             }
+            // Go round again only after a pass that popped something. The firmware leaves the
+            // cursor queue unconfigured, and there `enable_notification` keeps reporting entries
+            // `pop` never returns: looping on that alone hung the worker before the guest kernel
+            // came up. An entry that races the re-arm is picked up by the next mid-drain check
+            // or the next cursor kick.
             match cursor_queue.lock().unwrap().enable_notification(mem) {
-                Ok(true) => continue,
-                Ok(false) => break,
+                Ok(true) if used_any => continue,
+                Ok(_) => break,
                 Err(e) => {
                     error!("Error re-enabling cursor queue notification: {e:?}");
                     break;
