@@ -587,7 +587,13 @@ impl Worker {
                     loop {
                         drain_passes += 1;
                         let _ = control_queue.lock().unwrap().disable_notification(mem);
-                        let used_any = self.process_queue(virtio_gpu, control_queue, mem);
+                        let used_any = self.process_queue(
+                            virtio_gpu,
+                            control_queue,
+                            cursor_queue,
+                            interrupt,
+                            mem,
+                        );
                         let drained_ns = probe_pass.map(|_| crate::virtio::wake_probe::now_ns());
                         if let (Some(p), Some(k)) = (wake_probe.as_mut(), probe_pass) {
                             p.arm(k);
@@ -638,29 +644,7 @@ impl Worker {
                         error!("Failed to read cursor_evt: {e:?}");
                         continue;
                     }
-                    loop {
-                        let _ = cursor_queue.lock().unwrap().disable_notification(mem);
-                        let used_any = self.process_cursor_queue(virtio_gpu, cursor_queue, mem);
-                        if used_any
-                            && cursor_queue
-                                .lock()
-                                .unwrap()
-                                .needs_notification(mem)
-                                .unwrap_or(true)
-                        {
-                            if let Err(e) = interrupt.try_signal_used_queue() {
-                                error!("Error signaling cursor queue: {e:?}");
-                            }
-                        }
-                        match cursor_queue.lock().unwrap().enable_notification(mem) {
-                            Ok(true) => continue,
-                            Ok(false) => break,
-                            Err(e) => {
-                                error!("Error re-enabling cursor queue notification: {e:?}");
-                                break;
-                            }
-                        }
-                    }
+                    self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, mem);
                 }
                 // limina runtime resize: the host pushed a new display size. Apply it to the
                 // scanout's preferred mode, set the config-space display-event bit, and raise a
@@ -1188,6 +1172,8 @@ impl Worker {
         &mut self,
         virtio_gpu: &mut VirtioGpu,
         control_queue: &Arc<Mutex<VirtQueue>>,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        interrupt: &InterruptTransport,
         mem: &GuestMemoryMmap,
     ) -> bool {
         let mut used_any = false;
@@ -1324,10 +1310,15 @@ impl Worker {
                 }
 
                 // This drain can outlast many frames, and nothing else on this thread runs until
-                // it ends -- retired presents included. See `process_retired_presents_mid_drain`.
+                // it ends -- retired presents and pointer moves included. See
+                // `process_retired_presents_mid_drain`. Measured on a stock GNOME guest under a
+                // WebGL load: drains of 100-1500 ms (median 164), each a frozen pointer while the
+                // cursor queue waited. A cursor command cannot overtake the control queue: the
+                // guest waits for a new cursor image's transfer to complete before queueing it.
                 if last_present_pump.elapsed() >= PRESENT_PUMP_EVERY {
                     last_present_pump = std::time::Instant::now();
                     virtio_gpu.process_retired_presents_mid_drain();
+                    self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, &mem);
                 }
             } else {
                 break;
@@ -1336,6 +1327,40 @@ impl Worker {
 
         debug!("gpu: process_queue exit");
         used_any
+    }
+
+    /// Drain the cursor queue inside a disable/enable-notification bracket, signalling the guest
+    /// when it asked. Runs on a cursor kick and from inside a long control-queue drain; the
+    /// kick's eventfd is left to epoll, where it costs one wake that finds the queue empty.
+    fn service_cursor_queue(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        interrupt: &InterruptTransport,
+        mem: &GuestMemoryMmap,
+    ) {
+        loop {
+            let _ = cursor_queue.lock().unwrap().disable_notification(mem);
+            let used_any = self.process_cursor_queue(virtio_gpu, cursor_queue, mem);
+            if used_any
+                && cursor_queue
+                    .lock()
+                    .unwrap()
+                    .needs_notification(mem)
+                    .unwrap_or(true)
+                && let Err(e) = interrupt.try_signal_used_queue()
+            {
+                error!("Error signaling cursor queue: {e:?}");
+            }
+            match cursor_queue.lock().unwrap().enable_notification(mem) {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => {
+                    error!("Error re-enabling cursor queue notification: {e:?}");
+                    break;
+                }
+            }
+        }
     }
 
     /// limina: drain the cursor queue. Each entry is an `UPDATE_CURSOR`/`MOVE_CURSOR` command
