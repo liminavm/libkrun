@@ -17,6 +17,7 @@ use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+use virtio_bindings::virtio_net::VIRTIO_NET_HDR_F_DATA_VALID;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
@@ -33,6 +34,8 @@ pub struct NetWorker {
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
+    // The guest negotiated GUEST_CSUM, so a frame from a proxy can reach it marked checksum-valid.
+    rx_data_valid: bool,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
@@ -83,6 +86,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         backend: Box<dyn NetBackend + Send>,
         stop_fd: EventFd,
+        rx_data_valid: bool,
     ) -> Self {
         Self {
             rx_q,
@@ -96,6 +100,7 @@ impl NetWorker {
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
+            rx_data_valid,
 
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
@@ -302,9 +307,17 @@ impl NetWorker {
             }
         };
 
-        // At this point we processed as many Rx frames as possible.
-        // We have to wake the guest if at least one descriptor chain has been used.
-        if signal_queue {
+        // At this point we processed as many Rx frames as possible. Wake the guest only if it is
+        // waiting: with EVENT_IDX, NAPI parks `used_event` while it polls and trusts the device
+        // not to interrupt again until it moves, so signalling every drain costs the guest an
+        // interrupt per frame.
+        if signal_queue
+            && self
+                .rx_q
+                .queue
+                .needs_notification(&self.mem)
+                .unwrap_or(true)
+        {
             self.interrupt
                 .try_signal_used_queue()
                 .map_err(RxError::DeviceError)?;
@@ -507,6 +520,194 @@ impl NetWorker {
     /// Fills self.rx_frame_buf with an ethernet frame from backend and prepends virtio_net_hdr to it
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
+        // A proxy's frames come out of its own network stack over a local socket, checksums
+        // already right; without the flag the guest re-sums every byte it receives.
+        if self.rx_data_valid && self.backend.synthesizes_vnet_hdr() {
+            self.rx_frame_buf[0] = VIRTIO_NET_HDR_F_DATA_VALID as u8;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use utils::eventfd::EFD_NONBLOCK;
+    use vm_memory::GuestAddress;
+
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::VIRTIO_MMIO_INT_VRING;
+    use crate::virtio::net::write_virtio_net_hdr;
+    use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+    use crate::virtio::queue::tests::VirtQueue as GuestQueue;
+
+    /// A backend holding the frames the proxy has queued for the guest; `synthesizes` false
+    /// stands in for a tap, which relays the host kernel's header (blank here).
+    struct Proxy {
+        frames: VecDeque<Vec<u8>>,
+        synthesizes: bool,
+    }
+
+    impl NetBackend for Proxy {
+        fn synthesizes_vnet_hdr(&self) -> bool {
+            self.synthesizes
+        }
+        fn read_frame(&mut self, buf: &mut [u8]) -> result::Result<usize, ReadError> {
+            let frame = self.frames.pop_front().ok_or(ReadError::NothingRead)?;
+            let hdr_len = write_virtio_net_hdr(buf);
+            buf[hdr_len..hdr_len + frame.len()].copy_from_slice(&frame);
+            Ok(hdr_len + frame.len())
+        }
+        fn write_frame(&mut self, _: usize, _: &mut [u8]) -> result::Result<(), WriteError> {
+            Ok(())
+        }
+        fn has_unfinished_write(&self) -> bool {
+            false
+        }
+        fn try_finish_write(&mut self, _: usize, _: &[u8]) -> result::Result<(), WriteError> {
+            Ok(())
+        }
+        fn raw_socket_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    fn memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap()
+    }
+
+    /// A worker whose RX ring holds `buffers` posted 4 KiB buffers, with EVENT_IDX negotiated,
+    /// and whose proxy has `frames` small frames waiting.
+    fn worker(
+        mem: &GuestMemoryMmap,
+        rx: &GuestQueue,
+        tx: &GuestQueue,
+        buffers: u16,
+        frames: usize,
+    ) -> (NetWorker, InterruptTransport) {
+        worker_with(mem, rx, tx, buffers, frames, false, true)
+    }
+
+    fn worker_with(
+        mem: &GuestMemoryMmap,
+        rx: &GuestQueue,
+        tx: &GuestQueue,
+        buffers: u16,
+        frames: usize,
+        guest_csum: bool,
+        synthesizes: bool,
+    ) -> (NetWorker, InterruptTransport) {
+        for i in 0..buffers {
+            rx.dtable[i as usize].set(0x8000 + i as u64 * 0x1000, 0x1000, VIRTQ_DESC_F_WRITE, 0);
+            rx.avail.ring[i as usize].set(i);
+        }
+        rx.avail.idx.set(buffers);
+        let queue = |q: &GuestQueue| {
+            let mut queue = q.create_queue();
+            queue.set_event_idx(true);
+            DeviceQueue::new(queue, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
+        };
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "net-test".to_string()).unwrap();
+        let proxy = Proxy {
+            frames: (0..frames).map(|_| vec![0xab; 60]).collect(),
+            synthesizes,
+        };
+        let worker = NetWorker::new(
+            queue(rx),
+            queue(tx),
+            interrupt.clone(),
+            mem.clone(),
+            Box::new(proxy),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            guest_csum,
+        );
+        (worker, interrupt)
+    }
+
+    fn take_interrupt(interrupt: &InterruptTransport) -> bool {
+        interrupt.status().swap(0, Ordering::SeqCst) & VIRTIO_MMIO_INT_VRING as usize != 0
+    }
+
+    #[test]
+    fn a_guest_still_polling_its_rx_ring_is_not_interrupted() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, interrupt) = worker(&mem, &rx, &tx, 8, 2);
+
+        // NAPI parks used_event while it polls; the frames land, the doorbell stays quiet.
+        rx.avail.event.set(8);
+        worker.process_backend_socket_readable();
+
+        assert_eq!(rx.used.idx.get(), 2, "both frames were delivered");
+        assert!(
+            !take_interrupt(&interrupt),
+            "used index 2 has not passed used_event 8"
+        );
+    }
+
+    /// The virtio-net header flags the guest found on the first RX buffer.
+    fn delivered_hdr_flags(mem: &GuestMemoryMmap) -> u8 {
+        mem.read_obj(GuestAddress(0x8000)).unwrap()
+    }
+
+    #[test]
+    fn a_frame_from_the_proxy_reaches_a_csum_guest_marked_valid() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, _interrupt) = worker_with(&mem, &rx, &tx, 8, 1, true, true);
+
+        worker.process_backend_socket_readable();
+
+        // The proxy built this frame in its own stack and handed it over a local socket; with
+        // the flag the guest skips re-summing every byte.
+        assert_eq!(delivered_hdr_flags(&mem), VIRTIO_NET_HDR_F_DATA_VALID as u8);
+    }
+
+    #[test]
+    fn a_guest_without_guest_csum_gets_a_zero_header() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, _interrupt) = worker_with(&mem, &rx, &tx, 8, 1, false, true);
+
+        worker.process_backend_socket_readable();
+
+        assert_eq!(delivered_hdr_flags(&mem), 0);
+    }
+
+    #[test]
+    fn a_backend_that_brings_its_own_header_keeps_it() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, _interrupt) = worker_with(&mem, &rx, &tx, 8, 1, true, false);
+
+        worker.process_backend_socket_readable();
+
+        // A tap hands over the kernel's own header; its flags are the kernel's to set.
+        assert_eq!(delivered_hdr_flags(&mem), 0);
+    }
+
+    #[test]
+    fn a_guest_waiting_on_its_rx_ring_is_interrupted() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, interrupt) = worker(&mem, &rx, &tx, 8, 2);
+
+        rx.avail.event.set(0);
+        worker.process_backend_socket_readable();
+
+        assert!(
+            take_interrupt(&interrupt),
+            "used index 2 passes used_event 0"
+        );
     }
 }

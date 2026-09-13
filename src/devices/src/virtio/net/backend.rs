@@ -44,6 +44,12 @@ pub trait NetBackend {
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
     fn raw_socket_fd(&self) -> RawFd;
 
+    /// Whether `read_frame` writes a blank virtio-net header in front of the frame. A backend
+    /// that relays one (a tap, from the host kernel) returns false, so the header is left alone.
+    fn synthesizes_vnet_hdr(&self) -> bool {
+        true
+    }
+
     /// Delay in microseconds before retrying after NothingWritten.
     /// Returns 0 if no delay-based retry is needed (e.g. on Linux where
     /// EAGAIN + EPOLLET handles retries via writable events).

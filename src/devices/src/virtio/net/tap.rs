@@ -106,6 +106,10 @@ impl NetBackend for Tap {
         Ok(frame_length)
     }
 
+    fn synthesizes_vnet_hdr(&self) -> bool {
+        false
+    }
+
     /// Try to write a frame to the tap device.
     fn write_frame(&mut self, _hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
         let ret = write(&self.fd, buf).map_err(WriteError::Internal)?;

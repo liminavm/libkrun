@@ -22,7 +22,7 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
+use virtio_bindings::virtio_net::{VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_MAC};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
@@ -236,7 +236,16 @@ impl VirtioDevice for Net {
             self.id(),
             reused
         );
-        let worker = NetWorker::new(rx_q, tx_q, interrupt.clone(), mem.clone(), backend, stop_fd);
+        let rx_data_valid = self.acked_features & (1 << VIRTIO_NET_F_GUEST_CSUM) != 0;
+        let worker = NetWorker::new(
+            rx_q,
+            tx_q,
+            interrupt.clone(),
+            mem.clone(),
+            backend,
+            stop_fd,
+            rx_data_valid,
+        );
         self.worker_thread = Some(worker.run());
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
