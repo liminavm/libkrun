@@ -9,6 +9,8 @@ use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, UnixAddr, accept, bind,
     connect, listen, recv, send, shutdown, socket,
 };
+#[cfg(target_os = "macos")]
+use nix::sys::socket::{setsockopt, sockopt};
 use std::collections::HashMap;
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -47,6 +49,18 @@ pub struct UnixProxy {
     rx_cnt: Wrapping<u32>,
 }
 
+/// A guest packet carries up to 64 KiB, but macOS sizes a UNIX stream socket's send buffer at
+/// 8 KiB (`net.local.stream.sendspace`), and a connected proxy's sends block.
+#[cfg(target_os = "macos")]
+const PROXY_SNDBUF: usize = 1 << 20;
+
+#[cfg(target_os = "macos")]
+fn size_send_buffer(fd: &OwnedFd, id: u64) {
+    if let Err(e) = setsockopt(fd, sockopt::SndBuf, &PROXY_SNDBUF) {
+        warn!("couldn't size the send buffer: id={id}, err={e}");
+    }
+}
+
 fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
     let fd = socket(
         AddressFamily::Unix,
@@ -82,6 +96,7 @@ fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
                 std::mem::size_of_val(&option_value) as libc::socklen_t,
             )
         };
+        size_send_buffer(&fd, id);
     }
 
     Ok(fd)
@@ -701,6 +716,8 @@ impl Proxy for UnixAcceptorProxy {
                 Ok(accept_fd) => {
                     // Safe because we've just obtained the FD from the `accept` call above.
                     let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
+                    #[cfg(target_os = "macos")]
+                    size_send_buffer(&new_fd, self.id);
                     update.new_proxy = Some((
                         self.peer_port,
                         new_fd,
@@ -719,5 +736,38 @@ impl Proxy for UnixAcceptorProxy {
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::os::unix::net::UnixStream;
+
+    use nix::sys::socket::{getsockopt, sockopt};
+
+    use super::*;
+
+    fn send_buffer(fd: &OwnedFd) -> usize {
+        getsockopt(fd, sockopt::SndBuf).unwrap()
+    }
+
+    #[test]
+    fn a_proxy_socket_holds_a_guest_packet_and_more() {
+        let fd = proxy_fd_create(1).unwrap();
+        assert!(send_buffer(&fd) >= PROXY_SNDBUF);
+    }
+
+    #[test]
+    fn an_accepted_proxy_socket_holds_a_guest_packet_and_more() {
+        let path = std::env::temp_dir().join(format!("krun-vsock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut acceptor = UnixAcceptorProxy::new(1, &path, 1024).unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+
+        let update = acceptor.process_event(EventSet::IN);
+        let _ = std::fs::remove_file(&path);
+
+        let (_, fd, _, _) = update.new_proxy.unwrap();
+        assert!(send_buffer(&fd) >= PROXY_SNDBUF);
     }
 }
