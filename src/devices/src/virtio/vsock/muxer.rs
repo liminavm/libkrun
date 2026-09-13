@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
+use super::super::queue::DescriptorChain;
 use super::TsiFlags;
 use super::VsockError;
 use super::defs;
@@ -84,7 +85,7 @@ pub fn push_packet(
     mem: &GuestMemoryMmap,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
-    if let Some(head) = queue.pop(mem) {
+    if let Some(head) = pop_rx(&mut queue, mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
             if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
@@ -95,6 +96,38 @@ pub fn push_packet(
         error!("couldn't push pkt to queue, adding it to rxq");
         drop(queue);
         rxq_mutex.lock().unwrap().push(rx);
+    }
+}
+
+/// Pop the next RX buffer. With EVENT_IDX the guest announces a refill only when its avail index
+/// passes the `avail_event` the device publishes, so a ring found empty publishes the device's
+/// position before giving up, and takes a buffer that raced the publish.
+pub(crate) fn pop_rx<'a>(
+    queue: &mut VirtQueue,
+    mem: &'a GuestMemoryMmap,
+) -> Option<DescriptorChain<'a>> {
+    queue
+        .pop(mem)
+        .or_else(|| match queue.enable_notification(mem) {
+            Ok(true) => queue.pop(mem),
+            _ => None,
+        })
+}
+
+/// Interrupt the guest for the RX buffers used since the last check, unless EVENT_IDX says it is
+/// not waiting for them yet.
+pub(crate) fn signal_rx(
+    queue: &Mutex<VirtQueue>,
+    mem: &GuestMemoryMmap,
+    interrupt: &InterruptTransport,
+) {
+    if queue
+        .lock()
+        .unwrap()
+        .needs_notification(mem)
+        .unwrap_or(true)
+    {
+        interrupt.signal_used_queue();
     }
 }
 
@@ -266,7 +299,7 @@ impl VsockMuxer {
         };
 
         let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
+        if let Some(head) = pop_rx(&mut queue, mem) {
             if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
                 rx_to_pkt(self.cid, rx, &mut pkt);
                 if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
@@ -315,9 +348,10 @@ impl VsockMuxer {
         }
 
         if update.signal_queue
-            && let Some(interrupt) = &self.interrupt
+            && let (Some(interrupt), Some(queue), Some(mem)) =
+                (&self.interrupt, &self.queue, &self.mem)
         {
-            interrupt.signal_used_queue();
+            signal_rx(queue, mem, interrupt);
         }
     }
 

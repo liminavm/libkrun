@@ -5,6 +5,7 @@ use std::time;
 
 use super::super::Queue as VirtQueue;
 use super::defs::uapi;
+use super::muxer::pop_rx;
 use super::packet::VsockPacket;
 
 use crate::virtio::InterruptTransport;
@@ -91,7 +92,7 @@ impl TimesyncThread {
 
     fn send_time(&self, time: u64) {
         let mut queue = self.queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(&self.mem)
+        if let Some(head) = pop_rx(&mut queue, &self.mem)
             && let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head)
         {
             pkt.set_op(uapi::VSOCK_OP_RW)
@@ -108,7 +109,9 @@ impl TimesyncThread {
             {
                 error!("failed to add used elements to the queue: {e:?}");
             }
-            self.interrupt.signal_used_queue();
+            if queue.needs_notification(&self.mem).unwrap_or(true) {
+                self.interrupt.signal_used_queue();
+            }
         }
     }
 

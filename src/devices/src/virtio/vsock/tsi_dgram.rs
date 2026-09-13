@@ -18,7 +18,7 @@ use super::super::Queue as VirtQueue;
 use super::super::linux_errno::linux_errno_raw;
 use super::defs;
 use super::defs::uapi;
-use super::muxer::{MuxerRx, push_packet};
+use super::muxer::{MuxerRx, pop_rx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
@@ -194,7 +194,7 @@ impl TsiDgramProxy {
         let mut wait_credit = false;
         let mut queue = self.queue.lock().unwrap();
 
-        while let Some(head) = queue.pop(&self.mem) {
+        while let Some(head) = pop_rx(&mut queue, &self.mem) {
             let len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => match self.recv_to_pkt(&mut pkt) {
                     RecvPkt::WaitForCredit => {

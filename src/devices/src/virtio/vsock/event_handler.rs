@@ -142,7 +142,7 @@ impl Subscriber for Vsock {
                 }
                 _ => warn!("Unexpected vsock event received: {source:?}"),
             }
-            if raise_irq {
+            if raise_irq && self.needs_interrupt() {
                 debug!("raising IRQ");
                 self.device_state.signal_used_queue();
             }
