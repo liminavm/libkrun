@@ -42,6 +42,9 @@ pub struct VsockDeviceConfig {
     pub unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     /// TSI feature flags
     pub tsi_flags: TsiFlags,
+    /// Send the guest a wall-clock datagram on port 123 every minute (macOS only). Only a guest
+    /// listening there, such as libkrun's init, uses it; any other guest resets each one.
+    pub timesync: bool,
 }
 
 struct VsockWrapper {
@@ -90,6 +93,7 @@ impl VsockBuilder {
             cfg.host_port_map,
             cfg.unix_ipc_port_map,
             cfg.tsi_flags,
+            cfg.timesync,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
     }
@@ -128,6 +132,7 @@ pub(crate) mod tests {
             host_port_map: None,
             unix_ipc_port_map: None,
             tsi_flags: TsiFlags::empty(),
+            timesync: true,
         }
     }
 
