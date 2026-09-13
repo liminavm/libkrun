@@ -129,6 +129,8 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    timesync: bool,
     // Per-activation thread stop signals, so a device reset (suspend/resume) tears the current
     // activation's threads down before the device is re-activated with a fresh queue — otherwise a
     // stale timesync/muxer thread keeps writing into the recreated guest RX ring. Fire-and-forget:
@@ -143,6 +145,7 @@ impl VsockMuxer {
         host_port_map: Option<HashMap<u16, u16>>,
         mut unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
+        timesync: bool,
     ) -> super::Result<Self> {
         if let Some(map) = &mut unix_ipc_port_map {
             let needs_cwd = map
@@ -169,6 +172,7 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            timesync,
             timesync_stop: None,
             muxer_stop: None,
         })
@@ -185,7 +189,7 @@ impl VsockMuxer {
         self.interrupt = Some(interrupt.clone());
 
         #[cfg(target_os = "macos")]
-        {
+        if self.timesync {
             let stop = Arc::new(AtomicBool::new(false));
             let timesync = TimesyncThread::new(
                 self.cid,
@@ -727,13 +731,12 @@ impl VsockMuxer {
             defs::TSI_PROXY_RELEASE if self.tsi_flags.tsi_enabled() => {
                 self.process_proxy_release(pkt)
             }
-            _ => {
-                if pkt.op() == uapi::VSOCK_OP_RW {
-                    self.process_dgram_rw(pkt);
-                } else {
-                    error!("unexpected dgram pkt: {}", pkt.op());
-                }
-            }
+            _ => match pkt.op() {
+                uapi::VSOCK_OP_RW => self.process_dgram_rw(pkt),
+                // A guest with nothing bound to a datagram's port answers it with a reset.
+                uapi::VSOCK_OP_RST => debug!("dgram reset from guest port {}", pkt.src_port()),
+                op => error!("unexpected dgram pkt: {op}"),
+            },
         }
 
         Ok(())
@@ -1088,6 +1091,7 @@ mod protected_path_tests {
             None,
             Some(HashMap::from([(1234, (path.clone(), true))])),
             TsiFlags::HIJACK_UNIX,
+            true,
         )
         .unwrap();
         let addr = guest_unix_addr(b"/run/krun-init.sock\0suffix");
@@ -1112,6 +1116,7 @@ mod protected_path_tests {
             None,
             Some(HashMap::from([(port, (path.clone(), true))])),
             TsiFlags::HIJACK_UNIX,
+            true,
         )
         .unwrap();
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
@@ -1217,10 +1222,43 @@ mod protected_path_tests {
             None,
             Some(HashMap::from([(1234, (path, true))])),
             TsiFlags::HIJACK_UNIX,
+            true,
         )
         .unwrap();
         std::env::set_current_dir(std::env::temp_dir()).unwrap();
         assert_eq!(muxer.unix_ipc_port_map.as_ref().unwrap()[&1234].0, absolute);
         assert!(muxer.is_protected_unix_path(&guest_unix_addr(absolute.as_os_str().as_bytes())));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use vm_memory::GuestAddress;
+
+    fn activated_muxer(timesync: bool) -> VsockMuxer {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "vsock-test".to_string()).unwrap();
+        let queue = Arc::new(Mutex::new(VirtQueue::new(16)));
+        let mut muxer = VsockMuxer::new(3, None, None, TsiFlags::empty(), timesync).unwrap();
+        muxer.activate(mem, queue, interrupt);
+        muxer
+    }
+
+    #[test]
+    fn timesync_disabled_spawns_no_timesync_thread() {
+        let mut muxer = activated_muxer(false);
+        assert!(muxer.timesync_stop.is_none());
+        muxer.deactivate();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timesync_enabled_spawns_the_timesync_thread() {
+        let mut muxer = activated_muxer(true);
+        assert!(muxer.timesync_stop.is_some());
+        muxer.deactivate();
     }
 }
