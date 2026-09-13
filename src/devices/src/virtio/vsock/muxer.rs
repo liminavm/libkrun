@@ -623,7 +623,7 @@ impl VsockMuxer {
             }
             let rxq = self.rxq.clone();
 
-            let mut unix = UnixProxy::new(
+            let mut unix = match UnixProxy::new(
                 id,
                 self.cid,
                 pkt.dst_port(),
@@ -632,8 +632,18 @@ impl VsockMuxer {
                 queue.clone(),
                 rxq,
                 path.to_path_buf(),
-            )
-            .unwrap();
+            ) {
+                Ok(unix) => unix,
+                Err(e) => {
+                    warn!("refusing connection to port {}: {e:?}", pkt.dst_port());
+                    let rx = MuxerRx::Reset {
+                        local_port: pkt.dst_port(),
+                        peer_port: pkt.src_port(),
+                    };
+                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    return;
+                }
+            };
             let tsi = TsiConnectReq {
                 peer_port: 0,
                 addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
@@ -803,5 +813,83 @@ mod tests {
         let mut muxer = activated_muxer(true);
         assert!(muxer.timesync_stop.is_some());
         muxer.deactivate();
+    }
+
+    const EMFILE_CHILD: &str = "KRUN_VSOCK_EMFILE_CHILD";
+    const IPC_PORT: u32 = 1025;
+    const GUEST_PORT: u32 = 50000;
+
+    /// Exhausting descriptors would starve every other test in this process, so the scenario
+    /// runs in a child: this same test binary, re-run on just this test.
+    #[test]
+    fn a_connection_whose_proxy_socket_cannot_be_created_is_reset() {
+        if std::env::var_os(EMFILE_CHILD).is_some() {
+            connect_with_no_descriptors_left();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "virtio::vsock::muxer::tests::a_connection_whose_proxy_socket_cannot_be_created_is_reset",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child: {status}");
+    }
+
+    fn connect_with_no_descriptors_left() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::queue::tests::VirtQueue as GuestQueue;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let tx = GuestQueue::new(GuestAddress(0), &mem, 16);
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        tx.dtable[0].set(0x2000, VSOCK_PKT_HDR_SIZE as u32, 0, 0);
+        tx.avail.ring[0].set(0);
+        tx.avail.idx.set(1);
+        let mut txq = tx.create_queue();
+        let head = txq.pop(&mem).unwrap();
+        let mut pkt = VsockPacket::from_tx_virtq_head(&head).unwrap();
+        pkt.set_op(uapi::VSOCK_OP_REQUEST)
+            .set_src_port(GUEST_PORT)
+            .set_dst_port(IPC_PORT)
+            .set_dst_cid(uapi::VSOCK_HOST_CID);
+
+        let ipc = HashMap::from([(
+            IPC_PORT,
+            (PathBuf::from("/nonexistent/krun-vsock-test.sock"), false),
+        )]);
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "vsock-test".to_string()).unwrap();
+        let mut muxer = VsockMuxer::new(3, None, Some(ipc), TsiFlags::empty(), false);
+        muxer.activate(
+            mem.clone(),
+            Arc::new(Mutex::new(rx.create_queue())),
+            interrupt,
+        );
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        while unsafe { libc::dup(2) } >= 0 {}
+
+        muxer.process_op_request(&pkt);
+
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset {
+                local_port: IPC_PORT,
+                peer_port: GUEST_PORT,
+            })
+        ));
     }
 }
