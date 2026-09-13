@@ -18,6 +18,10 @@ pub struct NetworkInterfaceConfig {
     pub mac: [u8; 6],
     /// virtio-net features for the network interface.
     pub features: u32,
+    /// The backend's frames already carry correct checksums (a proxy builds them in its own
+    /// network stack), so a GUEST_CSUM guest may skip verifying them. Never set it for a backend
+    /// that relays frames from a wire.
+    pub rx_csum_valid: bool,
 }
 
 /// Errors associated with `NetworkInterfaceConfig`.
@@ -65,7 +69,13 @@ impl NetBuilder {
     /// Creates a Net device from a NetworkInterfaceConfig.
     pub fn create_net(cfg: NetworkInterfaceConfig) -> Result<Net> {
         // Create and return the Net device
-        Net::new(cfg.iface_id, cfg.backend, cfg.mac, cfg.features)
-            .map_err(NetworkInterfaceError::CreateNetworkDevice)
+        Net::new(
+            cfg.iface_id,
+            cfg.backend,
+            cfg.mac,
+            cfg.features,
+            cfg.rx_csum_valid,
+        )
+        .map_err(NetworkInterfaceError::CreateNetworkDevice)
     }
 }

@@ -268,6 +268,11 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
    as required by gvproxy in vfkit mode. */
 #define NET_FLAG_VFKIT (1 << 0)
 #define NET_FLAG_DHCP_CLIENT (1 << 1)
+/* The proxy's frames already carry correct checksums (it builds them in
+   its own network stack), so a guest that negotiated GUEST_CSUM may skip
+   verifying them. Never pass it for a proxy that relays frames from a
+   wire. Accepted by krun_add_net_unixstream and krun_add_net_unixgram. */
+#define NET_FLAG_CSUM_VALID (1 << 2)
 
 /* TSI (Transparent Socket Impersonation) feature flags for vsock */
 #define KRUN_TSI_HIJACK_INET  (1 << 0)

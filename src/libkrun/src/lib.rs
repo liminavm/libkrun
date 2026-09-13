@@ -771,8 +771,14 @@ pub unsafe extern "C" fn krun_add_disk3(
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 #[cfg(feature = "net")]
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
+/*
+ * The proxy's frames already carry correct checksums, so a guest
+ * that negotiated GUEST_CSUM may skip verifying them.
+ */
 #[cfg(feature = "net")]
-const NET_FLAG_ALL: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT;
+const NET_FLAG_CSUM_VALID: u32 = 1 << 2;
+#[cfg(feature = "net")]
+const NET_FLAG_ALL: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT | NET_FLAG_CSUM_VALID;
 
 /* Taken from uapi/linux/virtio_net.h */
 #[cfg(feature = "net")]
@@ -840,10 +846,11 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
             Err(_) => return -libc::EINVAL,
         };
 
-        if (flags & !NET_FLAG_DHCP_CLIENT) != 0 {
+        if (flags & !(NET_FLAG_DHCP_CLIENT | NET_FLAG_CSUM_VALID)) != 0 {
             return -libc::EINVAL;
         }
         let enable_dhcp_client: bool = flags & NET_FLAG_DHCP_CLIENT != 0;
+        let rx_csum_valid = flags & NET_FLAG_CSUM_VALID != 0;
 
         if (features & !NET_ALL_FEATURES) != 0 {
             return -libc::EINVAL;
@@ -852,7 +859,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
-                create_virtio_net(cfg, backend, mac, features);
+                create_virtio_net(cfg, backend, mac, features, rx_csum_valid);
                 if enable_dhcp_client {
                     cfg.vmr.dhcp_client = true;
                 }
@@ -905,6 +912,7 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
         }
         let send_vfkit_magic: bool = flags & NET_FLAG_VFKIT != 0;
         let enable_dhcp_client: bool = flags & NET_FLAG_DHCP_CLIENT != 0;
+        let rx_csum_valid = flags & NET_FLAG_CSUM_VALID != 0;
 
         let backend = if let Some(path) = path {
             VirtioNetBackend::UnixgramPath(path, send_vfkit_magic)
@@ -915,7 +923,7 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
-                create_virtio_net(cfg, backend, mac, features);
+                create_virtio_net(cfg, backend, mac, features, rx_csum_valid);
                 if enable_dhcp_client {
                     cfg.vmr.dhcp_client = true;
                 }
@@ -971,7 +979,8 @@ pub unsafe extern "C" fn krun_add_net_tap(
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
-                create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features);
+                // A tap relays the host kernel's own header; its flags are the kernel's to set.
+                create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features, false);
                 if enable_dhcp_client {
                     cfg.vmr.dhcp_client = true;
                 }
@@ -1966,12 +1975,14 @@ fn create_virtio_net(
     backend: VirtioNetBackend,
     mac: [u8; 6],
     features: u32,
+    rx_csum_valid: bool,
 ) {
     let network_interface_config = NetworkInterfaceConfig {
         iface_id: format!("eth{}", ctx_cfg.net_index),
         backend,
         mac,
         features,
+        rx_csum_valid,
     };
     ctx_cfg.net_index += 1;
     ctx_cfg
