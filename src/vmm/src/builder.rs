@@ -1287,6 +1287,25 @@ pub fn build_microvm(
             );
             return Err(StartMicrovmError::Internal(crate::Error::Snapshot));
         }
+        // Every device is attached by now, and a guest driver bound to a slot that now holds a
+        // different device spins on it (a vsock driver rings an input device and floods the log
+        // with HdrDescTooSmall). Refused before the RAM is applied, so a refusal costs nothing.
+        match &snap.head.slots {
+            Some(captured) => {
+                let here = vmm.mmio_device_manager.device_slots();
+                if let Some(diff) = crate::snapshot::slot_mismatch(captured, &here) {
+                    let why = format!(
+                        "restore refused: this VM's devices differ from the ones it was \
+                         suspended with ({diff})"
+                    );
+                    error!("{why}");
+                    return Err(StartMicrovmError::Internal(crate::Error::RestoreRefused(
+                        why,
+                    )));
+                }
+            }
+            None => warn!("restore: the snapshot predates the device-slot record; not checked"),
+        }
         let gate = Arc::new(crate::vstate::RestoreGate::default());
         let vcpu_states = std::mem::take(&mut snap.head.vcpus);
         let vcpus = vcpus

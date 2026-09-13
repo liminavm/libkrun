@@ -143,6 +143,9 @@ pub enum Error {
     Snapshot,
     /// A snapshot file read/write failed.
     SnapshotIo(std::io::Error),
+    /// The snapshot was taken on a machine whose devices differ from this one's; the message
+    /// says how.
+    RestoreRefused(String),
     /// Cannot spawn a new Vcpu thread.
     VcpuSpawn(std::io::Error),
     /// Vm error.
@@ -182,6 +185,7 @@ impl Display for Error {
             VcpuPause => write!(f, "vCPUs pause failed."),
             Snapshot => write!(f, "VM snapshot save/restore failed."),
             SnapshotIo(e) => write!(f, "VM snapshot file I/O failed: {e}"),
+            RestoreRefused(why) => write!(f, "{why}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
             VmmObserverInit(e) => write!(
@@ -710,6 +714,7 @@ impl Vmm {
             devices,
             gpu,
             usb,
+            slots: Some(self.mmio_device_manager.device_slots()),
         };
         // v6: stream chunked RAM frames straight out of guest memory (zero-chunk holes + lz4),
         // written by a worker pool — no whole-RAM intermediate copy, no serial multi-GB CRC.

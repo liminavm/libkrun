@@ -486,6 +486,25 @@ impl MMIODeviceManager {
         out
     }
 
+    /// Where every virtio-mmio device sits, in address order — what a snapshot records so a
+    /// restore can refuse a machine whose devices moved.
+    pub fn device_slots(&self) -> Vec<crate::snapshot::DeviceSlot> {
+        let mut slots: Vec<_> = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((dtype, _), info)| match *dtype {
+                DeviceType::Virtio(type_id) => Some(crate::snapshot::DeviceSlot {
+                    type_id,
+                    mmio_base: info.addr,
+                    irq: info.irq,
+                }),
+                _ => None,
+            })
+            .collect();
+        slots.sort_by_key(|s| s.mmio_base);
+        slots
+    }
+
     /// limina M9.3: capture the transport state of every virtio-mmio device the guest left
     /// `device_status != 0` at quiesce (today exactly virtio-gpu — it has no s2idle PM ops so it never
     /// resets/re-negotiates, unlike every other device which the guest reset to INIT). Those are the
@@ -777,6 +796,38 @@ mod tests {
             ),
             "no more IRQs are available".to_string()
         );
+    }
+
+    fn machine(types: &[u32]) -> MMIODeviceManager {
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x1000)]).unwrap();
+        let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+        for (i, &type_id) in types.iter().enumerate() {
+            manager
+                .register_virtio_device(
+                    guest_mem.clone(),
+                    Arc::new(Mutex::new(DummyDevice::new())),
+                    &mut cmdline,
+                    type_id,
+                    &format!("dev{i}"),
+                )
+                .unwrap();
+        }
+        manager
+    }
+
+    /// A windowed VM (the GPU, three input devices, then vsock) suspended and resumed without
+    /// its window: vsock slides into the first input device's slot, and the guest's vsock driver
+    /// is left ringing an address nothing answers. The resume must see that the devices moved.
+    #[test]
+    fn a_resume_without_the_input_devices_sees_the_devices_moved() {
+        let windowed = machine(&[16, 18, 18, 18, 19]).device_slots();
+        let headless = machine(&[16, 19]).device_slots();
+        let diff = crate::snapshot::slot_mismatch(&windowed, &headless)
+            .expect("the vsock device moved; the resume must be refused");
+        assert!(diff.contains("virtio-input"), "{diff}");
+        assert!(diff.contains("virtio-vsock"), "{diff}");
+        assert_eq!(crate::snapshot::slot_mismatch(&windowed, &windowed), None);
     }
 
     #[test]
