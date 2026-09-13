@@ -1317,6 +1317,7 @@ pub struct VsockDevice {
     tsi_flags: devices::virtio::TsiFlags,
     host_port_map: HashMap<u16, u16>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    timesync: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -1331,6 +1332,7 @@ impl VsockDevice {
             tsi_flags,
             host_port_map: HashMap::new(),
             unix_ipc_port_map: HashMap::new(),
+            timesync: true,
         })
     }
 
@@ -1352,6 +1354,16 @@ impl VsockDevice {
     }
 }
 
+impl VsockDevice {
+    /// Send the guest a wall-clock datagram on port 123 every minute (macOS only). On by
+    /// default; only a guest listening there, such as libkrun's init, uses it, and any other
+    /// guest resets each one.
+    pub fn timesync(mut self, enabled: bool) -> Self {
+        self.timesync = enabled;
+        self
+    }
+}
+
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl<'a> AttachDevice<'a> for VsockDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
@@ -1361,8 +1373,14 @@ impl<'a> AttachDevice<'a> for VsockDevice {
             (!self.unix_ipc_port_map.is_empty()).then_some(self.unix_ipc_port_map);
 
         let vsock =
-            devices::virtio::Vsock::new(self.cid, host_port_map, unix_ipc_port_map, self.tsi_flags)
-                .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
+            devices::virtio::Vsock::new(
+                self.cid,
+                host_port_map,
+                unix_ipc_port_map,
+                self.tsi_flags,
+                self.timesync,
+            )
+            .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
 
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;
