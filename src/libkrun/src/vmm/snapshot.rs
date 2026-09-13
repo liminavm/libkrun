@@ -56,7 +56,12 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // captures parked vCPUs as a matter of course. Their saved PC is the instruction after a PSCI
 // call that never returns; resuming them there makes a secondary return from CPU_OFF and the boot
 // CPU return from a suspend it did not take, and the guest never executes anything again.
-const VERSION: u32 = 8;
+// v9 appends where every virtio-mmio device sits (type, base, irq). The guest's drivers are bound
+// to those slots, and slots are handed out in attach order, so one device more or fewer shifts
+// every device after it. Restore refuses a machine whose slots differ. A v8 file carries no
+// record and is restored unchecked.
+const VERSION: u32 = 9;
+const OLDEST_READABLE_VERSION: u32 = 8;
 
 /// v6 RAM chunk size: 4 MiB — large enough to amortize per-frame overhead, small enough to spread
 /// across the worker pool and bound per-worker scratch memory.
@@ -123,6 +128,64 @@ pub struct DeviceTransportState {
     pub queues: Vec<QueueRegs>,
 }
 
+/// Where one virtio-mmio device sits on the captured machine.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct DeviceSlot {
+    pub type_id: u32,
+    pub mmio_base: u64,
+    pub irq: u32,
+}
+
+fn virtio_name(type_id: u32) -> String {
+    match type_id {
+        1 => "virtio-net".into(),
+        2 => "virtio-blk".into(),
+        3 => "virtio-console".into(),
+        4 => "virtio-rng".into(),
+        5 => "virtio-balloon".into(),
+        16 => "virtio-gpu".into(),
+        18 => "virtio-input".into(),
+        19 => "virtio-vsock".into(),
+        25 => "virtio-snd".into(),
+        26 => "virtio-fs".into(),
+        34 => "virtio-i2c".into(),
+        t => format!("virtio type {t}"),
+    }
+}
+
+fn describe(slots: &[&DeviceSlot]) -> String {
+    slots
+        .iter()
+        .map(|s| {
+            format!(
+                "{} @0x{:x} irq {}",
+                virtio_name(s.type_id),
+                s.mmio_base,
+                s.irq
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How the machine being restored into differs from the captured one, or `None` if the two
+/// place the same devices at the same slots.
+pub fn slot_mismatch(captured: &[DeviceSlot], here: &[DeviceSlot]) -> Option<String> {
+    let gone: Vec<_> = captured.iter().filter(|s| !here.contains(s)).collect();
+    let new: Vec<_> = here.iter().filter(|s| !captured.contains(s)).collect();
+    if gone.is_empty() && new.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !gone.is_empty() {
+        parts.push(format!("suspended with {}", describe(&gone)));
+    }
+    if !new.is_empty() {
+        parts.push(format!("now has {}", describe(&new)));
+    }
+    Some(parts.join("; "))
+}
+
 /// Everything in a snapshot except the guest RAM (v6: RAM is streamed separately as chunked
 /// frames — see [`write_streaming`] / [`SnapshotFile::apply_ram`]).
 pub struct SnapshotHead {
@@ -144,6 +207,8 @@ pub struct SnapshotHead {
     /// controller before the guest resumes so its USB devices survive the suspend transparently.
     /// `None` when the VM has no USB controller.
     pub usb: Option<XhciState>,
+    /// v9: every virtio-mmio device's slot. `None` for a v8 file, which never recorded them.
+    pub slots: Option<Vec<DeviceSlot>>,
 }
 
 /// CRC-32 (IEEE 802.3, reflected) — a small dependency-free integrity check over the payload.
@@ -311,6 +376,13 @@ fn encode_head(head: &SnapshotHead) -> Vec<u8> {
             encode_usb(&mut v, u);
         }
         None => v.push(0),
+    }
+    let slots = head.slots.as_deref().unwrap_or_default();
+    put_u32(&mut v, slots.len() as u32);
+    for s in slots {
+        put_u32(&mut v, s.type_id);
+        put_u64(&mut v, s.mmio_base);
+        put_u32(&mut v, s.irq);
     }
     v
 }
@@ -956,7 +1028,8 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
     if r.take(8)? != MAGIC {
         return Err(corrupt("bad magic"));
     }
-    if r.u32()? != VERSION {
+    let version = r.u32()?;
+    if !(OLDEST_READABLE_VERSION..=VERSION).contains(&version) {
         return Err(corrupt("unsupported version"));
     }
     let vcpu_count = r.u32()? as usize;
@@ -1057,6 +1130,20 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
         1 => Some(decode_usb(&mut r)?),
         _ => return Err(corrupt("bad usb presence byte")),
     };
+    let slots = if version >= 9 {
+        let n = bounded_count(&mut r, 1024, "device slot")?;
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            slots.push(DeviceSlot {
+                type_id: r.u32()?,
+                mmio_base: r.u64()?,
+                irq: r.u32()?,
+            });
+        }
+        Some(slots)
+    } else {
+        None
+    };
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
     let head_end = r.pos;
     let stored = r.u32()?;
@@ -1073,6 +1160,7 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
             devices,
             gpu,
             usb,
+            slots,
         },
         raw,
         ram_off,
@@ -1274,7 +1362,57 @@ mod tests {
             devices: vec![sample_gpu_device()],
             gpu: Some(vec![0x4c, 0x47, 0x50, 0x55, 9, 9]),
             usb: Some(sample_usb()),
+            slots: Some(windowed_slots()),
         }
+    }
+
+    fn slot(type_id: u32, mmio_base: u64, irq: u32) -> DeviceSlot {
+        DeviceSlot {
+            type_id,
+            mmio_base,
+            irq,
+        }
+    }
+
+    /// A windowed machine: the GPU, then three input devices, then vsock.
+    fn windowed_slots() -> Vec<DeviceSlot> {
+        vec![
+            slot(16, 0x0a00_8000, 47),
+            slot(18, 0x0a00_9000, 48),
+            slot(18, 0x0a00_a000, 49),
+            slot(18, 0x0a00_b000, 50),
+            slot(19, 0x0a00_c000, 51),
+        ]
+    }
+
+    #[test]
+    fn identical_slots_match() {
+        assert_eq!(slot_mismatch(&windowed_slots(), &windowed_slots()), None);
+    }
+
+    /// The same machine without its window: no input devices, so vsock takes the first input's
+    /// slot. The guest's vsock driver would keep talking to what is now nothing.
+    #[test]
+    fn a_machine_without_the_input_devices_is_named_as_different() {
+        let headless = vec![slot(16, 0x0a00_8000, 47), slot(19, 0x0a00_9000, 48)];
+        let diff = slot_mismatch(&windowed_slots(), &headless).expect("must differ");
+        assert!(
+            diff.contains("suspended with virtio-input @0xa009000 irq 48"),
+            "{diff}"
+        );
+        assert!(diff.contains("virtio-vsock @0xa00c000 irq 51"), "{diff}");
+        assert!(
+            diff.contains("now has virtio-vsock @0xa009000 irq 48"),
+            "{diff}"
+        );
+    }
+
+    #[test]
+    fn an_extra_device_is_named_as_different() {
+        let mut more = windowed_slots();
+        more.push(slot(1, 0x0a00_d000, 52));
+        let diff = slot_mismatch(&windowed_slots(), &more).expect("must differ");
+        assert_eq!(diff, "now has virtio-net @0xa00d000 irq 52");
     }
 
     fn write_sample(path: &Path) -> (SaveStats, Vec<u8>, Vec<u8>) {
@@ -1332,6 +1470,7 @@ mod tests {
         // v7: the whole xHCI controller state, field for field (the `PartialEq` covers every
         // register, ring position, slot and endpoint — a dropped field fails here).
         assert_eq!(head.usb, want.usb);
+        assert_eq!(head.slots, want.slots);
 
         // Restore into memory pre-filled with garbage: data frames AND holes must both overwrite.
         let mem2 = test_mem();
@@ -1359,6 +1498,7 @@ mod tests {
             devices: vec![],
             gpu: None,
             usb: None,
+            slots: Some(vec![]),
         };
         let mem = test_mem();
         let path =
