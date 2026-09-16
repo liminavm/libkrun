@@ -325,7 +325,7 @@ impl RutabagaComponent for VirglRenderer {
         self.r
             .lock()
             .unwrap()
-            .resource_iosurface_id(handle)
+            .resource_surface_id(handle)
             .map(|s| s.0)
             .ok_or(RutabagaError::Unsupported)
     }
@@ -368,7 +368,7 @@ impl RutabagaComponent for VirglRenderer {
     fn force_ctx_0(&self) {}
 
     fn limina_dump_state(&self) {
-        let r = self.r.lock().unwrap();
+        let mut r = self.r.lock().unwrap();
         let (resources, contexts) = r.counts();
         error!("virglrs: {resources} resources, {contexts} contexts");
         error!("virglrs: vrend journal: {}", r.journal_census());
@@ -392,7 +392,7 @@ impl RutabagaComponent for VirglRenderer {
     /// succeeded.
     fn limina_journal_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
         let id = ContextId::new(ctx_id)?;
-        let r = self.r.lock().unwrap();
+        let mut r = self.r.lock().unwrap();
         if r.is_classic(id) {
             r.vrend_journal_export(id)
         } else {
@@ -474,10 +474,16 @@ impl RutabagaComponent for VirglRenderer {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
+        // Ring 0 is the context's own stream, which `limina_replay_submit` feeds; a journal entry
+        // never names it here, and one that does is refused rather than replayed on the wrong
+        // decoder.
+        let Some(ring) = RingId::new(ring_id) else {
+            return false;
+        };
         self.r
             .lock()
             .unwrap()
-            .venus_replay_ring_cmd(id, RingId(ring_id), cmd)
+            .venus_replay_ring_cmd(id, ring, cmd)
             .is_ok()
     }
 
@@ -678,12 +684,12 @@ impl RutabagaComponent for VirglRenderer {
         height: u32,
     ) -> RutabagaResult<()> {
         let handle = res(resource_id)?;
-        match self.r.lock().unwrap().resource_read_iosurface(
-            handle,
-            dst,
-            dst_stride as usize,
-            height,
-        ) {
+        match self
+            .r
+            .lock()
+            .unwrap()
+            .resource_read_surface(handle, dst, dst_stride as usize, height)
+        {
             Some(rows) if rows == height => Ok(()),
             other => {
                 error!(
@@ -700,7 +706,7 @@ impl RutabagaComponent for VirglRenderer {
     #[cfg(target_os = "macos")]
     fn sync_iosurface(&self, resource_id: u32) -> RutabagaResult<()> {
         let handle = res(resource_id)?;
-        if self.r.lock().unwrap().resource_sync_iosurface(handle) {
+        if self.r.lock().unwrap().resource_sync_surface(handle) {
             Ok(())
         } else {
             Err(RutabagaError::ComponentError(-libc::EINVAL))
