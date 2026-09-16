@@ -36,6 +36,7 @@ use virglrenderer::ids::{
 };
 use virglrenderer::renderer::{BlobDesc, BlobSource, Caching, Error as RendererError, Renderer};
 use virglrenderer::venus::context::{Submitted, Wait};
+use virglrenderer::venus::driver::Answered;
 use virglrenderer::vrend::pipe::TextureTarget;
 use virglrenderer::vrend::proto::{Box3, Format};
 use virglrenderer::vrend::resource::{Args as ClassicArgs, Bind, ResourceFlags};
@@ -196,13 +197,22 @@ impl Drop for VirglRendererContext {
 ///
 /// The loop is the point, and it is the one thing this file cannot simplify away. The lock is held
 /// for the renderer's own call, so a `vkWaitRingSeqnoMESA` that blocked inside it would hold it
-/// against the ring thread that has to advance the very head being waited for. The renderer hands
-/// the wait back instead: it says how much of the buffer ran and what to wait for, this drops the
-/// guard, waits, and comes back with the remainder.
+/// against the ring thread that has to advance the very head being waited for, and a
+/// `vkWaitForFences` the driver cannot answer at once would hold it against every ring of the
+/// context. The renderer hands the wait back instead: it says how much of the buffer ran and what
+/// to wait for, this drops the guard, waits, and comes back with the remainder -- through
+/// `submit_cmd` after a ring wait, through `resume_cmd` with the driver's answer after a driver
+/// wait, because the remainder begins with the wait command and a `submit_cmd` would ask the
+/// driver again.
 fn submit_all(r: &Shared, id: ContextId, buf: &[u8]) -> RutabagaResult<()> {
     let mut at = 0usize;
+    // What the driver wait the remainder begins with answered, on the pass after one ran.
+    let mut answer: Option<Answered> = None;
     loop {
-        let out = r.lock().unwrap().submit_cmd(id, &buf[at..]);
+        let out = match answer.take() {
+            None => r.lock().unwrap().submit_cmd(id, &buf[at..]),
+            Some(a) => r.lock().unwrap().resume_cmd(id, &buf[at..], a),
+        };
         let waiter = match out {
             Err(e) => return Err(refused("submit_cmd", e)),
             Ok(Submitted::Done) => return Ok(()),
@@ -218,6 +228,19 @@ fn submit_all(r: &Shared, id: ContextId, buf: &[u8]) -> RutabagaResult<()> {
                     Ok(w) => w,
                     Err(e) => return Err(refused("ring_waiter", e)),
                 }
+            }
+            // A blocking driver call, run here with the renderer lock dropped: the guest's own
+            // thread is what is spent on it, and nothing else in the process waits behind it.
+            Ok(Submitted::Waiting {
+                consumed,
+                on: Wait::Driver(wait),
+            }) => {
+                at += consumed;
+                answer = Some(
+                    wait.run(|| true)
+                        .expect("nothing stops a virtqueue-side wait"),
+                );
+                continue;
             }
             // A virtqueue wait is legal only on a ring's own stream, and this is the context's.
             // Its handler refuses that origin, so the stream poisons rather than arriving here.
