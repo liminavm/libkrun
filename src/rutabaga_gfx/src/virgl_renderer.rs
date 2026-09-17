@@ -652,7 +652,7 @@ impl RutabagaComponent for VirglRenderer {
             .transfer(
                 handle,
                 ContextId::new(ctx_id),
-                true,
+                transfer::Direction::ToHost,
                 &info_of(&t, false),
                 Vec::new(),
             )
@@ -744,7 +744,7 @@ impl RutabagaComponent for VirglRenderer {
             .transfer(
                 handle,
                 ContextId::new(ctx_id),
-                false,
+                transfer::Direction::ToGuest,
                 &info_of(&t, false),
                 iov,
             )
