@@ -409,18 +409,12 @@ impl RutabagaComponent for VirglRenderer {
         }
     }
 
-    /// A context belongs to one renderer and each keeps its own journal, in its own format.
     /// `None` is a context with nothing retained, which is deliberately not an empty blob: a VMM
     /// that stored zero bytes and restored them later would have rebuilt nothing and been told it
-    /// succeeded.
+    /// succeeded. Which renderer keeps the journal is the renderer's question, not this one's.
     fn limina_journal_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
         let id = ContextId::new(ctx_id)?;
-        let mut r = self.r.lock().unwrap();
-        if r.is_classic(id) {
-            r.vrend_journal_export(id)
-        } else {
-            r.venus_journal_export(id)
-        }
+        self.r.lock().unwrap().journal_export(id)
     }
 
     fn limina_journal_seq(&self, ctx_id: u32) -> u64 {
@@ -437,50 +431,25 @@ impl RutabagaComponent for VirglRenderer {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        let mut r = self.r.lock().unwrap();
-        if r.is_classic(id) {
-            r.vrend_replay_begin(id)
-        } else {
-            r.venus_replay_begin(id).is_ok()
-        }
+        self.r.lock().unwrap().replay_begin(id).is_ok()
     }
 
     fn limina_journal_restore(&self, ctx_id: u32, blob: &[u8]) -> bool {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        let mut r = self.r.lock().unwrap();
-        let classic = r.is_classic(id);
-        let restored = if classic {
-            r.vrend_journal_restore(id, blob)
-        } else {
-            r.venus_journal_restore(id, blob)
-        };
-        match restored {
-            Ok(_) => true,
-            Err(why) => {
-                // The blob has been through a snapshot file since we wrote it. Saying which way it
-                // is wrong is the difference between a bug we can find and a resume that is merely
-                // black.
-                let which = if classic { "vrend" } else { "venus" };
-                error!("virglrs: {which}: ctx {ctx_id}: journal refused: {why}");
-                false
-            }
-        }
+        // A refused journal is reported by the renderer, which names the half that refused it.
+        self.r.lock().unwrap().journal_restore(id, blob).is_ok()
     }
 
     fn limina_journal_replay_upto(&self, ctx_id: u32, upto: u64) -> bool {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        let mut r = self.r.lock().unwrap();
-        if r.is_classic(id) {
-            return r.vrend_replay_upto(id, upto);
-        }
-        match r.venus_replay_upto(id, upto) {
+        match self.r.lock().unwrap().replay_upto(id, upto) {
             Ok(()) => true,
             Err(why) => {
-                error!("virglrs: venus: ctx {ctx_id}: replay to {upto} failed: {why}");
+                error!("virglrs: ctx {ctx_id}: replay to {upto} failed: {why}");
                 false
             }
         }
@@ -514,12 +483,7 @@ impl RutabagaComponent for VirglRenderer {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        let mut r = self.r.lock().unwrap();
-        if r.is_classic(id) {
-            r.vrend_replay_end(id)
-        } else {
-            r.venus_replay_end(id).is_ok()
-        }
+        self.r.lock().unwrap().replay_end(id).is_ok()
     }
 
     fn limina_sync_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
