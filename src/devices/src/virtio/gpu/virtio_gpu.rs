@@ -30,9 +30,9 @@ use rutabaga_gfx::{
     RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
 };
 use rutabaga_gfx::{
-    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_FLAG_FENCE, RUTABAGA_FLAG_INFO_RING_IDX,
-    RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder,
-    RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D,
+    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_FLAG_PRESENT, RUTABAGA_MAP_CACHE_MASK,
+    ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
+    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -437,11 +437,6 @@ impl ScanoutHolds {
     }
 }
 
-/// The reserved vkr fence ring for present fences (mirrors VKR_LIMINA_PRESENT_RING in
-/// our virglrenderer fork). Guest fences never use it — a guest process would need
-/// 63 concurrent VkQueues.
-const LIMINA_PRESENT_RING: u8 = 63;
-
 pub struct VirtioGpuScanout {
     resource_id: u32,
     /// limina: the SET_SCANOUT rect dimensions — the visible region the guest scans out, and
@@ -715,13 +710,11 @@ impl VirtioGpu {
                 completed_fence.fence_id, completed_fence.ring_idx
             );
 
-            // limina (#8): a fence on the reserved present ring is host-injected — it
-            // carries a parked-present cookie, not a guest fence id. Hand it to the
-            // worker thread (which owns the display backend) and stay clear of the
-            // guest fence bookkeeping below.
-            if completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0
-                && completed_fence.ring_idx == LIMINA_PRESENT_RING
-            {
+            // limina (#8): a present fence is host-injected — it carries a parked-present
+            // cookie, not a guest fence id, and names no context or ring because it was
+            // asked for about a resource. Hand it to the worker thread (which owns the
+            // display backend) and stay clear of the guest fence bookkeeping below.
+            if completed_fence.flags & RUTABAGA_FLAG_PRESENT != 0 {
                 present_retired
                     .lock()
                     .unwrap()
@@ -2569,36 +2562,18 @@ impl VirtioGpu {
                     // GPU completion stalls all of them -- measured at about 12.6 ms per present,
                     // 30-60 times a second, and 55% of that thread under a frame-paced workload.
                     //
-                    // An error from `present_waits_on` is not a failure: it says this present
-                    // cannot be answered by a single fence (no surface, nothing attached, or
-                    // several contexts attached, any of which would have the frame presented while
+                    // Refusing to park is not a failure: it says this present cannot be
+                    // answered by a single fence (no surface, nothing attached, or several
+                    // contexts attached, any of which would have the frame presented while
                     // someone's renders were still outstanding), so the blocking path is correct
-                    // for it and is what runs.
+                    // for it and is what runs. Which context to fence is the renderer's to
+                    // decide, from what the guest attached the resource to; asking first and
+                    // passing the answer back would be the same question answered twice.
                     let seq = self.present_order.stamp();
-                    let waits_on = self
-                        .rutabaga
-                        .as_ref()
-                        .and_then(|r| r.present_waits_on(resource_id).ok());
-                    if let Some(ctx_id) = waits_on
-                        && self.try_park_present(
-                            scanout_id,
-                            iosurface_id,
-                            resource_id,
-                            &rect,
-                            ctx_id,
-                            seq,
-                        )
-                    {
+                    if self.try_park_present(scanout_id, iosurface_id, resource_id, &rect, seq) {
                         continue;
                     }
-                    self.note_overtake(
-                        scanout_id,
-                        if waits_on.is_none() {
-                            "no single context to fence"
-                        } else {
-                            "parking refused"
-                        },
-                    );
+                    self.note_overtake(scanout_id, "parking refused");
                     // Presented at once, so no hold can form on this flush.
                     self.note_scanout_held(scanout_id, false);
                     if let Err(e) = self
@@ -2663,14 +2638,7 @@ impl VirtioGpu {
                     // retires (true GPU completion). Falls through to the immediate
                     // present if parking isn't possible.
                     let seq = self.present_order.stamp();
-                    if self.try_park_present(
-                        scanout_id,
-                        iosurface_id,
-                        resource_id,
-                        &rect,
-                        resource.ctx_id,
-                        seq,
-                    ) {
+                    if self.try_park_present(scanout_id, iosurface_id, resource_id, &rect, seq) {
                         continue;
                     }
                     self.note_overtake(scanout_id, "parking refused");
@@ -2888,10 +2856,9 @@ impl VirtioGpu {
         iosurface_id: u32,
         resource_id: u32,
         rect: &Rect,
-        ctx_id: u32,
         seq: u64,
     ) -> bool {
-        if ctx_id == 0 || !Self::fence_present_enabled() {
+        if !Self::fence_present_enabled() {
             return false;
         }
         let (Some(pf), Some(rutabaga)) = (self.present_fence.as_mut(), self.rutabaga.as_mut())
@@ -2915,14 +2882,8 @@ impl VirtioGpu {
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
         pf.flush_parked_cookies.push((cookie, scanout_id));
 
-        let fence = RutabagaFence {
-            flags: RUTABAGA_FLAG_FENCE | RUTABAGA_FLAG_INFO_RING_IDX,
-            fence_id: cookie,
-            ctx_id,
-            ring_idx: LIMINA_PRESENT_RING,
-        };
-        if let Err(e) = rutabaga.create_fence(fence) {
-            warn!("present fence injection failed (ctx {ctx_id}): {e}; presenting now");
+        if let Err(e) = rutabaga.present_fence(resource_id, cookie) {
+            warn!("present fence injection failed (resource {resource_id}): {e}; presenting now");
             // Roll the cookie ALL the way back: leaving it in flush_parked_cookies
             // poisons the next fenced flush's GuestFlushHold with a cookie that can
             // never present (no parked frame, no injected fence) -> the guest's
