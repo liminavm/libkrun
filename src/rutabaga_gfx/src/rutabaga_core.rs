@@ -261,6 +261,14 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// limina fence-accurate present: fence the work behind a flushed resource's contents and
+    /// retire `cookie` as a present fence when it has finished. An error is "cannot be answered
+    /// by a fence; present it instead". Only virgl implements it.
+    #[cfg(target_os = "macos")]
+    fn present_fence(&self, _resource_id: u32, _cookie: u64) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// Implementations must flush the given resource to the display.
     fn resource_flush(&self, _resource_id: &mut RutabagaResource) -> RutabagaResult<()> {
         Err(RutabagaError::Unsupported)
@@ -1173,6 +1181,21 @@ impl Rutabaga {
             .ok_or(RutabagaError::InvalidComponent)?;
 
         component.present_waits_on(resource_id)
+    }
+
+    /// limina fence-accurate present: fence what produced a flushed resource's contents.
+    ///
+    /// The frame parked on `cookie` is shown when the fence retires, which is true GPU
+    /// completion. An error means this present cannot be answered by a fence and the frame
+    /// should be shown now.
+    #[cfg(target_os = "macos")]
+    pub fn present_fence(&self, resource_id: u32, cookie: u64) -> RutabagaResult<()> {
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+
+        component.present_fence(resource_id, cookie)
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device
