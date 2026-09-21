@@ -572,7 +572,8 @@ impl Vcpu {
     /// Main loop of the vCPU thread.
     pub fn run(&mut self, init_tls_sender: Sender<u64>) {
         // On this thread, before it ever enters the guest: the band applies to mach_thread_self().
-        vcpu_sched::set_realtime_band(self.id as u64);
+        // The guard it hands back is this thread's own way out of the band — see `BandGuard`.
+        let band_guard = vcpu_sched::set_realtime_band(self.id as u64);
         let mut hvf_vcpu =
             HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
         if let Some(released_ram) = self.released_ram.take() {
@@ -594,7 +595,16 @@ impl Vcpu {
         // forces the exit; the loop decides whether a park is actually due.
         let heartbeat = Arc::new(vcpu_sched::Heartbeat::new());
         let hb_interval = vcpu_sched::heartbeat_interval();
-        if let Some(interval) = hb_interval {
+        // The kick is needed for either job, and for opposite reasons: the heartbeat forces an
+        // exit so the thread can *park* and keep the band, the band guard so it can *give the
+        // band back*. Both are checks in the loop below, and a guest that never leaves on its own
+        // reaches neither without this.
+        let kick_interval = hb_interval.or_else(|| {
+            band_guard
+                .as_ref()
+                .map(vcpu_sched::BandGuard::kick_interval)
+        });
+        if let Some(interval) = kick_interval {
             let heartbeat = Arc::clone(&heartbeat);
             thread::Builder::new()
                 .name(format!("vcpu{}-hb", self.id))
@@ -677,6 +687,12 @@ impl Vcpu {
             // affinity) and then parks the same way.
             if let Some(interval) = hb_interval {
                 heartbeat.beat(interval);
+            }
+            // Before anything that could block: a vCPU which has stopped parking must give the
+            // band back itself, because by then nothing else on the host may be getting a core
+            // to do it for us.
+            if let Some(guard) = &band_guard {
+                guard.check(&heartbeat);
             }
             match self.event_receiver.try_recv() {
                 Ok(VcpuEvent::Pause) => self.pause_and_park(&hvf_vcpu),
