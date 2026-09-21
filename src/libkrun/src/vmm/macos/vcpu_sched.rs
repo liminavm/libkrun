@@ -31,8 +31,8 @@
 //!
 //! `LIMINA_VCPU_RT` is still read as the old spelling of `rt`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
@@ -67,6 +67,13 @@ unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_wait_until(deadline: u64) -> i32;
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    fn sysctlbyname(
+        name: *const u8,
+        oldp: *mut core::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut core::ffi::c_void,
+        newlen: usize,
+    ) -> i32;
 }
 
 /// `QOS_CLASS_USER_INTERACTIVE` from `sys/qos.h`.
@@ -129,6 +136,15 @@ const DISARM_ABOVE: f64 = 0.60;
 /// Long enough that the thread really parks — a deadline already behind us returns without ever
 /// entering `TH_WAIT`, and then nothing is cleared.
 const HEARTBEAT_PARK: Duration = Duration::from_micros(100);
+
+/// How many declared periods a banded thread may compute, without ever parking, before it takes
+/// itself out of the band.
+///
+/// Two, because one is not yet evidence: a thread that has run for a whole period without parking
+/// has already spent more than the `computation` it promised for that period, and a second says
+/// it was not a one-off. The threshold is derived from the reservation rather than chosen, so it
+/// moves with a caller's `rt:period,...` instead of silently not applying to it.
+const SELF_DISARM_PERIODS: u32 = 2;
 
 fn ns_to_abs(ns: u64) -> u32 {
     let mut tb = MachTimebaseInfo::default();
@@ -272,12 +288,60 @@ impl Heartbeat {
     }
 }
 
+/// Read a `u32` sysctl by name, or `None` if it does not answer.
+fn sysctl_u32(name: &[u8]) -> Option<u32> {
+    debug_assert_eq!(
+        name.last(),
+        Some(&0),
+        "a sysctl name reaches C as a C string"
+    );
+    let mut out: u32 = 0;
+    let mut len = size_of::<u32>();
+    // SAFETY: `name` is NUL-terminated by the assert above, and the buffer and its length
+    // describe the same `u32` — the pair the kernel writes through.
+    let rc = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            &mut out as *mut u32 as *mut core::ffi::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == size_of::<u32>()).then_some(out)
+}
+
+/// How many vCPU threads may hold the band at once.
+///
+/// The band is a reservation, so this is the host's floor: the number of cores that can never be
+/// promised away. **It is deliberately not derived from `hw.activecpu`**, which reports every
+/// configured core whether or not any of them is parked — measured 10 of 10 on an idle M1 Max,
+/// while a panic report from an M4 Pro at the same moment showed 10 of its 14 cores offline with
+/// only the efficiency cluster running. A cap against a number that cannot fall is not a cap.
+///
+/// The efficiency cluster is what survives an idle machine, so half of it is the bound, floored
+/// at one. That is 1 on a 2-E-core M1 Max and 2 on a 4-E-core M4 Pro. The only configuration
+/// measured clean under a saturated guest is a single banded vCPU (`spikes/macos-timer-wakeup/`,
+/// `rt#1`), so this is a bound and not a tuned value: it exists to keep an explicit `rt+dyn` from
+/// owning the machine, not to say that everything under it performs well.
+fn arm_cap() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let e_cores = sysctl_u32(b"hw.perflevel1.logicalcpu\0")
+            .or_else(|| sysctl_u32(b"hw.perflevel0.logicalcpu\0"))
+            .unwrap_or(2) as usize;
+        (e_cores / 2).max(1)
+    })
+}
+
 /// One banded thread's mach port and the CPU time it had at the last sample.
 struct Sampled {
     vcpuid: u64,
     port: u32,
     cpu_us: u64,
-    armed: bool,
+    /// Shared with the vCPU thread itself, which takes itself out of the band without waiting to
+    /// be told — see [`BandGuard`]. The sampler must therefore read it rather than remember it.
+    armed: Arc<AtomicBool>,
 }
 
 static REGISTRY: Mutex<Vec<Sampled>> = Mutex::new(Vec::new());
@@ -338,6 +402,24 @@ fn next_state(armed: bool, share: f64) -> bool {
     }
 }
 
+/// What a thread's armed state should become, or `None` to leave it alone.
+///
+/// `next_state` asks only about the thread; this adds the one question that is about the host.
+/// The cap wins over the share in both directions: a thread idle enough to deserve the band does
+/// not get it when there is no room, and a thread already holding one gives it back when the room
+/// has gone — which is how a cap that is already exceeded walks itself back down instead of
+/// waiting for every holder to get busy.
+fn decide(armed: bool, share: f64, armed_now: usize, cap: usize) -> Option<bool> {
+    if armed && armed_now > cap {
+        return Some(false);
+    }
+    let want = next_state(armed, share);
+    if want == armed || (want && armed_now >= cap) {
+        return None;
+    }
+    Some(want)
+}
+
 /// Start the sampler that arms and disarms each registered vCPU thread. Idempotent.
 fn start_sampler(band: Band) {
     static STARTED: OnceLock<()> = OnceLock::new();
@@ -350,6 +432,14 @@ fn start_sampler(band: Band) {
             loop {
                 std::thread::sleep(SAMPLE_INTERVAL);
                 let mut threads = REGISTRY.lock().unwrap();
+                // Read rather than remembered: a vCPU thread takes itself out of the band from
+                // its own run loop, so this sampler's idea of who is armed is always downstream
+                // of theirs.
+                let mut armed_now = threads
+                    .iter()
+                    .filter(|t| t.armed.load(Ordering::Relaxed))
+                    .count();
+                let cap = arm_cap();
                 for t in threads.iter_mut() {
                     let Some(now_us) = thread_cpu_us(t.port) else {
                         continue;
@@ -357,22 +447,31 @@ fn start_sampler(band: Band) {
                     let share = (now_us.saturating_sub(t.cpu_us)) as f64
                         / SAMPLE_INTERVAL.as_micros() as f64;
                     t.cpu_us = now_us;
-                    let want = next_state(t.armed, share);
-                    if want == t.armed {
+                    let armed = t.armed.load(Ordering::Relaxed);
+                    let Some(want) = decide(armed, share, armed_now, cap) else {
                         continue;
-                    }
+                    };
                     let ok = if want {
                         set_band_on(t.port, band)
                     } else {
                         set_timeshare(t.port)
                     };
                     if ok {
-                        t.armed = want;
-                        log::debug!(
-                            "[VCPU-RT] vCPU {} {} the band (share {:.0}%)",
+                        t.armed.store(want, Ordering::Relaxed);
+                        armed_now = if want {
+                            armed_now + 1
+                        } else {
+                            armed_now.saturating_sub(1)
+                        };
+                        // Info, not debug: these are a few lines a minute, and their absence is
+                        // why the 2026-09-21 host panic cannot say how many vCPUs were banded.
+                        log::info!(
+                            "[VCPU-RT] vCPU {} {} the band (share {:.0}%, {}/{} armed)",
                             t.vcpuid,
                             if want { "took" } else { "gave back" },
-                            share * 100.0
+                            share * 100.0,
+                            armed_now,
+                            cap,
                         );
                     }
                 }
@@ -381,9 +480,54 @@ fn start_sampler(band: Band) {
         .ok();
 }
 
+/// A banded vCPU thread's own handle on the band, so it can give it back without being told.
+///
+/// The sampler cannot be the only thing that disarms. It is an ordinary-priority thread, and a
+/// banded thread cannot be preempted by one: measured directly during a saturated collapse, every
+/// other thread in the worker sat at 0.0% CPU while the vCPU threads held priority 97
+/// (`spikes/macos-timer-wakeup/`, `starvation-probe.sh`). The sampler is one of those threads, so
+/// the guard against over-committing the machine was itself the first thing the machine stopped
+/// running -- it has to be scheduled to fix the condition that stops it being scheduled. On
+/// 2026-09-21 that ended in a kernel panic: `watchdog timeout: no checkins from watchdogd in 94
+/// seconds`, with four vCPU threads at priority 97 and only the efficiency cluster online.
+///
+/// A thread that is running is, by definition, scheduled. So the thread rescues itself, from its
+/// own loop, with no lock and no syscall on the path that does not act -- which is why this is a
+/// plain check at every exit from the guest rather than anything cleverer.
+pub struct BandGuard {
+    port: u32,
+    armed: Arc<AtomicBool>,
+    /// How long this thread may compute without parking before it gives the band back.
+    disarm_after: Duration,
+}
+
+impl BandGuard {
+    /// How long this thread may compute without parking. The kicker that forces a saturated
+    /// guest back out to us uses it too, since a check the thread never reaches is not a check.
+    pub fn kick_interval(&self) -> Duration {
+        self.disarm_after
+    }
+
+    /// Give the band back if this thread has been computing for too long without parking.
+    ///
+    /// Call at every exit from the guest. Disarming only ever *lowers* this thread's claim on the
+    /// machine, so it needs no agreement with the sampler: the sampler re-arms only on a sample
+    /// showing the thread mostly idle, which a thread that just tripped this cannot produce for
+    /// at least one interval. That is also what keeps the pair from flapping.
+    pub fn check(&self, heartbeat: &Heartbeat) {
+        if !self.armed.load(Ordering::Relaxed) || !heartbeat.is_stale(self.disarm_after) {
+            return;
+        }
+        if set_timeshare(self.port) {
+            self.armed.store(false, Ordering::Relaxed);
+            log::info!("[VCPU-RT] a vCPU gave the band back from its own loop: it stopped parking");
+        }
+    }
+}
+
 /// Move the *calling* thread into whichever band was asked for. Must run on the vCPU thread
 /// itself, since both policies apply to the current thread.
-pub fn set_realtime_band(vcpuid: u64) {
+pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
     // A little vCPU takes the low QoS class instead, and never the real-time band. The two are
     // not compatible in either direction: xnu does not serve a time-constraint thread on an
     // efficiency core, so banding a little vCPU would quietly undo the asymmetry the guest was
@@ -396,14 +540,14 @@ pub fn set_realtime_band(vcpuid: u64) {
         } else {
             log::warn!("[VCPU-RT] vCPU {vcpuid}: little qos class refused (errno={ret})");
         }
-        return;
+        return None;
     }
     if vcpu_limit().is_some_and(|limit| vcpuid >= limit) {
-        return;
+        return None;
     }
     let (band, heartbeat) = requested();
     let Some(band) = band else {
-        return;
+        return None;
     };
     let (period, computation, constraint) = match band {
         Band::Qos => {
@@ -413,7 +557,7 @@ pub fn set_realtime_band(vcpuid: u64) {
             } else {
                 log::warn!("[VCPU-RT] vCPU {vcpuid}: qos class refused (errno={ret})");
             }
-            return;
+            return None;
         }
         Band::RealTime(p, c, k) => (p, c, k),
     };
@@ -422,18 +566,26 @@ pub fn set_realtime_band(vcpuid: u64) {
         // Register and let the sampler decide: a vCPU that is running guest code flat out must not
         // hold a real-time reservation, whatever it is doing right now.
         let port = unsafe { mach_thread_self() };
+        let armed = Arc::new(AtomicBool::new(false));
         REGISTRY.lock().unwrap().push(Sampled {
             vcpuid,
             port,
             cpu_us: thread_cpu_us(port).unwrap_or(0),
-            armed: false,
+            armed: Arc::clone(&armed),
         });
         start_sampler(band);
         log::info!(
             "[VCPU-RT] vCPU {vcpuid} joins the dynamic band (period={period:?} \
-             computation={computation:?} constraint={constraint:?})"
+             computation={computation:?} constraint={constraint:?}, at most {} armed at once)",
+            arm_cap(),
         );
-        return;
+        // The thread keeps its own way out, which is the only one that still works once every
+        // core is promised away.
+        return Some(BandGuard {
+            port,
+            armed,
+            disarm_after: period * SELF_DISARM_PERIODS,
+        });
     }
     let mut policy = ThreadTimeConstraintPolicy {
         period: ns_to_abs(period.as_nanos() as u64),
@@ -458,11 +610,103 @@ pub fn set_realtime_band(vcpuid: u64) {
     } else {
         log::warn!("[VCPU-RT] vCPU {vcpuid}: thread_policy_set refused the band (kr={ret})");
     }
+    // A statically banded thread holds the band for its whole life by construction, so there is
+    // nothing here for a guard to give back.
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap bounds how much of the machine can be promised away, in both directions.
+    ///
+    /// This is the guarantee that does not depend on any thread being scheduled to enforce it,
+    /// which is what the 2026-09-21 host panic cost: the sampler that should have disarmed four
+    /// saturated banded vCPUs was an ordinary-priority thread those same vCPUs had starved.
+    #[test]
+    fn the_cap_bounds_the_band_whatever_the_threads_are_doing() {
+        // An idle thread takes the band while there is room.
+        assert_eq!(decide(false, 0.10, 0, 2), Some(true));
+        // And is refused once there is not, however idle it is.
+        assert_eq!(
+            decide(false, 0.00, 2, 2),
+            None,
+            "a full cap refuses an idle thread"
+        );
+        // A thread already holding one gives it back when the room has gone -- the case that
+        // walks an exceeded cap back down rather than waiting for its holders to get busy.
+        assert_eq!(
+            decide(true, 0.00, 3, 2),
+            Some(false),
+            "over the cap, the band goes back"
+        );
+        // Saturation still disarms on its own, which is the ordinary path.
+        assert_eq!(decide(true, 0.95, 1, 2), Some(false));
+        // And the hysteresis is not lost: between the thresholds, nothing changes.
+        assert_eq!(decide(true, 0.50, 1, 2), None);
+        assert_eq!(decide(false, 0.50, 1, 2), None);
+    }
+
+    /// The cap always leaves the host something, on any machine.
+    ///
+    /// A cap of zero would disable the band; a cap that counted every core would be the panic
+    /// again. Note what it is *not* derived from: `hw.activecpu` reports every configured core
+    /// whether or not it is parked, so a cap against it could not fall when the machine idles
+    /// down -- which is precisely when every vCPU is armed.
+    #[test]
+    fn the_cap_leaves_the_host_at_least_one_core_and_never_zero() {
+        let cap = arm_cap();
+        assert!(
+            cap >= 1,
+            "a cap of zero would turn the band off rather than bound it"
+        );
+        let e_cores = sysctl_u32(b"hw.perflevel1.logicalcpu\0").unwrap_or(2) as usize;
+        assert!(
+            cap <= e_cores.max(1),
+            "the cap ({cap}) may never exceed the cluster that survives an idle machine \
+             ({e_cores} efficiency cores)"
+        );
+    }
+
+    /// A banded thread that stops parking takes itself out of the band.
+    ///
+    /// The whole point is that this needs nobody else to run: the thread is holding a core by
+    /// definition, so it is the one actor guaranteed to be schedulable.
+    #[test]
+    fn a_thread_that_stops_parking_gives_the_band_back_itself() {
+        let armed = Arc::new(AtomicBool::new(true));
+        let guard = BandGuard {
+            port: unsafe { mach_thread_self() },
+            armed: Arc::clone(&armed),
+            disarm_after: Duration::from_secs(3600),
+        };
+        let heartbeat = Heartbeat::new();
+
+        // Freshly parked: nothing is owed, whatever else is true.
+        guard.check(&heartbeat);
+        assert!(
+            armed.load(Ordering::Relaxed),
+            "a thread that just parked keeps the band"
+        );
+
+        // Computing for longer than it promised: it gives the band back without being asked.
+        let hot = BandGuard {
+            port: unsafe { mach_thread_self() },
+            armed: Arc::clone(&armed),
+            disarm_after: Duration::from_nanos(1),
+        };
+        std::thread::sleep(Duration::from_millis(2));
+        hot.check(&heartbeat);
+        assert!(
+            !armed.load(Ordering::Relaxed),
+            "a thread that has stopped parking must not still hold a reservation"
+        );
+
+        // Idempotent: a thread that has already stood down does not keep calling the kernel.
+        hot.check(&heartbeat);
+        assert!(!armed.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn a_duration_survives_the_trip_through_mach_units() {
