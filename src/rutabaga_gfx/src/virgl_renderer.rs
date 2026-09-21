@@ -89,6 +89,17 @@ impl FenceSink for Fences {
             ring_idx: 0,
         });
     }
+
+    /// A present fence: the cookie a parked frame is waiting on, and no context or ring, because
+    /// this fence was asked for about a resource rather than created on a guest stream.
+    fn present_fence(&mut self, fence: FenceId) {
+        self.0.call(RutabagaFence {
+            flags: RUTABAGA_FLAG_FENCE | RUTABAGA_FLAG_PRESENT,
+            fence_id: fence.0,
+            ctx_id: 0,
+            ring_idx: 0,
+        });
+    }
 }
 
 /// A renderer refusal as rutabaga's error, with the reason kept where a reader can see it.
@@ -714,6 +725,27 @@ impl RutabagaComponent for VirglRenderer {
             .resource_present_waits_on(handle)
             .map(|ctx| ctx.get())
             .ok_or(RutabagaError::ComponentError(-libc::EINVAL))
+    }
+
+    /// limina fence-accurate present: fence the work behind a flushed resource's contents, and
+    /// retire `cookie` as a present fence once it has finished on the host.
+    ///
+    /// `EINVAL` is not a failure: it says this present cannot be answered by a fence -- nothing
+    /// has the resource attached, several contexts have, or the one that does has no queue to
+    /// fence -- and the caller should present the frame rather than park it.
+    #[cfg(target_os = "macos")]
+    fn present_fence(&self, resource_id: u32, cookie: u64) -> RutabagaResult<()> {
+        let handle = res(resource_id)?;
+        if self
+            .r
+            .lock()
+            .unwrap()
+            .resource_present_fence(handle, FenceId(cookie))
+        {
+            Ok(())
+        } else {
+            Err(RutabagaError::ComponentError(-libc::EINVAL))
+        }
     }
 
     fn transfer_read(
