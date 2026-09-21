@@ -123,6 +123,10 @@ pub const RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x00ff;
 pub const RUTABAGA_FLAG_FENCE: u32 = 1 << 0;
 pub const RUTABAGA_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 pub const RUTABAGA_FLAG_FENCE_SHAREABLE: u32 = 1 << 2;
+/// limina: a host-injected present fence, carrying a parked-frame cookie rather than a guest
+/// fence id. It is set by the renderer's sink and read by the gpu device; it never reaches a
+/// guest, and no `VIRTIO_GPU_FLAG_*` corresponds to it.
+pub const RUTABAGA_FLAG_PRESENT: u32 = 1 << 3;
 
 /// Convenience struct for Rutabaga fences
 #[repr(C)]
