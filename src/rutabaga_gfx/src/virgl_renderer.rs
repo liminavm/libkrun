@@ -901,10 +901,15 @@ impl RutabagaComponent for VirglRenderer {
 
 /// limina: hand a previously-published scanout IOSurface back to the supervisor.
 ///
-/// virglrs keeps no process-wide surface registry to republish out of -- a surface is owned by the
-/// resource holding it -- so there is nothing here to answer with. The C's registry is what this
-/// stood on.
+/// virglrs keeps the registry of the surfaces it published, and answers through the same
+/// publisher -- so on the same Mach queue as every other publish and release, whose ordering is
+/// what keeps a recycled id from naming the wrong surface. `Unsupported` when the renderer does
+/// not hold the id, which is the caller's cue to ask the display backend instead.
 #[cfg(target_os = "macos")]
-pub fn republish_iosurface(_iosurface_id: u32) -> RutabagaResult<()> {
-    Err(RutabagaError::Unsupported)
+pub fn republish_iosurface(iosurface_id: u32) -> RutabagaResult<()> {
+    if virglrenderer::metal::republish(iosurface_id) {
+        Ok(())
+    } else {
+        Err(RutabagaError::Unsupported)
+    }
 }
