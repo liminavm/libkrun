@@ -559,6 +559,27 @@ impl Vmm {
         self.quiesce_holdouts().is_empty()
     }
 
+    /// limina: the virtio-mmio devices a driver has handed back — reset to `INIT`, which is what
+    /// the guest's `.suspend` callbacks do on the way into suspend. Together with
+    /// [`quiesce_holdouts`](Self::quiesce_holdouts) this shows a suspend in progress: some devices
+    /// released, some still held. Same `(virtio type id, device id, device_status)` shape.
+    #[cfg(target_os = "macos")]
+    pub fn released_devices(&self) -> Vec<(u32, String, u32)> {
+        self.mmio_device_manager
+            .virtio_statuses()
+            .into_iter()
+            .filter(|(type_id, _, status)| is_driver_released(*type_id, *status))
+            .collect()
+    }
+
+    /// limina: the counter every guest power-state transition bumps — a virtio device status
+    /// change, or a vCPU entering or leaving PSCI `SYSTEM_SUSPEND` — for a VMM that would rather
+    /// wait for the next one than poll.
+    #[cfg(target_os = "macos")]
+    pub fn power_watch(&self) -> std::sync::Arc<devices::legacy::GuestPowerWatch> {
+        self.vcpu_list.power_watch()
+    }
+
     /// True once every vCPU is blocked in a WFx wait (or parked offline).
     ///
     /// [`Self::is_quiesced`] and this answer different questions, and a caller that needs
@@ -1013,14 +1034,28 @@ impl Subscriber for Vmm {
 /// exactly `DRIVER_OK`.
 #[cfg(target_os = "macos")]
 fn is_quiesce_holdout(type_id: u32, device_status: u32) -> bool {
-    const VIRTIO_ID_GPU: u32 = 16;
-    const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
     type_id != VIRTIO_ID_GPU && device_status & VIRTIO_CONFIG_S_DRIVER_OK != 0
 }
 
+/// Whether a driver has handed one virtio-mmio device back — the predicate behind
+/// [`Vmm::released_devices`]. Status `INIT` is written only by a reset, and the guest's virtio
+/// core sets `ACKNOWLEDGE` on every device it registers, so after boot a device at `INIT` is one a
+/// driver reset: on the way into suspend, or on the way out of the machine. virtio-gpu is excepted
+/// for the same reason as in [`is_quiesce_holdout`]: it has no PM ops, so its status says nothing
+/// about suspend.
+#[cfg(target_os = "macos")]
+fn is_driver_released(type_id: u32, device_status: u32) -> bool {
+    type_id != VIRTIO_ID_GPU && device_status == 0
+}
+
+#[cfg(target_os = "macos")]
+const VIRTIO_ID_GPU: u32 = 16;
+#[cfg(target_os = "macos")]
+const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
+
 #[cfg(all(test, target_os = "macos"))]
 mod quiesce_tests {
-    use super::is_quiesce_holdout;
+    use super::{is_driver_released, is_quiesce_holdout};
 
     const BLK: u32 = 2;
     const GPU: u32 = 16;
@@ -1063,5 +1098,24 @@ mod quiesce_tests {
     #[test]
     fn the_gpu_is_never_a_holdout() {
         assert!(!is_quiesce_holdout(GPU, DRIVER_OK));
+    }
+
+    /// A reset device is one its driver handed back — the mark a suspend leaves as it goes.
+    #[test]
+    fn a_reset_device_is_released() {
+        assert!(is_driver_released(BLK, INIT));
+    }
+
+    /// Neither a driver-owned device nor one no driver ever took has been handed back.
+    #[test]
+    fn held_and_never_taken_devices_are_not_released() {
+        assert!(!is_driver_released(BLK, DRIVER_OK));
+        assert!(!is_driver_released(I2C, ACKNOWLEDGE));
+    }
+
+    /// virtio-gpu has no PM ops, so even at INIT its status says nothing about suspend.
+    #[test]
+    fn the_gpu_is_never_released() {
+        assert!(!is_driver_released(GPU, INIT));
     }
 }
