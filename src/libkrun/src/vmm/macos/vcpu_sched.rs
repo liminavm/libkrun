@@ -631,10 +631,14 @@ impl BandGuard {
 /// Move the *calling* thread into whichever band was asked for. Must run on the vCPU thread
 /// itself, since both policies apply to the current thread.
 pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
-    // A little vCPU takes the low QoS class instead, and never the real-time band. The two are
-    // not compatible in either direction: xnu does not serve a time-constraint thread on an
-    // efficiency core, so banding a little vCPU would quietly undo the asymmetry the guest was
-    // told about — and the guest, believing the CPU is slow, would keep packing work onto it.
+    // A little vCPU takes the low QoS class instead, and never the real-time band: the band would
+    // stop it being little. xnu places a time-constraint thread on an efficiency core readily (a
+    // mostly idle one runs ~96% of its time there, and still wakes ~20 µs late), but only while it
+    // is idle: saturated, it runs on a performance core and at priority 97. The QoS class cannot
+    // hold it back. QOS_CLASS_BACKGROUND set after the policy is refused (EPERM), and set before
+    // it is overridden (0.01% of saturated samples on E). A banded little vCPU would therefore
+    // quietly undo the asymmetry the guest was told about, and the guest, believing the CPU is
+    // slow, would keep packing work onto it (`spikes/rt-ecore-placement/`).
     if is_little(vcpuid) {
         let (class, name) = little_qos();
         let ret = unsafe { pthread_set_qos_class_self_np(class, 0) };
