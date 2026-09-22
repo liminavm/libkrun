@@ -692,7 +692,7 @@ impl Vcpu {
             // band back itself, because by then nothing else on the host may be getting a core
             // to do it for us.
             if let Some(guard) = &band_guard {
-                guard.check(&heartbeat);
+                guard.check();
             }
             match self.event_receiver.try_recv() {
                 Ok(VcpuEvent::Pause) => self.pause_and_park(&hvf_vcpu),
