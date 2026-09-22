@@ -155,6 +155,15 @@ fn ns_to_abs(ns: u64) -> u32 {
     abs.min(u32::MAX as u128) as u32
 }
 
+/// The inverse of [`ns_to_abs`], for reading back a `mach_absolute_time` interval.
+fn abs_to_ns(abs: u64) -> u64 {
+    let mut tb = MachTimebaseInfo::default();
+    if unsafe { mach_timebase_info(&mut tb) } != 0 || tb.denom == 0 {
+        return abs;
+    }
+    ((abs as u128 * tb.numer as u128) / tb.denom as u128).min(u64::MAX as u128) as u64
+}
+
 /// What a vCPU thread should ask the scheduler for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Band {
@@ -342,6 +351,11 @@ struct Sampled {
     /// Shared with the vCPU thread itself, which takes itself out of the band without waiting to
     /// be told — see [`BandGuard`]. The sampler must therefore read it rather than remember it.
     armed: Arc<AtomicBool>,
+    /// `mach_absolute_time` when the band was last handed to this thread, and the thread's total
+    /// CPU microseconds at that moment. The thread's own guard spends its budget from these, not
+    /// from the last park it happens to have inherited — see [`should_disarm`].
+    armed_at: Arc<AtomicU64>,
+    armed_cpu_us: Arc<AtomicU64>,
 }
 
 static REGISTRY: Mutex<Vec<Sampled>> = Mutex::new(Vec::new());
@@ -420,6 +434,26 @@ fn decide(armed: bool, share: f64, armed_now: usize, cap: usize) -> Option<bool>
     Some(want)
 }
 
+/// Whether a banded thread owes its band back.
+///
+/// The budget is spent in **CPU time this thread actually burned since it was armed**, not in
+/// wall time and not in time since its last recorded park. All three were tried; only this one
+/// answers the question the band asks, which is whether the thread is *computing* flat out.
+///
+/// Wall time alone disarms an idle vCPU, because time passes whether or not it is running.
+/// Time-since-park looks right and is not: HVF parks an idle vCPU inside `hv_vcpu_run` rather
+/// than handing us the WFI trap, so `observed_block` never fires on the idle path and the
+/// timestamp ages while the thread sleeps. The 2026-09-21 log holds the contradiction in plain
+/// sight — the sampler armed threads it measured at 0%, 1%, 2%, 9% of a core, and the guard then
+/// declared those same threads to have computed for 33 ms without parking. Both cannot be true.
+///
+/// CPU time cannot lie either way: a thread parked in HVF accrues none however long it waits, and
+/// a saturated one accrues it 1:1 with the wall clock and still trips at the budget — so the
+/// protection that the host panic bought is kept exactly, and only the false positives go.
+fn should_disarm(armed: bool, cpu_used: Duration, budget: Duration) -> bool {
+    armed && cpu_used >= budget
+}
+
 /// Start the sampler that arms and disarms each registered vCPU thread. Idempotent.
 fn start_sampler(band: Band) {
     static STARTED: OnceLock<()> = OnceLock::new();
@@ -457,6 +491,13 @@ fn start_sampler(band: Band) {
                         set_timeshare(t.port)
                     };
                     if ok {
+                        if want {
+                            // Before `armed`, so the thread's own guard can never observe itself
+                            // armed against a stale baseline and stand down at once.
+                            t.armed_at
+                                .store(unsafe { mach_absolute_time() }, Ordering::Relaxed);
+                            t.armed_cpu_us.store(now_us, Ordering::Relaxed);
+                        }
                         t.armed.store(want, Ordering::Relaxed);
                         armed_now = if want {
                             armed_now + 1
@@ -497,7 +538,11 @@ fn start_sampler(band: Band) {
 pub struct BandGuard {
     port: u32,
     armed: Arc<AtomicBool>,
-    /// How long this thread may compute without parking before it gives the band back.
+    /// When the band was handed over, and this thread's CPU microseconds at that moment. The
+    /// budget below is spent from these, so it measures this hold and not the thread's past.
+    armed_at: Arc<AtomicU64>,
+    armed_cpu_us: Arc<AtomicU64>,
+    /// How much CPU time this thread may burn, in one hold, before it gives the band back.
     disarm_after: Duration,
 }
 
@@ -508,19 +553,52 @@ impl BandGuard {
         self.disarm_after
     }
 
-    /// Give the band back if this thread has been computing for too long without parking.
+    /// How long this thread has held the band, in wall time.
+    fn held_for(&self) -> Duration {
+        let armed_at = self.armed_at.load(Ordering::Relaxed);
+        if armed_at == 0 {
+            return Duration::ZERO;
+        }
+        let now = unsafe { mach_absolute_time() };
+        Duration::from_nanos(abs_to_ns(now.saturating_sub(armed_at)))
+    }
+
+    /// Give the band back if this thread has burned its whole budget of CPU time holding it.
     ///
     /// Call at every exit from the guest. Disarming only ever *lowers* this thread's claim on the
-    /// machine, so it needs no agreement with the sampler: the sampler re-arms only on a sample
-    /// showing the thread mostly idle, which a thread that just tripped this cannot produce for
-    /// at least one interval. That is also what keeps the pair from flapping.
-    pub fn check(&self, heartbeat: &Heartbeat) {
-        if !self.armed.load(Ordering::Relaxed) || !heartbeat.is_stale(self.disarm_after) {
+    /// machine, so it needs no agreement with the sampler.
+    ///
+    /// The wall clock is only a **pre-filter**, so that the common case costs no syscall: until
+    /// the budget could even have been spent, nothing needs asking. Once it could have been, one
+    /// `thread_info` call settles whether it actually was. That is at most one call per budget
+    /// per armed vCPU — and only while armed.
+    ///
+    /// A thread that passes the wall gate while genuinely idle re-baselines both clocks and keeps
+    /// the band. That is the case the band exists for: it must not have to re-earn, every 33 ms,
+    /// a reservation it is not spending.
+    pub fn check(&self) {
+        if !self.armed.load(Ordering::Relaxed) || self.held_for() < self.disarm_after {
+            return;
+        }
+        let Some(cpu_now) = thread_cpu_us(self.port) else {
+            return;
+        };
+        let cpu_used = Duration::from_micros(
+            cpu_now.saturating_sub(self.armed_cpu_us.load(Ordering::Relaxed)),
+        );
+        if !should_disarm(true, cpu_used, self.disarm_after) {
+            // Idle after all: start a fresh window rather than asking again on the next exit.
+            self.armed_at
+                .store(unsafe { mach_absolute_time() }, Ordering::Relaxed);
+            self.armed_cpu_us.store(cpu_now, Ordering::Relaxed);
             return;
         }
         if set_timeshare(self.port) {
             self.armed.store(false, Ordering::Relaxed);
-            log::info!("[VCPU-RT] a vCPU gave the band back from its own loop: it stopped parking");
+            log::info!(
+                "[VCPU-RT] a vCPU gave the band back from its own loop: it burned {:?} of CPU                  holding it",
+                cpu_used,
+            );
         }
     }
 }
@@ -567,11 +645,15 @@ pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
         // hold a real-time reservation, whatever it is doing right now.
         let port = unsafe { mach_thread_self() };
         let armed = Arc::new(AtomicBool::new(false));
+        let armed_at = Arc::new(AtomicU64::new(0));
+        let armed_cpu_us = Arc::new(AtomicU64::new(0));
         REGISTRY.lock().unwrap().push(Sampled {
             vcpuid,
             port,
             cpu_us: thread_cpu_us(port).unwrap_or(0),
             armed: Arc::clone(&armed),
+            armed_at: Arc::clone(&armed_at),
+            armed_cpu_us: Arc::clone(&armed_cpu_us),
         });
         start_sampler(band);
         log::info!(
@@ -584,6 +666,8 @@ pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
         return Some(BandGuard {
             port,
             armed,
+            armed_at,
+            armed_cpu_us,
             disarm_after: period * SELF_DISARM_PERIODS,
         });
     }
@@ -675,37 +759,83 @@ mod tests {
     /// definition, so it is the one actor guaranteed to be schedulable.
     #[test]
     fn a_thread_that_stops_parking_gives_the_band_back_itself() {
+        let port = unsafe { mach_thread_self() };
         let armed = Arc::new(AtomicBool::new(true));
+        let armed_at = Arc::new(AtomicU64::new(unsafe { mach_absolute_time() }));
+        let armed_cpu_us = Arc::new(AtomicU64::new(thread_cpu_us(port).unwrap_or(0)));
         let guard = BandGuard {
-            port: unsafe { mach_thread_self() },
+            port,
             armed: Arc::clone(&armed),
+            armed_at: Arc::clone(&armed_at),
+            armed_cpu_us: Arc::clone(&armed_cpu_us),
             disarm_after: Duration::from_secs(3600),
         };
-        let heartbeat = Heartbeat::new();
 
-        // Freshly parked: nothing is owed, whatever else is true.
-        guard.check(&heartbeat);
+        // Nothing like the budget burned yet: nothing is owed.
+        guard.check();
         assert!(
             armed.load(Ordering::Relaxed),
-            "a thread that just parked keeps the band"
+            "a thread that has burned nothing keeps the band"
         );
 
-        // Computing for longer than it promised: it gives the band back without being asked.
+        // Burning CPU past what it promised: it gives the band back without being asked. Spin
+        // rather than sleep — sleeping is exactly what must NOT count against the budget.
         let hot = BandGuard {
-            port: unsafe { mach_thread_self() },
+            port,
             armed: Arc::clone(&armed),
-            disarm_after: Duration::from_nanos(1),
+            armed_at: Arc::clone(&armed_at),
+            armed_cpu_us: Arc::clone(&armed_cpu_us),
+            disarm_after: Duration::from_millis(2),
         };
-        std::thread::sleep(Duration::from_millis(2));
-        hot.check(&heartbeat);
+        let spin_until = std::time::Instant::now() + Duration::from_millis(20);
+        while std::time::Instant::now() < spin_until {
+            std::hint::spin_loop();
+        }
+        hot.check();
         assert!(
             !armed.load(Ordering::Relaxed),
-            "a thread that has stopped parking must not still hold a reservation"
+            "a thread burning CPU flat out must not still hold a reservation"
         );
 
         // Idempotent: a thread that has already stood down does not keep calling the kernel.
-        hot.check(&heartbeat);
+        hot.check();
         assert!(!armed.load(Ordering::Relaxed));
+    }
+
+    /// A band that was just taken is not immediately owed back.
+    ///
+    /// The regression this pins: judging only on the last park gave the band back within
+    /// microseconds of the sampler handing it over, because the thread inherited a park from
+    /// before it was armed. Measured over one 103 s boot: 464 arm/disarm pairs, median hold
+    /// 6.1 ms, maximum 27.8 ms — all of them under the 33.3 ms budget, so the budget was
+    /// plainly not being spent from the arm. The band was held 3.3% of the time it was meant
+    /// to be held.
+    #[test]
+    fn the_disarm_budget_is_spent_in_cpu_time_not_wall_time() {
+        let budget = Duration::from_millis(33);
+
+        // An idle vCPU: hours may pass, but it burned nothing, so it owes nothing. This is the
+        // regression — judged on the wall clock, or on a park an idle vCPU never records because
+        // HVF absorbs its WFI, it gave the band straight back and the sampler re-armed it a
+        // moment later. Measured across two boots: 464 pairs at a 6.1 ms median (3.3% duty),
+        // then 265 arms a minute at a 45 ms median (20%). Held for real, both are one arm.
+        assert!(
+            !should_disarm(true, Duration::ZERO, budget),
+            "a parked vCPU owes nothing, however long it has been parked"
+        );
+        assert!(!should_disarm(true, Duration::from_millis(6), budget));
+        assert!(
+            !should_disarm(true, Duration::from_millis(32), budget),
+            "just under the budget is still under it"
+        );
+
+        // A saturated vCPU burns the budget 1:1 with the wall clock: the panic case, still
+        // caught, and caught at exactly the same threshold as before.
+        assert!(should_disarm(true, budget, budget));
+        assert!(should_disarm(true, Duration::from_secs(5), budget));
+
+        // Not armed: nothing to give back, and no syscall on the path that does not act.
+        assert!(!should_disarm(false, Duration::from_secs(5), budget));
     }
 
     #[test]
