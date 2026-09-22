@@ -467,6 +467,15 @@ impl MMIODeviceManager {
     /// exception (no PM ops → stays `DRIVER_OK`). Only virtio-mmio transports are inspected (the
     /// legacy PL0xx devices carry no virtio status).
     pub fn virtio_statuses(&self) -> Vec<(u32, String, u32)> {
+        self.virtio_status_changes()
+            .into_iter()
+            .map(|(type_id, id, status, _)| (type_id, id, status))
+            .collect()
+    }
+
+    /// limina: [`Self::virtio_statuses`] plus each device's `status_changed_at` — the power-watch
+    /// generation of its last status change, which orders changes across devices.
+    pub fn virtio_status_changes(&self) -> Vec<(u32, String, u32, u64)> {
         use devices::BusDevice;
         use devices::virtio::MmioTransport;
         let mut out = Vec::new();
@@ -478,7 +487,12 @@ impl MMIODeviceManager {
                     // (not the blanket `impl<T: Any> AsAny for T` on the non-'static MutexGuard).
                     let dev_ref: &dyn BusDevice = &*guard;
                     if let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() {
-                        out.push((type_id, id.clone(), mmio.device_status()));
+                        out.push((
+                            type_id,
+                            id.clone(),
+                            mmio.device_status(),
+                            mmio.status_changed_at(),
+                        ));
                     }
                 }
             }

@@ -100,6 +100,10 @@ pub struct MmioTransport {
     // limina: notified whenever `device_status` changes, so the VMM can follow the guest into and
     // out of suspend without polling (see `GuestPowerWatch`). `None` until the VMM installs it.
     power_watch: Option<Arc<GuestPowerWatch>>,
+    // limina: the power-watch generation of this device's last status change (0 = none yet). It
+    // orders status changes across devices, which is what tells a guest releasing its devices
+    // (suspending) from one taking them back (resuming) when a snapshot shows both kinds.
+    status_changed_at: u64,
 }
 
 /// A virtqueue's negotiated register file (guest-physical ring addresses + size/ready), as the driver
@@ -247,6 +251,7 @@ impl MmioTransport {
             trace_name,
             queues_programmed: false,
             power_watch: None,
+            status_changed_at: 0,
         })
     }
 
@@ -298,6 +303,12 @@ impl MmioTransport {
     /// INIT-invariant assert on the host-side snapshot path.
     pub fn device_status(&self) -> u32 {
         self.device_status
+    }
+
+    /// limina: the power-watch generation of the last `device_status` change, 0 if none has been
+    /// recorded (no watch installed, or the driver never touched the device).
+    pub fn status_changed_at(&self) -> u64 {
+        self.status_changed_at
     }
 
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
@@ -578,7 +589,7 @@ impl MmioTransport {
         if self.device_status != before
             && let Some(watch) = &self.power_watch
         {
-            watch.notify();
+            self.status_changed_at = watch.notify();
         }
     }
 }

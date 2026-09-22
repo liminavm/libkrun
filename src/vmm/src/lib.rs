@@ -572,6 +572,21 @@ impl Vmm {
             .collect()
     }
 
+    /// limina: which way the guest last moved a virtio device — handing it back (reset to `INIT`,
+    /// as on the way into suspend) or taking it (negotiating towards `DRIVER_OK`, as on resume or
+    /// boot). `None` before any driver has touched a device. A snapshot of statuses alone cannot
+    /// tell a guest half-way into a suspend from one half-way out of it; the most recent change
+    /// can.
+    #[cfg(target_os = "macos")]
+    pub fn last_driver_transition(&self) -> Option<DriverTransition> {
+        last_driver_transition(
+            self.mmio_device_manager
+                .virtio_status_changes()
+                .into_iter()
+                .map(|(type_id, _, status, changed_at)| (type_id, status, changed_at)),
+        )
+    }
+
     /// limina: the counter every guest power-state transition bumps — a virtio device status
     /// change, or a vCPU entering or leaving PSCI `SYSTEM_SUSPEND` — for a VMM that would rather
     /// wait for the next one than poll.
@@ -1048,6 +1063,36 @@ fn is_driver_released(type_id: u32, device_status: u32) -> bool {
     type_id != VIRTIO_ID_GPU && device_status == 0
 }
 
+/// limina: the direction of a guest driver's most recent virtio device status change. See
+/// [`Vmm::last_driver_transition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverTransition {
+    /// A driver reset its device to `INIT`.
+    Released,
+    /// A driver moved its device towards `DRIVER_OK`.
+    Taken,
+}
+
+/// The predicate behind [`Vmm::last_driver_transition`]: the most recent change among
+/// `(virtio type id, device_status, status_changed_at)`, ignoring devices never changed (0) and
+/// virtio-gpu, whose no-PM-ops resume resets it on the way UP and so would read backwards.
+#[cfg(target_os = "macos")]
+fn last_driver_transition(
+    devices: impl IntoIterator<Item = (u32, u32, u64)>,
+) -> Option<DriverTransition> {
+    devices
+        .into_iter()
+        .filter(|&(type_id, _, changed_at)| type_id != VIRTIO_ID_GPU && changed_at != 0)
+        .max_by_key(|&(_, _, changed_at)| changed_at)
+        .map(|(_, status, _)| {
+            if status == 0 {
+                DriverTransition::Released
+            } else {
+                DriverTransition::Taken
+            }
+        })
+}
+
 #[cfg(target_os = "macos")]
 const VIRTIO_ID_GPU: u32 = 16;
 #[cfg(target_os = "macos")]
@@ -1055,7 +1100,7 @@ const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
 
 #[cfg(all(test, target_os = "macos"))]
 mod quiesce_tests {
-    use super::{is_driver_released, is_quiesce_holdout};
+    use super::{DriverTransition, is_driver_released, is_quiesce_holdout, last_driver_transition};
 
     const BLK: u32 = 2;
     const GPU: u32 = 16;
@@ -1117,5 +1162,44 @@ mod quiesce_tests {
     #[test]
     fn the_gpu_is_never_released() {
         assert!(!is_driver_released(GPU, INIT));
+    }
+
+    /// Half-way into a suspend: the newest change is a reset.
+    #[test]
+    fn a_guest_releasing_devices_reads_released() {
+        let devices = [(BLK, DRIVER_OK, 3), (I2C, INIT, 7), (BLK, INIT, 9)];
+        assert_eq!(
+            last_driver_transition(devices),
+            Some(DriverTransition::Released)
+        );
+    }
+
+    /// Half-way out of it: the same mix of held and reset devices, but the newest change is a
+    /// driver taking a device back — the resume the status snapshot alone cannot see.
+    #[test]
+    fn a_guest_taking_devices_back_reads_taken() {
+        let devices = [(BLK, INIT, 9), (I2C, ACKNOWLEDGE, 11), (BLK, DRIVER_OK, 10)];
+        assert_eq!(
+            last_driver_transition(devices),
+            Some(DriverTransition::Taken)
+        );
+    }
+
+    /// virtio-gpu's no-PM-ops resume resets it while the guest comes UP, so it is ignored.
+    #[test]
+    fn the_gpu_does_not_set_the_direction() {
+        let devices = [(BLK, DRIVER_OK, 4), (GPU, INIT, 12)];
+        assert_eq!(
+            last_driver_transition(devices),
+            Some(DriverTransition::Taken)
+        );
+    }
+
+    #[test]
+    fn untouched_devices_give_no_direction() {
+        assert_eq!(
+            last_driver_transition([(BLK, INIT, 0), (GPU, DRIVER_OK, 5)]),
+            None
+        );
     }
 }
