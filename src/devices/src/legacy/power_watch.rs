@@ -17,11 +17,13 @@ pub struct GuestPowerWatch {
 }
 
 impl GuestPowerWatch {
-    /// Record a transition and wake every waiter.
-    pub fn notify(&self) {
+    /// Record a transition and wake every waiter. Returns the new generation, which orders this
+    /// transition against every other one the counter has seen.
+    pub fn notify(&self) -> u64 {
         let mut generation = self.generation.lock().unwrap();
         *generation = generation.wrapping_add(1);
         self.changed.notify_all();
+        *generation
     }
 
     /// The current generation. Read it BEFORE inspecting the state it guards, then pass it to
