@@ -434,24 +434,42 @@ fn decide(armed: bool, share: f64, armed_now: usize, cap: usize) -> Option<bool>
     Some(want)
 }
 
+/// What share of a hold must be CPU time before the thread counts as computing flat out.
+///
+/// Chosen from the separation actually measured, not from what a spin "should" look like. The
+/// idle false positives this rate exists to reject ran at 0.0%, 2.4% and 8.5% of a core. A vCPU
+/// under four saturating spinners, over eight disarms, ran at 73.7, 86.3, 87.8, 89.9, 99.3, 99.8,
+/// 100.0 and 100.0 — so the gap to clear is 8.5% to 73.7%, and half a core sits in the middle of
+/// it with room on both sides.
+///
+/// **90% would have been wrong**, and was the first guess: four of those eight real saturations
+/// fall under it, so it would have missed them and quietly given back the protection this whole
+/// mechanism exists for. The asymmetry is the reason to keep the margin generous — missing a real
+/// spin is a host panic, rejecting an idle thread costs one re-arm.
+const SATURATED_PERCENT: u32 = 50;
+
 /// Whether a banded thread owes its band back.
 ///
-/// The budget is spent in **CPU time this thread actually burned since it was armed**, not in
-/// wall time and not in time since its last recorded park. All three were tried; only this one
-/// answers the question the band asks, which is whether the thread is *computing* flat out.
+/// Two conditions, and both are needed. **The budget** is CPU time burned since the arm, which is
+/// what makes an idle vCPU cheap to promise: wall time alone disarms one because time passes
+/// whether or not it runs, and time-since-park does too, because HVF parks an idle vCPU inside
+/// `hv_vcpu_run` rather than handing us the WFI trap — `observed_block` never fires on the idle
+/// path, so the timestamp ages while the thread sleeps. The 2026-09-21 log holds that
+/// contradiction in plain sight: the sampler armed threads it measured at 0%, 1%, 2% and 9% of a
+/// core, and the guard declared those same threads to have computed for 33 ms without parking.
 ///
-/// Wall time alone disarms an idle vCPU, because time passes whether or not it is running.
-/// Time-since-park looks right and is not: HVF parks an idle vCPU inside `hv_vcpu_run` rather
-/// than handing us the WFI trap, so `observed_block` never fires on the idle path and the
-/// timestamp ages while the thread sleeps. The 2026-09-21 log holds the contradiction in plain
-/// sight — the sampler armed threads it measured at 0%, 1%, 2%, 9% of a core, and the guard then
-/// declared those same threads to have computed for 33 ms without parking. Both cannot be true.
+/// **The rate** is what makes the budget mean "flat out" rather than "eventually". This runs only
+/// at exits from the guest, so the window between two of them is unbounded — and an absolute
+/// budget over an unbounded window is an arbitrarily low bar. Measured with the budget alone:
+/// holds of 413 ms, 1.75 s and 97.5 s all ended on 35-45 ms of CPU, which is 8.5%, 2.4% and 0.0%
+/// of a core. Those threads were idle and gave the band back anyway. Comparing the CPU against
+/// the hold rather than against nothing is scale-free, so it says the same thing at any window.
 ///
-/// CPU time cannot lie either way: a thread parked in HVF accrues none however long it waits, and
-/// a saturated one accrues it 1:1 with the wall clock and still trips at the budget — so the
-/// protection that the host panic bought is kept exactly, and only the false positives go.
-fn should_disarm(armed: bool, cpu_used: Duration, budget: Duration) -> bool {
-    armed && cpu_used >= budget
+/// The rate leaves the panic protection untouched: a saturated vCPU burns CPU 1:1 with the wall
+/// clock and clears 90% comfortably — measured at 42.4 ms of CPU against a 33.3 ms budget, with
+/// four spinners saturating a four-vCPU guest.
+fn should_disarm(armed: bool, cpu_used: Duration, held: Duration, budget: Duration) -> bool {
+    armed && cpu_used >= budget && cpu_used * 100 >= held * SATURATED_PERCENT
 }
 
 /// Start the sampler that arms and disarms each registered vCPU thread. Idempotent.
@@ -577,16 +595,19 @@ impl BandGuard {
     /// the band. That is the case the band exists for: it must not have to re-earn, every 33 ms,
     /// a reservation it is not spending.
     pub fn check(&self) {
-        if !self.armed.load(Ordering::Relaxed) || self.held_for() < self.disarm_after {
+        let held = self.held_for();
+        if !self.armed.load(Ordering::Relaxed) || held < self.disarm_after {
             return;
         }
-        let Some(cpu_now) = thread_cpu_us(self.port) else {
-            return;
-        };
-        let cpu_used = Duration::from_micros(
-            cpu_now.saturating_sub(self.armed_cpu_us.load(Ordering::Relaxed)),
-        );
-        if !should_disarm(true, cpu_used, self.disarm_after) {
+        // A read that fails falls THROUGH to the disarm rather than returning: a guard which
+        // cannot see its own input must not be the reason a real-time reservation is kept.
+        let sampled = thread_cpu_us(self.port).map(|cpu_now| {
+            let used = cpu_now.saturating_sub(self.armed_cpu_us.load(Ordering::Relaxed));
+            (cpu_now, Duration::from_micros(used))
+        });
+        if let Some((cpu_now, cpu_used)) = sampled
+            && !should_disarm(true, cpu_used, held, self.disarm_after)
+        {
             // Idle after all: start a fresh window rather than asking again on the next exit.
             self.armed_at
                 .store(unsafe { mach_absolute_time() }, Ordering::Relaxed);
@@ -595,10 +616,14 @@ impl BandGuard {
         }
         if set_timeshare(self.port) {
             self.armed.store(false, Ordering::Relaxed);
-            log::info!(
-                "[VCPU-RT] a vCPU gave the band back from its own loop: it burned {:?} of CPU                  holding it",
-                cpu_used,
-            );
+            match sampled {
+                Some((_, cpu_used)) => log::info!(
+                    "[VCPU-RT] a vCPU gave the band back from its own loop: it burned {cpu_used:?} of CPU over a {held:?} hold"
+                ),
+                None => log::warn!(
+                    "[VCPU-RT] a vCPU gave the band back from its own loop: its CPU time could not be read over a {held:?} hold"
+                ),
+            }
         }
     }
 }
@@ -813,29 +838,61 @@ mod tests {
     #[test]
     fn the_disarm_budget_is_spent_in_cpu_time_not_wall_time() {
         let budget = Duration::from_millis(33);
+        let ms = Duration::from_millis;
 
         // An idle vCPU: hours may pass, but it burned nothing, so it owes nothing. This is the
-        // regression — judged on the wall clock, or on a park an idle vCPU never records because
-        // HVF absorbs its WFI, it gave the band straight back and the sampler re-armed it a
-        // moment later. Measured across two boots: 464 pairs at a 6.1 ms median (3.3% duty),
+        // first regression — judged on the wall clock, or on a park an idle vCPU never records
+        // because HVF absorbs its WFI, it gave the band straight back and the sampler re-armed it
+        // a moment later. Measured across two boots: 464 pairs at a 6.1 ms median (3.3% duty),
         // then 265 arms a minute at a 45 ms median (20%). Held for real, both are one arm.
         assert!(
-            !should_disarm(true, Duration::ZERO, budget),
+            !should_disarm(true, Duration::ZERO, Duration::from_secs(3600), budget),
             "a parked vCPU owes nothing, however long it has been parked"
         );
-        assert!(!should_disarm(true, Duration::from_millis(6), budget));
+        assert!(!should_disarm(true, ms(6), ms(40), budget));
         assert!(
-            !should_disarm(true, Duration::from_millis(32), budget),
+            !should_disarm(true, ms(32), ms(33), budget),
             "just under the budget is still under it"
         );
 
-        // A saturated vCPU burns the budget 1:1 with the wall clock: the panic case, still
-        // caught, and caught at exactly the same threshold as before.
-        assert!(should_disarm(true, budget, budget));
-        assert!(should_disarm(true, Duration::from_secs(5), budget));
+        // A saturated vCPU burns CPU nearly 1:1 with the wall clock: the panic case, caught at
+        // the same budget it always was.
+        assert!(should_disarm(true, budget, budget, budget));
+        // The WORST real saturation measured under four spinners — 33.55 ms over 38.87 ms, 86%.
+        // A threshold set by intuition at 90% would have let this one through, and three of its
+        // seven siblings with it.
+        assert!(
+            should_disarm(true, ms(34), ms(39), budget),
+            "a vCPU at 86% of a core is spinning, whatever a round number suggests"
+        );
+        // And the worst of all eight, at 73.7%.
+        assert!(should_disarm(true, ms(35), ms(47), budget));
+
+        // The second regression: an absolute budget over an UNBOUNDED window is an arbitrarily
+        // low bar, because this check only runs at exits from the guest. Every one of these was
+        // observed disarming a real vCPU that was doing essentially nothing.
+        assert!(
+            !should_disarm(true, ms(35), ms(413), budget),
+            "8.5% of a core is not computing flat out"
+        );
+        assert!(!should_disarm(
+            true,
+            ms(43),
+            Duration::from_millis(1751),
+            budget
+        ));
+        assert!(
+            !should_disarm(true, ms(35), Duration::from_secs(97), budget),
+            "0.0% of a core least of all"
+        );
 
         // Not armed: nothing to give back, and no syscall on the path that does not act.
-        assert!(!should_disarm(false, Duration::from_secs(5), budget));
+        assert!(!should_disarm(
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            budget
+        ));
     }
 
     #[test]
