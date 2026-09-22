@@ -2690,7 +2690,10 @@ pub(crate) fn attach_mmio_device(
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
-    let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+    #[allow(unused_mut)]
+    let mut mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+    #[cfg(target_os = "macos")]
+    mmio_device.set_power_watch(vmm.vcpu_list.power_watch());
 
     let type_id = mmio_device.locked_device().device_type();
 

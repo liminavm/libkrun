@@ -1,7 +1,7 @@
 use crossbeam_channel::Sender;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arch::aarch64::layout::VTIMER_IRQ;
 use arch::aarch64::sysreg::*;
@@ -10,6 +10,8 @@ use hvf::bindings::{
     hv_vcpu_get_sys_reg, hv_vcpu_set_sys_reg,
 };
 use hvf::{Vcpus, vcpu_request_exit};
+
+use super::GuestPowerWatch;
 
 // See https://developer.arm.com/documentation/ddi0595/2020-12/AArch64-Registers/ICC-IAR0-EL1--Interrupt-Controller-Interrupt-Acknowledge-Register-0
 const GIC_INTID_SPURIOUS: u32 = 1023;
@@ -110,6 +112,9 @@ pub struct VcpuList {
     /// last core still online. Read by the VMM to decide whether the guest needs a host-driven
     /// wake (there is no vCPU left to take a wake interrupt) and which vCPU to send it to.
     system_suspended: AtomicI64,
+    /// limina: notified on every guest power-state transition — here, entering and leaving
+    /// `SYSTEM_SUSPEND`; the virtio-mmio transports share it for device status changes.
+    power_watch: Arc<GuestPowerWatch>,
 }
 
 impl VcpuList {
@@ -130,6 +135,7 @@ impl VcpuList {
             cpu_count,
             vcpus,
             system_suspended: AtomicI64::new(-1),
+            power_watch: Arc::new(GuestPowerWatch::default()),
         }
     }
 
@@ -181,6 +187,12 @@ impl VcpuList {
     pub fn set_system_suspended(&self, vcpuid: Option<u64>) {
         self.system_suspended
             .store(vcpuid.map(|v| v as i64).unwrap_or(-1), Ordering::SeqCst);
+        self.power_watch.notify();
+    }
+
+    /// The guest power-state change counter shared by this VM's vCPUs and devices.
+    pub fn power_watch(&self) -> Arc<GuestPowerWatch> {
+        self.power_watch.clone()
     }
 
     /// The vCPU parked in PSCI `SYSTEM_SUSPEND`, if the guest is suspended to RAM.
