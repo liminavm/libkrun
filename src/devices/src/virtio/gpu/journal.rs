@@ -35,9 +35,14 @@ pub enum GpuJournalOp {
         context_init: u32,
         name: Option<String>,
     },
+    /// One per context and resource, kept at the first attach. A detach only marks it:
+    /// what the context made while the resource was attached (a sampler view) outlives the
+    /// detach, and its replay needs the resource attached again. Restore re-attaches, replays,
+    /// and then applies the detach.
     CtxAttachResource {
         ctx_id: u32,
         resource_id: u32,
+        detached: bool,
     },
     CreateBlob {
         ctx_id: u32,
@@ -49,10 +54,7 @@ pub enum GpuJournalOp {
         backing: Vec<(u64, usize)>,
     },
     /// Latest-wins per resource; the guest PA window is `shm base + offset`.
-    MapBlob {
-        resource_id: u32,
-        offset: u64,
-    },
+    MapBlob { resource_id: u32, offset: u64 },
     /// Latest-wins per scanout.
     SetScanoutBlob {
         scanout_id: u32,
@@ -198,17 +200,35 @@ impl GpuJournal {
     }
 
     pub fn ctx_attach_resource(&mut self, ctx_id: u32, resource_id: u32) {
+        // A re-attach reuses the first one's place, so a guest that attaches every frame does
+        // not grow the journal.
+        if let Some(d) = self.attach_mut(ctx_id, resource_id) {
+            *d = false;
+            return;
+        }
         self.push(GpuJournalOp::CtxAttachResource {
             ctx_id,
             resource_id,
+            detached: false,
         });
     }
 
     pub fn ctx_detach_resource(&mut self, ctx_id: u32, resource_id: u32) {
-        self.prune(|op| {
-            matches!(op, GpuJournalOp::CtxAttachResource { ctx_id: c, resource_id: r }
-                if *c == ctx_id && *r == resource_id)
-        });
+        if let Some(d) = self.attach_mut(ctx_id, resource_id) {
+            *d = true;
+        }
+    }
+
+    /// The `detached` mark of the attach record for this context and resource.
+    fn attach_mut(&mut self, ctx_id: u32, resource_id: u32) -> Option<&mut bool> {
+        self.entries.iter_mut().find_map(|e| match &mut e.op {
+            GpuJournalOp::CtxAttachResource {
+                ctx_id: c,
+                resource_id: r,
+                detached,
+            } if *c == ctx_id && *r == resource_id => Some(detached),
+            _ => None,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -610,8 +630,11 @@ impl GpuSnapshotPayload {
                 GpuJournalOp::CtxAttachResource {
                     ctx_id,
                     resource_id,
+                    detached,
                 } => {
-                    buf.push(2);
+                    // A detached attach takes its own tag, so snapshots written before the mark
+                    // existed still read.
+                    buf.push(if *detached { 10 } else { 2 });
                     put_u32(&mut buf, *ctx_id);
                     put_u32(&mut buf, *resource_id);
                 }
@@ -824,9 +847,10 @@ impl GpuSnapshotPayload {
                         name: if name.is_empty() { None } else { Some(name) },
                     }
                 }
-                2 => GpuJournalOp::CtxAttachResource {
+                2 | 10 => GpuJournalOp::CtxAttachResource {
                     ctx_id: c.u32()?,
                     resource_id: c.u32()?,
+                    detached: tag == 10,
                 },
                 3 => {
                     let ctx_id = c.u32()?;
@@ -1199,6 +1223,16 @@ mod tests {
                     op: GpuJournalOp::CtxAttachResource {
                         ctx_id: 3,
                         resource_id: 7,
+                        detached: false,
+                    },
+                },
+                GpuJournalEntry {
+                    seq: 6,
+                    vkr_seq: 41,
+                    op: GpuJournalOp::CtxAttachResource {
+                        ctx_id: 4,
+                        resource_id: 7,
+                        detached: true,
                     },
                 },
                 GpuJournalEntry {
@@ -1294,8 +1328,19 @@ mod tests {
         };
         let bytes = payload.to_bytes();
         let got = GpuSnapshotPayload::from_bytes(&bytes).expect("parse");
-        assert_eq!(got.ops.len(), 5);
+        assert_eq!(got.ops.len(), 6);
         assert_eq!(got.ops[1].vkr_seq, 41);
+        let attaches: Vec<(u32, bool)> = got
+            .ops
+            .iter()
+            .filter_map(|e| match e.op {
+                GpuJournalOp::CtxAttachResource {
+                    ctx_id, detached, ..
+                } => Some((ctx_id, detached)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attaches, vec![(3, false), (4, true)]);
         match &got.ops[1].op {
             GpuJournalOp::CreateBlob {
                 resource_id,
@@ -1369,5 +1414,46 @@ mod tests {
         }
         .to_bytes();
         assert!(GpuSnapshotPayload::from_bytes(&bytes[..bytes.len() - 3]).is_none());
+    }
+
+    /// Firefox's compositor attaches a video frame, makes its plane views, and detaches the
+    /// frame a frame later, while the views live on. A replay must find the frame attached where
+    /// the views were made, so a detach cannot erase the attach.
+    #[test]
+    fn a_detach_keeps_the_attach_the_replay_needs() {
+        let mut j = GpuJournal::new(Arc::new(GpuTraceStats::default()));
+        j.ctx_create(9, 0x2, Some("Renderer".into()));
+        j.ctx_attach_resource(9, 1239);
+        j.ctx_detach_resource(9, 1239);
+        let attaches = j
+            .entries()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.op,
+                    GpuJournalOp::CtxAttachResource {
+                        ctx_id: 9,
+                        resource_id: 1239,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(attaches, 1, "the detach erased the attach");
+        // Attached and detached every frame: still one record, and it says what is true now.
+        j.ctx_attach_resource(9, 1239);
+        assert!(matches!(
+            j.entries().last().map(|e| &e.op),
+            Some(GpuJournalOp::CtxAttachResource {
+                detached: false,
+                ..
+            })
+        ));
+        j.ctx_detach_resource(9, 1239);
+        assert_eq!(j.entries().len(), 2);
+        assert!(matches!(
+            j.entries()[1].op,
+            GpuJournalOp::CtxAttachResource { detached: true, .. }
+        ));
     }
 }
