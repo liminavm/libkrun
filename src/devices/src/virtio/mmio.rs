@@ -17,7 +17,7 @@ use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use super::device_status;
 use super::*;
 use crate::bus::BusDevice;
-use crate::legacy::IrqChip;
+use crate::legacy::{GuestPowerWatch, IrqChip};
 use utils::{byte_order, eventfd::EventFd};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -97,6 +97,9 @@ pub struct MmioTransport {
     // guest command would wait forever (the M9.3 restore wedge, and equally an in-place s2idle).
     // When this is false at DRIVER_OK, `activate()` re-arms from `activated_queue_regs`.
     queues_programmed: bool,
+    // limina: notified whenever `device_status` changes, so the VMM can follow the guest into and
+    // out of suspend without polling (see `GuestPowerWatch`). `None` until the VMM installs it.
+    power_watch: Option<Arc<GuestPowerWatch>>,
 }
 
 /// A virtqueue's negotiated register file (guest-physical ring addresses + size/ready), as the driver
@@ -243,7 +246,14 @@ impl MmioTransport {
             mmio_trace,
             trace_name,
             queues_programmed: false,
+            power_watch: None,
         })
+    }
+
+    /// limina: install the VM's guest power-state change counter; every `device_status` change
+    /// notifies it from then on.
+    pub fn set_power_watch(&mut self, watch: Arc<GuestPowerWatch>) {
+        self.power_watch = Some(watch);
     }
 
     /// limina M9.3 restore: seed the previous-activation queue register file on a FRESH transport
@@ -520,6 +530,7 @@ impl MmioTransport {
             self.device_status,
             status
         );
+        let before = self.device_status;
         // match changed bits
         match !self.device_status & status {
             ACKNOWLEDGE if self.device_status == INIT => {
@@ -563,6 +574,11 @@ impl MmioTransport {
                     self.device_status, status
                 );
             }
+        }
+        if self.device_status != before
+            && let Some(watch) = &self.power_watch
+        {
+            watch.notify();
         }
     }
 }
