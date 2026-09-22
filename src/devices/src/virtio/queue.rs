@@ -434,9 +434,19 @@ impl Queue {
     }
 
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
+    ///
+    /// A ring the guest placed outside its memory reads as empty. The guest controls the ring's
+    /// address and can kick a queue it never set up, so an unreadable index is guest input, and
+    /// the device thread must not die of it.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self, mem: &GuestMemoryMmap) -> u16 {
-        (self.avail_idx(mem, Ordering::Acquire).unwrap() - self.next_avail).0
+        match self.avail_idx(mem, Ordering::Acquire) {
+            Ok(idx) => (idx - self.next_avail).0,
+            Err(e) => {
+                debug!("virtio queue avail index unreadable, treating the ring as empty: {e:?}");
+                0
+            }
+        }
     }
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
@@ -1115,6 +1125,22 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!d.has_next());
         assert!(d.next_descriptor().is_none());
+    }
+
+    #[test]
+    fn a_ring_outside_guest_memory_reads_as_empty() {
+        // A guest can kick a queue it never configured -- the balloon's free-page-reporting queue
+        // with F_REPORTING masked, say -- and its avail ring then points wherever the reset left
+        // it, which need not be guest memory at all. That is the guest's bug, not a reason for
+        // the VMM to die.
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+        q.avail_ring = GuestAddress(0x10_0000);
+
+        assert_eq!(q.len(m), 0);
+        assert!(q.is_empty(m));
+        assert!(q.pop(m).is_none());
     }
 
     #[test]
