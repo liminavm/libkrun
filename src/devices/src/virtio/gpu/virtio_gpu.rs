@@ -1639,9 +1639,12 @@ impl VirtioGpu {
                         op_failed += 1;
                     }
                 }
+                // Attached even when the guest has since detached it: the replay needs it where
+                // the context used it. The detach is applied once the replay is done, below.
                 GpuJournalOp::CtxAttachResource {
                     ctx_id,
                     resource_id,
+                    ..
                 } => {
                     if self.context_attach_resource(*ctx_id, *resource_id).is_err() {
                         error!("gpu restore: ATTACH ctx {ctx_id} res {resource_id} failed");
@@ -1933,6 +1936,22 @@ impl VirtioGpu {
                      {flips} scanout flips",
                     classic_contents.len()
                 );
+            }
+        }
+
+        // The detaches the attach records carry, now that nothing is left to replay against
+        // them. A failure leaves the context able to reach one resource the guest had let go
+        // of, which it cannot name anyway.
+        for e in &ops {
+            if let GpuJournalOp::CtxAttachResource {
+                ctx_id,
+                resource_id,
+                detached: true,
+            } = &e.op
+            {
+                if self.context_detach_resource(*ctx_id, *resource_id).is_err() {
+                    warn!("gpu restore: DETACH ctx {ctx_id} res {resource_id} failed");
+                }
             }
         }
 
