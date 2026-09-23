@@ -87,6 +87,11 @@ pub trait RutabagaComponent {
     /// called on the renderer thread.
     fn limina_dump_state(&self) {}
 
+    /// limina: bring the component's hardware decodes to rest before a snapshot -- every decode
+    /// thread idle, every decoded picture delivered into its target. Default: no-op, for a
+    /// component that decodes synchronously or not at all. Renderer-thread-only.
+    fn limina_settle_video(&self) {}
+
     /// limina M9.3 P1 snapshot-replay hooks (virglrenderer implements them; every
     /// other component returns the do-nothing defaults). All renderer-thread-only.
     fn limina_journal_export(&self, _ctx_id: u32) -> Option<Vec<u8>> {
@@ -674,6 +679,14 @@ impl Rutabaga {
         );
         if let Some(component) = self.components.get(&self.default_component) {
             component.limina_dump_state();
+        }
+    }
+
+    /// limina: settle the default component's hardware decodes before a snapshot. See
+    /// [`RutabagaComponent::limina_settle_video`].
+    pub fn limina_settle_video(&self) {
+        if let Some(component) = self.components.get(&self.default_component) {
+            component.limina_settle_video();
         }
     }
 
