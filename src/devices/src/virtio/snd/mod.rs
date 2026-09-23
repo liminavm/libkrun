@@ -18,8 +18,8 @@
 #[cfg(target_os = "macos")]
 mod audio_macos;
 mod device;
-mod event_handler;
 mod protocol;
+mod worker;
 
 pub use self::defs::uapi::VIRTIO_ID_SOUND as TYPE_SND;
 pub use self::device::Snd;
