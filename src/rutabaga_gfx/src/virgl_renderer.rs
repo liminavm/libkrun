@@ -401,6 +401,10 @@ impl RutabagaComponent for VirglRenderer {
     /// reason the rewrite exists.
     fn force_ctx_0(&self) {}
 
+    fn limina_settle_video(&self) {
+        self.r.lock().unwrap().settle_video();
+    }
+
     fn limina_dump_state(&self) {
         let mut r = self.r.lock().unwrap();
         let (resources, contexts) = r.counts();
