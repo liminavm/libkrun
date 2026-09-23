@@ -175,6 +175,17 @@ pub trait VirtioDevice: AsAny + Send {
     /// default implementation ignores it.
     fn set_thaw_activation(&mut self, _thaw: bool) {}
 
+    /// limina: service a queue notification on the vCPU that wrote it, instead of waking the
+    /// device's thread through the queue eventfd. Returns `true` when the device handled it,
+    /// in which case the transport does not write the eventfd.
+    ///
+    /// For a device whose requests are cheap and whose driver is latency-sensitive in a way the
+    /// eventfd path makes worse. The work runs with the vCPU stopped in an MMIO exit and the
+    /// device locked, so it must not block. The default declines.
+    fn notify_inline(&mut self, _queue: u32) -> bool {
+        false
+    }
+
     /// Optionally deactivates this device. The device should drop its queues.
     /// After reset, the transport will recreate queues from queue_config().
     fn reset(&mut self) -> bool {
