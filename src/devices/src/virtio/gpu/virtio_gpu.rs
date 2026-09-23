@@ -1295,6 +1295,12 @@ impl VirtioGpu {
 
     /// bytes (host allocations, invisible to the guest-RAM dump). Worker thread.
     pub fn snapshot_gpu_payload(&mut self) -> Option<Vec<u8>> {
+        // Hardware decodes run on threads of their own, so a quiesced guest is not a quiet
+        // renderer: a decode may still be writing a target. Everything below reads resource
+        // contents, so every decode is brought to rest first.
+        if let Some(rutabaga) = self.rutabaga.as_ref() {
+            rutabaga.limina_settle_video();
+        }
         if self.rutabaga.is_none() || self.journal.entries().is_empty() {
             return None;
         }
