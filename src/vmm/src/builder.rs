@@ -1123,7 +1123,6 @@ pub fn build_microvm(
     if vm_resources.snd {
         attach_snd_device(
             &mut vmm,
-            event_manager,
             intc.clone(),
             vm_resources.snd_capture,
             vm_resources.snd_state_cb.clone(),
@@ -3047,11 +3046,11 @@ fn attach_i2c_battery_device(
 
 /// limina: native virtio-snd device (device ID 25) driving host audio. Attached when
 /// `VmResources::snd` is set; the guest's stock virtio_snd driver binds it and exposes
-/// an ALSA card (see devices::virtio::snd). Works on macOS (in-VMM, no vhost-user).
+/// an ALSA card (see devices::virtio::snd). Works on macOS (in-VMM, no vhost-user). The
+/// device services its queues on its own thread, not the shared event loop.
 #[cfg(feature = "snd")]
 fn attach_snd_device(
     vmm: &mut Vmm,
-    event_manager: &mut EventManager,
     intc: IrqChip,
     capture_enabled: bool,
     state_cb: Option<devices::virtio::PcmStateFn>,
@@ -3070,10 +3069,6 @@ fn attach_snd_device(
     #[cfg(not(target_os = "macos"))]
     let _ = audibility_cb;
     let snd = Arc::new(Mutex::new(dev));
-
-    event_manager
-        .add_subscriber(snd.clone())
-        .map_err(RegisterEvent)?;
 
     let id = String::from(snd.lock().unwrap().id());
 
