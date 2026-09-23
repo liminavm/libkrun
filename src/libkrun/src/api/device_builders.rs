@@ -1266,8 +1266,8 @@ impl<'a> AttachDevice<'a> for SndDevice {
         if let Some((silence, cb)) = self.audibility_cb {
             snd.set_pcm_audibility_callback(silence, cb);
         }
+        // The device services its queues on its own thread, not the shared event loop.
         let inner = Arc::new(Mutex::new(snd));
-        ctx.subscribe_events(inner.clone())?;
         let id = inner.lock().unwrap().id().to_string();
         ctx.register(&id, inner)
     }
