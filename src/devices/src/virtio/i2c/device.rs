@@ -444,6 +444,22 @@ impl VirtioDevice for I2c {
         self.device_state.is_activated()
     }
 
+    /// Serviced on the vCPU that kicked. A transfer is one register read or write answered from
+    /// memory (the provider returns a cached snapshot), so it is done well before the event loop
+    /// could even wake. That closes the window in which the guest driver can give up on an
+    /// in-flight transfer and free its buffers: the stock `i2c-virtio` driver's interruptible
+    /// wait does exactly that when a task is killed mid-read, and the completion we then write
+    /// lands in freed memory.
+    fn notify_inline(&mut self, queue: u32) -> bool {
+        if queue as usize != REQ_INDEX || !self.is_activated() {
+            return false;
+        }
+        if self.process_req() {
+            self.device_state.signal_used_queue();
+        }
+        true
+    }
+
     fn reset(&mut self) -> bool {
         self.queues = None;
         self.device_state = DeviceState::Inactive;

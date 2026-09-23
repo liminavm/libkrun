@@ -731,8 +731,14 @@ impl BusDevice for MmioTransport {
                         }
                     }),
                     0x50 => {
-                        // Queue notification - write to the eventfd for the specified queue.
-                        if let Some(eventfd) = self.queue_evts.get(v as usize) {
+                        // A device may service the notification right here, on this vCPU; see
+                        // `VirtioDevice::notify_inline`. Only once the driver is running: before
+                        // that there are no queues to service.
+                        let inline = self.check_device_status(device_status::DRIVER_OK, 0)
+                            && self.locked_device().notify_inline(v);
+                        if inline {
+                            // Handled; nothing to wake.
+                        } else if let Some(eventfd) = self.queue_evts.get(v as usize) {
                             // limina wake-probe: stamp the doorbell BEFORE the eventfd write, so
                             // the worker's `kick -> wake` covers the wake itself. No-op (one
                             // never-matching relaxed load) unless LIMINA_WAKE_PROBE=1.
@@ -812,6 +818,9 @@ pub(crate) mod tests {
         avail_features: u64,
         device_activated: bool,
         config_bytes: [u8; 0xeff],
+        /// The queue `notify_inline` services, if any; every notification it saw.
+        inline_queue: Option<u32>,
+        inline_notified: Vec<u32>,
     }
 
     impl DummyDevice {
@@ -821,6 +830,8 @@ pub(crate) mod tests {
                 avail_features: 0,
                 device_activated: false,
                 config_bytes: [0; 0xeff],
+                inline_queue: None,
+                inline_notified: Vec::new(),
             }
         }
 
@@ -876,6 +887,11 @@ pub(crate) mod tests {
 
         fn is_activated(&self) -> bool {
             self.device_activated
+        }
+
+        fn notify_inline(&mut self, queue: u32) -> bool {
+            self.inline_notified.push(queue);
+            self.inline_queue == Some(queue)
         }
     }
 
@@ -1264,6 +1280,37 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK
         );
         assert!(d.locked_device().is_activated());
+    }
+
+    #[test]
+    fn test_notify_inline_skips_the_queue_eventfd() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.inline_queue = Some(1);
+        let dummy = Arc::new(Mutex::new(dummy));
+        let mut d = MmioTransport::new(m, DummyIrqChip::new().into(), dummy.clone()).unwrap();
+        let notify = |d: &mut MmioTransport, queue: u32| {
+            let mut buf = [0; 4];
+            write_le_u32(&mut buf[..], queue);
+            d.write(0, 0x50, &buf[..]);
+        };
+
+        // Before DRIVER_OK the device is not asked; the eventfd carries the kick.
+        notify(&mut d, 1);
+        assert!(dummy.lock().unwrap().inline_notified.is_empty());
+        assert_eq!(d.queue_evts()[1].read().unwrap(), 1);
+
+        activate_device(&mut d);
+
+        // The device services queue 1 itself: no eventfd write, so no thread is woken.
+        notify(&mut d, 1);
+        assert!(d.queue_evts()[1].read().is_err());
+
+        // It declines queue 0, which is kicked through its eventfd as before.
+        notify(&mut d, 0);
+        assert_eq!(d.queue_evts()[0].read().unwrap(), 1);
+
+        assert_eq!(dummy.lock().unwrap().inline_notified, vec![1, 0]);
     }
 
     #[test]
