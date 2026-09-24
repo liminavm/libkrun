@@ -797,17 +797,18 @@ impl RutabagaComponent for VirglRenderer {
     ) -> RutabagaResult<RutabagaResource> {
         let handle = res(resource_id)?;
         // A nonzero blob id names something a context already holds, and it means nothing without
-        // the context whose table it is an id in. Zero is the other operation entirely: the guest
-        // asking the host for memory it does not yet have.
+        // the context whose table it is an id in. Zero is the guest asking the host for memory it
+        // does not yet have, which the context pays for. Anything but host3d is the guest's own
+        // pages, and needs no context at all.
         let source = match (c.blob_mem, c.blob_id) {
             (RUTABAGA_BLOB_MEM_HOST3D, id) if id != 0 => BlobSource::InContext {
                 ctx: ctx(ctx_id)?,
                 id: BlobId(id),
             },
-            _ => BlobSource::HostMinted,
+            (RUTABAGA_BLOB_MEM_HOST3D, _) => BlobSource::HostMinted { ctx: ctx(ctx_id)? },
+            _ => BlobSource::Guest,
         };
         let desc = BlobDesc {
-            blob_mem: c.blob_mem,
             blob_flags: c.blob_flags,
             source,
             size: c.size,
