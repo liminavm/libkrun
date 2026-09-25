@@ -22,7 +22,15 @@
 use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Once, OnceLock};
+
+// The locks are loom's under `--cfg loom`, so its model can interleave release, heal and
+// reclaim. The atomics stay std: they are statistics and the sweep's signal-handler state,
+// neither of which orders anything the model checks.
+#[cfg(loom)]
+use loom::sync::Mutex;
+#[cfg(not(loom))]
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::bindings::*;
@@ -776,7 +784,7 @@ fn contains_point(map: &BTreeMap<u64, u64>, p: u64) -> bool {
         .is_some_and(|(&s, &l)| p < s + l)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::{
         FaultOutcome, ReleasedRam, STRAY_RETRY_CAP, contains_point, insert_range, live_complement,
@@ -1042,7 +1050,7 @@ mod tests {
 /// After every step the released set and the stage-2 state must both equal a model kept outside
 /// the code: a bool per page, set by a release the code must accept and cleared by a reclaim or
 /// by a heal of the window the model computes.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod every_sequence {
     use super::{FaultOutcome, ReleasedRam, Stage2, ZeroOnRelease, contains_point, hv_return_t};
     use crate::bindings::{HV_ERROR, HV_SUCCESS};
@@ -1401,5 +1409,186 @@ mod every_sequence {
         let mut walked = 0;
         walk(&ops, &mut Vec::with_capacity(DEPTH), &mut walked);
         assert_eq!(walked, (ops.len() as u64).pow(DEPTH as u32));
+    }
+}
+
+/// loom models of release, heal and reclaim racing one another, over one two-page region whose
+/// heal window is the whole region.
+///
+/// Run with `RUSTFLAGS="--cfg loom" cargo test --release --lib loom_model` in this crate. The
+/// released-set lock is loom's, and so is the lock of the stage-2 stand-in, so a vCPU's check that
+/// its page is mapped is a point loom can interleave against the other thread's calls. After each
+/// run the set must equal what stage 2 has unmapped, no page may have been made reusable while the
+/// guest could reach it or mapped while still reusable, and every vCPU access must have landed.
+#[cfg(all(test, loom))]
+mod loom_model {
+    use super::{FaultOutcome, ReleasedRam, Stage2, ZeroOnRelease, contains_point, hv_return_t};
+    use crate::bindings::{HV_ERROR, HV_SUCCESS};
+    use crate::host_page_size;
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+
+    const GPA: u64 = 0x4000_0000;
+    const HOST: u64 = 0x10_0000_0000;
+    const PAGES: usize = 2;
+    const TRANSLATION_FAULT: u64 = 0b000101;
+    /// A vCPU's access that faults, heals or retries, then faults again, has not landed.
+    const ATTEMPTS: usize = 3;
+
+    fn page() -> u64 {
+        host_page_size()
+    }
+    fn index(addr: u64, base: u64) -> usize {
+        ((addr - base) / page()) as usize
+    }
+
+    #[derive(Default)]
+    struct State {
+        unmapped: [bool; PAGES],
+        reusable: [bool; PAGES],
+        wrong: Vec<String>,
+    }
+
+    #[derive(Default)]
+    struct Model(Mutex<State>);
+
+    impl Stage2 for Model {
+        fn unmap(&self, gpa: u64, len: u64) -> hv_return_t {
+            let mut s = self.0.lock().unwrap();
+            for p in index(gpa, GPA)..index(gpa + len, GPA) {
+                s.unmapped[p] = true;
+            }
+            HV_SUCCESS as hv_return_t
+        }
+
+        fn map(&self, _host: u64, gpa: u64, len: u64) -> hv_return_t {
+            let mut s = self.0.lock().unwrap();
+            let pages = index(gpa, GPA)..index(gpa + len, GPA);
+            if pages.clone().any(|p| !s.unmapped[p]) {
+                s.wrong.push(format!("a map over live pages in {pages:?}"));
+                return HV_ERROR as hv_return_t;
+            }
+            for p in pages {
+                if s.reusable[p] {
+                    s.wrong
+                        .push(format!("page {p} mapped while still reusable"));
+                }
+                s.unmapped[p] = false;
+            }
+            HV_SUCCESS as hv_return_t
+        }
+
+        unsafe fn discard(&self, host: u64, len: u64, _zero: bool) -> std::io::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            for p in index(host, HOST)..index(host + len, HOST) {
+                if !s.unmapped[p] {
+                    s.wrong
+                        .push(format!("page {p} made reusable while the guest reaches it"));
+                }
+                s.reusable[p] = true;
+            }
+            Ok(())
+        }
+
+        fn reuse(&self, host: u64, len: u64) -> std::io::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            for p in index(host, HOST)..index(host + len, HOST) {
+                s.reusable[p] = false;
+            }
+            Ok(())
+        }
+    }
+
+    fn ram(released: &[usize]) -> Arc<ReleasedRam<Model>> {
+        let rr = ReleasedRam::with_stage2(
+            Model::default(),
+            vec![(GPA, HOST, PAGES as u64 * page())],
+            PAGES as u64 * page(),
+            ZeroOnRelease::InflateQueue,
+        );
+        for &p in released {
+            assert!(rr.release(GPA + p as u64 * page(), page(), false));
+        }
+        Arc::new(rr)
+    }
+
+    /// A vCPU touching page `p`: the access lands once the page is mapped, and a fault on the
+    /// way there must heal or retry, never anything else.
+    fn touch(rr: &ReleasedRam<Model>, p: usize) {
+        for _ in 0..ATTEMPTS {
+            if !rr.stage2.0.lock().unwrap().unmapped[p] {
+                return;
+            }
+            match rr.handle_fault(GPA + p as u64 * page(), TRANSLATION_FAULT) {
+                FaultOutcome::Healed | FaultOutcome::Retry => {}
+                FaultOutcome::NotHandled => panic!("a fault on page {p} was not handled"),
+                FaultOutcome::Fatal => panic!("a fault on page {p} stopped the VM"),
+            }
+        }
+        panic!("page {p} was still unmapped after {ATTEMPTS} faults");
+    }
+
+    fn check(rr: &ReleasedRam<Model>) {
+        let s = rr.stage2.0.lock().unwrap();
+        if let Some(w) = s.wrong.first() {
+            panic!("{w}");
+        }
+        let set = rr.released.lock().unwrap();
+        for p in 0..PAGES {
+            let in_set = contains_point(&set, GPA + p as u64 * page());
+            assert_eq!(
+                in_set, s.unmapped[p],
+                "page {p}: in the released set {in_set}, unmapped {}",
+                s.unmapped[p]
+            );
+        }
+    }
+
+    /// A release while a vCPU faults on the other page of the same heal window. The heal can
+    /// run before, after or (if the lock did not cover it) between the release's unmap and its
+    /// discard, which would leave a page the guest reaches marked reusable.
+    #[test]
+    fn a_release_races_a_heal_of_its_window() {
+        loom::model(|| {
+            let rr = ram(&[0]);
+            let releaser = {
+                let rr = rr.clone();
+                thread::spawn(move || assert!(rr.release(GPA + page(), page(), true)))
+            };
+            touch(&rr, 0);
+            releaser.join().unwrap();
+            check(&rr);
+        });
+    }
+
+    /// Two vCPUs fault on one released page. One heals it; the other finds it gone from the
+    /// set and must retry into the mapping, not stop the VM.
+    #[test]
+    fn two_vcpus_fault_on_one_page() {
+        loom::model(|| {
+            let rr = ram(&[0]);
+            let other = {
+                let rr = rr.clone();
+                thread::spawn(move || touch(&rr, 0))
+            };
+            touch(&rr, 0);
+            other.join().unwrap();
+            check(&rr);
+        });
+    }
+
+    /// A deflate's reclaim takes back the pages a vCPU is faulting on.
+    #[test]
+    fn a_reclaim_races_a_heal() {
+        loom::model(|| {
+            let rr = ram(&[0, 1]);
+            let reclaimer = {
+                let rr = rr.clone();
+                thread::spawn(move || assert!(rr.reclaim(GPA, PAGES as u64 * page())))
+            };
+            touch(&rr, 1);
+            reclaimer.join().unwrap();
+            check(&rr);
+        });
     }
 }
