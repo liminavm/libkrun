@@ -117,16 +117,10 @@ impl ReclaimCoalescer {
         if len < GUEST_PAGE {
             return;
         }
-        let start = (addr + GUEST_PAGE - 1) & !(GUEST_PAGE - 1); // round up
-        let end = (addr + len) & !(GUEST_PAGE - 1); // round down
+        let (start, end) = inward(addr, len);
         let mut p = start;
         while p < end {
-            let base = p & !(self.host_page - 1);
-            let sub = (p - base) / GUEST_PAGE;
-            // GPA of the host-page base: shift the run's gpa by the same offset its host base
-            // sits at. `base` can precede `addr` (the run starts mid-host-page), so keep the
-            // arithmetic ordered to stay in range.
-            let gpa_base = gpa + (p - addr) as u64 - (p - base) as u64;
+            let (base, sub, gpa_base) = locate(self.host_page, addr, gpa, p);
             let entry = self.partial.entry(base).or_insert((0, gpa_base));
             debug_assert_eq!(
                 entry.1, gpa_base,
@@ -154,6 +148,31 @@ impl ReclaimCoalescer {
         });
         out
     }
+}
+
+/// The whole guest pages inside the run `[addr, addr + len)`, as `start..end`: rounded *inward*
+/// (start up, end down), so a guest page the run covers only partly is never among them. Split
+/// out of [`ReclaimCoalescer::add`], with [`locate`], so the arithmetic can be proved on its own
+/// (`proofs` below): the coalescer's map seeds its hasher from the OS, which Kani cannot model.
+fn inward(addr: usize, len: usize) -> (usize, usize) {
+    let start = (addr + GUEST_PAGE - 1) & !(GUEST_PAGE - 1); // round up
+    let end = (addr + len) & !(GUEST_PAGE - 1); // round down
+    (start, end)
+}
+
+/// Where the guest page at host address `p`, inside a run reported at host `addr` / guest
+/// physical `gpa`, lives: its host page's base address, its index among that host page's guest
+/// pages, and the guest physical address of that base.
+///
+/// The GPA shifts the run's by the same offset its host base sits at. `base` can precede `addr`
+/// (the run starts mid-host-page), so the arithmetic is ordered to stay in range, which holds
+/// when `gpa` and `addr` sit at the same offset into their host pages: guest RAM regions are
+/// host-page aligned in both address spaces.
+fn locate(host_page: usize, addr: usize, gpa: u64, p: usize) -> (usize, usize, u64) {
+    let base = p & !(host_page - 1);
+    let sub = (p - base) / GUEST_PAGE;
+    let gpa_base = gpa + (p - addr) as u64 - (p - base) as u64;
+    (base, sub, gpa_base)
 }
 
 /// Merge per-host-page `(host, gpa, len)` triples into maximal runs contiguous in BOTH address
@@ -757,6 +776,63 @@ impl VirtioDevice for Balloon {
         *self.pending_target.lock().unwrap() = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{GUEST_PAGE, inward, locate};
+
+    /// For every run a guest can report and every host page size a guest-page bitmask can
+    /// describe, each guest page the coalescer marks free lies wholly inside the reported run,
+    /// sits in the host page and slot it is filed under, and is filed under the right GPA.
+    /// One page Kani picks from the run stands for every page of it, so no loop is unrolled.
+    ///
+    /// Powers of two are tested with masks rather than `%`: a remainder by a symbolic divisor
+    /// is a full divider for the solver, and the property does not need one. The assertions are
+    /// written so they cannot overflow themselves: a broken `inward` or `locate` must fail the
+    /// assertion about it, not an overflow in the harness that hides which property broke.
+    #[kani::proof]
+    fn every_marked_page_lies_inside_its_run_at_its_gpa() {
+        let shift: u32 = kani::any();
+        kani::assume(shift <= 6); // 4 KiB ..= 256 KiB: at most 64 guest pages, one mask bit each
+        let host_page = GUEST_PAGE << shift;
+        let (addr, len, gpa): (usize, usize, u64) = (kani::any(), kani::any(), kani::any());
+        kani::assume(len >= GUEST_PAGE); // `add` returns early below that
+        kani::assume(addr.checked_add(len).is_some());
+        kani::assume(gpa.checked_add(len as u64).is_some());
+        // Guest RAM regions are host-page aligned in both address spaces: they start at 1 or
+        // 2 GiB (`arch/src/aarch64/layout.rs`), their sizes are rounded up to the host page, and
+        // their host mappings are page-aligned. Load-bearing: without it `locate` underflows.
+        kani::assume(gpa & (host_page as u64 - 1) == (addr & (host_page - 1)) as u64);
+
+        // Any page `add` visits: it walks `start..end` a guest page at a time.
+        let (start, end) = inward(addr, len);
+        let p: usize = kani::any();
+        kani::assume(p >= start && p < end && (p - start) & (GUEST_PAGE - 1) == 0);
+
+        assert!(
+            p & (GUEST_PAGE - 1) == 0,
+            "a page marked free does not start on a guest page"
+        );
+        assert!(
+            p >= addr && p - addr <= len - GUEST_PAGE,
+            "a page the run covers only partly was marked free"
+        );
+        let (base, sub, gpa_base) = locate(host_page, addr, gpa, p);
+        assert!(
+            base & (host_page - 1) == 0 && base <= p && p - base < host_page,
+            "a page was filed under a host page that does not hold it"
+        );
+        assert!(
+            sub < 1 << shift && sub == (p - base) / GUEST_PAGE,
+            "a page was filed in the wrong slot of its host page"
+        );
+        assert!(
+            gpa_base.wrapping_add((p - base) as u64) == gpa + (p - addr) as u64,
+            "a host page was filed under the wrong guest physical address"
+        );
+        kani::cover!(base < addr, "a run that starts mid-host-page");
     }
 }
 
