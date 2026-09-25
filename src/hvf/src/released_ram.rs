@@ -1012,8 +1012,13 @@ mod tests {
         });
 
         let faults0 = rr.stats().sweep_faults;
+        // Bounded by time, not a sweep count: a toucher starved by a busy host (the tests run
+        // in parallel) can manage a single pass in 50 sweeps.
+        let started = std::time::Instant::now();
         let mut sweeps = 0;
-        while rr.stats().sweep_faults == faults0 && sweeps < 50 {
+        while rr.stats().sweep_faults == faults0
+            && started.elapsed() < std::time::Duration::from_secs(10)
+        {
             rr.settle_sweep()
                 .expect("nothing else sweeps under the test lock");
             sweeps += 1;
