@@ -163,6 +163,10 @@ impl XhciDevice {
         if base == 0 || size == 0 {
             return;
         }
+        if !EventRing::fits(base, size) {
+            warn!("xhci: event ring segment {base:#x}+{size} TRBs runs past the top of memory");
+            return;
+        }
         self.event_ring = Some(EventRing::new(base, size));
     }
 
@@ -1771,6 +1775,26 @@ mod tests {
                 "slot {slot_id} changed the slot table"
             );
         }
+    }
+
+    /// The event segment's base and size come from the ERST entry in guest RAM. A segment that
+    /// runs past the top of the address space is refused, and the controller carries on with no
+    /// event ring. RED before the check: its end overflowed the first time an event was posted,
+    /// which panicked a debug worker with the controller locked (found by the `xhci_guest` fuzz
+    /// target), and wrapped silently in a release one.
+    #[test]
+    fn an_event_segment_past_the_top_of_memory_is_refused() {
+        let m = mem();
+        let dev = new_dev();
+        let mut d = dev.lock().unwrap();
+        m.write_obj::<u64>(0xffff_ffff_ffff_ffc0, GuestAddress(0x1000))
+            .unwrap();
+        m.write_obj::<u32>(16, GuestAddress(0x1008)).unwrap();
+        d.write(0, 0x1028, &1u32.to_le_bytes()); // ERSTSZ
+        d.write(0, 0x1030, &0x1000u64.to_le_bytes()); // ERSTBA
+        d.ensure_event_ring(&m);
+        assert!(d.event_ring.is_none(), "a wrapping event segment was built");
+        d.post_event(&m, command_completion_event(0, cc::SUCCESS, 0));
     }
 
     #[test]

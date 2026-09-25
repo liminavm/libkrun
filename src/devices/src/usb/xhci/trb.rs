@@ -253,6 +253,15 @@ impl EventRing {
         }
     }
 
+    /// Whether a segment of `seg_size` TRBs at `seg_base` lies below the top of the address
+    /// space. Both come from the guest (its ERST entry), and every address the ring computes is
+    /// `seg_base` plus an offset within the segment, so one that does not fit would overflow.
+    pub fn fits(seg_base: u64, seg_size: u32) -> bool {
+        (seg_base & !0x3f)
+            .checked_add(u64::from(seg_size.max(1)) * 16)
+            .is_some()
+    }
+
     /// Rebuild a producer from snapshot-carried state (see `devices::usb_state`). The segment
     /// geometry and the producer position are host-only — the guest's ERDP only tells us where its
     /// *consumer* is, so neither can be re-derived after a worker teardown.

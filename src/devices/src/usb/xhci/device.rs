@@ -553,7 +553,11 @@ impl XhciDevice {
         self.next_address = s.next_address;
         self.crcr_stop_write = s.crcr_stop_write;
         self.cmd_ring = s.cmd_ring.map(|(p, c)| RingWalker::new(p, c));
-        self.event_ring = s.event_ring.as_ref().map(EventRing::from_state);
+        self.event_ring = s
+            .event_ring
+            .as_ref()
+            .filter(|e| EventRing::fits(e.seg_base, e.seg_size))
+            .map(EventRing::from_state);
         self.work = WorkQueue {
             run_started: s.work_run_started,
             cmd_doorbell: s.work_cmd_doorbell,
