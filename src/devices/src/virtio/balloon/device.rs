@@ -953,3 +953,138 @@ mod tests {
         assert_eq!(merge_runs(split_gpa.clone()), split_gpa);
     }
 }
+
+/// Every sequence of three reported runs over three host pages, at half-guest-page granularity,
+/// through [`ReclaimCoalescer`] and [`merge_runs`] as the FRQ path uses them. The first two host
+/// pages are one region and the third another, host-contiguous with the first but not in GPA.
+///
+/// The model: a guest page is free when one run covers all of it (a page two runs cover half
+/// each stays live, because each run rounds inward alone), and a host page is released exactly
+/// when all its guest pages are free. The merged runs must be exactly those host pages, at their
+/// own GPAs, each run contiguous in both address spaces, and no two runs left that could merge.
+#[cfg(test)]
+mod every_sequence {
+    use super::{GUEST_PAGE, ReclaimCoalescer, merge_runs};
+
+    const HOST_PAGE: usize = 16384;
+    const SUBS: usize = HOST_PAGE / GUEST_PAGE;
+    const HOST_PAGES: usize = 3;
+    const HALF: usize = GUEST_PAGE / 2;
+    const HALVES: usize = HOST_PAGES * HOST_PAGE / HALF;
+    const BASE: usize = 0x4000_0000;
+    /// Host page 2 is a second region: its GPA does not follow host page 1's.
+    const GPA_A: u64 = 0x8000_0000;
+    const GPA_B: u64 = 0x2_0000_0000;
+    const DEPTH: usize = 3;
+
+    fn region_of_half(h: usize) -> usize {
+        usize::from(h * HALF >= 2 * HOST_PAGE)
+    }
+    fn gpa(host: usize) -> u64 {
+        let off = host - BASE;
+        if off < 2 * HOST_PAGE {
+            GPA_A + off as u64
+        } else {
+            GPA_B + (off - 2 * HOST_PAGE) as u64
+        }
+    }
+
+    /// Every run `[start, start + len)` in halves that stays inside one region, as a descriptor
+    /// does.
+    fn alphabet() -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        for start in 0..HALVES {
+            for len in [1, 2, 3, 8] {
+                let end = start + len;
+                if end <= HALVES && region_of_half(start) == region_of_half(end - 1) {
+                    runs.push((start, len));
+                }
+            }
+        }
+        runs
+    }
+
+    fn expected(seq: &[(usize, usize)]) -> Vec<(usize, u64, usize)> {
+        let mut free = [false; HOST_PAGES * SUBS];
+        for &(start, len) in seq {
+            for (g, f) in free.iter_mut().enumerate() {
+                let (lo, hi) = (g * 2, g * 2 + 2);
+                if start <= lo && hi <= start + len {
+                    *f = true;
+                }
+            }
+        }
+        (0..HOST_PAGES)
+            .filter(|&h| free[h * SUBS..(h + 1) * SUBS].iter().all(|&f| f))
+            .map(|h| {
+                let host = BASE + h * HOST_PAGE;
+                (host, gpa(host), HOST_PAGE)
+            })
+            .collect()
+    }
+
+    fn run(seq: &[(usize, usize)]) -> Result<(), String> {
+        let mut c = ReclaimCoalescer::new(HOST_PAGE);
+        for &(start, len) in seq {
+            let host = BASE + start * HALF;
+            c.add(host, gpa(host), len * HALF);
+        }
+        let merged = merge_runs(c.take_full_pages());
+        if !c.take_full_pages().is_empty() {
+            return Err("a second take found pages the first left behind".into());
+        }
+        let mut pages: Vec<(usize, u64, usize)> = Vec::new();
+        for &(host, g, len) in &merged {
+            if len == 0 || len % HOST_PAGE != 0 {
+                return Err(format!("run {host:#x}+{len:#x} is not whole host pages"));
+            }
+            for i in 0..len / HOST_PAGE {
+                let h = host + i * HOST_PAGE;
+                let pg = g + (i * HOST_PAGE) as u64;
+                if pg != gpa(h) {
+                    return Err(format!(
+                        "host {h:#x} released at GPA {pg:#x}, not {:#x}",
+                        gpa(h)
+                    ));
+                }
+                pages.push((h, pg, HOST_PAGE));
+            }
+        }
+        for &a in &merged {
+            for &b in &merged {
+                if a.0 + a.2 == b.0 && a.1 + a.2 as u64 == b.1 {
+                    return Err(format!("runs {a:x?} and {b:x?} could have merged"));
+                }
+            }
+        }
+        pages.sort_unstable();
+        let want = expected(seq);
+        if pages != want {
+            return Err(format!("released {pages:x?}, the model says {want:x?}"));
+        }
+        Ok(())
+    }
+
+    fn walk(runs: &[(usize, usize)], seq: &mut Vec<(usize, usize)>, walked: &mut u64) {
+        if seq.len() == DEPTH {
+            *walked += 1;
+            if let Err(m) = run(seq) {
+                panic!("runs {seq:?} (in halves of a guest page): {m}");
+            }
+            return;
+        }
+        for &r in runs {
+            seq.push(r);
+            walk(runs, seq, walked);
+            seq.pop();
+        }
+    }
+
+    #[test]
+    fn every_run_sequence_releases_exactly_the_whole_free_host_pages() {
+        let runs = alphabet();
+        let mut walked = 0;
+        walk(&runs, &mut Vec::with_capacity(DEPTH), &mut walked);
+        assert_eq!(walked, (runs.len() as u64).pow(DEPTH as u32));
+    }
+}
