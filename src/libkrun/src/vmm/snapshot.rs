@@ -1977,15 +1977,25 @@ mod tests {
             std::process::id()
         ));
         let _ = write_sample(&path);
-        // Flip a head byte (offset 12 is inside the vCPU section); the head CRC must catch it.
+        // Flip a byte of the GIC blob, which parses whatever it holds: only the head CRC can
+        // catch it. (A byte in a count or a presence flag would be refused by the parse instead,
+        // and the CRC would go untested.)
         let mut raw = fs::read(&path).unwrap();
-        raw[12] ^= 0xff;
+        let gic = raw
+            .windows(4)
+            .position(|w| w == [0xde, 0xad, 0xbe, 0xef])
+            .expect("the sample's GIC blob");
+        raw[gic] ^= 0xff;
         fs::write(&path, &raw).unwrap();
         let err = read(&path)
             .err()
             .expect("head-corrupted snapshot must be rejected");
         let _ = fs::remove_file(&path);
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("head CRC mismatch"),
+            "refused for the wrong reason: {err}"
+        );
     }
 
     #[test]
