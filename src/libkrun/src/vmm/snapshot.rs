@@ -462,6 +462,17 @@ pub struct SaveStats {
     pub zero_frames: u64,
     pub lz4_frames: u64,
     pub raw_frames: u64,
+    /// Where the wall time went, for the summary line. `head` is the encode (the GPU section's
+    /// compress is serial); `write` and `wait` are the writer thread's time in `write`/`flush`
+    /// and waiting on the pool; `work` and `stall` are summed over the pool's workers (reading +
+    /// compressing chunks, and blocked handing a frame to a writer that is behind).
+    pub head: std::time::Duration,
+    pub write: std::time::Duration,
+    pub wait: std::time::Duration,
+    pub work: std::time::Duration,
+    pub stall: std::time::Duration,
+    /// The pool's width.
+    pub workers: usize,
 }
 
 /// One produced RAM frame, in flight from a compressor worker to the writer.
@@ -482,19 +493,29 @@ pub fn write_streaming(
     mem: &GuestMemoryMmap,
     regions: &[(u64, u64)],
 ) -> io::Result<SaveStats> {
+    use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant};
     let file = fs::File::create(path)?;
     let mut out = io::BufWriter::with_capacity(4 << 20, file);
+    let t = Instant::now();
     let mut hv = encode_head(head);
     let hcrc = crc32(&hv);
     put_u32(&mut hv, hcrc);
     put_u32(&mut hv, regions.len() as u32);
+    let head_time = t.elapsed();
+    let t = Instant::now();
     out.write_all(&hv)?;
 
     let mut stats = SaveStats {
         written_bytes: hv.len() as u64,
+        head: head_time,
+        write: t.elapsed(),
         ..Default::default()
     };
+    let work_ns = AtomicU64::new(0);
+    let stall_ns = AtomicU64::new(0);
     let workers = ram_workers();
+    stats.workers = workers;
     for &(gpa, len) in regions {
         stats.ram_bytes += len;
         let nchunks = len.div_ceil(CHUNK_SIZE as u64) as usize;
@@ -512,15 +533,23 @@ pub fn write_streaming(
             for _ in 0..workers {
                 let tx = tx.clone();
                 let next = &next;
+                let (work_ns, stall_ns) = (&work_ns, &stall_ns);
                 s.spawn(move || {
                     let mut inbuf = vec![0u8; CHUNK_SIZE];
                     let mut outbuf =
                         vec![0u8; lz4_flex::block::get_maximum_output_size(CHUNK_SIZE)];
+                    let (mut work, mut stall) = (Duration::ZERO, Duration::ZERO);
+                    let account = |work: Duration, stall: Duration| {
+                        work_ns.fetch_add(work.as_nanos() as u64, Ordering::Relaxed);
+                        stall_ns.fetch_add(stall.as_nanos() as u64, Ordering::Relaxed);
+                    };
                     loop {
                         let idx = next.fetch_add(1, Ordering::Relaxed);
                         if idx >= nchunks {
+                            account(work, stall);
                             return;
                         }
+                        let t = Instant::now();
                         let off = idx as u64 * CHUNK_SIZE as u64;
                         let clen = (len - off).min(CHUNK_SIZE as u64) as usize;
                         let res = (|| -> io::Result<Frame> {
@@ -555,7 +584,12 @@ pub fn write_streaming(
                             })
                         })();
                         let failed = res.is_err();
-                        if tx.send(res).is_err() || failed {
+                        work += t.elapsed();
+                        let t = Instant::now();
+                        let sent = tx.send(res).is_ok();
+                        stall += t.elapsed();
+                        if !sent || failed {
+                            account(work, stall);
                             return; // writer gone (error abort), or our own error is now delivered
                         }
                     }
@@ -564,9 +598,12 @@ pub fn write_streaming(
             drop(tx);
             // Frames arrive in completion order; each carries its offset, so order is immaterial.
             for _ in 0..nchunks {
+                let t = Instant::now();
                 let frame = rx
                     .recv()
                     .map_err(|_| io::Error::other("snapshot: compressor workers died"))??;
+                stats.wait += t.elapsed();
+                let t = Instant::now();
                 let mut fh = Vec::with_capacity(21);
                 put_u64(&mut fh, frame.off);
                 fh.push(frame.kind);
@@ -584,12 +621,17 @@ pub fn write_streaming(
                 }
                 out.write_all(&fh)?;
                 out.write_all(&frame.data)?;
+                stats.write += t.elapsed();
                 stats.written_bytes += (fh.len() + frame.data.len()) as u64;
             }
             Ok(())
         })?;
     }
+    let t = Instant::now();
     out.flush()?;
+    stats.write += t.elapsed();
+    stats.work = Duration::from_nanos(work_ns.into_inner());
+    stats.stall = Duration::from_nanos(stall_ns.into_inner());
     Ok(stats)
 }
 
@@ -767,6 +809,10 @@ pub struct ApplyStats {
     pub ram_bytes: u64,
     pub zero_frames: u64,
     pub data_frames: u64,
+    /// Summed over the pool's workers: verifying + decompressing frames, and storing the result
+    /// into guest memory (where first-touch page faults land).
+    pub decode: std::time::Duration,
+    pub store: std::time::Duration,
 }
 
 /// One parsed RAM frame, referencing its stored bytes inside `SnapshotFile::raw`.
@@ -842,29 +888,44 @@ impl SnapshotFile {
 
         let next = AtomicUsize::new(0);
         let first_err: Mutex<Option<io::Error>> = Mutex::new(None);
+        let decode_ns = std::sync::atomic::AtomicU64::new(0);
+        let store_ns = std::sync::atomic::AtomicU64::new(0);
         std::thread::scope(|s| {
             for _ in 0..ram_workers() {
                 let next = &next;
                 let first_err = &first_err;
                 let frames = &frames;
                 let raw = &self.raw;
+                let (decode_ns, store_ns) = (&decode_ns, &store_ns);
                 s.spawn(move || {
                     let mut outbuf = vec![0u8; max_chunk];
                     let zeros = vec![0u8; max_chunk];
+                    let store = std::cell::Cell::new(std::time::Duration::ZERO);
+                    let mut busy = std::time::Duration::ZERO;
+                    let account = |busy: std::time::Duration| {
+                        let store = store.get();
+                        decode_ns.fetch_add((busy - store).as_nanos() as u64, Ordering::Relaxed);
+                        store_ns.fetch_add(store.as_nanos() as u64, Ordering::Relaxed);
+                    };
                     loop {
                         let idx = next.fetch_add(1, Ordering::Relaxed);
                         if idx >= frames.len() || first_err.lock().unwrap().is_some() {
+                            account(busy);
                             return;
                         }
                         let f = &frames[idx];
+                        let t = std::time::Instant::now();
                         let res = (|| -> io::Result<()> {
                             let write = |buf: &[u8]| {
-                                mem.write_slice(buf, GuestAddress(f.gpa)).map_err(|e| {
+                                let t = std::time::Instant::now();
+                                let r = mem.write_slice(buf, GuestAddress(f.gpa)).map_err(|e| {
                                     io::Error::other(format!(
                                         "snapshot: writing RAM at 0x{:x}: {e:?}",
                                         f.gpa
                                     ))
-                                })
+                                });
+                                store.set(store.get() + t.elapsed());
+                                r
                             };
                             match f.kind {
                                 FRAME_ZERO => write(&zeros[..f.ulen]),
@@ -896,14 +957,18 @@ impl SnapshotFile {
                                 }
                             }
                         })();
+                        busy += t.elapsed();
                         if let Err(e) = res {
                             first_err.lock().unwrap().get_or_insert(e);
+                            account(busy);
                             return;
                         }
                     }
                 });
             }
         });
+        stats.decode = std::time::Duration::from_nanos(decode_ns.into_inner());
+        stats.store = std::time::Duration::from_nanos(store_ns.into_inner());
         match first_err.into_inner().unwrap() {
             Some(e) => Err(e),
             None => Ok(stats),
@@ -1757,15 +1822,6 @@ mod tests {
             f.raw.len() >> 20
         );
 
-        let t = Instant::now();
-        let crc = crc32(&f.raw);
-        let s = t.elapsed().as_secs_f64();
-        eprintln!(
-            "bench: crc32 one thread over the file {:.2}s ({:.2} GB/s, {crc:08x})",
-            s,
-            f.raw.len() as f64 / s / 1e9
-        );
-
         let regions = file_regions(&f);
         let ranges: Vec<_> = regions
             .iter()
@@ -1775,12 +1831,26 @@ mod tests {
         let t = Instant::now();
         let a = f.apply_ram(&mem).unwrap();
         eprintln!(
-            "bench: apply_ram {:.2}s ({} MiB, {} zero / {} data frames, {} workers)",
+            "bench: apply_ram {:.2}s ({} MiB, {} zero / {} data frames, {} workers; pool {:.2}s \
+             decoding, {:.2}s storing)",
             t.elapsed().as_secs_f64(),
             a.ram_bytes >> 20,
             a.zero_frames,
             a.data_frames,
-            ram_workers()
+            ram_workers(),
+            a.decode.as_secs_f64(),
+            a.store.as_secs_f64()
+        );
+
+        // After the apply, deliberately: this pass faults the whole mapping in, and running it
+        // first hid the restore's own page-in cost from apply_ram.
+        let t = Instant::now();
+        let crc = crc32(&f.raw);
+        let s = t.elapsed().as_secs_f64();
+        eprintln!(
+            "bench: crc32 one thread over the (now mapped-in) file {:.2}s ({:.2} GB/s, {crc:08x})",
+            s,
+            f.raw.len() as f64 / s / 1e9
         );
 
         // The save is dominated by CPU in the pool but its file write adds run-to-run noise, so
@@ -1797,6 +1867,15 @@ mod tests {
             let t = Instant::now();
             let w = write_streaming(&out, &f.head, &mem, &regions).unwrap();
             secs.push(t.elapsed().as_secs_f64());
+            eprintln!(
+                "bench:   head {:.2}s, writer {:.2}s write / {:.2}s wait, pool {:.1}s work / \
+                 {:.1}s stall",
+                w.head.as_secs_f64(),
+                w.write.as_secs_f64(),
+                w.wait.as_secs_f64(),
+                w.work.as_secs_f64(),
+                w.stall.as_secs_f64()
+            );
             if !null_sink {
                 let _ = fs::remove_file(&out);
             }
