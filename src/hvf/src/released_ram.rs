@@ -285,13 +285,14 @@ impl<S: Stage2> ReleasedRam<S> {
         }
 
         let mut released = self.released.lock().unwrap();
-        insert_range(&mut released, gpa, len);
         let ret = self.stage2.unmap(gpa, len);
         if ret != HV_SUCCESS {
+            // The set is left alone: part of the range may be released already, and rolling
+            // an insert back would forget those pages while they stay unmapped.
             error!("released-ram: hv_vm_unmap(gpa={gpa:#x}, len={len:#x}) failed: {ret:#x}");
-            remove_overlaps(&mut released, gpa, gpa + len);
             return false;
         }
+        insert_range(&mut released, gpa, len);
         let host = Self::host_of(region, gpa);
         let zero = match self.zero_on_release {
             ZeroOnRelease::All => true,
@@ -319,12 +320,7 @@ impl<S: Stage2> ReleasedRam<S> {
     pub fn reclaim(&self, gpa: u64, len: u64) -> bool {
         let mut released = self.released.lock().unwrap();
         let ranges = remove_overlaps(&mut released, gpa, gpa + len);
-        for &(start, rlen) in &ranges {
-            if !self.reuse_and_map(&mut released, start, rlen) {
-                return false;
-            }
-        }
-        true
+        self.reuse_and_map_all(&mut released, &ranges)
     }
 
     /// Heal a stage-2 fault at `pa` (data or instruction abort with translation-fault
@@ -373,13 +369,12 @@ impl<S: Stage2> ReleasedRam<S> {
         // A covered fault resets the consecutive-stray guard: the vCPU is making progress.
         *self.last_stray.lock().unwrap() = (u64::MAX, 0);
 
-        let window_start = (pa & !(self.chunk - 1)).max(region.gpa);
-        let window_end = (window_start + self.chunk).min(region.gpa + region.len);
+        let aligned = pa & !(self.chunk - 1);
+        let window_start = aligned.max(region.gpa);
+        let window_end = (aligned + self.chunk).min(region.gpa + region.len);
         let ranges = remove_overlaps(&mut released, window_start, window_end);
-        for &(start, len) in &ranges {
-            if !self.reuse_and_map(&mut released, start, len) {
-                return FaultOutcome::Fatal;
-            }
+        if !self.reuse_and_map_all(&mut released, &ranges) {
+            return FaultOutcome::Fatal;
         }
 
         let heals = self.heals.fetch_add(1, Ordering::Relaxed) + 1;
@@ -405,6 +400,33 @@ impl<S: Stage2> ReleasedRam<S> {
             sweep_ms: self.sweep_ms.load(Ordering::Relaxed),
             sweep_faults: SWEEP_FAULTS.load(Ordering::Relaxed),
         }
+    }
+
+    /// [`Self::reuse_and_map`] each extracted range in turn. On the first failure the ranges
+    /// not yet mapped go back into the set with the failed one, since they are still unmapped.
+    ///
+    /// The set coalesces ranges that touch, so one range can span two regions adjacent in GPA
+    /// but not on the host. Each is mapped a region at a time, from that region's own host base.
+    fn reuse_and_map_all(&self, released: &mut BTreeMap<u64, u64>, ranges: &[(u64, u64)]) -> bool {
+        let ranges: Vec<(u64, u64)> = ranges
+            .iter()
+            .flat_map(|&(start, len)| {
+                self.regions.iter().filter_map(move |r| {
+                    let s = start.max(r.gpa);
+                    let e = (start + len).min(r.gpa + r.len);
+                    (s < e).then(|| (s, e - s))
+                })
+            })
+            .collect();
+        for (i, &(start, len)) in ranges.iter().enumerate() {
+            if !self.reuse_and_map(released, start, len) {
+                for &(s, l) in &ranges[i + 1..] {
+                    insert_range(released, s, l);
+                }
+                return false;
+            }
+        }
+        true
     }
 
     /// `MADV_FREE_REUSE` + `hv_vm_map` one extracted range. On map failure the range is
@@ -1004,5 +1026,380 @@ mod tests {
             );
         }
         unsafe { libc::munmap(host as *mut libc::c_void, len as usize) };
+    }
+}
+
+/// Every sequence of releases, reclaims, guest touches, raw stage-2 faults and injected
+/// unmap/map failures, to depth four, over seven pages: region A (four pages) and region B (two),
+/// adjacent in GPA but not on the host, then a page that is not RAM. A starts one page past a
+/// heal-window boundary, so windows are clipped at its start and at the A|B boundary.
+///
+/// The stage-2 stand-in follows `spikes/hv-unmap-semantics` in limina: an unmap succeeds on any
+/// mix of mapped and unmapped pages, a map over a live page fails. It also reports what HVF
+/// would not catch: a page mapped to the wrong host address, a page mapped while still reusable,
+/// and a page made reusable while the guest can still reach it.
+///
+/// After every step the released set and the stage-2 state must both equal a model kept outside
+/// the code: a bool per page, set by a release the code must accept and cleared by a reclaim or
+/// by a heal of the window the model computes.
+#[cfg(test)]
+mod every_sequence {
+    use super::{FaultOutcome, ReleasedRam, Stage2, ZeroOnRelease, contains_point, hv_return_t};
+    use crate::bindings::{HV_ERROR, HV_SUCCESS};
+    use crate::host_page_size;
+    use std::ops::Range;
+    use std::sync::Mutex;
+
+    const PAGES: usize = 7;
+    const REGION_A: Range<usize> = 0..4;
+    const REGION_B: Range<usize> = 4..6;
+    const HOST_A: u64 = 0x10_0000_0000;
+    const HOST_B: u64 = 0x20_0000_0000;
+    const WINDOW_PAGES: u64 = 4;
+    const TRANSLATION_FAULT: u64 = 0b000101;
+    const DEPTH: usize = 4;
+
+    fn page() -> u64 {
+        host_page_size()
+    }
+    fn base() -> u64 {
+        0x4000_0000 + page()
+    }
+    fn gpa(p: usize) -> u64 {
+        base() + p as u64 * page()
+    }
+    fn region(p: usize) -> Option<Range<usize>> {
+        [REGION_A, REGION_B].into_iter().find(|r| r.contains(&p))
+    }
+    fn host_of(p: usize) -> u64 {
+        if REGION_A.contains(&p) {
+            HOST_A + (p - REGION_A.start) as u64 * page()
+        } else {
+            HOST_B + (p - REGION_B.start) as u64 * page()
+        }
+    }
+
+    #[derive(Default)]
+    struct State {
+        unmapped: [bool; PAGES],
+        reusable: [bool; PAGES],
+        fail_unmap: bool,
+        fail_map: bool,
+        wrong: Vec<String>,
+    }
+
+    #[derive(Default)]
+    struct Model(Mutex<State>);
+
+    impl Model {
+        fn pages_of_gpa(s: &mut State, gpa: u64, len: u64) -> Vec<usize> {
+            let pages: Vec<usize> = (0..len / page())
+                .map(|i| ((gpa - base()) / page() + i) as usize)
+                .collect();
+            if let Some(p) = pages.iter().find(|&&p| region(p).is_none()) {
+                s.wrong
+                    .push(format!("a stage-2 call reaches page {p}, which is not RAM"));
+            }
+            pages.into_iter().filter(|&p| region(p).is_some()).collect()
+        }
+
+        fn pages_of_host(s: &mut State, host: u64, len: u64) -> Vec<usize> {
+            (0..len / page())
+                .filter_map(|i| {
+                    let h = host + i * page();
+                    let p = (0..PAGES).find(|&p| region(p).is_some() && host_of(p) == h);
+                    if p.is_none() {
+                        s.wrong
+                            .push(format!("host address {h:#x} backs no guest page"));
+                    }
+                    p
+                })
+                .collect()
+        }
+    }
+
+    impl Stage2 for Model {
+        fn unmap(&self, gpa: u64, len: u64) -> hv_return_t {
+            let mut s = self.0.lock().unwrap();
+            if std::mem::take(&mut s.fail_unmap) {
+                return HV_ERROR as hv_return_t;
+            }
+            for p in Self::pages_of_gpa(&mut s, gpa, len) {
+                s.unmapped[p] = true;
+            }
+            HV_SUCCESS as hv_return_t
+        }
+
+        fn map(&self, host: u64, gpa: u64, len: u64) -> hv_return_t {
+            let mut s = self.0.lock().unwrap();
+            let pages = Self::pages_of_gpa(&mut s, gpa, len);
+            for (i, &p) in pages.iter().enumerate() {
+                let h = host + i as u64 * page();
+                if h != host_of(p) {
+                    s.wrong.push(format!(
+                        "page {p} mapped to host {h:#x}, not its own {:#x}",
+                        host_of(p)
+                    ));
+                }
+                if s.reusable[p] {
+                    s.wrong
+                        .push(format!("page {p} mapped while still reusable"));
+                }
+            }
+            if pages.iter().any(|&p| !s.unmapped[p]) {
+                s.wrong.push(format!("a map over live pages in {pages:?}"));
+                return HV_ERROR as hv_return_t;
+            }
+            if std::mem::take(&mut s.fail_map) {
+                return HV_ERROR as hv_return_t;
+            }
+            for p in pages {
+                s.unmapped[p] = false;
+            }
+            HV_SUCCESS as hv_return_t
+        }
+
+        unsafe fn discard(&self, host: u64, len: u64, _zero: bool) -> std::io::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            for p in Self::pages_of_host(&mut s, host, len) {
+                if !s.unmapped[p] {
+                    s.wrong
+                        .push(format!("page {p} made reusable while the guest reaches it"));
+                }
+                s.reusable[p] = true;
+            }
+            Ok(())
+        }
+
+        fn reuse(&self, host: u64, len: u64) -> std::io::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            for p in Self::pages_of_host(&mut s, host, len) {
+                s.reusable[p] = false;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Release(usize, usize),
+        Reclaim(usize, usize),
+        /// The guest touches a page, which faults only if the page is unmapped.
+        Touch(usize),
+        /// A stage-2 fault reported whatever the page's state, as when another vCPU's heal
+        /// raced it.
+        Fault(usize),
+        FailUnmap,
+        FailMap,
+    }
+
+    fn alphabet() -> Vec<Op> {
+        let mut ops = Vec::new();
+        for f in 0..PAGES {
+            for n in 1..=2 {
+                ops.push(Op::Release(f, n));
+            }
+        }
+        ops.extend([
+            Op::Reclaim(0, PAGES),
+            Op::Reclaim(3, 2),
+            Op::Reclaim(0, 1),
+            Op::Reclaim(4, 1),
+        ]);
+        ops.extend((0..PAGES - 1).map(Op::Touch));
+        ops.extend((0..PAGES).map(Op::Fault));
+        ops.extend([Op::FailUnmap, Op::FailMap]);
+        ops
+    }
+
+    /// The pages a heal of page `p` maps back: the window-aligned chunk around it, clipped to
+    /// its region.
+    fn window(p: usize) -> Range<usize> {
+        let r = region(p).unwrap();
+        let start = gpa(p) & !(WINDOW_PAGES * page() - 1);
+        let first = start.saturating_sub(base()) / page();
+        let end = (start + WINDOW_PAGES * page() - base()) / page();
+        (first as usize).max(r.start)..(end as usize).min(r.end)
+    }
+
+    #[derive(Default)]
+    struct Expect {
+        released: [bool; PAGES],
+        fail_unmap: bool,
+        fail_map: bool,
+    }
+
+    impl Expect {
+        fn heal(&mut self, p: usize) -> &'static str {
+            if std::mem::take(&mut self.fail_map) {
+                return "Fatal";
+            }
+            for q in window(p) {
+                self.released[q] = false;
+            }
+            "Healed"
+        }
+    }
+
+    fn outcome(o: FaultOutcome) -> &'static str {
+        match o {
+            FaultOutcome::Healed => "Healed",
+            FaultOutcome::Retry => "Retry",
+            FaultOutcome::NotHandled => "NotHandled",
+            FaultOutcome::Fatal => "Fatal",
+        }
+    }
+
+    fn step(rr: &ReleasedRam<Model>, e: &mut Expect, op: Op) -> Result<(), String> {
+        let (got, want) = match op {
+            Op::Release(f, n) => {
+                let valid = region(f).is_some_and(|r| r.contains(&(f + n - 1)));
+                let want = valid && !std::mem::take(&mut e.fail_unmap);
+                if want {
+                    (f..f + n).for_each(|p| e.released[p] = true);
+                }
+                let got = rr.release(gpa(f), n as u64 * page(), f % 2 == 0);
+                (got.to_string(), want.to_string())
+            }
+            Op::Reclaim(f, n) => {
+                let any = (f..f + n).any(|p| e.released[p]);
+                let want = !any || !std::mem::take(&mut e.fail_map);
+                if want {
+                    (f..f + n).for_each(|p| e.released[p] = false);
+                }
+                let got = rr.reclaim(gpa(f), n as u64 * page());
+                (got.to_string(), want.to_string())
+            }
+            Op::Touch(p) => {
+                if !rr.stage2.0.lock().unwrap().unmapped[p] {
+                    return Ok(());
+                }
+                let want = if e.released[p] { e.heal(p) } else { "Retry" };
+                let got = outcome(rr.handle_fault(gpa(p), TRANSLATION_FAULT));
+                (got.to_string(), want.to_string())
+            }
+            Op::Fault(p) => {
+                let want = match region(p) {
+                    None => "NotHandled",
+                    Some(_) if e.released[p] => e.heal(p),
+                    Some(_) => "Retry",
+                };
+                let got = outcome(rr.handle_fault(gpa(p), TRANSLATION_FAULT));
+                (got.to_string(), want.to_string())
+            }
+            Op::FailUnmap => {
+                e.fail_unmap = true;
+                rr.stage2.0.lock().unwrap().fail_unmap = true;
+                return Ok(());
+            }
+            Op::FailMap => {
+                e.fail_map = true;
+                rr.stage2.0.lock().unwrap().fail_map = true;
+                return Ok(());
+            }
+        };
+        if got != want {
+            return Err(format!("returned {got}, the model says {want}"));
+        }
+        Ok(())
+    }
+
+    fn check(rr: &ReleasedRam<Model>, e: &Expect) -> Result<(), String> {
+        let s = rr.stage2.0.lock().unwrap();
+        if let Some(w) = s.wrong.first() {
+            return Err(w.clone());
+        }
+        let set = rr.released.lock().unwrap();
+        let not = |b: bool| if b { "" } else { "not " };
+        for p in (0..PAGES).filter(|&p| region(p).is_some()) {
+            let in_set = contains_point(&set, gpa(p));
+            if in_set != e.released[p] {
+                return Err(format!(
+                    "page {p} is {}in the released set; the model says it is {}released",
+                    not(in_set),
+                    not(e.released[p])
+                ));
+            }
+            if s.unmapped[p] != e.released[p] {
+                return Err(format!(
+                    "page {p} is {}mapped in stage 2; the model says it is {}released",
+                    not(!s.unmapped[p]),
+                    not(e.released[p])
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn run(seq: &[Op]) -> Result<(), String> {
+        let regions = [REGION_A, REGION_B]
+            .into_iter()
+            .map(|r| (gpa(r.start), host_of(r.start), r.len() as u64 * page()))
+            .collect();
+        let rr = ReleasedRam::with_stage2(
+            Model::default(),
+            regions,
+            WINDOW_PAGES * page(),
+            ZeroOnRelease::InflateQueue,
+        );
+        let mut e = Expect::default();
+        for (i, &op) in seq.iter().enumerate() {
+            step(&rr, &mut e, op)
+                .and_then(|()| check(&rr, &e))
+                .map_err(|m| format!("{:?}, at step {}: {m}", &seq[..=i], i + 1))?;
+        }
+        Ok(())
+    }
+
+    fn walk(ops: &[Op], seq: &mut Vec<Op>, walked: &mut u64) {
+        if seq.len() == DEPTH {
+            *walked += 1;
+            replay(seq);
+            return;
+        }
+        for &op in ops {
+            seq.push(op);
+            walk(ops, seq, walked);
+            seq.pop();
+        }
+    }
+
+    fn replay(seq: &[Op]) {
+        if let Err(m) = run(seq) {
+            panic!("{m}");
+        }
+    }
+
+    /// A release that repeats an earlier one, whose unmap then fails, must leave the earlier
+    /// release recorded: its pages are still unmapped.
+    #[test]
+    fn a_failed_release_keeps_the_pages_released_before_it() {
+        replay(&[Op::Release(0, 1), Op::FailUnmap, Op::Release(0, 2)]);
+    }
+
+    /// A reclaim whose first map fails must keep every range it had not mapped yet.
+    #[test]
+    fn a_failed_reclaim_keeps_the_ranges_it_did_not_reach() {
+        replay(&[
+            Op::Release(0, 1),
+            Op::Release(2, 1),
+            Op::FailMap,
+            Op::Reclaim(0, PAGES),
+        ]);
+    }
+
+    /// Releases on each side of the A|B boundary coalesce into one range; mapping it back must
+    /// take each region's pages from that region's host mapping.
+    #[test]
+    fn a_heal_across_adjacent_regions_maps_each_from_its_own_host() {
+        replay(&[Op::Release(3, 1), Op::Release(4, 1), Op::Reclaim(3, 2)]);
+    }
+
+    #[test]
+    fn every_release_and_heal_sequence_matches_the_model() {
+        let ops = alphabet();
+        let mut walked = 0;
+        walk(&ops, &mut Vec::with_capacity(DEPTH), &mut walked);
+        assert_eq!(walked, (ops.len() as u64).pow(DEPTH as u32));
     }
 }
