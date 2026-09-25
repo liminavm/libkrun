@@ -1724,17 +1724,28 @@ mod tests {
 
         // The save is dominated by CPU in the pool but its file write adds run-to-run noise, so
         // repeat it and report the spread.
-        let out = src.with_extension("bench-out");
+        // LIMINA_SNAPSHOT_BENCH_SINK=null writes to /dev/null: the pool's compute alone.
+        let null_sink = std::env::var("LIMINA_SNAPSHOT_BENCH_SINK").is_ok_and(|v| v == "null");
+        let out = if null_sink {
+            std::path::PathBuf::from("/dev/null")
+        } else {
+            src.with_extension("bench-out")
+        };
         let mut secs = Vec::new();
         for _ in 0..5 {
             let t = Instant::now();
             let w = write_streaming(&out, &f.head, &mem, &regions).unwrap();
             secs.push(t.elapsed().as_secs_f64());
-            let _ = fs::remove_file(&out);
+            if !null_sink {
+                let _ = fs::remove_file(&out);
+            }
             assert_eq!(w.ram_bytes, a.ram_bytes);
             assert_eq!(w.zero_frames, a.zero_frames);
         }
-        eprintln!("bench: write_streaming x5 {secs:.2?}");
+        eprintln!(
+            "bench: write_streaming x5 {secs:.2?} (sink: {})",
+            out.display()
+        );
         secs.sort_by(f64::total_cmp);
         eprintln!(
             "bench: write_streaming min {:.2}s median {:.2}s",
