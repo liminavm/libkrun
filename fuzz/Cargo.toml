@@ -1,0 +1,30 @@
+# libkrun's cargo-fuzz targets on the limina fork (limina's docs/design/in-crate-checkers.md). Its
+# own workspace, so `cargo fuzz` builds it with its own flags and the libkrun build never sees
+# libFuzzer.
+#
+#   cargo +nightly fuzz run <target> -- -max_total_time=<seconds>
+[package]
+name = "krun-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+devices = { package = "krun-devices", path = "../src/devices", features = ["usb"] }
+libfuzzer-sys = "0.4"
+utils = { package = "krun-utils", path = "../src/utils" }
+vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "xhci_guest"
+path = "fuzz_targets/xhci_guest.rs"
+test = false
+doc = false
+bench = false
