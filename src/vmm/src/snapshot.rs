@@ -703,8 +703,16 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Ceilings on the counts the head reads before its CRC is checked (see [`bounded_count`]). A vCPU
+/// count comes from a `u8` (`krun_set_vm_config`); a vCPU saves 113 system registers and 9 GIC CPU
+/// interface ones; the others are far past any device model.
+const MAX_VCPUS: u32 = 255;
+const MAX_VCPU_REGS: u32 = 1024;
+const MAX_DEVICES: u32 = 1024;
+const MAX_QUEUES: u32 = 1024;
+
 fn decode_u64_vec(r: &mut Reader) -> io::Result<Vec<u64>> {
-    let n = r.u32()? as usize;
+    let n = bounded_count(r, MAX_VCPU_REGS, "register")?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(r.u64()?);
@@ -812,7 +820,7 @@ impl StreamedFile {
     }
 
     /// A file whose bytes are all in memory already: no reader thread, nothing left to land.
-    #[cfg(fuzzing)]
+    #[cfg(any(test, fuzzing))]
     fn landed(buf: Vec<u8>) -> std::sync::Arc<Self> {
         let len = buf.len();
         std::sync::Arc::new(StreamedFile {
@@ -1042,8 +1050,14 @@ impl SnapshotFile {
                     let len = r.u64()?;
                     let chunk = r.u32()? as u64;
                     let nframes = r.u32()? as usize;
-                    if chunk == 0 {
-                        return Err(corrupt("zero chunk size"));
+                    if gpa.checked_add(len).is_none() {
+                        return Err(corrupt("region past the top of the address space"));
+                    }
+                    // Every frame is sized by the chunk, and every version this reads writes
+                    // CHUNK_SIZE: anything larger is corruption that would size each worker's
+                    // buffer before the write into RAM could refuse it.
+                    if chunk == 0 || chunk > CHUNK_SIZE as u64 {
+                        return Err(corrupt("implausible chunk size"));
                     }
                     if nframes as u64 != len.div_ceil(chunk) {
                         return Err(corrupt("frame count does not cover the region"));
@@ -1284,7 +1298,7 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
     if !(OLDEST_READABLE_VERSION..=VERSION).contains(&version) {
         return Err(corrupt("unsupported version"));
     }
-    let vcpu_count = r.u32()? as usize;
+    let vcpu_count = bounded_count(&mut r, MAX_VCPUS, "vCPU")?;
     let mut vcpus = Vec::with_capacity(vcpu_count);
     for _ in 0..vcpu_count {
         vcpus.push(decode_vcpu(&mut r)?);
@@ -1316,7 +1330,7 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
         },
     };
     // v4 per-device virtio-transport section.
-    let dev_count = r.u32()? as usize;
+    let dev_count = bounded_count(&mut r, MAX_DEVICES, "device")?;
     let mut devices = Vec::with_capacity(dev_count);
     for _ in 0..dev_count {
         let type_id = r.u32()?;
@@ -1326,7 +1340,7 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
         let acked_features = r.u64()?;
         let config_generation = r.u32()?;
         let isr = r.u32()?;
-        let q_count = r.u32()? as usize;
+        let q_count = bounded_count(&mut r, MAX_QUEUES, "queue")?;
         let mut queues = Vec::with_capacity(q_count);
         for _ in 0..q_count {
             let size = r.u16()?;
@@ -1768,6 +1782,129 @@ mod tests {
             "an absent USB section must decode as None"
         );
         assert_eq!(got.head.layout, sample_layout());
+    }
+
+    /// Every count the head reads before its CRC is checked must be refused past its ceiling
+    /// before it sizes an allocation: the vCPUs, each vCPU's register lists, the devices and each
+    /// device's queues. A fuzzed head asked for 22.9 GB through a register count.
+    #[test]
+    fn head_counts_are_bounded_before_they_allocate() {
+        fn prefix() -> Vec<u8> {
+            let mut v = MAGIC.to_vec();
+            put_u32(&mut v, VERSION);
+            v
+        }
+        fn refused(mut v: Vec<u8>, what: &str) {
+            v.resize(v.len().max(64), 0);
+            let err = match parse(StreamedFile::landed(v)) {
+                Ok(_) => panic!("a head with an implausible {what} count read"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(&format!("implausible {what} count")),
+                "{what}: refused for the wrong reason: {err}"
+            );
+        }
+
+        let mut v = prefix();
+        put_u32(&mut v, 0xffff_ffff);
+        refused(v, "vCPU");
+
+        let mut v = prefix();
+        put_u32(&mut v, 1);
+        v.extend_from_slice(&[0; 31 * 8 + 4 * 8 + 32 * 16]);
+        put_u32(&mut v, 0xffff_ffff);
+        refused(v, "register");
+
+        let mut v = prefix();
+        put_u32(&mut v, 0); // vCPUs
+        put_u64(&mut v, 0); // GIC blob
+        v.push(0); // no GPIO
+        v.extend_from_slice(&[0; 3 * 8 + 1]); // layout
+        let devices = v.len();
+        put_u32(&mut v, 0xffff_ffff);
+        refused(v.clone(), "device");
+
+        v.truncate(devices);
+        put_u32(&mut v, 1);
+        v.extend_from_slice(&[0; 4 + 8 + 4 + 4 + 8 + 4 + 4]); // one device's fields
+        put_u32(&mut v, 0xffff_ffff);
+        refused(v, "queue");
+    }
+
+    /// A frame's size comes from the region's chunk size, and each worker sizes its buffer to it
+    /// before the write into guest RAM can fail. A zero frame costs nine bytes of file, so a
+    /// corrupt chunk must be refused before any frame is handed out, or those bytes make a worker
+    /// zero-fill up to 4 GiB.
+    #[test]
+    fn a_chunk_past_the_writers_is_refused_before_it_sizes_a_frame() {
+        let head = SnapshotHead {
+            vcpus: vec![],
+            gic: vec![],
+            gpio: None,
+            layout: sample_layout(),
+            devices: vec![],
+            gpu: None,
+            usb: None,
+            slots: Some(vec![]),
+        };
+        let mut v = encode_head(&head);
+        let crc = crc32(&v);
+        put_u32(&mut v, crc);
+        put_u32(&mut v, 1); // regions
+        put_u64(&mut v, REGION_A.0);
+        put_u64(&mut v, u32::MAX as u64); // len
+        put_u32(&mut v, u32::MAX); // chunk
+        put_u32(&mut v, 1); // frames
+        put_u64(&mut v, 0);
+        v.push(FRAME_ZERO);
+        let file = parse(StreamedFile::landed(v)).expect("the head is sound");
+        let err = file
+            .apply_ram(&test_mem())
+            .err()
+            .expect("a 4 GiB chunk applied");
+        assert!(
+            err.to_string().contains("implausible chunk size"),
+            "refused for the wrong reason: {err}"
+        );
+    }
+
+    /// A region's frames are addressed from its GPA, so a region reaching past the top of the
+    /// address space must be refused, not overflow the address of a frame inside it.
+    #[test]
+    fn a_region_past_the_top_of_the_address_space_is_refused() {
+        let head = SnapshotHead {
+            vcpus: vec![],
+            gic: vec![],
+            gpio: None,
+            layout: sample_layout(),
+            devices: vec![],
+            gpu: None,
+            usb: None,
+            slots: Some(vec![]),
+        };
+        let mut v = encode_head(&head);
+        let crc = crc32(&v);
+        put_u32(&mut v, crc);
+        put_u32(&mut v, 1); // regions
+        put_u64(&mut v, u64::MAX - 0xfff);
+        put_u64(&mut v, 2 * CHUNK_SIZE as u64);
+        put_u32(&mut v, CHUNK_SIZE as u32);
+        put_u32(&mut v, 2); // frames
+        for off in [0, CHUNK_SIZE as u64] {
+            put_u64(&mut v, off);
+            v.push(FRAME_ZERO);
+        }
+        let file = parse(StreamedFile::landed(v)).expect("the head is sound");
+        let err = file
+            .apply_ram(&test_mem())
+            .err()
+            .expect("the region applied");
+        assert!(
+            err.to_string()
+                .contains("region past the top of the address space"),
+            "refused for the wrong reason: {err}"
+        );
     }
 
     /// A corrupt element count in the USB section must fail closed, not drive a huge allocation:
