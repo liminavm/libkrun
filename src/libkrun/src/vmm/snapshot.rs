@@ -811,6 +811,20 @@ impl StreamedFile {
         Ok(sf)
     }
 
+    /// A file whose bytes are all in memory already: no reader thread, nothing left to land.
+    #[cfg(fuzzing)]
+    fn landed(buf: Vec<u8>) -> std::sync::Arc<Self> {
+        let len = buf.len();
+        std::sync::Arc::new(StreamedFile {
+            ptr: Box::into_raw(buf.into_boxed_slice()) as *mut u8,
+            len,
+            filled: AtomicUsize::new(len),
+            failure: Mutex::new(None),
+            landed: std::sync::Condvar::new(),
+            cancel: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
     fn fill(&self, file: &mut fs::File) {
         use std::io::Read as _;
         const READ_CHUNK: usize = 8 << 20;
@@ -986,7 +1000,7 @@ impl SnapshotFile {
                                 return write(&zeros[..f.ulen]);
                             }
                             let data = raw.slice(f.data_off, f.data_len);
-                            if crc32(data) != f.crc {
+                            if crc32(data) != f.crc && !cfg!(fuzzing) {
                                 return Err(corrupt("frame CRC mismatch"));
                             }
                             if f.kind == FRAME_RAW {
@@ -1240,7 +1254,25 @@ fn decode_usb(r: &mut Reader) -> io::Result<XhciState> {
 /// Read + verify a snapshot's head from `path` (magic, version, head CRC). The RAM frames are
 /// verified per-frame when [`SnapshotFile::apply_ram`] runs.
 pub fn read(path: &Path) -> io::Result<SnapshotFile> {
-    let raw = StreamedFile::open(path)?;
+    parse(StreamedFile::open(path)?)
+}
+
+/// [`read`] over bytes already in memory, for the fuzz targets.
+#[cfg(fuzzing)]
+pub fn read_bytes(buf: Vec<u8>) -> io::Result<SnapshotFile> {
+    parse(StreamedFile::landed(buf))
+}
+
+/// The head as [`write_streaming`] writes it, CRC included, for the fuzz targets' round trip.
+#[cfg(fuzzing)]
+pub fn encode_head_for_fuzzing(head: &SnapshotHead) -> Vec<u8> {
+    let mut v = encode_head(head);
+    let crc = crc32(&v);
+    put_u32(&mut v, crc);
+    v
+}
+
+fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
     if raw.len < 16 {
         return Err(corrupt("too small"));
     }
@@ -1367,7 +1399,9 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
     let head_end = r.pos;
     let stored = r.u32()?;
-    if crc32(raw.slice(0, head_end)) != stored {
+    // A fuzzer cannot forge a CRC, and everything past it would be out of its reach; the unit
+    // tests keep the check honest.
+    if crc32(raw.slice(0, head_end)) != stored && !cfg!(fuzzing) {
         return Err(corrupt("head CRC mismatch"));
     }
     let ram_off = r.pos;
