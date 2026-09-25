@@ -92,3 +92,5 @@ devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../d
 [lib]
 name = "krun"
 crate-type = ["cdylib", "lib"]
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
