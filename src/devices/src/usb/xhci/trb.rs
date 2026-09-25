@@ -207,9 +207,18 @@ impl RingWalker {
     /// - `Ok(None)` — the ring is empty (producer cycle boundary reached).
     /// - `Err(_)` — a malformed ring (bounded loop / bad pointer).
     pub fn next(&mut self, mem: &GuestMemoryMmap) -> Result<Option<(u64, Trb)>, RingError> {
+        self.next_from(|addr| Trb::read(mem, addr))
+    }
+
+    /// [`Self::next`] over any source of TRBs. Split out so the walk can be proved on its own
+    /// (`proofs` below): guest memory is an mmap, which Kani cannot model.
+    fn next_from(
+        &mut self,
+        mut read: impl FnMut(u64) -> Result<Trb, RingError>,
+    ) -> Result<Option<(u64, Trb)>, RingError> {
         for _ in 0..MAX_LINK_HOPS {
             let addr = self.ptr;
-            let trb = Trb::read(mem, addr)?;
+            let trb = read(addr)?;
             if trb.cycle() != self.ccs {
                 // Producer hasn't published this slot yet: ring empty.
                 return Ok(None);
@@ -367,6 +376,111 @@ pub fn port_status_change_event(port_id: u8) -> Trb {
         parameter: u64::from(port_id) << 24,
         status: cc::SUCCESS << 24,
         control: trb_type::PORT_STATUS_CHANGE << 10,
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Every read the walk makes, and what it saw.
+    struct Reads {
+        n: usize,
+        last: Option<(u64, Trb)>,
+        ccs_at_last: bool,
+    }
+
+    /// Whatever a ring holds, and however the guest rewrites it between reads, one step of the walk
+    /// returns only a work TRB it read with a matching cycle bit, and leaves the walker just past
+    /// it; stops at the producer boundary parked on the TRB it will read again; keeps the dequeue
+    /// pointer 16-byte aligned; and gives up only after following every link it is allowed to.
+    ///
+    /// Each read answers an arbitrary TRB, or a failed access, independently of every other read:
+    /// that stands for every ring contents and for a guest writing to its ring while the walk runs.
+    #[kani::proof]
+    #[kani::unwind(66)]
+    fn a_step_returns_only_a_published_work_trb() {
+        let start: u64 = kani::any();
+        let mut w = RingWalker::new(start, kani::any());
+        let mut seen = Reads {
+            n: 0,
+            last: None,
+            ccs_at_last: false,
+        };
+        let ccs = std::cell::Cell::new(w.ccs);
+        let result = {
+            let seen = &mut seen;
+            let ccs = &ccs;
+            let mut read = |addr: u64| {
+                assert!(addr & 0xf == 0, "a TRB read at an unaligned address");
+                seen.n += 1;
+                if kani::any() {
+                    return Err(RingError::BadAccess(addr));
+                }
+                let trb = Trb {
+                    parameter: kani::any(),
+                    status: kani::any(),
+                    control: kani::any(),
+                };
+                seen.last = Some((addr, trb));
+                seen.ccs_at_last = ccs.get();
+                // Track the walker's CCS as a Link with Toggle Cycle flips it.
+                if trb.cycle() == ccs.get()
+                    && trb.trb_type() == trb_type::LINK
+                    && trb.toggle_cycle()
+                {
+                    ccs.set(!ccs.get());
+                }
+                Ok(trb)
+            };
+            w.next_from(&mut read)
+        };
+
+        assert!(
+            seen.n <= MAX_LINK_HOPS,
+            "the walk read more TRBs than it may follow links"
+        );
+        assert!(w.ptr & 0xf == 0, "the dequeue pointer lost its alignment");
+        match result {
+            Ok(Some((addr, trb))) => {
+                let (at, last) = seen.last.expect("a TRB was read");
+                assert!(
+                    at == addr && last == trb,
+                    "returned a TRB other than the one it read"
+                );
+                assert!(
+                    trb.trb_type() != trb_type::LINK,
+                    "returned a Link TRB as work"
+                );
+                assert!(
+                    trb.cycle() == seen.ccs_at_last,
+                    "returned an unpublished TRB"
+                );
+                assert!(
+                    w.ptr == addr.wrapping_add(16),
+                    "did not advance past the TRB"
+                );
+                assert!(
+                    w.ccs == seen.ccs_at_last,
+                    "changed its cycle state on a work TRB"
+                );
+            }
+            Ok(None) => {
+                let (at, last) = seen.last.expect("a TRB was read");
+                assert!(
+                    last.cycle() != w.ccs,
+                    "stopped at a TRB it should have consumed"
+                );
+                assert!(w.ptr == at, "stopped somewhere other than the boundary TRB");
+            }
+            Err(RingError::LinkLoop) => {
+                assert!(
+                    seen.n == MAX_LINK_HOPS,
+                    "gave up before following every link"
+                );
+            }
+            Err(_) => {}
+        }
     }
 }
 
