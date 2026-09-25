@@ -737,67 +737,11 @@ fn decode_vcpu(r: &mut Reader) -> io::Result<VcpuState> {
     })
 }
 
-/// A snapshot file's bytes, mapped read-only rather than read.
-///
-/// `fs::read` of a multi-GB snapshot copied the whole file before the restore's apply could start
-/// (~0.6 s for 3.5 GB even from the page cache). Mapped, nothing is copied and the apply pool
-/// pages frames in as it decompresses them, so the IO overlaps the work.
-struct FileBytes {
-    ptr: *mut libc::c_void,
-    len: usize,
-}
-
-// SAFETY: a private read-only mapping, never written after creation.
-unsafe impl Send for FileBytes {}
-unsafe impl Sync for FileBytes {}
-
-impl FileBytes {
-    fn open(path: &Path) -> io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        let f = fs::File::open(path)?;
-        let len = usize::try_from(f.metadata()?.len())
-            .map_err(|_| corrupt("snapshot larger than the address space"))?;
-        if len == 0 {
-            return Err(corrupt("too small"));
-        }
-        // SAFETY: a fresh mapping of `len` bytes of an open file; checked below.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                f.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { ptr, len })
-    }
-}
-
-impl std::ops::Deref for FileBytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        // SAFETY: `len` readable bytes, mapped for the lifetime of `self`.
-        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
-    }
-}
-
-impl Drop for FileBytes {
-    fn drop(&mut self) {
-        // SAFETY: the mapping `open` created, unmapped once.
-        unsafe { libc::munmap(self.ptr, self.len) };
-    }
-}
-
-/// A parsed-and-verified snapshot: the deserialized head plus the mapped file, from which
+/// A parsed-and-verified snapshot: the deserialized head plus the file's bytes, from which
 /// [`Self::apply_ram`] later streams the RAM frames straight into guest memory.
 pub struct SnapshotFile {
     pub head: SnapshotHead,
-    raw: FileBytes,
+    raw: Vec<u8>,
     /// Byte offset of the RAM section (the u32 region count) within `raw`.
     ram_off: usize,
 }
@@ -1123,7 +1067,11 @@ fn decode_usb(r: &mut Reader) -> io::Result<XhciState> {
 /// Read + verify a snapshot's head from `path` (magic, version, head CRC). The RAM frames are
 /// verified per-frame when [`SnapshotFile::apply_ram`] runs.
 pub fn read(path: &Path) -> io::Result<SnapshotFile> {
-    let raw = FileBytes::open(path)?;
+    // A plain read, deliberately. It reads a cold file at the SSD's rate. Mapping the file
+    // instead won 0.3 s warm but lost 0.4 s cold: the apply pool faulted it in with small
+    // synchronous reads. Parallel preads and MADV_WILLNEED were no better cold either
+    // (spikes/suspend-perf).
+    let raw = fs::read(path)?;
     if raw.len() < 16 {
         return Err(corrupt("too small"));
     }
