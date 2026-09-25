@@ -638,8 +638,16 @@ pub fn write_streaming(
 // --- decode ---------------------------------------------------------------------------------
 
 /// A bounds-checked little-endian cursor; every read fails closed on underrun.
+/// Where a [`Reader`] gets its bytes: a buffer already in memory, or a snapshot file that is still
+/// landing, in which case reads wait for the bytes they need.
+enum Src<'a> {
+    #[cfg(test)]
+    Mem(&'a [u8]),
+    File(&'a StreamedFile),
+}
+
 struct Reader<'a> {
-    buf: &'a [u8],
+    src: Src<'a>,
     pos: usize,
 }
 
@@ -648,12 +656,29 @@ fn corrupt(what: &str) -> io::Error {
 }
 
 impl<'a> Reader<'a> {
+    #[cfg(test)]
+    fn mem(buf: &'a [u8]) -> Self {
+        Reader {
+            src: Src::Mem(buf),
+            pos: 0,
+        }
+    }
+    fn file(f: &'a StreamedFile, pos: usize) -> Self {
+        Reader {
+            src: Src::File(f),
+            pos,
+        }
+    }
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
         let end = self.pos.checked_add(n).ok_or_else(|| corrupt("overflow"))?;
-        let s = self
-            .buf
-            .get(self.pos..end)
-            .ok_or_else(|| corrupt("truncated"))?;
+        let s = match self.src {
+            #[cfg(test)]
+            Src::Mem(buf) => buf.get(self.pos..end).ok_or_else(|| corrupt("truncated"))?,
+            Src::File(f) => {
+                f.wait_for(end)?;
+                f.slice(self.pos, n)
+            }
+        };
         self.pos = end;
         Ok(s)
     }
@@ -737,13 +762,145 @@ fn decode_vcpu(r: &mut Reader) -> io::Result<VcpuState> {
     })
 }
 
-/// A parsed-and-verified snapshot: the deserialized head plus the file's bytes, from which
-/// [`Self::apply_ram`] later streams the RAM frames straight into guest memory.
+/// A snapshot file read into memory by a background thread, readable as it lands.
+///
+/// A cold resume used to read the whole multi-GB file and only then start on it. Now the head
+/// parse (with the GPU section's decompress) and the RAM apply each wait only for the bytes they
+/// need, so the file's IO overlaps all of them. The read itself stays one sequential stream: that
+/// already runs at the SSD's rate, and mapping the file instead was measured and rejected (the
+/// apply pool faulted it in with small synchronous reads; see spikes/suspend-perf).
+///
+/// The buffer is written only by the reader thread and only past `filled`, and every slice handed
+/// out lies below `filled`, so no reader ever aliases bytes still being written. The reader
+/// thread holds its own `Arc`, so the buffer outlives it.
+struct StreamedFile {
+    ptr: *mut u8,
+    len: usize,
+    /// How many leading bytes have landed. Only grows.
+    filled: AtomicUsize,
+    /// Why the reader stopped short, once it has. Also the mutex `landed` waits under.
+    failure: Mutex<Option<(io::ErrorKind, String)>>,
+    landed: std::sync::Condvar,
+    /// Set when the snapshot is dropped before its read finished: the reader stops early.
+    cancel: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: the raw buffer is shared by the rules above; everything else is already Sync.
+unsafe impl Send for StreamedFile {}
+unsafe impl Sync for StreamedFile {}
+
+impl StreamedFile {
+    fn open(path: &Path) -> io::Result<std::sync::Arc<Self>> {
+        let mut file = fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| corrupt("snapshot larger than the address space"))?;
+        // Zeroed via calloc, so these are untouched zero pages until the read writes each once.
+        let ptr = Box::into_raw(vec![0u8; len].into_boxed_slice()) as *mut u8;
+        let sf = std::sync::Arc::new(StreamedFile {
+            ptr,
+            len,
+            filled: AtomicUsize::new(0),
+            failure: Mutex::new(None),
+            landed: std::sync::Condvar::new(),
+            cancel: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bg = sf.clone();
+        std::thread::Builder::new()
+            .name("snapshot-read".into())
+            .spawn(move || bg.fill(&mut file))?;
+        Ok(sf)
+    }
+
+    fn fill(&self, file: &mut fs::File) {
+        use std::io::Read as _;
+        const READ_CHUNK: usize = 8 << 20;
+        let mut at = 0;
+        while at < self.len {
+            if self.cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let n = (self.len - at).min(READ_CHUNK);
+            // SAFETY: `at..at + n` is past `filled`, so no slice of it has been handed out.
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.add(at), n) };
+            match file.read(dst) {
+                Ok(0) => {
+                    return self.fail(io::ErrorKind::UnexpectedEof, "the file shrank".into());
+                }
+                Ok(k) => {
+                    at += k;
+                    self.filled.store(at, Ordering::Release);
+                    // Taken so a waiter between its check and its wait cannot miss this.
+                    let _g = self.failure.lock().unwrap();
+                    self.landed.notify_all();
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return self.fail(e.kind(), e.to_string()),
+            }
+        }
+    }
+
+    fn fail(&self, kind: io::ErrorKind, msg: String) {
+        *self.failure.lock().unwrap() = Some((kind, format!("snapshot read: {msg}")));
+        self.landed.notify_all();
+    }
+
+    /// Block until the first `end` bytes have landed.
+    fn wait_for(&self, end: usize) -> io::Result<()> {
+        if end > self.len {
+            return Err(corrupt("truncated"));
+        }
+        if self.filled.load(Ordering::Acquire) >= end {
+            return Ok(());
+        }
+        let mut failure = self.failure.lock().unwrap();
+        loop {
+            if self.filled.load(Ordering::Acquire) >= end {
+                return Ok(());
+            }
+            if let Some((kind, msg)) = &*failure {
+                return Err(io::Error::new(*kind, msg.clone()));
+            }
+            failure = self.landed.wait(failure).unwrap();
+        }
+    }
+
+    /// `n` bytes at `off`, which the caller has already waited for.
+    fn slice(&self, off: usize, n: usize) -> &[u8] {
+        assert!(off + n <= self.filled.load(Ordering::Acquire));
+        // SAFETY: landed bytes below `filled` are never written again.
+        unsafe { std::slice::from_raw_parts(self.ptr.add(off), n) }
+    }
+
+    /// The whole file, once it has all landed.
+    #[cfg(test)]
+    fn all(&self) -> io::Result<&[u8]> {
+        self.wait_for(self.len)?;
+        Ok(self.slice(0, self.len))
+    }
+}
+
+impl Drop for StreamedFile {
+    fn drop(&mut self) {
+        // SAFETY: the allocation `open` made; the reader thread's Arc is gone, so nothing else
+        // can touch it.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr, self.len)) });
+    }
+}
+
+/// A parsed-and-verified snapshot head, plus the file still streaming in behind it, from which
+/// [`Self::apply_ram`] applies the RAM frames straight into guest memory as they land.
 pub struct SnapshotFile {
     pub head: SnapshotHead,
-    raw: Vec<u8>,
+    raw: std::sync::Arc<StreamedFile>,
     /// Byte offset of the RAM section (the u32 region count) within `raw`.
     ram_off: usize,
+}
+
+impl Drop for SnapshotFile {
+    fn drop(&mut self) {
+        // Nothing will read the rest; let the reader stop instead of finishing a multi-GB read.
+        self.raw.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Restore-side counters, for the operator-visible summary log line.
@@ -775,144 +932,160 @@ impl SnapshotFile {
     /// Parallel across a worker pool; frames target disjoint ranges. Fails closed on any frame
     /// CRC/shape mismatch or an out-of-range write.
     pub fn apply_ram(&self, mem: &GuestMemoryMmap) -> io::Result<ApplyStats> {
-        let mut r = Reader {
-            buf: &self.raw,
-            pos: self.ram_off,
-        };
+        use std::time::{Duration, Instant};
+        let workers = ram_workers();
         let mut stats = ApplyStats::default();
-        let region_count = r.u32()? as usize;
-        let mut frames: Vec<FrameRef> = Vec::new();
-        let mut max_chunk = 0usize;
-        for _ in 0..region_count {
-            let gpa = r.u64()?;
-            let len = r.u64()?;
-            let chunk = r.u32()? as u64;
-            let nframes = r.u32()? as usize;
-            if chunk == 0 {
-                return Err(corrupt("zero chunk size"));
-            }
-            if nframes as u64 != len.div_ceil(chunk) {
-                return Err(corrupt("frame count does not cover the region"));
-            }
-            stats.ram_bytes += len;
-            max_chunk = max_chunk.max(chunk as usize);
-            for _ in 0..nframes {
-                let off = r.u64()?;
-                let kind = r.u8()?;
-                if off >= len || off % chunk != 0 {
-                    return Err(corrupt("frame offset out of range"));
-                }
-                let ulen = (len - off).min(chunk) as usize;
-                let (crc, data_off, data_len) = match kind {
-                    FRAME_ZERO => (0, 0, 0),
-                    FRAME_LZ4 | FRAME_RAW => {
-                        let crc = r.u32()?;
-                        let dlen = r.u64()? as usize;
-                        let start = r.pos;
-                        r.take(dlen)?;
-                        (crc, start, dlen)
-                    }
-                    _ => return Err(corrupt("bad frame kind")),
-                };
-                frames.push(FrameRef {
-                    gpa: gpa + off,
-                    ulen,
-                    kind,
-                    crc,
-                    data_off,
-                    data_len,
-                });
-            }
-        }
-        if r.pos != self.raw.len() {
-            return Err(corrupt("trailing garbage after RAM section"));
-        }
-        stats.zero_frames = frames.iter().filter(|f| f.kind == FRAME_ZERO).count() as u64;
-        stats.data_frames = frames.len() as u64 - stats.zero_frames;
-
-        let next = AtomicUsize::new(0);
         let first_err: Mutex<Option<io::Error>> = Mutex::new(None);
+        let failed = || first_err.lock().unwrap().is_some();
         let decode_ns = std::sync::atomic::AtomicU64::new(0);
         let store_ns = std::sync::atomic::AtomicU64::new(0);
+        // This thread walks the frame index while the file is still landing, and hands each
+        // frame to the pool as soon as its bytes are in, so a cold resume's IO overlaps the
+        // decompress rather than preceding it. It follows that RAM is written before the whole
+        // file has been validated — as a frame failing its CRC always could — and a failed
+        // apply fails the restore, whose worker then exits with the memory it wrote.
+        let (tx, rx) = crossbeam_channel::bounded::<FrameRef>(workers * 4);
         std::thread::scope(|s| {
-            for _ in 0..ram_workers() {
-                let next = &next;
+            for _ in 0..workers {
+                let rx = rx.clone();
                 let first_err = &first_err;
-                let frames = &frames;
-                let raw = &self.raw;
+                let raw = &*self.raw;
                 let (decode_ns, store_ns) = (&decode_ns, &store_ns);
                 s.spawn(move || {
-                    let mut outbuf = vec![0u8; max_chunk];
-                    let zeros = vec![0u8; max_chunk];
-                    let store = std::cell::Cell::new(std::time::Duration::ZERO);
-                    let mut busy = std::time::Duration::ZERO;
-                    let account = |busy: std::time::Duration| {
-                        let store = store.get();
-                        decode_ns.fetch_add((busy - store).as_nanos() as u64, Ordering::Relaxed);
-                        store_ns.fetch_add(store.as_nanos() as u64, Ordering::Relaxed);
-                    };
-                    loop {
-                        let idx = next.fetch_add(1, Ordering::Relaxed);
-                        if idx >= frames.len() || first_err.lock().unwrap().is_some() {
-                            account(busy);
-                            return;
+                    let mut outbuf: Vec<u8> = Vec::new();
+                    let mut zeros: Vec<u8> = Vec::new();
+                    let (mut decode, mut store) = (Duration::ZERO, Duration::ZERO);
+                    // Drains to the end even after a failure, so the walk never blocks on a
+                    // full channel nobody is emptying.
+                    for f in rx.iter() {
+                        if first_err.lock().unwrap().is_some() {
+                            continue;
                         }
-                        let f = &frames[idx];
-                        let t = std::time::Instant::now();
-                        let res = (|| -> io::Result<()> {
-                            let write = |buf: &[u8]| {
-                                let t = std::time::Instant::now();
-                                let r = mem.write_slice(buf, GuestAddress(f.gpa)).map_err(|e| {
+                        let buf = if f.kind == FRAME_ZERO {
+                            &mut zeros
+                        } else {
+                            &mut outbuf
+                        };
+                        if buf.len() < f.ulen {
+                            buf.resize(f.ulen, 0);
+                        }
+                        let t = Instant::now();
+                        // Ok(time spent storing into guest RAM).
+                        let res = (|| -> io::Result<Duration> {
+                            let write = |buf: &[u8]| -> io::Result<Duration> {
+                                let t = Instant::now();
+                                mem.write_slice(buf, GuestAddress(f.gpa)).map_err(|e| {
                                     io::Error::other(format!(
                                         "snapshot: writing RAM at 0x{:x}: {e:?}",
                                         f.gpa
                                     ))
-                                });
-                                store.set(store.get() + t.elapsed());
-                                r
+                                })?;
+                                Ok(t.elapsed())
                             };
-                            match f.kind {
-                                FRAME_ZERO => write(&zeros[..f.ulen]),
-                                kind => {
-                                    let data = &raw[f.data_off..f.data_off + f.data_len];
-                                    if crc32(data) != f.crc {
-                                        return Err(corrupt("frame CRC mismatch"));
-                                    }
-                                    if kind == FRAME_RAW {
-                                        if data.len() != f.ulen {
-                                            return Err(corrupt("raw frame length mismatch"));
-                                        }
-                                        write(data)
-                                    } else {
-                                        let n = lz4_flex::block::decompress_into(
-                                            data,
-                                            &mut outbuf[..f.ulen],
-                                        )
-                                        .map_err(|e| {
-                                            corrupt(&format!("frame decompress failed: {e}"))
-                                        })?;
-                                        if n != f.ulen {
-                                            return Err(corrupt(
-                                                "frame decompressed size mismatch",
-                                            ));
-                                        }
-                                        write(&outbuf[..f.ulen])
-                                    }
-                                }
+                            if f.kind == FRAME_ZERO {
+                                return write(&zeros[..f.ulen]);
                             }
+                            let data = raw.slice(f.data_off, f.data_len);
+                            if crc32(data) != f.crc {
+                                return Err(corrupt("frame CRC mismatch"));
+                            }
+                            if f.kind == FRAME_RAW {
+                                if data.len() != f.ulen {
+                                    return Err(corrupt("raw frame length mismatch"));
+                                }
+                                return write(data);
+                            }
+                            let n = lz4_flex::block::decompress_into(data, &mut outbuf[..f.ulen])
+                                .map_err(|e| {
+                                corrupt(&format!("frame decompress failed: {e}"))
+                            })?;
+                            if n != f.ulen {
+                                return Err(corrupt("frame decompressed size mismatch"));
+                            }
+                            write(&outbuf[..f.ulen])
                         })();
-                        busy += t.elapsed();
-                        if let Err(e) = res {
-                            first_err.lock().unwrap().get_or_insert(e);
-                            account(busy);
-                            return;
+                        let busy = t.elapsed();
+                        match res {
+                            Ok(st) => {
+                                store += st;
+                                decode += busy.saturating_sub(st);
+                            }
+                            Err(e) => {
+                                first_err.lock().unwrap().get_or_insert(e);
+                            }
                         }
                     }
+                    decode_ns.fetch_add(decode.as_nanos() as u64, Ordering::Relaxed);
+                    store_ns.fetch_add(store.as_nanos() as u64, Ordering::Relaxed);
                 });
             }
+            drop(rx);
+            let walk = (|| -> io::Result<()> {
+                let mut r = Reader::file(&self.raw, self.ram_off);
+                let region_count = r.u32()? as usize;
+                for _ in 0..region_count {
+                    let gpa = r.u64()?;
+                    let len = r.u64()?;
+                    let chunk = r.u32()? as u64;
+                    let nframes = r.u32()? as usize;
+                    if chunk == 0 {
+                        return Err(corrupt("zero chunk size"));
+                    }
+                    if nframes as u64 != len.div_ceil(chunk) {
+                        return Err(corrupt("frame count does not cover the region"));
+                    }
+                    stats.ram_bytes += len;
+                    for _ in 0..nframes {
+                        let off = r.u64()?;
+                        let kind = r.u8()?;
+                        if off >= len || off % chunk != 0 {
+                            return Err(corrupt("frame offset out of range"));
+                        }
+                        let ulen = (len - off).min(chunk) as usize;
+                        let (crc, data_off, data_len) = match kind {
+                            FRAME_ZERO => (0, 0, 0),
+                            FRAME_LZ4 | FRAME_RAW => {
+                                let crc = r.u32()?;
+                                let dlen = r.u64()? as usize;
+                                let start = r.pos;
+                                r.take(dlen)?;
+                                (crc, start, dlen)
+                            }
+                            _ => return Err(corrupt("bad frame kind")),
+                        };
+                        if kind == FRAME_ZERO {
+                            stats.zero_frames += 1;
+                        } else {
+                            stats.data_frames += 1;
+                        }
+                        if failed()
+                            || tx
+                                .send(FrameRef {
+                                    gpa: gpa + off,
+                                    ulen,
+                                    kind,
+                                    crc,
+                                    data_off,
+                                    data_len,
+                                })
+                                .is_err()
+                        {
+                            return Ok(()); // a worker failed; its error is the one to report
+                        }
+                    }
+                }
+                if r.pos != self.raw.len {
+                    return Err(corrupt("trailing garbage after RAM section"));
+                }
+                Ok(())
+            })();
+            drop(tx);
+            if let Err(e) = walk {
+                first_err.lock().unwrap().get_or_insert(e);
+            }
         });
-        stats.decode = std::time::Duration::from_nanos(decode_ns.into_inner());
-        stats.store = std::time::Duration::from_nanos(store_ns.into_inner());
+        stats.decode = Duration::from_nanos(decode_ns.into_inner());
+        stats.store = Duration::from_nanos(store_ns.into_inner());
         match first_err.into_inner().unwrap() {
             Some(e) => Err(e),
             None => Ok(stats),
@@ -1067,15 +1240,11 @@ fn decode_usb(r: &mut Reader) -> io::Result<XhciState> {
 /// Read + verify a snapshot's head from `path` (magic, version, head CRC). The RAM frames are
 /// verified per-frame when [`SnapshotFile::apply_ram`] runs.
 pub fn read(path: &Path) -> io::Result<SnapshotFile> {
-    // A plain read, deliberately. It reads a cold file at the SSD's rate. Mapping the file
-    // instead won 0.3 s warm but lost 0.4 s cold: the apply pool faulted it in with small
-    // synchronous reads. Parallel preads and MADV_WILLNEED were no better cold either
-    // (spikes/suspend-perf).
-    let raw = fs::read(path)?;
-    if raw.len() < 16 {
+    let raw = StreamedFile::open(path)?;
+    if raw.len < 16 {
         return Err(corrupt("too small"));
     }
-    let mut r = Reader { buf: &raw, pos: 0 };
+    let mut r = Reader::file(&raw, 0);
     if r.take(8)? != MAGIC {
         return Err(corrupt("bad magic"));
     }
@@ -1198,7 +1367,7 @@ pub fn read(path: &Path) -> io::Result<SnapshotFile> {
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
     let head_end = r.pos;
     let stored = r.u32()?;
-    if crc32(&raw[..head_end]) != stored {
+    if crc32(raw.slice(0, head_end)) != stored {
         return Err(corrupt("head CRC mismatch"));
     }
     let ram_off = r.pos;
@@ -1574,7 +1743,7 @@ mod tests {
     fn usb_section_rejects_implausible_counts() {
         let mut v = Vec::new();
         put_u32(&mut v, 0xffff_ffff); // a "slot count" of 4 billion
-        let mut r = Reader { buf: &v, pos: 0 };
+        let mut r = Reader::mem(&v);
         let err = bounded_count(&mut r, 256, "usb slot").expect_err("must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -1601,7 +1770,7 @@ mod tests {
         // And a length that would overflow u32 must survive the u64 round-trip in the header.
         let mut h = Vec::new();
         put_u64(&mut h, 0x1_0000_0000u64); // exactly 4 GiB — the value a u32 truncates to 0
-        let mut r = Reader { buf: &h, pos: 0 };
+        let mut r = Reader::mem(&h);
         assert_eq!(r.u64().unwrap(), 0x1_0000_0000u64);
     }
 
@@ -1670,6 +1839,23 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// A restore that fails before `apply_ram` drops its snapshot while the file is still
+    /// streaming in. The reader must stop on its own; the buffer it writes into outlives it.
+    #[test]
+    fn a_snapshot_dropped_mid_read_lets_its_reader_go() {
+        let path =
+            std::env::temp_dir().join(format!("limina-snap-drop-{}.bin", std::process::id()));
+        let _ = write_sample(&path);
+        for _ in 0..20 {
+            let f = read(&path).expect("sample snapshot reads");
+            drop(f);
+        }
+        // And a full read + apply after all that still works.
+        let got = read(&path).unwrap();
+        got.apply_ram(&test_mem()).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn snapshot_rejects_truncation() {
         let path =
@@ -1726,10 +1912,7 @@ mod tests {
 
     /// The RAM regions a snapshot file covers, read back from its region headers.
     fn file_regions(f: &SnapshotFile) -> Vec<(u64, u64)> {
-        let mut r = Reader {
-            buf: &f.raw,
-            pos: f.ram_off,
-        };
+        let mut r = Reader::file(&f.raw, f.ram_off);
         let mut regions = Vec::new();
         for _ in 0..r.u32().unwrap() {
             let gpa = r.u64().unwrap();
@@ -1762,22 +1945,27 @@ mod tests {
             return;
         };
         let src = Path::new(&src);
-        let t = Instant::now();
-        let f = read(src).unwrap();
-        eprintln!(
-            "bench: read + head verify {:.2}s ({} MiB)",
-            t.elapsed().as_secs_f64(),
-            f.raw.len() >> 20
-        );
-
-        let regions = file_regions(&f);
+        // The region list comes from walking the whole file, which would wait for all of it and
+        // hide the read/apply overlap under test. LIMINA_SNAPSHOT_BENCH_INDEX names a copy to
+        // take it from instead, so a cold `src` stays cold until the timed read.
+        let index = std::env::var_os("LIMINA_SNAPSHOT_BENCH_INDEX");
+        let regions = file_regions(&read(index.as_deref().map_or(src, Path::new)).unwrap());
         let ranges: Vec<_> = regions
             .iter()
             .map(|&(g, l)| (GuestAddress(g), l as usize))
             .collect();
         let mem = GuestMemoryMmap::from_ranges(&ranges).unwrap();
+
+        let t0 = Instant::now();
+        let f = read(src).unwrap();
+        eprintln!(
+            "bench: read + head verify {:.2}s ({} MiB)",
+            t0.elapsed().as_secs_f64(),
+            f.raw.len >> 20
+        );
         let t = Instant::now();
         let a = f.apply_ram(&mem).unwrap();
+        eprintln!("bench: read + apply {:.2}s", t0.elapsed().as_secs_f64());
         eprintln!(
             "bench: apply_ram {:.2}s ({} MiB, {} zero / {} data frames, {} workers; pool {:.2}s \
              decoding, {:.2}s storing)",
@@ -1793,12 +1981,12 @@ mod tests {
         // After the apply, deliberately: this pass faults the whole mapping in, and running it
         // first hid the restore's own page-in cost from apply_ram.
         let t = Instant::now();
-        let crc = crc32(&f.raw);
+        let crc = crc32(f.raw.all().unwrap());
         let s = t.elapsed().as_secs_f64();
         eprintln!(
             "bench: crc32 one thread over the (now mapped-in) file {:.2}s ({:.2} GB/s, {crc:08x})",
             s,
-            f.raw.len() as f64 / s / 1e9
+            f.raw.len as f64 / s / 1e9
         );
 
         // The save is dominated by CPU in the pool but its file write adds run-to-run noise, so
