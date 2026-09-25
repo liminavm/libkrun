@@ -2524,3 +2524,252 @@ mod tests {
         assert_eq!(next.control & 1, 0, "and nothing follows it on the ring");
     }
 }
+
+/// Every sequence of slot commands to a fixed depth, against a model of the slot table kept
+/// outside the controller (limina's `docs/design/in-crate-checkers.md`, exhaustive enumeration).
+///
+/// The model is the xHCI spec's (4.6) where it decides something the host depends on: which slots
+/// exist, the state each command leaves a slot in, and that only a Configured slot has data
+/// endpoints. It departs from the spec in two places, both the controller's chosen behaviour:
+///
+/// - A command naming a slot that is not enabled completes with nothing changed, where the spec
+///   says Slot Not Enabled. A restore drops the slots of a device that went away across a suspend,
+///   and the guest's teardown of them must complete or it wedges (see `restore_state`). Address
+///   Device alone refuses, because it would otherwise create the slot.
+/// - A command in the wrong *state* (re-addressing an Addressed slot, configuring one never
+///   addressed, resetting a Default one) is accepted where the spec says Context State Error.
+///   None of those reaches anything unsafe, and no driver issues them.
+#[cfg(test)]
+mod every_sequence {
+    use super::*;
+    use crate::usb::mock::MockUsbDevice;
+    use crate::usb::xhci::context::slot_state as ss;
+    use utils::eventfd::EventFd;
+
+    const DEPTH: usize = 4;
+    /// Slots a command may name: two the walk can enable, and one it never can.
+    const SLOTS: [u8; 3] = [1, 2, 200];
+    /// The data endpoint Configure Endpoint adds (EP1 IN).
+    const DCI: u8 = 3;
+    const DCBAA: u64 = 0x9000;
+    const ADDRESS_CTX: u64 = 0x6000;
+    const CONFIG_CTX: u64 = 0x6800;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Cmd {
+        Enable,
+        Disable(u8),
+        Address(u8, bool),
+        Configure(u8, bool),
+        ResetDevice(u8),
+        StopEp(u8),
+        ResetEp(u8),
+    }
+
+    fn all_cmds() -> Vec<Cmd> {
+        let mut v = vec![Cmd::Enable];
+        for s in SLOTS {
+            v.extend([
+                Cmd::Disable(s),
+                Cmd::Address(s, false),
+                Cmd::Address(s, true),
+                Cmd::Configure(s, false),
+                Cmd::Configure(s, true),
+                Cmd::ResetDevice(s),
+                Cmd::StopEp(s),
+                Cmd::ResetEp(s),
+            ]);
+        }
+        v
+    }
+
+    fn trb(cmd: Cmd) -> Trb {
+        let (ty, slot, param, extra) = match cmd {
+            Cmd::Enable => (trb_type::ENABLE_SLOT, 0, 0, 0),
+            Cmd::Disable(s) => (trb_type::DISABLE_SLOT, s, 0, 0),
+            Cmd::Address(s, bsr) => (
+                trb_type::ADDRESS_DEVICE,
+                s,
+                ADDRESS_CTX,
+                if bsr { CTRL_BSR } else { 0 },
+            ),
+            Cmd::Configure(s, dc) => (
+                trb_type::CONFIGURE_ENDPOINT,
+                s,
+                CONFIG_CTX,
+                if dc { CTRL_DC } else { 0 },
+            ),
+            Cmd::ResetDevice(s) => (trb_type::RESET_DEVICE, s, 0, 0),
+            Cmd::StopEp(s) => (trb_type::STOP_ENDPOINT, s, 0, u32::from(DCI) << 16),
+            Cmd::ResetEp(s) => (trb_type::RESET_ENDPOINT, s, 0, u32::from(DCI) << 16),
+        };
+        Trb {
+            parameter: param,
+            status: 0,
+            control: (ty << 10) | (u32::from(slot) << 24) | extra,
+        }
+    }
+
+    /// Guest RAM laid out once: a DCBAA covering every slot id, an Address Device input context
+    /// for port 1, and a Configure Endpoint input context adding an interrupt IN endpoint.
+    fn ram() -> GuestMemoryMmap {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
+        for slot in 0..=255u64 {
+            m.write_obj::<u64>(0x2_0000 + slot * 0x400, GuestAddress(DCBAA + slot * 8))
+                .unwrap();
+        }
+        Ctx32([0, 0b11, 0, 0, 0, 0, 0, 0])
+            .write(&m, ADDRESS_CTX)
+            .unwrap();
+        Ctx32([0, 1 << 16, 0, 0, 0, 0, 0, 0])
+            .write(&m, ADDRESS_CTX + INPUT_SLOT_OFFSET)
+            .unwrap();
+        Ctx32([0, (4 << 3) | (64 << 16), 0x7001, 0, 0, 0, 0, 0])
+            .write(&m, ADDRESS_CTX + input_ep_offset(1))
+            .unwrap();
+        Ctx32([0, 1 | (1 << DCI), 0, 0, 0, 0, 0, 0])
+            .write(&m, CONFIG_CTX)
+            .unwrap();
+        Ctx32([u32::from(DCI) << 27, 1 << 16, 0, 0, 0, 0, 0, 0])
+            .write(&m, CONFIG_CTX + INPUT_SLOT_OFFSET)
+            .unwrap();
+        Ctx32([0, (7 << 3) | (64 << 16), 0x7401, 0, 0, 0, 0, 0])
+            .write(&m, CONFIG_CTX + input_ep_offset(DCI))
+            .unwrap();
+        m
+    }
+
+    /// The model's view of one enabled slot.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Model {
+        state: u32,
+        has_ep: bool,
+    }
+
+    /// What the spec says `cmd` answers and leaves behind, given the slots the model holds.
+    fn expect(model: &mut [Option<Model>; 9], cmd: Cmd) -> (u32, Option<u8>) {
+        let enabled =
+            |m: &[Option<Model>; 9], s: u8| m.get(s as usize).is_some_and(Option::is_some);
+        match cmd {
+            Cmd::Enable => match (1..=8).find(|&i| model[i].is_none()) {
+                Some(i) => {
+                    model[i] = Some(Model {
+                        state: ss::DISABLED_ENABLED,
+                        has_ep: false,
+                    });
+                    (cc::SUCCESS, Some(i as u8))
+                }
+                None => (cc::NO_SLOTS_AVAILABLE, None),
+            },
+            _ => {
+                let s = match cmd {
+                    Cmd::Disable(s)
+                    | Cmd::Address(s, _)
+                    | Cmd::Configure(s, _)
+                    | Cmd::ResetDevice(s)
+                    | Cmd::StopEp(s)
+                    | Cmd::ResetEp(s) => s,
+                    Cmd::Enable => unreachable!(),
+                };
+                if !enabled(model, s) {
+                    let code = match cmd {
+                        Cmd::Address(..) => cc::SLOT_NOT_ENABLED,
+                        _ => cc::SUCCESS,
+                    };
+                    return (code, Some(s));
+                }
+                let slot = &mut model[s as usize];
+                match cmd {
+                    Cmd::Disable(_) => *slot = None,
+                    Cmd::Address(_, bsr) => {
+                        *slot = Some(Model {
+                            state: if bsr { ss::DEFAULT } else { ss::ADDRESSED },
+                            has_ep: false,
+                        })
+                    }
+                    Cmd::Configure(_, dc) => {
+                        *slot = Some(Model {
+                            state: if dc { ss::ADDRESSED } else { ss::CONFIGURED },
+                            has_ep: !dc,
+                        })
+                    }
+                    Cmd::ResetDevice(_) => {
+                        *slot = Some(Model {
+                            state: ss::DEFAULT,
+                            has_ep: false,
+                        })
+                    }
+                    Cmd::StopEp(_) | Cmd::ResetEp(_) | Cmd::Enable => {}
+                }
+                (cc::SUCCESS, Some(s))
+            }
+        }
+    }
+
+    fn check(d: &XhciDevice, model: &[Option<Model>; 9], trail: &[Cmd]) {
+        for (id, (got, want)) in d.slots.iter().zip(model.iter()).enumerate() {
+            let got = got.as_ref().map(|s| Model {
+                state: s.state,
+                has_ep: s.eps.contains_key(&DCI),
+            });
+            assert_eq!(got, *want, "slot {id} after {trail:?}");
+            if let Some(s) = d.slots[id].as_ref() {
+                assert!(
+                    s.eps.is_empty() || s.state == ss::CONFIGURED,
+                    "slot {id} has data endpoints while not Configured, after {trail:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_slot_command_sequence_matches_the_model() {
+        let m = ram();
+        let cmds = all_cmds();
+        let mut walks = 0usize;
+        // The cases the walk exists for: an Address Device refused for a slot never enabled, and a
+        // Configured slot taken back down.
+        let (mut refused, mut unconfigured) = (0usize, 0usize);
+        let mut idx = vec![0usize; DEPTH];
+        loop {
+            let mut d = XhciDevice::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+            d.port_models[0] = Some(Arc::new(MockUsbDevice::new()));
+            d.set_dcbaap_for_test(DCBAA);
+            let mut model: [Option<Model>; 9] = Default::default();
+            let mut deferred = Vec::new();
+            for (n, &i) in idx.iter().enumerate() {
+                let cmd = cmds[i];
+                let was_configured = model.iter().flatten().any(|s| s.state == ss::CONFIGURED);
+                let (want_code, want_slot) = expect(&mut model, cmd);
+                let (code, slot) = d.run_command(&m, &trb(cmd), &mut deferred);
+                let trail = &idx[..=n].iter().map(|&i| cmds[i]).collect::<Vec<_>>();
+                assert_eq!(code, want_code, "completion code after {trail:?}");
+                if let Some(want) = want_slot {
+                    assert_eq!(slot, want, "completion slot after {trail:?}");
+                }
+                check(&d, &model, trail);
+                refused += usize::from(want_code == cc::SLOT_NOT_ENABLED);
+                unconfigured += usize::from(
+                    was_configured && !model.iter().flatten().any(|s| s.state == ss::CONFIGURED),
+                );
+                deferred.clear();
+            }
+            walks += 1;
+            // Next sequence, odometer style.
+            let mut k = DEPTH;
+            loop {
+                if k == 0 {
+                    assert_eq!(walks, cmds.len().pow(DEPTH as u32));
+                    assert!(refused > 0 && unconfigured > 0, "the walk missed its cases");
+                    return;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] < cmds.len() {
+                    break;
+                }
+                idx[k] = 0;
+            }
+        }
+    }
+}
