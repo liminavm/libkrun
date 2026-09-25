@@ -17,6 +17,7 @@ cargo-fuzz = true
 devices = { package = "krun-devices", path = "../src/devices", features = ["usb"] }
 libfuzzer-sys = "0.4"
 utils = { package = "krun-utils", path = "../src/utils" }
+vmm = { package = "krun-vmm", path = "../src/vmm", features = ["usb"] }
 vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
 
 [workspace]
@@ -25,6 +26,20 @@ members = ["."]
 [[bin]]
 name = "xhci_guest"
 path = "fuzz_targets/xhci_guest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_head"
+path = "fuzz_targets/snapshot_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_ram"
+path = "fuzz_targets/snapshot_ram.rs"
 test = false
 doc = false
 bench = false
