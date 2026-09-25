@@ -22,6 +22,7 @@ aws-nitro = []
 vhost-user = ["devices/vhost-user"]
 
 [dependencies]
+crc32fast = "1.5"
 crossbeam-channel = ">=0.5.15"
 flate2 = "1.0.35"
 libc = ">=0.2.39"

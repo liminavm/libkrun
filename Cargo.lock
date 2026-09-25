@@ -873,6 +873,7 @@ dependencies = [
  "bitfield",
  "bitflags 2.11.0",
  "bzip2",
+ "crc32fast",
  "crossbeam-channel",
  "flate2",
  "iocuddle",
