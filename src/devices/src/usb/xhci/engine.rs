@@ -446,6 +446,12 @@ impl XhciDevice {
         let slot_id = trb.slot_id();
         let bsr = trb.control & CTRL_BSR != 0;
         let input = trb.parameter & !0xf;
+        // The slot is a byte the guest wrote into the command. Only one Enable Slot handed out
+        // may be addressed (xHCI 4.6.5): anything else would index past the slot table, or
+        // conjure a slot the guest never enabled.
+        if slot_id == 0 || !matches!(self.slots.get(slot_id as usize), Some(Some(_))) {
+            return (cc::SLOT_NOT_ENABLED, slot_id);
+        }
 
         let result = (|| -> Result<u8, u32> {
             let ictl = Ctx32::read(mem, input).map_err(|_| cc::TRB_ERROR)?;
@@ -1718,6 +1724,53 @@ mod tests {
             oep0.0[0] & 0x7,
             crate::usb::xhci::context::ep_state::RUNNING
         );
+    }
+
+    /// Address Device names its slot in the command TRB, a byte the guest chooses. A slot the
+    /// guest never enabled -- past the table, slot 0, or in range but vacant -- is Slot Not
+    /// Enabled (xHCI 4.6.5), and must leave the slot table alone. RED before the check: slot 255
+    /// indexed the 9-entry table and panicked the worker with the controller locked (found by the
+    /// `xhci_guest` fuzz target), and a vacant in-range slot was silently created.
+    #[test]
+    fn address_device_refuses_a_slot_it_never_enabled() {
+        let m = mem();
+        let dev = new_dev();
+        let dcbaap = 0x9000u64;
+        {
+            let mut d = dev.lock().unwrap();
+            d.port_models[0] = Some(Arc::new(MockUsbDevice::new()));
+            d.event_ring = Some(EventRing::new(0x3000, 16));
+            d.set_dcbaap_for_test(dcbaap);
+        }
+        for slot in 0..=255u64 {
+            m.write_obj::<u64>(0x8000, GuestAddress(dcbaap + slot * 8))
+                .unwrap_or(());
+        }
+        Ctx32([0, 0b11, 0, 0, 0, 0, 0, 0])
+            .write(&m, 0x6000)
+            .unwrap();
+        Ctx32([0, 1 << 16, 0, 0, 0, 0, 0, 0])
+            .write(&m, 0x6000 + INPUT_SLOT_OFFSET)
+            .unwrap();
+        let mut iep0 = Ctx32::default();
+        iep0.0[2] = 0x7001;
+        iep0.write(&m, 0x6000 + input_ep_offset(1)).unwrap();
+
+        let mut deferred = Vec::new();
+        for slot_id in [255u32, 0, 3] {
+            let mut d = dev.lock().unwrap();
+            let trb = Trb {
+                parameter: 0x6000,
+                status: 0,
+                control: (trb_type::ADDRESS_DEVICE << 10) | (slot_id << 24),
+            };
+            let (code, _) = d.run_command(&m, &trb, &mut deferred);
+            assert_eq!(code, cc::SLOT_NOT_ENABLED, "slot {slot_id}");
+            assert!(
+                d.slots.iter().all(Option::is_none),
+                "slot {slot_id} changed the slot table"
+            );
+        }
     }
 
     #[test]
