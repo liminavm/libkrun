@@ -1634,4 +1634,134 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
+
+    /// The frame and head CRCs are part of the on-disk format: whatever computes them must stay
+    /// the reflected IEEE 802.3 CRC-32, or every snapshot already on disk fails to restore.
+    #[test]
+    fn crc32_is_ieee_802_3() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(&[]), 0);
+        // Bit-by-bit reference over a buffer long and odd enough to cross any vector stride.
+        let data: Vec<u8> = (0..100_003u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut want: u32 = 0xFFFF_FFFF;
+        for &b in &data {
+            want ^= b as u32;
+            for _ in 0..8 {
+                want = if want & 1 != 0 {
+                    0xEDB8_8320 ^ (want >> 1)
+                } else {
+                    want >> 1
+                };
+            }
+        }
+        assert_eq!(crc32(&data), !want);
+        assert_eq!(crc32(&data[7..]), {
+            let mut c: u32 = 0xFFFF_FFFF;
+            for &b in &data[7..] {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        });
+    }
+
+    /// The RAM regions a snapshot file covers, read back from its region headers.
+    fn file_regions(f: &SnapshotFile) -> Vec<(u64, u64)> {
+        let mut r = Reader {
+            buf: &f.raw,
+            pos: f.ram_off,
+        };
+        let mut regions = Vec::new();
+        for _ in 0..r.u32().unwrap() {
+            let gpa = r.u64().unwrap();
+            let len = r.u64().unwrap();
+            let _chunk = r.u32().unwrap();
+            for _ in 0..r.u32().unwrap() {
+                let _off = r.u64().unwrap();
+                if r.u8().unwrap() != FRAME_ZERO {
+                    let _crc = r.u32().unwrap();
+                    let dlen = r.u64().unwrap() as usize;
+                    r.take(dlen).unwrap();
+                }
+            }
+            regions.push((gpa, len));
+        }
+        regions
+    }
+
+    /// Suspend/resume RAM-path bench on a REAL snapshot (spikes/suspend-perf): read + apply it
+    /// into fresh guest memory, then save that memory again, timing each phase. Needs RAM for
+    /// the whole guest plus the file; run it in release, alone:
+    ///   LIMINA_SNAPSHOT_BENCH=<snapshot> cargo test --release -p vmm --lib \
+    ///     snapshot::tests::bench_real_snapshot -- --ignored --nocapture
+    #[test]
+    #[ignore = "bench: needs LIMINA_SNAPSHOT_BENCH=<snapshot file>"]
+    fn bench_real_snapshot() {
+        use std::time::Instant;
+        let Some(src) = std::env::var_os("LIMINA_SNAPSHOT_BENCH") else {
+            eprintln!("LIMINA_SNAPSHOT_BENCH unset; nothing to bench");
+            return;
+        };
+        let src = Path::new(&src);
+        let t = Instant::now();
+        let f = read(src).unwrap();
+        eprintln!(
+            "bench: read + head verify {:.2}s ({} MiB)",
+            t.elapsed().as_secs_f64(),
+            f.raw.len() >> 20
+        );
+
+        let t = Instant::now();
+        let crc = crc32(&f.raw);
+        let s = t.elapsed().as_secs_f64();
+        eprintln!(
+            "bench: crc32 one thread over the file {:.2}s ({:.2} GB/s, {crc:08x})",
+            s,
+            f.raw.len() as f64 / s / 1e9
+        );
+
+        let regions = file_regions(&f);
+        let ranges: Vec<_> = regions
+            .iter()
+            .map(|&(g, l)| (GuestAddress(g), l as usize))
+            .collect();
+        let mem = GuestMemoryMmap::from_ranges(&ranges).unwrap();
+        let t = Instant::now();
+        let a = f.apply_ram(&mem).unwrap();
+        eprintln!(
+            "bench: apply_ram {:.2}s ({} MiB, {} zero / {} data frames, {} workers)",
+            t.elapsed().as_secs_f64(),
+            a.ram_bytes >> 20,
+            a.zero_frames,
+            a.data_frames,
+            ram_workers()
+        );
+
+        // The save is dominated by CPU in the pool but its file write adds run-to-run noise, so
+        // repeat it and report the spread.
+        let out = src.with_extension("bench-out");
+        let mut secs = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let w = write_streaming(&out, &f.head, &mem, &regions).unwrap();
+            secs.push(t.elapsed().as_secs_f64());
+            let _ = fs::remove_file(&out);
+            assert_eq!(w.ram_bytes, a.ram_bytes);
+            assert_eq!(w.zero_frames, a.zero_frames);
+        }
+        eprintln!("bench: write_streaming x5 {secs:.2?}");
+        secs.sort_by(f64::total_cmp);
+        eprintln!(
+            "bench: write_streaming min {:.2}s median {:.2}s",
+            secs[0], secs[2]
+        );
+    }
 }
