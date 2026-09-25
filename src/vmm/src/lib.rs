@@ -773,6 +773,16 @@ impl Vmm {
             .map_err(Error::SnapshotIo)?;
         std::fs::rename(&tmp, path).map_err(Error::SnapshotIo)?;
         info!(
+            "snapshot write: head encode {:.2}s; writer {:.2}s in write, {:.2}s waiting on the \
+             pool; pool {:.1}s working, {:.1}s blocked on the writer ({} workers)",
+            stats.head.as_secs_f32(),
+            stats.write.as_secs_f32(),
+            stats.wait.as_secs_f32(),
+            stats.work.as_secs_f32(),
+            stats.stall.as_secs_f32(),
+            stats.workers,
+        );
+        info!(
             "snapshot written: {} vCPUs, {}-byte GIC, {} RAM regions, {} MiB RAM -> {} MiB file \
              ({} zero / {} lz4 / {} raw frames) in {:.1}s -> {}",
             head.vcpus.len(),

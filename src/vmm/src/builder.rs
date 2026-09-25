@@ -1342,11 +1342,14 @@ pub fn build_microvm(
             StartMicrovmError::Internal(crate::Error::Snapshot)
         })?;
         info!(
-            "restore: applied {} MiB RAM ({} zero / {} data frames) in {:.1}s",
+            "restore: applied {} MiB RAM ({} zero / {} data frames) in {:.1}s (pool: {:.1}s \
+             decoding, {:.1}s storing into guest RAM)",
             stats.ram_bytes >> 20,
             stats.zero_frames,
             stats.data_frames,
-            t0.elapsed().as_secs_f32()
+            t0.elapsed().as_secs_f32(),
+            stats.decode.as_secs_f32(),
+            stats.store.as_secs_f32()
         );
     }
 
