@@ -72,11 +72,16 @@ const FRAME_ZERO: u8 = 0;
 const FRAME_LZ4: u8 = 1;
 const FRAME_RAW: u8 = 2;
 
-/// Worker-pool width for the RAM save/restore paths: leave headroom for the VMM's own threads,
-/// and past ~8 workers the memcpy/lz4 pipeline is memory-bandwidth-bound anyway.
+/// Worker-pool width for the RAM save/restore paths: every core but two, which stay free for the
+/// VMM's own threads (the vCPUs are parked for both paths).
+///
+/// There is no upper cap. One used to sit at 8 on the belief that the pipeline was
+/// memory-bandwidth-bound past that, but a 10 GiB save moves ~10 GB/s, a few percent of the
+/// bandwidth; the save is lz4-bound and scales with workers (bench_real_snapshot, M4 Pro, lived-in
+/// 10 GiB guest: 8 workers 1.13 s, 11 workers 0.92 s, 14 workers 0.87 s).
 fn ram_workers() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).clamp(2, 8))
+        .map(|n| n.get().saturating_sub(2).max(2))
         .unwrap_or(4)
 }
 
