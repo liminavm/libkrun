@@ -76,7 +76,67 @@ struct RamRegion {
     len: u64,
 }
 
-pub struct ReleasedRam {
+/// What [`ReleasedRam`] does to the guest's stage-2 mappings and to the host pages behind them.
+/// [`Hvf`] is Hypervisor.framework and `madvise`; the tests put a model of both here.
+///
+/// Measured HVF semantics the bookkeeping rests on: `hv_vm_unmap` is page-wise and idempotent (it
+/// succeeds over any mix of mapped and unmapped pages), and `hv_vm_map` fails on any overlap with
+/// a live mapping.
+pub trait Stage2: Send + Sync {
+    fn unmap(&self, gpa: u64, len: u64) -> hv_return_t;
+    fn map(&self, host: u64, gpa: u64, len: u64) -> hv_return_t;
+    /// Zero the host range if `zero`, then mark it `MADV_FREE_REUSABLE`.
+    ///
+    /// # Safety
+    ///
+    /// `[host, host + len)` lies inside a guest RAM region's host mapping and is unmapped from the
+    /// guest, so nothing else writes it.
+    unsafe fn discard(&self, host: u64, len: u64, zero: bool) -> std::io::Result<()>;
+    /// Mark the host range `MADV_FREE_REUSE`.
+    fn reuse(&self, host: u64, len: u64) -> std::io::Result<()>;
+}
+
+pub struct Hvf;
+
+impl Stage2 for Hvf {
+    fn unmap(&self, gpa: u64, len: u64) -> hv_return_t {
+        unsafe { hv_vm_unmap(gpa, len as usize) }
+    }
+
+    fn map(&self, host: u64, gpa: u64, len: u64) -> hv_return_t {
+        unsafe {
+            hv_vm_map(
+                host as *mut core::ffi::c_void,
+                gpa,
+                len as usize,
+                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+            )
+        }
+    }
+
+    unsafe fn discard(&self, host: u64, len: u64, zero: bool) -> std::io::Result<()> {
+        if zero {
+            // SAFETY: the caller's contract: guest RAM, unmapped from the guest.
+            unsafe { std::ptr::write_bytes(host as *mut u8, 0, len as usize) };
+        }
+        madvise(host, len, libc::MADV_FREE_REUSABLE)
+    }
+
+    fn reuse(&self, host: u64, len: u64) -> std::io::Result<()> {
+        madvise(host, len, libc::MADV_FREE_REUSE)
+    }
+}
+
+fn madvise(host: u64, len: u64, advice: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::madvise(host as *mut libc::c_void, len as usize, advice) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+pub struct ReleasedRam<S: Stage2 = Hvf> {
+    stage2: S,
     regions: Vec<RamRegion>,
     /// Released GPA ranges: start -> len, disjoint, coalesced. Exact by construction: every
     /// byte in here is stage-2 unmapped and only bytes in here are (balloon-released) ones.
@@ -124,6 +184,27 @@ impl ReleasedRam {
     /// `regions` are the guest RAM regions as `(gpa, host_va, len)`. Regions not aligned to
     /// the host page granule are dropped (loudly): release/heal must never round.
     pub fn new(regions: Vec<(u64, u64, u64)>) -> Self {
+        let chunk_mib = std::env::var("LIMINA_BALLOON_REMAP_CHUNK_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2);
+        let zero_on_release = match std::env::var("LIMINA_BALLOON_RELEASE_MEMSET").as_deref() {
+            Ok("1") => ZeroOnRelease::All,
+            Ok("0") | Ok("none") => ZeroOnRelease::None,
+            _ => ZeroOnRelease::InflateQueue,
+        };
+        Self::with_stage2(Hvf, regions, chunk_mib << 20, zero_on_release)
+    }
+}
+
+impl<S: Stage2> ReleasedRam<S> {
+    fn with_stage2(
+        stage2: S,
+        regions: Vec<(u64, u64, u64)>,
+        chunk: u64,
+        zero_on_release: ZeroOnRelease,
+    ) -> Self {
         let page = host_page_size();
         let regions: Vec<RamRegion> = regions
             .into_iter()
@@ -140,12 +221,7 @@ impl ReleasedRam {
             .map(|(gpa, host, len)| RamRegion { gpa, host, len })
             .collect();
 
-        let chunk_mib = std::env::var("LIMINA_BALLOON_REMAP_CHUNK_MIB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(2);
-        let chunk = (chunk_mib << 20).next_power_of_two().max(page);
+        let chunk = chunk.next_power_of_two().max(page);
 
         let handler_regions: &'static [(u64, u64)] = Box::leak(
             regions
@@ -156,6 +232,7 @@ impl ReleasedRam {
         );
 
         Self {
+            stage2,
             regions,
             released: Mutex::new(BTreeMap::new()),
             chunk,
@@ -164,11 +241,7 @@ impl ReleasedRam {
             remapped_bytes: AtomicU64::new(0),
             stray_faults: AtomicU64::new(0),
             last_stray: Mutex::new((u64::MAX, 0)),
-            zero_on_release: match std::env::var("LIMINA_BALLOON_RELEASE_MEMSET").as_deref() {
-                Ok("1") => ZeroOnRelease::All,
-                Ok("0") | Ok("none") => ZeroOnRelease::None,
-                _ => ZeroOnRelease::InflateQueue,
-            },
+            zero_on_release,
             handler_regions,
             sweeps: AtomicU64::new(0),
             sweep_debited_bytes: AtomicU64::new(0),
@@ -213,7 +286,7 @@ impl ReleasedRam {
 
         let mut released = self.released.lock().unwrap();
         insert_range(&mut released, gpa, len);
-        let ret = unsafe { hv_vm_unmap(gpa, len as usize) };
+        let ret = self.stage2.unmap(gpa, len);
         if ret != HV_SUCCESS {
             error!("released-ram: hv_vm_unmap(gpa={gpa:#x}, len={len:#x}) failed: {ret:#x}");
             remove_overlaps(&mut released, gpa, gpa + len);
@@ -225,25 +298,14 @@ impl ReleasedRam {
             ZeroOnRelease::InflateQueue => from_inflate_queue,
             ZeroOnRelease::None => false,
         };
-        if zero {
-            // SAFETY: the range was just unmapped from the guest (above, under the lock),
-            // is balloon-owned, and lies inside this region's host mapping — no guest
-            // access can race the write; a touch faults and heals afterward.
-            unsafe { std::ptr::write_bytes(host as *mut u8, 0, len as usize) };
-        }
-        let rc = unsafe {
-            libc::madvise(
-                host as *mut libc::c_void,
-                len as usize,
-                libc::MADV_FREE_REUSABLE,
-            )
-        };
-        if rc != 0 {
+        // SAFETY: the range was just unmapped from the guest (above, under the lock), is
+        // balloon-owned, and lies inside this region's host mapping — no guest access can race
+        // the write; a touch faults and heals afterward.
+        if let Err(e) = unsafe { self.stage2.discard(host, len, zero) } {
             // The unmap stands (a guest touch will fault and heal); only the host-side
             // reclaim didn't happen, so the pages simply stay resident.
             warn!(
-                "released-ram: madvise(MADV_FREE_REUSABLE) at {host:#x} len={len:#x} failed: {}",
-                std::io::Error::last_os_error()
+                "released-ram: madvise(MADV_FREE_REUSABLE) at {host:#x} len={len:#x} failed: {e}"
             );
         }
         self.released_bytes.fetch_add(len, Ordering::Relaxed);
@@ -353,27 +415,10 @@ impl ReleasedRam {
             .region_of(gpa)
             .expect("released range outside every RAM region");
         let host = Self::host_of(region, gpa);
-        let rc = unsafe {
-            libc::madvise(
-                host as *mut libc::c_void,
-                len as usize,
-                libc::MADV_FREE_REUSE,
-            )
-        };
-        if rc != 0 {
-            warn!(
-                "released-ram: madvise(MADV_FREE_REUSE) at {host:#x} len={len:#x} failed: {}",
-                std::io::Error::last_os_error()
-            );
+        if let Err(e) = self.stage2.reuse(host, len) {
+            warn!("released-ram: madvise(MADV_FREE_REUSE) at {host:#x} len={len:#x} failed: {e}");
         }
-        let ret = unsafe {
-            hv_vm_map(
-                host as *mut core::ffi::c_void,
-                gpa,
-                len as usize,
-                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
-            )
-        };
+        let ret = self.stage2.map(host, gpa, len);
         if ret != HV_SUCCESS {
             error!(
                 "released-ram: hv_vm_map(host={host:#x}, gpa={gpa:#x}, len={len:#x}) failed: \
