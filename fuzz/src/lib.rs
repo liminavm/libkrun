@@ -198,3 +198,10 @@ pub fn drive(ops: &[Op]) -> XhciState {
     }
     dev.lock().unwrap().save_state()
 }
+
+/// The guest memory the snapshot targets apply RAM into, and `snapshot-seeds` writes RAM from:
+/// two whole 4 MiB frames and a short one, so a seed carries a zero, an lz4 and a raw frame.
+pub mod snapshot {
+    pub const RAM_GPA: u64 = 0x4000_0000;
+    pub const RAM_LEN: usize = (8 << 20) + (64 << 10);
+}
