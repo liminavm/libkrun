@@ -17,4 +17,7 @@ mod trb;
 mod worker;
 
 pub use self::device::{XHCI_MMIO_LEN, XhciDevice};
+/// One synchronous worker pass, for the fuzz targets in the fork's `fuzz/` workspace.
+#[cfg(fuzzing)]
+pub use self::worker::run_pass;
 pub use self::worker::spawn as spawn_worker;
