@@ -11,7 +11,7 @@
 //! MMIO. It holds only a `Weak` handle to the controller, so VMM teardown (the
 //! bus dropping the device) breaks the loop with no reference cycle.
 
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -89,19 +89,26 @@ fn work(dev: Weak<Mutex<XhciDevice>>, mem: GuestMemoryMmap, kick: EventFd, stop:
         let Some(dev) = dev.upgrade() else {
             return;
         };
-        let deferred = {
-            let mut d = dev.lock().unwrap();
-            d.run_worker_pass(&mem, &dev)
-        };
-        // The controller lock is now released — safe to call into gadgets, which
-        // may block or defer completion to another thread.
-        for call in deferred {
-            match call {
-                DeferredCall::Control(model, xfer) => model.handle_control(xfer),
-                DeferredCall::Transfer(model, ep, xfer) => model.handle_transfer(ep, xfer),
-                DeferredCall::Reset(model) => model.reset(),
-                DeferredCall::EndpointStopped(model, ep) => model.endpoint_stopped(ep),
-            }
+        run_pass(&dev, &mem);
+    }
+}
+
+/// One worker pass, as the thread runs it for each kick: collect work with the controller
+/// locked, then make the gadget calls it deferred with the lock released. Public under
+/// `cfg(fuzzing)` so the fuzz targets drive exactly this path, synchronously.
+pub fn run_pass(dev: &Arc<Mutex<XhciDevice>>, mem: &GuestMemoryMmap) {
+    let deferred = {
+        let mut d = dev.lock().unwrap();
+        d.run_worker_pass(mem, dev)
+    };
+    // The controller lock is now released — safe to call into gadgets, which
+    // may block or defer completion to another thread.
+    for call in deferred {
+        match call {
+            DeferredCall::Control(model, xfer) => model.handle_control(xfer),
+            DeferredCall::Transfer(model, ep, xfer) => model.handle_transfer(ep, xfer),
+            DeferredCall::Reset(model) => model.reset(),
+            DeferredCall::EndpointStopped(model, ep) => model.endpoint_stopped(ep),
         }
     }
 }
