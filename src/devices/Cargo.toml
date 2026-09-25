@@ -78,3 +78,7 @@ windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
 ] }
+
+# `cfg(kani)` gates the proofs `cargo kani` runs (limina's docs/design/in-crate-checkers.md).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
