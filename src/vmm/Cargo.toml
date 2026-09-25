@@ -77,3 +77,6 @@ windows-sys = { version = "0.61.2", features = [
 
 [dev-dependencies]
 devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices", features = ["test_utils"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
