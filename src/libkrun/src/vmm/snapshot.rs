@@ -211,38 +211,15 @@ pub struct SnapshotHead {
     pub slots: Option<Vec<DeviceSlot>>,
 }
 
-/// CRC-32 (IEEE 802.3, reflected) — a small dependency-free integrity check over the payload.
+/// CRC-32 (IEEE 802.3, reflected): the head's and every RAM frame's integrity check.
 ///
-/// Table-driven (one byte per step, not one bit): the payload spans the whole guest RAM, so the
-/// naive bit-by-bit form costs 8 iterations/byte — tens of seconds over a multi-GiB VM, enough to
-/// look like a hang. The 256-entry table is built once (same reflected `0xEDB88320` polynomial, so
-/// it produces byte-for-byte the same CRC as the bit-by-bit form).
+/// It runs over the whole snapshot on both save and restore, so it must be fast: `crc32fast`
+/// uses the ARMv8 CRC32 instructions: 11 GB/s on one core against the old byte-at-a-time table's
+/// 0.5 GB/s, which cost ~7 s of worker time per save and again per restore of a 3.5 GB snapshot.
+/// Same polynomial, init and final xor, so files written by either implementation verify under the
+/// other.
 fn crc32(data: &[u8]) -> u32 {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        let mut i = 0usize;
-        while i < 256 {
-            let mut c = i as u32;
-            let mut k = 0;
-            while k < 8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-                k += 1;
-            }
-            t[i] = c;
-            i += 1;
-        }
-        t
-    });
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
-    }
-    !crc
+    crc32fast::hash(data)
 }
 
 // --- encode ---------------------------------------------------------------------------------

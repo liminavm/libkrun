@@ -25,6 +25,7 @@ timesync = ["devices/timesync"]
 ffi = ["serde_json", "dep:ffier", "dep:ffier-builtins", "devices/ffi"]
 
 [dependencies]
+crc32fast = "1.5"
 bitfield = { version = "0.19.4", optional = true }
 bitflags = "2.10.0"
 crossbeam-channel = ">=0.5.15"
