@@ -1430,7 +1430,8 @@ pub fn build_microvm(
         let mut snap = crate::vmm::snapshot::read(path)
             .map_err(|e| StartMicrovmError::Internal(crate::vmm::Error::SnapshotIo(e)))?;
         info!(
-            "restore: read + validated the snapshot file ({} MiB) in {:.1}s",
+            "restore: read + validated the snapshot head ({} MiB file; RAM frames stream in \
+             behind it) in {:.1}s",
             std::fs::metadata(path).map(|m| m.len() >> 20).unwrap_or(0),
             t0.elapsed().as_secs_f32()
         );
