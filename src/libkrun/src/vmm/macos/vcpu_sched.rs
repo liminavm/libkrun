@@ -304,7 +304,7 @@ impl Heartbeat {
         // Whether the beat reaches a saturated vCPU at all is the thing to check first when the
         // band still misbehaves under load, so make it observable without a debugger.
         let n = BEATS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 200 == 0 {
+        if n.is_multiple_of(200) {
             log::info!("[VCPU-RT] heartbeat parks so far: {n}");
         }
     }
@@ -800,9 +800,7 @@ pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
         return None;
     }
     let (band, heartbeat) = requested();
-    let Some(band) = band else {
-        return None;
-    };
+    let band = band?;
     let (period, computation, constraint) = match band {
         Band::Qos => {
             let ret = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
@@ -1057,7 +1055,7 @@ mod tests {
     fn arming_has_a_gap_a_thread_can_sit_in() {
         // Without hysteresis a vCPU hovering at the threshold changes policy every sample, and a
         // policy change is exactly the moment the present path can lose its core.
-        assert!(ARM_BELOW < DISARM_ABOVE);
+        const { assert!(ARM_BELOW < DISARM_ABOVE) };
         // Idle: takes the band and keeps it.
         assert!(next_state(false, 0.02));
         assert!(next_state(true, 0.02));

@@ -1451,8 +1451,8 @@ mod tests {
             icc: (0..9).map(|i| seed * 10 + i).collect(),
             vtimer_offset: seed + 500,
             vtimer_masked: seed % 2 == 1,
-            pending_irq: seed % 2 == 0,
-            pending_fiq: seed % 3 == 0,
+            pending_irq: seed.is_multiple_of(2),
+            pending_fiq: seed.is_multiple_of(3),
             // Vary by seed so the round-trip covers all three encodings, including the
             // variable-length one (SystemSuspended carries two u64s; the others carry none, so a
             // mis-sized tag would desync every field after it).

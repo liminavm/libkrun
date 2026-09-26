@@ -31,37 +31,6 @@ fn sync_due(now: u64, last_awake: u64, last_update: u64) -> bool {
         || now.saturating_sub(last_update) >= UPDATE_INTERVAL
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A backward wall-clock step between the `last_awake` sample and the `now` sample
-    /// (NTP, manual set) must not panic (debug subtract-with-overflow — seen in the wild
-    /// as `attempt to subtract with overflow` at timesync.rs:83) or wrap to a huge
-    /// elapsed value in release.
-    #[test]
-    fn backward_clock_step_does_not_underflow() {
-        let now = 1_000_000_000u64;
-        let last_awake = now + 5_000_000_000; // clock stepped back ~5s
-        let last_update = now;
-        assert!(!sync_due(now, last_awake, last_update));
-    }
-
-    #[test]
-    fn long_nap_triggers_sync() {
-        let last_awake = 1_000_000_000_000u64;
-        let now = last_awake + SLEEP_NSECS * 3;
-        assert!(sync_due(now, last_awake, now));
-    }
-
-    #[test]
-    fn update_interval_triggers_sync() {
-        let last_update = 1_000_000_000_000u64;
-        let now = last_update + UPDATE_INTERVAL;
-        assert!(sync_due(now, now, last_update));
-    }
-}
-
 pub struct TimesyncThread {
     cid: u64,
     mem: GuestMemoryMmap,
@@ -139,5 +108,36 @@ impl TimesyncThread {
             .name("vsock timesync".into())
             .spawn(move || self.work())
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backward wall-clock step between the `last_awake` sample and the `now` sample
+    /// (NTP, manual set) must not panic (debug subtract-with-overflow — seen in the wild
+    /// as `attempt to subtract with overflow` at timesync.rs:83) or wrap to a huge
+    /// elapsed value in release.
+    #[test]
+    fn backward_clock_step_does_not_underflow() {
+        let now = 1_000_000_000u64;
+        let last_awake = now + 5_000_000_000; // clock stepped back ~5s
+        let last_update = now;
+        assert!(!sync_due(now, last_awake, last_update));
+    }
+
+    #[test]
+    fn long_nap_triggers_sync() {
+        let last_awake = 1_000_000_000_000u64;
+        let now = last_awake + SLEEP_NSECS * 3;
+        assert!(sync_due(now, last_awake, now));
+    }
+
+    #[test]
+    fn update_interval_triggers_sync() {
+        let last_update = 1_000_000_000_000u64;
+        let now = last_update + UPDATE_INTERVAL;
+        assert!(sync_due(now, now, last_update));
     }
 }

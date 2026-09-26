@@ -84,6 +84,7 @@ impl From<FdtError> for Error {
 }
 
 /// Creates the flattened device tree for this aarch64 microVM.
+#[allow(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     guest_mem: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,

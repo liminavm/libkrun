@@ -691,11 +691,15 @@ pub struct GpuResponsePlaneInfo {
     pub offset: u32,
 }
 
+/// One scanout in a `VIRTIO_GPU_RESP_OK_DISPLAY_INFO`: its position, its size, and whether a
+/// display is connected to it.
+pub type DisplayInfoEntry = ((u32, u32), (u32, u32), bool);
+
 /// A response to a `GpuCommand`. These correspond to `VIRTIO_GPU_RESP_*`.
 #[derive(Debug)]
 pub enum GpuResponse {
     OkNoData,
-    OkDisplayInfo(Vec<((u32, u32), (u32, u32), bool)>),
+    OkDisplayInfo(Vec<DisplayInfoEntry>),
     OkEdid(Box<[u8]>),
     OkCapsetInfo {
         capset_id: u32,
