@@ -43,3 +43,10 @@ path = "fuzz_targets/snapshot_ram.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "gpu_snapshot"
+path = "fuzz_targets/gpu_snapshot.rs"
+test = false
+doc = false
+bench = false
