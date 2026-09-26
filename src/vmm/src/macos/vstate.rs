@@ -20,7 +20,7 @@ use super::wfi_latency::{self, Wake};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{Receiver, Select, Sender, after, select, unbounded};
+use crossbeam_channel::{Receiver, RecvError, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
 use hvf::{
     HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuPower, VcpuState, Vcpus,
@@ -694,12 +694,8 @@ impl Vcpu {
             if let Some(guard) = &band_guard {
                 guard.check();
             }
-            match self.event_receiver.try_recv() {
-                Ok(VcpuEvent::Pause) => self.pause_and_park(&hvf_vcpu),
-                Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(&mut hvf_vcpu, reply),
-                // A stale `Resume` with no matching pause, a `SystemWake` for a vCPU that is not
-                // system-suspended, or an empty channel.
-                Ok(VcpuEvent::Resume(_)) | Ok(VcpuEvent::SystemWake) | Err(_) => {}
+            if let Ok(ev) = self.event_receiver.try_recv() {
+                self.service(&mut hvf_vcpu, ParkSite::RunLoop, Ok(ev));
             }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
@@ -726,14 +722,14 @@ impl Vcpu {
                     // to tell a guest that has finished entering s2idle (every vCPU in WFx)
                     // from one still executing, and a busy vCPU takes no vmexits either.
                     self.vcpu_list.set_parked(hvf_vcpuid, true);
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu);
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &mut hvf_vcpu);
                     self.vcpu_list.set_parked(hvf_vcpuid, false);
                     heartbeat.observed_block();
                 }
                 Ok(VcpuEmulation::WaitForEventExpired) => wfi_latency::record_expired(),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
                     self.vcpu_list.set_parked(hvf_vcpuid, true);
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu);
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &mut hvf_vcpu);
                     self.vcpu_list.set_parked(hvf_vcpuid, false);
                     heartbeat.observed_block();
                 }
@@ -768,7 +764,7 @@ impl Vcpu {
         hvf_vcpuid: u64,
         receiver: &Receiver<u32>,
         timeout: Option<Duration>,
-        hvf_vcpu: &HvfVcpu,
+        hvf_vcpu: &mut HvfVcpu,
     ) {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
             wfi_latency::record_no_wait();
@@ -778,27 +774,25 @@ impl Vcpu {
         // purpose, and counting it as punctual would report a healthy timer for a broken one.
         let measure = wfi_latency::enabled();
         let started = measure.then(Instant::now);
+        let mut event = None;
         let wake = if let Some(timeout) = timeout {
             select! {
                 recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); Wake::Irq }
-                recv(self.event_receiver) -> ev => {
-                    if matches!(ev, Ok(VcpuEvent::Pause)) { Wake::Pause } else { Wake::Irq }
-                }
+                recv(self.event_receiver) -> ev => { event = Some(ev); Wake::Pause }
                 recv(after(timeout)) -> _ => Wake::Deadline,
             }
         } else {
             select! {
                 recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); Wake::Irq }
-                recv(self.event_receiver) -> ev => {
-                    if matches!(ev, Ok(VcpuEvent::Pause)) { Wake::Pause } else { Wake::Irq }
-                }
+                recv(self.event_receiver) -> ev => { event = Some(ev); Wake::Pause }
             }
         };
         if let (Some(timeout), Some(started)) = (timeout, started) {
             wfi_latency::record(wake, timeout, started.elapsed());
         }
-        if wake == Wake::Pause {
-            self.pause_and_park(hvf_vcpu);
+        // Taken off the channel, so it is this site's to service: nothing else will see it.
+        if let Some(ev) = event {
+            self.service(hvf_vcpu, ParkSite::WfxWait, ev);
         }
     }
 
@@ -832,12 +826,8 @@ impl Vcpu {
                 return op.recv(&boot).ok();
             }
             debug_assert_eq!(picked, evt_idx);
-            match op.recv(&events) {
-                Ok(VcpuEvent::Pause) => self.pause_and_park(hvf_vcpu),
-                Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(hvf_vcpu, reply),
-                // Stale resume with no pause, or a system-wake for a vCPU that never suspended.
-                Ok(VcpuEvent::Resume(_)) | Ok(VcpuEvent::SystemWake) => {}
-                Err(_) => return None, // channel dropped: process tearing down
+            if self.service(hvf_vcpu, ParkSite::BootEntry, op.recv(&events)) == Serviced::Closed {
+                return None; // channel dropped: process tearing down
             }
         }
     }
@@ -892,13 +882,9 @@ impl Vcpu {
                 return;
             }
             debug_assert_eq!(picked, evt_idx);
-            match op.recv(&events) {
-                // A snapshot Pause/Snapshot while offlined: service it, then keep parking offline.
-                Ok(VcpuEvent::Pause) => self.pause_and_park(hvf_vcpu),
-                Ok(VcpuEvent::Snapshot(reply)) => self.handle_snapshot(hvf_vcpu, reply),
-                // Stale resume with no pause, or a system-wake for a vCPU that never suspended.
-                Ok(VcpuEvent::Resume(_)) | Ok(VcpuEvent::SystemWake) => {}
-                Err(_) => return, // channel dropped: process tearing down
+            // A snapshot Pause/Snapshot while offlined is serviced, then this keeps parking.
+            if self.service(hvf_vcpu, ParkSite::Offline, op.recv(&events)) == Serviced::Closed {
+                return; // channel dropped: process tearing down
             }
         }
     }
@@ -947,15 +933,10 @@ impl Vcpu {
                         r.expect("WFE channel closed unexpectedly");
                         true
                     }
-                    recv(events) -> ev => match ev {
-                        Ok(VcpuEvent::SystemWake) => true,
-                        Ok(VcpuEvent::Pause) => { self.pause_and_park(hvf_vcpu); false }
-                        Ok(VcpuEvent::Snapshot(reply)) => {
-                            self.handle_snapshot(hvf_vcpu, reply);
-                            false
-                        }
-                        Ok(VcpuEvent::Resume(_)) => false, // stale resume with no pause: ignore
-                        Err(_) => return,                  // channel dropped: tearing down
+                    recv(events) -> ev => match self.service(hvf_vcpu, ParkSite::SystemSuspended, ev) {
+                        Serviced::SystemWake => true,
+                        Serviced::Closed => return, // channel dropped: tearing down
+                        Serviced::Continue | Serviced::Resumed => false,
                     },
                 }
             };
@@ -974,10 +955,49 @@ impl Vcpu {
         }
     }
 
-    /// Snapshot this vCPU (M9): save its full architectural state on this thread, send it back,
-    /// then park until `Resume` (or the process tears down). Called from the top of the run loop,
-    /// a clean boundary between `hv_vcpu_run` calls, so the captured register file is consistent.
-    fn handle_snapshot(&mut self, hvf_vcpu: &mut HvfVcpu, reply: Sender<Box<VcpuState>>) {
+    /// Act on an event that reached this vCPU at `site`, as [`event_action`] says. Every place the
+    /// thread waits for events hands them here, so what each site does with each event is written
+    /// once, in a table that can be checked without a vCPU.
+    fn service(
+        &mut self,
+        hvf_vcpu: &mut HvfVcpu,
+        site: ParkSite,
+        ev: result::Result<VcpuEvent, RecvError>,
+    ) -> Serviced {
+        match (event_action(site, &ev), ev) {
+            (EventAction::Pause, _) => {
+                self.pause_and_park(hvf_vcpu);
+                Serviced::Continue
+            }
+            (EventAction::SnapshotAndPark, Ok(VcpuEvent::Snapshot(reply))) => {
+                self.save_and_reply(hvf_vcpu, reply);
+                self.park_until_resume(hvf_vcpu);
+                Serviced::Continue
+            }
+            (EventAction::Snapshot, Ok(VcpuEvent::Snapshot(reply))) => {
+                self.save_and_reply(hvf_vcpu, reply);
+                Serviced::Continue
+            }
+            (EventAction::Resume, Ok(VcpuEvent::Resume(paused_ticks))) => {
+                hvf_vcpu
+                    .advance_vtimer_offset(paused_ticks)
+                    .unwrap_or_else(|e| panic!("vCPU {} vtimer advance failed: {e:?}", self.id));
+                self.response_sender
+                    .send(VcpuResponse::Resumed)
+                    .expect("failed to send Resumed status");
+                Serviced::Resumed
+            }
+            (EventAction::SystemWake, _) => Serviced::SystemWake,
+            (EventAction::Closed, _) => Serviced::Closed,
+            (EventAction::Ignore, _) => Serviced::Continue,
+            (action, _) => unreachable!("{action:?} for an event it does not describe"),
+        }
+    }
+
+    /// Snapshot this vCPU (M9): save its full architectural state on this thread and send it
+    /// back. Runs where a `Snapshot` is serviced, a clean boundary between `hv_vcpu_run` calls, so
+    /// the captured register file is consistent.
+    fn save_and_reply(&mut self, hvf_vcpu: &mut HvfVcpu, reply: Sender<Box<VcpuState>>) {
         match hvf_vcpu.save_state() {
             Ok(state) => {
                 // If the collector is gone the whole snapshot is being aborted; just park.
@@ -988,21 +1008,16 @@ impl Vcpu {
                 // Dropping `reply` without sending signals the collector that this vCPU failed.
             }
         }
+    }
+
+    /// Block until `Resume` (or the process tears down), servicing what arrives meanwhile as
+    /// [`ParkSite::Parked`].
+    fn park_until_resume(&mut self, hvf_vcpu: &mut HvfVcpu) {
         loop {
-            match self.event_receiver.recv() {
-                Ok(VcpuEvent::Resume(paused_ticks)) => {
-                    hvf_vcpu
-                        .advance_vtimer_offset(paused_ticks)
-                        .unwrap_or_else(|e| {
-                            panic!("vCPU {} vtimer advance failed: {e:?}", self.id)
-                        });
-                    self.response_sender
-                        .send(VcpuResponse::Resumed)
-                        .expect("failed to report vcpu Resumed");
-                    return;
-                }
-                Ok(_) => {}       // redundant Pause/Snapshot while parked; ignore
-                Err(_) => return, // event channel dropped: process tearing down
+            let ev = self.event_receiver.recv();
+            match self.service(hvf_vcpu, ParkSite::Parked, ev) {
+                Serviced::Resumed | Serviced::Closed => return,
+                Serviced::Continue | Serviced::SystemWake => {}
             }
         }
     }
@@ -1014,27 +1029,11 @@ impl Vcpu {
     /// keeps the guest's CNTVCT continuous so armed timers don't fire en masse
     /// to catch up the gap. The coordinator computes the tick count once for the
     /// whole VM, so multi-vCPU offsets stay in lockstep.
-    fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) {
+    fn pause_and_park(&mut self, hvf_vcpu: &mut HvfVcpu) {
         self.response_sender
             .send(VcpuResponse::Paused)
             .expect("failed to send Paused status");
-        loop {
-            match self.event_receiver.recv() {
-                Ok(VcpuEvent::Resume(paused_ticks)) => {
-                    hvf_vcpu
-                        .advance_vtimer_offset(paused_ticks)
-                        .unwrap_or_else(|e| {
-                            panic!("vCPU {} vtimer advance failed: {e:?}", self.id)
-                        });
-                    self.response_sender
-                        .send(VcpuResponse::Resumed)
-                        .expect("failed to send Resumed status");
-                    return;
-                }
-                Ok(_) => {}
-                Err(_) => return,
-            }
-        }
+        self.park_until_resume(hvf_vcpu);
     }
 
     fn exit(&mut self, exit_code: u8) {
@@ -1051,6 +1050,92 @@ impl Vcpu {
 impl Drop for Vcpu {
     fn drop(&mut self) {
         let _ = self.reset_thread_local_data();
+    }
+}
+
+/// Where a vCPU thread is when an event reaches it. Every place the thread waits for one is here,
+/// and each hands what it takes off the channel to [`Vcpu::service`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkSite {
+    /// The top of the run loop, between two guest runs.
+    RunLoop,
+    /// Blocked in a WFx wait ([`Vcpu::wait_for_event`]).
+    WfxWait,
+    /// A secondary waiting for its first `CPU_ON`.
+    BootEntry,
+    /// Offlined by PSCI `CPU_OFF`.
+    Offline,
+    /// Parked in PSCI `SYSTEM_SUSPEND`.
+    SystemSuspended,
+    /// Paused or snapshotted, until `Resume`.
+    Parked,
+}
+
+impl ParkSite {
+    #[cfg(test)]
+    const ALL: [ParkSite; 6] = [
+        ParkSite::RunLoop,
+        ParkSite::WfxWait,
+        ParkSite::BootEntry,
+        ParkSite::Offline,
+        ParkSite::SystemSuspended,
+        ParkSite::Parked,
+    ];
+}
+
+/// What a park site does with an event ([`event_action`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventAction {
+    /// Report `Paused` and park until `Resume`.
+    Pause,
+    /// Save this vCPU's state, send it back, and park until `Resume`.
+    SnapshotAndPark,
+    /// Save this vCPU's state and send it back. The vCPU is already parked.
+    Snapshot,
+    /// Leave the park: advance the vtimer by the paused ticks and report `Resumed`.
+    Resume,
+    /// Leave PSCI `SYSTEM_SUSPEND`.
+    SystemWake,
+    /// Nothing to do: a stale event, or one this site has no use for.
+    Ignore,
+    /// The channel is gone: the process is tearing down.
+    Closed,
+}
+
+/// What [`Vcpu::service`] tells the site it was called from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Serviced {
+    Continue,
+    Resumed,
+    SystemWake,
+    Closed,
+}
+
+/// What `site` does with `ev`. The whole contract between the coordinator and a vCPU thread's
+/// waits, in one place: [`Vmm::pause`](crate::Vmm) and `snapshot_vcpus` each wait for every
+/// vCPU's answer while holding the VMM lock, so an event a site drops hangs or fails them.
+fn event_action(site: ParkSite, ev: &result::Result<VcpuEvent, RecvError>) -> EventAction {
+    use EventAction as A;
+    use ParkSite as P;
+    let Ok(ev) = ev else {
+        return A::Closed;
+    };
+    match (ev, site) {
+        // Already parked: the coordinator does not pause a paused VM.
+        (VcpuEvent::Pause, P::Parked) => A::Ignore,
+        (VcpuEvent::Pause, _) => A::Pause,
+        // Already parked: answer, and stay parked for the one `Resume` that is coming. Ignored
+        // here, a snapshot of a paused VM failed the moment its reply channel dropped.
+        (VcpuEvent::Snapshot(_), P::Parked) => A::Snapshot,
+        // Every other site, a WFx wait included: that one once treated a `Snapshot` as an IRQ
+        // wake, dropping it and its reply channel with it, which fails `snapshot_vcpus` at once.
+        (VcpuEvent::Snapshot(_), _) => A::SnapshotAndPark,
+        (VcpuEvent::Resume(_), P::Parked) => A::Resume,
+        // A stale resume with no pause.
+        (VcpuEvent::Resume(_), _) => A::Ignore,
+        (VcpuEvent::SystemWake, P::SystemSuspended) => A::SystemWake,
+        // A system-wake for a vCPU that is not system-suspended.
+        (VcpuEvent::SystemWake, _) => A::Ignore,
     }
 }
 
@@ -1152,6 +1237,59 @@ mod tests {
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    /// The coordinator's side of every park site, event by event. `Vmm::pause` and
+    /// `snapshot_vcpus` each wait on every vCPU's answer with the VMM lock held, so a site that
+    /// drops a `Pause` or a `Snapshot` hangs or fails them, and one that parks twice for one
+    /// request needs a `Resume` nobody sends.
+    #[test]
+    fn every_park_site_answers_the_coordinator() {
+        let snapshot = || Ok(VcpuEvent::Snapshot(unbounded().0));
+        for site in ParkSite::ALL {
+            let parked = site == ParkSite::Parked;
+            assert_eq!(
+                event_action(site, &snapshot()),
+                if parked {
+                    EventAction::Snapshot
+                } else {
+                    EventAction::SnapshotAndPark
+                },
+                "a Snapshot at {site:?} must be saved and answered, and park only a running vCPU"
+            );
+            assert_eq!(
+                event_action(site, &Ok(VcpuEvent::Pause)),
+                if parked {
+                    EventAction::Ignore
+                } else {
+                    EventAction::Pause
+                },
+                "a Pause at {site:?}"
+            );
+            assert_eq!(
+                event_action(site, &Ok(VcpuEvent::Resume(7))),
+                if parked {
+                    EventAction::Resume
+                } else {
+                    EventAction::Ignore
+                },
+                "a Resume at {site:?}"
+            );
+            assert_eq!(
+                event_action(site, &Ok(VcpuEvent::SystemWake)),
+                if site == ParkSite::SystemSuspended {
+                    EventAction::SystemWake
+                } else {
+                    EventAction::Ignore
+                },
+                "a SystemWake at {site:?}"
+            );
+            assert_eq!(
+                event_action(site, &Err(RecvError)),
+                EventAction::Closed,
+                "a closed channel at {site:?}"
+            );
+        }
+    }
 
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods

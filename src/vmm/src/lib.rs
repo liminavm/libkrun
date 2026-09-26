@@ -507,8 +507,13 @@ impl Vmm {
     pub fn snapshot_vcpus(&mut self) -> Result<Vec<VcpuState>> {
         // Participate in the live-pause bookkeeping: the vCPUs park just like
         // [`Vmm::pause`]'s, so [`Vmm::resume`] (via `resume_parked_vcpus`) must
-        // see the VM as paused and advance the vtimers by the parked time.
-        self.paused_at = unsafe { hvf::mach_absolute_time() };
+        // see the VM as paused and advance the vtimers by the parked time. A VM
+        // already paused keeps the moment it stopped: each parked vCPU answers the
+        // `Snapshot` where it stands and stays parked for the same `Resume`, so
+        // that resume must hide the whole pause, not only the part after this.
+        if !self.paused {
+            self.paused_at = unsafe { hvf::mach_absolute_time() };
+        }
         let mut receivers = Vec::with_capacity(self.vcpus_handles.len());
         for handle in self.vcpus_handles.iter() {
             let (tx, rx) = crossbeam_channel::unbounded();
