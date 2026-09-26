@@ -182,10 +182,10 @@ impl GpuJournal {
                 blob_id,
                 ..
             } = &e.op
+                && *r == resource_id
+                && *blob_id != 0
             {
-                if *r == resource_id && *blob_id != 0 {
-                    pinned = Some((*ctx_id, *blob_id));
-                }
+                pinned = Some((*ctx_id, *blob_id));
             }
         }
         self.prune(|op| match op {

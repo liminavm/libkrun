@@ -363,10 +363,10 @@ impl XhciDevice {
 
     /// Nudge the worker to process queued work (no-op in unit tests).
     fn kick_worker(&self) {
-        if let Some(k) = &self.worker_kick {
-            if let Err(e) = k.write(1) {
-                warn!("xhci: failed to kick worker: {e:?}");
-            }
+        if let Some(k) = &self.worker_kick
+            && let Err(e) = k.write(1)
+        {
+            warn!("xhci: failed to kick worker: {e:?}");
         }
     }
 
@@ -610,7 +610,7 @@ impl XhciDevice {
                 continue;
             }
             let port_idx = st.port as usize;
-            if port_idx >= 1 && port_idx <= NUM_PORTS && reconciled[port_idx - 1] {
+            if (1..=NUM_PORTS).contains(&port_idx) && reconciled[port_idx - 1] {
                 warn!(
                     "xhci restore: dropping slot {id} (its port {} was reconciled)",
                     st.port
