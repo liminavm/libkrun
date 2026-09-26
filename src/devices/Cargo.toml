@@ -72,7 +72,11 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 
-# `cfg(kani)` gates the proofs `cargo kani` runs, and `cfg(fuzzing)` the hooks the fuzz targets
-# in `fuzz/` use (limina's docs/design/in-crate-checkers.md).
+# loom's models (`loom_model` modules) build only under `--cfg loom`.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+# `cfg(kani)` gates the proofs `cargo kani` runs, `cfg(fuzzing)` the hooks the fuzz targets in
+# `fuzz/` use, and `cfg(loom)` the loom models (limina's docs/design/in-crate-checkers.md).
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(fuzzing)", "cfg(loom)"] }
