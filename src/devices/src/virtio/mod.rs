@@ -25,6 +25,8 @@ pub mod file_traits;
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(any(feature = "gpu", fuzzing))]
+pub mod gpu_snapshot;
 #[cfg(not(feature = "tee"))]
 pub mod i2c;
 #[cfg(feature = "input")]
