@@ -165,10 +165,17 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    /// `n` is often a 64-bit length out of the payload, so the end is checked, not added.
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.data.get(self.pos..self.pos + n)?;
+        let s = self.data.get(self.pos..self.pos.checked_add(n)?)?;
         self.pos += n;
         Some(s)
+    }
+    /// A count of entries of `each` bytes that sizes an allocation before they are read, refused
+    /// when the bytes left cannot hold that many. Trusted as read, one count asked for 38.8 GB.
+    fn count(&mut self, each: usize) -> Option<usize> {
+        let n = self.u32()? as usize;
+        (n <= (self.data.len() - self.pos) / each).then_some(n)
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -508,8 +515,8 @@ impl GpuSnapshotPayload {
                     let blob_flags = c.u32()?;
                     let blob_id = c.u64()?;
                     let size = c.u64()?;
-                    let nbacking = c.u32()?;
-                    let mut backing = Vec::with_capacity(nbacking as usize);
+                    let nbacking = c.count(16)?;
+                    let mut backing = Vec::with_capacity(nbacking);
                     for _ in 0..nbacking {
                         let addr = c.u64()?;
                         let len = c.u64()? as usize;
@@ -557,8 +564,8 @@ impl GpuSnapshotPayload {
                 },
                 8 => {
                     let resource_id = c.u32()?;
-                    let nbacking = c.u32()?;
-                    let mut backing = Vec::with_capacity(nbacking as usize);
+                    let nbacking = c.count(16)?;
+                    let mut backing = Vec::with_capacity(nbacking);
                     for _ in 0..nbacking {
                         let addr = c.u64()?;
                         let len = c.u64()? as usize;
@@ -1044,6 +1051,34 @@ mod tests {
             panic!("display 1 lost its provided EDID blob")
         };
         assert_eq!(&bytes[..], &[0x9c; 128][..]);
+    }
+
+    /// A backing count past what the payload holds is refused before it sizes anything, and a
+    /// length that would run the reader past the end of the address space is refused, not added.
+    #[test]
+    fn gpu_snapshot_payload_refuses_counts_and_lengths_past_its_end() {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, PAYLOAD_MAGIC);
+        put_u32(&mut bytes, PAYLOAD_VERSION);
+        put_u32(&mut bytes, 1); // one op
+        put_u64(&mut bytes, 0);
+        bytes.push(8); // AttachBacking
+        put_u32(&mut bytes, 1);
+        put_u32(&mut bytes, u32::MAX); // backing entries
+        put_u64(&mut bytes, 0x1000);
+        put_u64(&mut bytes, 0x1000);
+        let mut c = Cursor {
+            data: &bytes,
+            pos: bytes.len() - 20,
+        };
+        assert_eq!(c.count(16), None, "u32::MAX entries in 16 bytes");
+        assert!(GpuSnapshotPayload::from_bytes(&bytes).is_none());
+
+        let mut c = Cursor {
+            data: &bytes,
+            pos: 1,
+        };
+        assert_eq!(c.take(usize::MAX), None);
     }
 
     #[test]
