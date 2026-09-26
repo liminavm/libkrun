@@ -148,7 +148,7 @@ pub fn maybe_spawn_reporter(stats: Arc<GpuTraceStats>, fence_state: Arc<Mutex<Fe
                      fences_ret=+{fret} outstanding={outstanding} journal={jl}/{jr}/{jp}"
                 );
 
-                if vkr_ticks && tick % 10 == 0 {
+                if vkr_ticks && tick.is_multiple_of(10) {
                     stats.dump_requested.store(true, Ordering::Relaxed);
                 }
             }
