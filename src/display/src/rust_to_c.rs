@@ -42,6 +42,7 @@ pub trait DisplayBackendBasicFramebuffer {
     /// `scanout_id` is load-bearing on a multi-head guest: a compositor enables the cursor plane
     /// on only the CRTC the pointer is on and disables the others, so this is the whole signal
     /// for which display should show the sprite.
+    #[allow(clippy::too_many_arguments)]
     fn set_cursor(
         &mut self,
         _scanout_id: u32,

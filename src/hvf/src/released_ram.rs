@@ -279,7 +279,7 @@ impl<S: Stage2> ReleasedRam<S> {
     /// would re-mark live-again pages as disposable.
     pub fn release(&self, gpa: u64, len: u64, from_inflate_queue: bool) -> bool {
         let page = host_page_size();
-        if len == 0 || gpa % page != 0 || len % page != 0 {
+        if len == 0 || !gpa.is_multiple_of(page) || !len.is_multiple_of(page) {
             error!("released-ram: misaligned release gpa={gpa:#x} len={len:#x}; ignoring");
             return false;
         }
