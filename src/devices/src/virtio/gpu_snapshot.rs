@@ -2,9 +2,10 @@
 // wire journal, the contents of mapped blobs and device memory, and the display state, written
 // at snapshot and read back at restore (limina docs/design/venus-snapshot-replay.md).
 //
-// Split out of `gpu/journal.rs` so it builds without the `gpu` feature: the reader takes bytes a
-// file hands back after a crash, a partial write or a version skew, and the fuzz target that
-// holds it to "read or refuse, never panic" should not have to build a renderer to get here.
+// Split out of `gpu/journal.rs` so it builds without the `gpu` feature, and in every test build:
+// the reader takes bytes a file hands back after a crash, a partial write or a version skew, and
+// neither the fuzz target that holds it to "read or refuse, never panic" nor its unit tests
+// should have to build a renderer to get here.
 
 use crate::display::{
     DetailedMode, DisplayInfo, DisplayInfoEdid, EdidIdentity, EdidParams, PhysicalSize,
