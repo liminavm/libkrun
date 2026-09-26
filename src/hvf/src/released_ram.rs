@@ -24,12 +24,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 
-// The locks are loom's under `--cfg loom`, so its model can interleave release, heal and
-// reclaim. The atomics stay std: they are statistics and the sweep's signal-handler state,
-// neither of which orders anything the model checks.
-#[cfg(loom)]
+// The locks are loom's in this crate's own tests under `--cfg loom`, so its model can interleave
+// release, heal and reclaim. The atomics stay std: they are statistics and the sweep's
+// signal-handler state, neither of which orders anything the model checks.
+#[cfg(all(test, loom))]
 use loom::sync::Mutex;
-#[cfg(not(loom))]
+#[cfg(not(all(test, loom)))]
 use std::sync::Mutex;
 use std::time::Instant;
 
