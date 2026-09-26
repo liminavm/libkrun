@@ -768,6 +768,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
+ "loom",
  "lru",
  "nix 0.30.1",
  "rand 0.10.2",
