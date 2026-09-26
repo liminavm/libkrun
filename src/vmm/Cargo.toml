@@ -78,5 +78,9 @@ windows-sys = { version = "0.61.2", features = [
 [dev-dependencies]
 devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices", features = ["test_utils"] }
 
+# loom's models (`loom_model` modules) build only under `--cfg loom`.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(loom)"] }
