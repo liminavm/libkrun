@@ -31,9 +31,22 @@
 //!
 //! `LIMINA_VCPU_RT` is still read as the old spelling of `rt`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+// Each vCPU's arm state is loom's in this crate's own tests under `--cfg loom`, so `loom_model`
+// can race the sampler against the vCPU's own guard. The process-wide statics stay std's: loom's
+// are not `const`.
+#[cfg(all(test, loom))]
+use loom::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+#[cfg(not(all(test, loom)))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
 
@@ -244,7 +257,7 @@ pub fn heartbeat_interval() -> Option<Duration> {
 }
 
 /// Total forced parks across every vCPU thread, for the log line below.
-static BEATS: AtomicU64 = AtomicU64::new(0);
+static BEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The last time this thread was known to have blocked, in mach absolute units.
 ///
@@ -253,13 +266,13 @@ static BEATS: AtomicU64 = AtomicU64::new(0);
 /// has gone stale.
 #[derive(Default)]
 pub struct Heartbeat {
-    last_block: AtomicU64,
+    last_block: std::sync::atomic::AtomicU64,
 }
 
 impl Heartbeat {
     pub fn new() -> Self {
         Self {
-            last_block: AtomicU64::new(unsafe { mach_absolute_time() }),
+            last_block: std::sync::atomic::AtomicU64::new(unsafe { mach_absolute_time() }),
         }
     }
 
@@ -350,12 +363,115 @@ struct Sampled {
     cpu_us: u64,
     /// Shared with the vCPU thread itself, which takes itself out of the band without waiting to
     /// be told — see [`BandGuard`]. The sampler must therefore read it rather than remember it.
-    armed: Arc<AtomicBool>,
-    /// `mach_absolute_time` when the band was last handed to this thread, and the thread's total
-    /// CPU microseconds at that moment. The thread's own guard spends its budget from these, not
-    /// from the last park it happens to have inherited — see [`should_disarm`].
-    armed_at: Arc<AtomicU64>,
-    armed_cpu_us: Arc<AtomicU64>,
+    hold: Arc<Hold>,
+}
+
+/// Whether a thread has the band, shared by the sampler and the thread's own [`BandGuard`].
+///
+/// Either party moves the thread in or out, and each move is two steps: the kernel call, and the
+/// record of it that everyone else reads. Taken as two plain steps by each party, they interleaved
+/// into a thread the kernel had banded while the record said it was not: a guard that had judged
+/// its hold, preempted across the sampler taking the band back and handing it over again, cleared
+/// the record after the new hold's kernel call (found by `loom_model`). Nothing ever takes such a
+/// thread back out, because the guard and the sampler both believe it already out, and that is the
+/// 2026-09-21 panic's precondition.
+///
+/// So a move is claimed before it is made, by a compare-and-swap on one word, and finished by
+/// whoever claimed it; the other party sees the claim and leaves the thread alone. The word also
+/// counts the holds, so a decision about one hold is never applied to the next: a guard that judged
+/// the first may find, by the time it acts, a second on which nothing has been burned.
+pub struct Hold {
+    /// The phase in the low two bits ([`OUT`], [`ARMING`], [`IN`], [`DISARMING`]) and, above them,
+    /// how many holds have been handed out.
+    word: AtomicU64,
+    /// `mach_absolute_time` when this hold began, and the thread's total CPU microseconds at that
+    /// moment. The guard spends its budget from these, not from the last park it happens to have
+    /// inherited — see [`should_disarm`]. Written before the word publishes the hold, and read
+    /// after loading the word, whose release/acquire pair carries them.
+    armed_at: AtomicU64,
+    armed_cpu_us: AtomicU64,
+}
+
+const OUT: u64 = 0;
+const ARMING: u64 = 1;
+const IN: u64 = 2;
+const DISARMING: u64 = 3;
+const PHASE: u64 = 3;
+
+impl Hold {
+    fn new() -> Hold {
+        Hold {
+            word: AtomicU64::new(OUT),
+            armed_at: AtomicU64::new(0),
+            armed_cpu_us: AtomicU64::new(0),
+        }
+    }
+
+    /// A thread already in its first hold, which began at `armed_at` with `cpu_us` burned.
+    #[cfg(test)]
+    fn banded_since(armed_at: u64, cpu_us: u64) -> Hold {
+        Hold {
+            word: AtomicU64::new((PHASE + 1) | IN),
+            armed_at: AtomicU64::new(armed_at),
+            armed_cpu_us: AtomicU64::new(cpu_us),
+        }
+    }
+
+    fn load(&self) -> u64 {
+        self.word.load(Ordering::Acquire)
+    }
+
+    /// Whether `word` counts against the cap: anything but out does, a move in flight included.
+    fn counts(word: u64) -> bool {
+        word & PHASE != OUT
+    }
+
+    /// Hand the band over, if the thread is out and nobody is already moving it.
+    fn arm<O: BandOs>(&self, os: &O, port: u32, band: Band, cpu_now: u64) -> bool {
+        let seen = self.load();
+        if seen & PHASE != OUT {
+            return false;
+        }
+        let hold = (seen & !PHASE) + (PHASE + 1);
+        if self
+            .word
+            .compare_exchange(seen, hold | ARMING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        if !os.set_band(port, band) {
+            self.word.store(seen, Ordering::Release);
+            return false;
+        }
+        self.armed_at.store(os.now(), Ordering::Relaxed);
+        self.armed_cpu_us.store(cpu_now, Ordering::Relaxed);
+        self.word.store(hold | IN, Ordering::Release);
+        true
+    }
+
+    /// Take the band back, if the thread is still in the hold `seen` was loaded in and nobody is
+    /// already moving it.
+    fn disarm<O: BandOs>(&self, os: &O, port: u32, seen: u64) -> bool {
+        if seen & PHASE != IN {
+            return false;
+        }
+        let hold = seen & !PHASE;
+        if self
+            .word
+            .compare_exchange(seen, hold | DISARMING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        if os.set_timeshare(port) {
+            self.word.store(hold | OUT, Ordering::Release);
+            true
+        } else {
+            self.word.store(seen, Ordering::Release);
+            false
+        }
+    }
 }
 
 static REGISTRY: Mutex<Vec<Sampled>> = Mutex::new(Vec::new());
@@ -399,6 +515,36 @@ fn set_band_on(port: u32, band: Band) -> bool {
             &mut policy as *mut _ as *mut u32,
             count,
         ) == 0
+    }
+}
+
+/// What moving a thread in and out of the band asks of the kernel, and the clocks it is judged by.
+/// A seam so `loom_model` can race the sampler against a vCPU's own guard over a stand-in kernel;
+/// everything else is [`Mach`].
+pub trait BandOs {
+    /// `mach_absolute_time`.
+    fn now(&self) -> u64;
+    /// The thread's total CPU microseconds ([`thread_cpu_us`]).
+    fn cpu_us(&self, port: u32) -> Option<u64>;
+    fn set_band(&self, port: u32, band: Band) -> bool;
+    fn set_timeshare(&self, port: u32) -> bool;
+}
+
+/// The real kernel.
+pub struct Mach;
+
+impl BandOs for Mach {
+    fn now(&self) -> u64 {
+        unsafe { mach_absolute_time() }
+    }
+    fn cpu_us(&self, port: u32) -> Option<u64> {
+        thread_cpu_us(port)
+    }
+    fn set_band(&self, port: u32, band: Band) -> bool {
+        set_band_on(port, band)
+    }
+    fn set_timeshare(&self, port: u32) -> bool {
+        set_timeshare(port)
     }
 }
 
@@ -489,54 +635,52 @@ fn start_sampler(band: Band) {
                 // of theirs.
                 let mut armed_now = threads
                     .iter()
-                    .filter(|t| t.armed.load(Ordering::Relaxed))
+                    .filter(|t| Hold::counts(t.hold.load()))
                     .count();
                 let cap = arm_cap();
                 for t in threads.iter_mut() {
-                    let Some(now_us) = thread_cpu_us(t.port) else {
-                        continue;
-                    };
-                    let share = (now_us.saturating_sub(t.cpu_us)) as f64
-                        / SAMPLE_INTERVAL.as_micros() as f64;
-                    t.cpu_us = now_us;
-                    let armed = t.armed.load(Ordering::Relaxed);
-                    let Some(want) = decide(armed, share, armed_now, cap) else {
-                        continue;
-                    };
-                    let ok = if want {
-                        set_band_on(t.port, band)
-                    } else {
-                        set_timeshare(t.port)
-                    };
-                    if ok {
-                        if want {
-                            // Before `armed`, so the thread's own guard can never observe itself
-                            // armed against a stale baseline and stand down at once.
-                            t.armed_at
-                                .store(unsafe { mach_absolute_time() }, Ordering::Relaxed);
-                            t.armed_cpu_us.store(now_us, Ordering::Relaxed);
-                        }
-                        t.armed.store(want, Ordering::Relaxed);
-                        armed_now = if want {
-                            armed_now + 1
-                        } else {
-                            armed_now.saturating_sub(1)
-                        };
-                        // Info, not debug: these are a few lines a minute, and their absence is
-                        // why the 2026-09-21 host panic cannot say how many vCPUs were banded.
-                        log::info!(
-                            "[VCPU-RT] vCPU {} {} the band (share {:.0}%, {}/{} armed)",
-                            t.vcpuid,
-                            if want { "took" } else { "gave back" },
-                            share * 100.0,
-                            armed_now,
-                            cap,
-                        );
-                    }
+                    sample_one(&Mach, t, band, &mut armed_now, cap);
                 }
             }
         })
         .ok();
+}
+
+/// One sample of one registered thread: measure its share of a core since the last sample, and
+/// hand it the band or take the band back as [`decide`] says. `armed_now` is how many threads
+/// hold the band, kept current as this changes it.
+fn sample_one<O: BandOs>(os: &O, t: &mut Sampled, band: Band, armed_now: &mut usize, cap: usize) {
+    let Some(now_us) = os.cpu_us(t.port) else {
+        return;
+    };
+    let share = (now_us.saturating_sub(t.cpu_us)) as f64 / SAMPLE_INTERVAL.as_micros() as f64;
+    t.cpu_us = now_us;
+    let seen = t.hold.load();
+    let Some(want) = decide(Hold::counts(seen), share, *armed_now, cap) else {
+        return;
+    };
+    let ok = if want {
+        t.hold.arm(os, t.port, band, now_us)
+    } else {
+        t.hold.disarm(os, t.port, seen)
+    };
+    if ok {
+        *armed_now = if want {
+            *armed_now + 1
+        } else {
+            armed_now.saturating_sub(1)
+        };
+        // Info, not debug: these are a few lines a minute, and their absence is
+        // why the 2026-09-21 host panic cannot say how many vCPUs were banded.
+        log::info!(
+            "[VCPU-RT] vCPU {} {} the band (share {:.0}%, {}/{} armed)",
+            t.vcpuid,
+            if want { "took" } else { "gave back" },
+            share * 100.0,
+            *armed_now,
+            cap,
+        );
+    }
 }
 
 /// A banded vCPU thread's own handle on the band, so it can give it back without being told.
@@ -553,18 +697,18 @@ fn start_sampler(band: Band) {
 /// A thread that is running is, by definition, scheduled. So the thread rescues itself, from its
 /// own loop, with no lock and no syscall on the path that does not act -- which is why this is a
 /// plain check at every exit from the guest rather than anything cleverer.
-pub struct BandGuard {
+pub struct BandGuard<O: BandOs = Mach> {
+    os: O,
     port: u32,
-    armed: Arc<AtomicBool>,
-    /// When the band was handed over, and this thread's CPU microseconds at that moment. The
-    /// budget below is spent from these, so it measures this hold and not the thread's past.
-    armed_at: Arc<AtomicU64>,
-    armed_cpu_us: Arc<AtomicU64>,
+    /// The band's record, shared with the sampler. Its baseline is when the band was handed over
+    /// and this thread's CPU microseconds then, so the budget below measures this hold and not
+    /// the thread's past.
+    hold: Arc<Hold>,
     /// How much CPU time this thread may burn, in one hold, before it gives the band back.
     disarm_after: Duration,
 }
 
-impl BandGuard {
+impl<O: BandOs> BandGuard<O> {
     /// How long this thread may compute without parking. The kicker that forces a saturated
     /// guest back out to us uses it too, since a check the thread never reaches is not a check.
     pub fn kick_interval(&self) -> Duration {
@@ -573,18 +717,18 @@ impl BandGuard {
 
     /// How long this thread has held the band, in wall time.
     fn held_for(&self) -> Duration {
-        let armed_at = self.armed_at.load(Ordering::Relaxed);
+        let armed_at = self.hold.armed_at.load(Ordering::Relaxed);
         if armed_at == 0 {
             return Duration::ZERO;
         }
-        let now = unsafe { mach_absolute_time() };
+        let now = self.os.now();
         Duration::from_nanos(abs_to_ns(now.saturating_sub(armed_at)))
     }
 
     /// Give the band back if this thread has burned its whole budget of CPU time holding it.
     ///
     /// Call at every exit from the guest. Disarming only ever *lowers* this thread's claim on the
-    /// machine, so it needs no agreement with the sampler.
+    /// machine, so it needs no agreement with the sampler beyond [`Hold`]'s claim on the move.
     ///
     /// The wall clock is only a **pre-filter**, so that the common case costs no syscall: until
     /// the budget could even have been spent, nothing needs asking. Once it could have been, one
@@ -595,27 +739,30 @@ impl BandGuard {
     /// the band. That is the case the band exists for: it must not have to re-earn, every 33 ms,
     /// a reservation it is not spending.
     pub fn check(&self) {
+        // The word first: it is what makes the baseline read below this hold's.
+        let seen = self.hold.load();
+        if seen & PHASE != IN {
+            return;
+        }
         let held = self.held_for();
-        if !self.armed.load(Ordering::Relaxed) || held < self.disarm_after {
+        if held < self.disarm_after {
             return;
         }
         // A read that fails falls THROUGH to the disarm rather than returning: a guard which
         // cannot see its own input must not be the reason a real-time reservation is kept.
-        let sampled = thread_cpu_us(self.port).map(|cpu_now| {
-            let used = cpu_now.saturating_sub(self.armed_cpu_us.load(Ordering::Relaxed));
+        let sampled = self.os.cpu_us(self.port).map(|cpu_now| {
+            let used = cpu_now.saturating_sub(self.hold.armed_cpu_us.load(Ordering::Relaxed));
             (cpu_now, Duration::from_micros(used))
         });
         if let Some((cpu_now, cpu_used)) = sampled
             && !should_disarm(true, cpu_used, held, self.disarm_after)
         {
             // Idle after all: start a fresh window rather than asking again on the next exit.
-            self.armed_at
-                .store(unsafe { mach_absolute_time() }, Ordering::Relaxed);
-            self.armed_cpu_us.store(cpu_now, Ordering::Relaxed);
+            self.hold.armed_at.store(self.os.now(), Ordering::Relaxed);
+            self.hold.armed_cpu_us.store(cpu_now, Ordering::Relaxed);
             return;
         }
-        if set_timeshare(self.port) {
-            self.armed.store(false, Ordering::Relaxed);
+        if self.hold.disarm(&self.os, self.port, seen) {
             match sampled {
                 Some((_, cpu_used)) => log::info!(
                     "[VCPU-RT] a vCPU gave the band back from its own loop: it burned {cpu_used:?} of CPU over a {held:?} hold"
@@ -673,16 +820,12 @@ pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
         // Register and let the sampler decide: a vCPU that is running guest code flat out must not
         // hold a real-time reservation, whatever it is doing right now.
         let port = unsafe { mach_thread_self() };
-        let armed = Arc::new(AtomicBool::new(false));
-        let armed_at = Arc::new(AtomicU64::new(0));
-        let armed_cpu_us = Arc::new(AtomicU64::new(0));
+        let hold = Arc::new(Hold::new());
         REGISTRY.lock().unwrap().push(Sampled {
             vcpuid,
             port,
             cpu_us: thread_cpu_us(port).unwrap_or(0),
-            armed: Arc::clone(&armed),
-            armed_at: Arc::clone(&armed_at),
-            armed_cpu_us: Arc::clone(&armed_cpu_us),
+            hold: Arc::clone(&hold),
         });
         start_sampler(band);
         log::info!(
@@ -693,10 +836,9 @@ pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
         // The thread keeps its own way out, which is the only one that still works once every
         // core is promised away.
         return Some(BandGuard {
+            os: Mach,
             port,
-            armed,
-            armed_at,
-            armed_cpu_us,
+            hold,
             disarm_after: period * SELF_DISARM_PERIODS,
         });
     }
@@ -728,7 +870,7 @@ pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -789,31 +931,28 @@ mod tests {
     #[test]
     fn a_thread_that_stops_parking_gives_the_band_back_itself() {
         let port = unsafe { mach_thread_self() };
-        let armed = Arc::new(AtomicBool::new(true));
-        let armed_at = Arc::new(AtomicU64::new(unsafe { mach_absolute_time() }));
-        let armed_cpu_us = Arc::new(AtomicU64::new(thread_cpu_us(port).unwrap_or(0)));
+        let hold = Arc::new(Hold::banded_since(
+            unsafe { mach_absolute_time() },
+            thread_cpu_us(port).unwrap_or(0),
+        ));
+        let armed = || hold.load() & PHASE == IN;
         let guard = BandGuard {
+            os: Mach,
             port,
-            armed: Arc::clone(&armed),
-            armed_at: Arc::clone(&armed_at),
-            armed_cpu_us: Arc::clone(&armed_cpu_us),
+            hold: Arc::clone(&hold),
             disarm_after: Duration::from_secs(3600),
         };
 
         // Nothing like the budget burned yet: nothing is owed.
         guard.check();
-        assert!(
-            armed.load(Ordering::Relaxed),
-            "a thread that has burned nothing keeps the band"
-        );
+        assert!(armed(), "a thread that has burned nothing keeps the band");
 
         // Burning CPU past what it promised: it gives the band back without being asked. Spin
         // rather than sleep — sleeping is exactly what must NOT count against the budget.
         let hot = BandGuard {
+            os: Mach,
             port,
-            armed: Arc::clone(&armed),
-            armed_at: Arc::clone(&armed_at),
-            armed_cpu_us: Arc::clone(&armed_cpu_us),
+            hold: Arc::clone(&hold),
             disarm_after: Duration::from_millis(2),
         };
         let spin_until = std::time::Instant::now() + Duration::from_millis(20);
@@ -822,13 +961,13 @@ mod tests {
         }
         hot.check();
         assert!(
-            !armed.load(Ordering::Relaxed),
+            !armed(),
             "a thread burning CPU flat out must not still hold a reservation"
         );
 
         // Idempotent: a thread that has already stood down does not keep calling the kernel.
         hot.check();
-        assert!(!armed.load(Ordering::Relaxed));
+        assert!(!armed());
     }
 
     /// A band that was just taken is not immediately owed back.
@@ -977,5 +1116,136 @@ mod tests {
             (Some(rt_default), Some(Duration::from_millis(50)))
         );
         unsafe { std::env::remove_var("LIMINA_VCPU_SCHED") };
+    }
+}
+
+/// loom model of the sampler and a vCPU's own [`BandGuard`] deciding about the same thread at once.
+///
+/// Run with `RUSTFLAGS="--cfg loom" cargo test --release --lib loom_model` in this crate (or
+/// `cargo xtask check loom third_party/libkrun/src/vmm`). The thread's arm state is loom's, and so
+/// is the stand-in kernel's lock, so every kernel call is a point loom can interleave against the
+/// other party.
+///
+/// The thread starts banded and has computed flat out for its whole hold, so both parties want
+/// the band back. The sampler takes it back and then, the thread having gone quiet, hands it over
+/// again: a second hold, on which nothing has been burned. The guard checks once, concurrently.
+/// After each run the kernel must agree with the flag everyone else reads — a thread banded while
+/// flagged disarmed is one nothing will ever take back out, the 2026-09-21 panic's precondition —
+/// and the guard must not have taken back the second hold, which it never judged.
+#[cfg(all(test, loom))]
+mod loom_model {
+    use super::{Arc, Band, BandGuard, BandOs, Hold, IN, PHASE, Sampled, ns_to_abs, sample_one};
+    use loom::sync::Mutex;
+    use loom::thread;
+    use std::time::Duration;
+
+    const PORT: u32 = 7;
+    /// What the thread's CPU clock reads throughout: a second, against a 100 ms hold.
+    const CPU_US: u64 = 1_000_000;
+    const BAND: Band = Band::RealTime(
+        Duration::from_micros(16_667),
+        Duration::from_micros(1_000),
+        Duration::from_micros(2_000),
+    );
+
+    #[derive(Default)]
+    struct State {
+        banded: bool,
+        /// How many times the band has been handed over; the thread starts in the first.
+        hold: u64,
+        /// Which holds the guard took back.
+        guard_took: Vec<u64>,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Who {
+        Sampler,
+        Guard,
+    }
+
+    /// One party's view of the stand-in kernel: a clock that stands still, a CPU clock that
+    /// reads [`CPU_US`], and the band.
+    #[derive(Clone)]
+    struct Kernel(Arc<Mutex<State>>, Who);
+
+    fn now() -> u64 {
+        u64::from(ns_to_abs(10_000_000_000))
+    }
+
+    impl BandOs for Kernel {
+        fn now(&self) -> u64 {
+            now()
+        }
+        fn cpu_us(&self, _port: u32) -> Option<u64> {
+            Some(CPU_US)
+        }
+        fn set_band(&self, _port: u32, _band: Band) -> bool {
+            let mut s = self.0.lock().unwrap();
+            s.banded = true;
+            s.hold += 1;
+            true
+        }
+        fn set_timeshare(&self, _port: u32) -> bool {
+            let mut s = self.0.lock().unwrap();
+            if self.1 == Who::Guard && s.banded {
+                let hold = s.hold;
+                s.guard_took.push(hold);
+            }
+            s.banded = false;
+            true
+        }
+    }
+
+    #[test]
+    fn the_sampler_and_the_guard_decide_at_once() {
+        loom::model(|| {
+            let state = Arc::new(Mutex::new(State {
+                banded: true,
+                hold: 1,
+                guard_took: Vec::new(),
+            }));
+            // Banded 100 ms ago, having burned nothing then.
+            let hold = Arc::new(Hold::banded_since(
+                now() - u64::from(ns_to_abs(100_000_000)),
+                0,
+            ));
+
+            let sampler = {
+                let kernel = Kernel(state.clone(), Who::Sampler);
+                let mut t = Sampled {
+                    vcpuid: 0,
+                    port: PORT,
+                    cpu_us: 0,
+                    hold: hold.clone(),
+                };
+                thread::spawn(move || {
+                    let mut armed_now = 1;
+                    // Flat out since the last sample: the band goes back.
+                    sample_one(&kernel, &mut t, BAND, &mut armed_now, 1);
+                    // Quiet since: it is handed over again.
+                    sample_one(&kernel, &mut t, BAND, &mut armed_now, 1);
+                })
+            };
+            let guard = BandGuard {
+                os: Kernel(state.clone(), Who::Guard),
+                port: PORT,
+                hold: hold.clone(),
+                disarm_after: Duration::from_millis(33),
+            };
+            guard.check();
+            sampler.join().unwrap();
+
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.banded,
+                hold.load() & PHASE == IN,
+                "the kernel and the flag disagree on whether the thread holds the band"
+            );
+            assert!(
+                !s.guard_took.contains(&2),
+                "the guard took back a hold it never judged (took {:?})",
+                s.guard_took
+            );
+        });
     }
 }

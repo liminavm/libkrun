@@ -92,5 +92,9 @@ devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../d
 [lib]
 name = "krun"
 crate-type = ["cdylib", "lib"]
+# loom's models (`loom_model` modules) build only under `--cfg loom`.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(loom)"] }
