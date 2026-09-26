@@ -346,7 +346,7 @@ mod tests {
 
         // Read and write to the MR register.
         byte_order::write_le_u32(&mut data, 123);
-        rtc.write(0, RTCMR, &mut data);
+        rtc.write(0, RTCMR, &data);
         rtc.read(0, RTCMR, &mut data);
         let v = byte_order::read_le_u32(&data[..]);
         assert_eq!(v, 123);
@@ -364,7 +364,7 @@ mod tests {
         let v = utils::time::get_time(utils::time::ClockType::Real);
         let loaded = (v / utils::time::NANOS_PER_SECOND) as u32 - 3600; // "an hour ago"
         byte_order::write_le_u32(&mut data, loaded);
-        rtc.write(0, RTCLR, &mut data);
+        rtc.write(0, RTCLR, &data);
         assert!(rtc.wall_delta_ns < 0);
 
         rtc.read(0, RTCLR, &mut data);
@@ -380,7 +380,7 @@ mod tests {
         // Test with non zero value.
         let non_zero = 1;
         byte_order::write_le_u32(&mut data, non_zero);
-        rtc.write(0, RTCIMSC, &mut data);
+        rtc.write(0, RTCIMSC, &data);
         // The interrupt line should be on.
         assert!(rtc.interrupt_evt.read().unwrap() == 1);
         rtc.read(0, RTCIMSC, &mut data);
@@ -389,14 +389,14 @@ mod tests {
 
         // Now test with 0.
         byte_order::write_le_u32(&mut data, 0);
-        rtc.write(0, RTCIMSC, &mut data);
+        rtc.write(0, RTCIMSC, &data);
         rtc.read(0, RTCIMSC, &mut data);
         let v = byte_order::read_le_u32(&data[..]);
         assert_eq!(0, v);
 
         // Attempts to turn off the RTC should not go through.
         byte_order::write_le_u32(&mut data, 0);
-        rtc.write(0, RTCCR, &mut data);
+        rtc.write(0, RTCCR, &data);
         rtc.read(0, RTCCR, &mut data);
         let v = byte_order::read_le_u32(&data[..]);
         assert_eq!(v, 1);
@@ -421,9 +421,9 @@ mod tests {
         rtc.read(0, RTCDR, &mut data);
         let now = byte_order::read_le_u32(&data);
         byte_order::write_le_u32(&mut data, now + 1);
-        rtc.write(0, RTCMR, &mut data);
+        rtc.write(0, RTCMR, &data);
         byte_order::write_le_u32(&mut data, 1);
-        rtc.write(0, RTCIMSC, &mut data);
+        rtc.write(0, RTCIMSC, &data);
 
         // The timer thread should signal `alarm_wake` at ~1.1s; poll it (as the event manager does).
         let mut fired = false;
@@ -447,7 +447,7 @@ mod tests {
 
         // Clearing it (RTCICR) drops the raw status, as the driver expects.
         byte_order::write_le_u32(&mut data, 1);
-        rtc.write(0, RTCICR, &mut data);
+        rtc.write(0, RTCICR, &data);
         rtc.read(0, RTCRIS, &mut data);
         assert_eq!(
             byte_order::read_le_u32(&data),

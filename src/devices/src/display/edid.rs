@@ -812,7 +812,7 @@ mod tests {
         let bytes = ext[2] as usize;
         let dispid_length = DISPLAYID_HEADER_LEN + bytes + 1;
         assert!(
-            dispid_length <= 127 - 1,
+            dispid_length < 127,
             "DisplayID structure overruns the block"
         );
         let csum = ext[1..1 + dispid_length]

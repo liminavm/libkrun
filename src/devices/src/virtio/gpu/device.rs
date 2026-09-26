@@ -350,9 +350,9 @@ impl Gpu {
         self.worker_tx.as_ref().unwrap()
     }
 
-    /// limina M9.3: ask the worker to serialize the GPU re-creation state (rutabaga journal
-    /// + venus wire journals + mapped-blob contents). Call with the vCPUs quiesced. `None`
-    /// means nothing to save (software-2D, stock guest, or an empty journal).
+    /// limina M9.3: ask the worker to serialize the GPU re-creation state (the rutabaga
+    /// journal, the venus wire journals and the mapped-blob contents). Call with the vCPUs
+    /// quiesced. `None` means nothing to save (software-2D, stock guest, or an empty journal).
     pub fn snapshot_gpu(&self) -> Option<Vec<u8>> {
         let tx = self.worker_tx.as_ref()?;
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -575,10 +575,10 @@ impl Drop for Gpu {
             let _ = tx.send(WorkerCmd::Shutdown);
             let _ = self.worker_stopfd.write(1);
         }
-        if let Some(worker) = self.worker_thread.take() {
-            if let Err(e) = worker.join() {
-                error!("error waiting for gpu worker thread: {e:?}");
-            }
+        if let Some(worker) = self.worker_thread.take()
+            && let Err(e) = worker.join()
+        {
+            error!("error waiting for gpu worker thread: {e:?}");
         }
     }
 }

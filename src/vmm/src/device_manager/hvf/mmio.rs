@@ -258,6 +258,7 @@ impl MMIODeviceManager {
 
     #[cfg(target_arch = "aarch64")]
     /// Register a GPIO
+    #[allow(clippy::too_many_arguments)]
     pub fn register_mmio_gpio(
         &mut self,
         _vm: &Vm,
@@ -480,20 +481,20 @@ impl MMIODeviceManager {
         use devices::virtio::MmioTransport;
         let mut out = Vec::new();
         for (dtype, id) in self.id_to_dev_info.keys() {
-            if let DeviceType::Virtio(type_id) = *dtype {
-                if let Some(dev) = self.get_device(*dtype, id) {
-                    let guard = dev.lock().unwrap();
-                    // Deref to `&dyn BusDevice` so `as_any` dispatches via the supertrait vtable
-                    // (not the blanket `impl<T: Any> AsAny for T` on the non-'static MutexGuard).
-                    let dev_ref: &dyn BusDevice = &*guard;
-                    if let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() {
-                        out.push((
-                            type_id,
-                            id.clone(),
-                            mmio.device_status(),
-                            mmio.status_changed_at(),
-                        ));
-                    }
+            if let DeviceType::Virtio(type_id) = *dtype
+                && let Some(dev) = self.get_device(*dtype, id)
+            {
+                let guard = dev.lock().unwrap();
+                // Deref to `&dyn BusDevice` so `as_any` dispatches via the supertrait vtable
+                // (not the blanket `impl<T: Any> AsAny for T` on the non-'static MutexGuard).
+                let dev_ref: &dyn BusDevice = &*guard;
+                if let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() {
+                    out.push((
+                        type_id,
+                        id.clone(),
+                        mmio.device_status(),
+                        mmio.status_changed_at(),
+                    ));
                 }
             }
         }
@@ -934,7 +935,7 @@ mod tests {
         let id = "bar";
         assert!(
             device_manager
-                .get_device(DeviceType::Virtio(type_id), &id)
+                .get_device(DeviceType::Virtio(type_id), id)
                 .is_none()
         );
     }

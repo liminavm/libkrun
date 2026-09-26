@@ -581,6 +581,7 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
+#[allow(clippy::too_many_arguments)]
 pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
@@ -2211,6 +2212,7 @@ fn attach_legacy_devices(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn attach_legacy_devices(
     vm: &Vm,
     mmio_device_manager: &mut MMIODeviceManager,

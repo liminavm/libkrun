@@ -1042,17 +1042,17 @@ impl HvfVcpu<'_> {
     /// next entry). After this the register file is fully consistent, so a [`VcpuState`]
     /// captures everything and a restore needs to carry no HVF-internal software flags.
     fn flush_pending_state(&mut self) -> Result<(), Error> {
-        if let Some(mmio_read) = self.pending_mmio_read.take() {
-            if mmio_read.srt < 31 {
-                let val = match mmio_read.len {
-                    1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                    2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                    4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                    8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                    _ => return Err(Error::Unhandled),
-                };
-                self.write_reg(mmio_read.srt, val)?;
-            }
+        if let Some(mmio_read) = self.pending_mmio_read.take()
+            && mmio_read.srt < 31
+        {
+            let val = match mmio_read.len {
+                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
+                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
+                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
+                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
+                _ => return Err(Error::Unhandled),
+            };
+            self.write_reg(mmio_read.srt, val)?;
         }
         if self.pending_advance_pc {
             let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
