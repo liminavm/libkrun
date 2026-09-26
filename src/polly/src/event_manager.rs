@@ -259,11 +259,11 @@ impl EventManager {
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => 0,
             Err(e) => return Err(Error::Poll(e)),
         };
-        if event_count > 0 {
-            if let Some(trace) = self.wake_trace.as_mut() {
-                let events = self.ready_events[..event_count].to_vec();
-                trace.record(&events);
-            }
+        if event_count > 0
+            && let Some(trace) = self.wake_trace.as_mut()
+        {
+            let events = self.ready_events[..event_count].to_vec();
+            trace.record(&events);
         }
         self.dispatch_events(event_count);
 
