@@ -636,7 +636,7 @@ impl ScanoutLedger {
         if self.live.insert(resource_id) {
             self.fresh += 1;
         }
-        if self.binds % Self::REPORT_EVERY == 0 {
+        if self.binds.is_multiple_of(Self::REPORT_EVERY) {
             self.report();
         }
     }
@@ -700,10 +700,10 @@ impl VirtioGpu {
         // limina wake-trace (LIMINA_WAKE_TRACE=1): guest-fence callback/signal rates,
         // ~5s cadence — see docs/perf/overhead-inventory.md. Shared across the fence
         // threads, hence the mutex (trace-only, env-gated).
-        let wake_trace: Option<Arc<Mutex<(std::time::Instant, [u64; 3])>>> =
-            std::env::var("LIMINA_WAKE_TRACE")
-                .ok()
-                .map(|_| Arc::new(Mutex::new((std::time::Instant::now(), [0u64; 3]))));
+        type WakeTrace = Arc<Mutex<(std::time::Instant, [u64; 3])>>;
+        let wake_trace: Option<WakeTrace> = std::env::var("LIMINA_WAKE_TRACE")
+            .ok()
+            .map(|_| Arc::new(Mutex::new((std::time::Instant::now(), [0u64; 3]))));
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
             debug!(
                 "XXX - fence called: id={}, ring_idx={}",
@@ -1627,10 +1627,10 @@ impl VirtioGpu {
                         op_failed += 1;
                         continue;
                     }
-                    if let Some(bytes) = contents.get(resource_id) {
-                        if !self.blob_content_write(*resource_id, bytes) {
-                            warn!("gpu restore: content restore for blob {resource_id} failed");
-                        }
+                    if let Some(bytes) = contents.get(resource_id)
+                        && !self.blob_content_write(*resource_id, bytes)
+                    {
+                        warn!("gpu restore: content restore for blob {resource_id} failed");
                     }
                 }
                 GpuJournalOp::MapBlob {
@@ -1767,14 +1767,13 @@ impl VirtioGpu {
             // binary semaphores) to their retired pre-suspend state BEFORE the
             // rings start — a started ring may immediately consume a guest wait
             // rooted in the pre-suspend epoch (the mutter WSI-semaphore wedge).
-            if let Some((_, blob)) = sync_states.iter().find(|(c, _)| *c == ctx_id) {
-                if !self
+            if let Some((_, blob)) = sync_states.iter().find(|(c, _)| *c == ctx_id)
+                && !self
                     .rutabaga
                     .as_ref()
                     .is_some_and(|r| r.limina_sync_restore(ctx_id, blob))
-                {
-                    warn!("gpu restore: sync fast-forward failed for ctx {ctx_id}");
-                }
+            {
+                warn!("gpu restore: sync fast-forward failed for ctx {ctx_id}");
             }
             if !self
                 .rutabaga
@@ -1954,10 +1953,9 @@ impl VirtioGpu {
                 resource_id,
                 detached: true,
             } = &e.op
+                && self.context_detach_resource(*ctx_id, *resource_id).is_err()
             {
-                if self.context_detach_resource(*ctx_id, *resource_id).is_err() {
-                    warn!("gpu restore: DETACH ctx {ctx_id} res {resource_id} failed");
-                }
+                warn!("gpu restore: DETACH ctx {ctx_id} res {resource_id} failed");
             }
         }
 
@@ -2411,10 +2409,10 @@ impl VirtioGpu {
             .ok_or(ErrInvalidScanoutId)?;
 
         // Disable this scanout for any resource currently bound to it.
-        if let Some(prev) = scanout.as_ref().map(|s| s.resource_id) {
-            if let Some(resource) = self.resources.get_mut(&prev) {
-                resource.scanouts.disable(scanout_id);
-            }
+        if let Some(prev) = scanout.as_ref().map(|s| s.resource_id)
+            && let Some(resource) = self.resources.get_mut(&prev)
+        {
+            resource.scanouts.disable(scanout_id);
         }
 
         // resource_id == 0 disables the scanout (virtio spec).
@@ -2745,12 +2743,11 @@ impl VirtioGpu {
                 // host GPU time to finish rendering this buffer. If the incomplete-frame
                 // rate collapses with N>0, the flicker is a readback-vs-render race (the
                 // readback path lacks the #8 fence-accurate present the zero-copy path has).
-                if let Ok(s) = std::fs::read_to_string("/tmp/limina-readback-delay") {
-                    if let Ok(ms) = s.trim().parse::<u64>() {
-                        if ms > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(ms));
-                        }
-                    }
+                if let Ok(s) = std::fs::read_to_string("/tmp/limina-readback-delay")
+                    && let Ok(ms) = s.trim().parse::<u64>()
+                    && ms > 0
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
                 }
                 if let Err(e) = Self::read_2d_resource(rutabaga, resource, scan_w, scan_h, buffer) {
                     log::error!(
@@ -3114,7 +3111,7 @@ impl VirtioGpu {
                 log::info!(
                     "virtio-gpu: fence-accurate presents ENGAGED (first deferred present, scanout {scanout_id}, iosurface {iosurface_id})"
                 );
-            } else if n % 512 == 0 {
+            } else if n.is_multiple_of(512) {
                 log::trace!(
                     "[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})"
                 );
@@ -3660,36 +3657,35 @@ impl VirtioGpu {
         // event), pacing mutter honestly and keeping the buffer unwritten while CA
         // still samples it.
         let context_ring = rutabaga_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0;
-        if is_flush && !context_ring {
-            if let Some(pf) = self.present_fence.as_mut() {
-                if !pf.flush_parked_cookies.is_empty() {
-                    let cookies = std::mem::take(&mut pf.flush_parked_cookies);
-                    let set: std::collections::BTreeSet<u64> =
-                        cookies.iter().map(|(c, _)| *c).collect();
-                    let scanouts: std::collections::BTreeSet<u32> =
-                        cookies.iter().map(|(_, s)| *s).collect();
-                    let now = std::time::Instant::now();
-                    // Wedge-proof ceiling: whatever happens to the parked frames
-                    // (lost ack, dead context, any future leak class), the guest's
-                    // display fence completes by now+500ms. Completion is
-                    // idempotent with the ack/fallback paths.
-                    let ceiling = now + std::time::Duration::from_millis(500);
-                    if let Err(e) = pf.latch_tx.send((ceiling, rutabaga_fence)) {
-                        error!("latch thread gone: {e}");
-                    }
-                    pf.guest_holds.push(GuestFlushHold {
-                        fence: rutabaga_fence,
-                        unpresented: set.clone(),
-                        unconfirmed: set,
-                        fallback_at: None,
-                        created_at: now,
-                    });
-                    for scanout_id in scanouts {
-                        self.note_scanout_held(scanout_id, true);
-                    }
-                    return Ok(OkNoData);
-                }
+        if is_flush
+            && !context_ring
+            && let Some(pf) = self.present_fence.as_mut()
+            && !pf.flush_parked_cookies.is_empty()
+        {
+            let cookies = std::mem::take(&mut pf.flush_parked_cookies);
+            let set: std::collections::BTreeSet<u64> = cookies.iter().map(|(c, _)| *c).collect();
+            let scanouts: std::collections::BTreeSet<u32> =
+                cookies.iter().map(|(_, s)| *s).collect();
+            let now = std::time::Instant::now();
+            // Wedge-proof ceiling: whatever happens to the parked frames
+            // (lost ack, dead context, any future leak class), the guest's
+            // display fence completes by now+500ms. Completion is
+            // idempotent with the ack/fallback paths.
+            let ceiling = now + std::time::Duration::from_millis(500);
+            if let Err(e) = pf.latch_tx.send((ceiling, rutabaga_fence)) {
+                error!("latch thread gone: {e}");
             }
+            pf.guest_holds.push(GuestFlushHold {
+                fence: rutabaga_fence,
+                unpresented: set.clone(),
+                unconfirmed: set,
+                fallback_at: None,
+                created_at: now,
+            });
+            for scanout_id in scanouts {
+                self.note_scanout_held(scanout_id, true);
+            }
+            return Ok(OkNoData);
         }
         self.create_fence_inner(rutabaga_fence)
     }

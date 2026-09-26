@@ -421,11 +421,7 @@ mod tests {
         // the interest list of epoll instance.
         assert!(
             epoll
-                .ctl(
-                    ControlOperation::Add,
-                    event_fd_1.as_raw_fd() as i32,
-                    &event_1
-                )
+                .ctl(ControlOperation::Add, event_fd_1.as_raw_fd(), &event_1)
                 .is_ok()
         );
 
@@ -435,7 +431,7 @@ mod tests {
             epoll
                 .ctl(
                     ControlOperation::Add,
-                    event_fd_2.as_raw_fd() as i32,
+                    event_fd_2.as_raw_fd(),
                     // For this fd, we want an Event instance that has `data` field set to other
                     // value than the value of the fd and `events` without EPOLLIN type set.
                     &EpollEvent::new(EventSet::IN, 10)
@@ -454,7 +450,7 @@ mod tests {
 
         // Let's check also the Event values that are now returned in the ready list.
         assert_eq!(ready_events[0].data(), event_fd_1.as_raw_fd() as u64);
-        assert_eq!(ready_events[1].data(), 10 as u64);
+        assert_eq!(ready_events[1].data(), 10_u64);
 
         // EPOLLIN and EPOLLOUT should be available for this fd.
         assert_eq!(ready_events[0].events(), EventSet::IN.bits());
@@ -466,7 +462,7 @@ mod tests {
             epoll
                 .ctl(
                     ControlOperation::Delete,
-                    event_fd_2.as_raw_fd() as i32,
+                    event_fd_2.as_raw_fd(),
                     &EpollEvent::default()
                 )
                 .is_ok()

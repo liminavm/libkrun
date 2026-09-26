@@ -415,12 +415,11 @@ impl XhciDevice {
     }
 
     fn defer_slot_reset(&self, slot: u8, deferred: &mut Vec<DeferredCall>) {
-        if let Some(s) = self.slots.get(slot as usize).and_then(|x| x.as_ref()) {
-            if s.port != 0 {
-                if let Some(Some(m)) = self.port_models.get((s.port - 1) as usize) {
-                    deferred.push(DeferredCall::Reset(m.clone()));
-                }
-            }
+        if let Some(s) = self.slots.get(slot as usize).and_then(|x| x.as_ref())
+            && s.port != 0
+            && let Some(Some(m)) = self.port_models.get((s.port - 1) as usize)
+        {
+            deferred.push(DeferredCall::Reset(m.clone()));
         }
     }
 
@@ -428,18 +427,17 @@ impl XhciDevice {
     /// Device Context Index to the endpoint address the gadget speaks (`dci >> 1` = endpoint
     /// number, odd dci = IN).
     fn defer_endpoint_stopped(&self, slot: u8, dci: u8, deferred: &mut Vec<DeferredCall>) {
-        if let Some(s) = self.slots.get(slot as usize).and_then(|x| x.as_ref()) {
-            if s.port != 0 {
-                if let Some(Some(m)) = self.port_models.get((s.port - 1) as usize) {
-                    deferred.push(DeferredCall::EndpointStopped(
-                        m.clone(),
-                        EpAddr {
-                            num: dci >> 1,
-                            dir_in: dci & 1 == 1,
-                        },
-                    ));
-                }
-            }
+        if let Some(s) = self.slots.get(slot as usize).and_then(|x| x.as_ref())
+            && s.port != 0
+            && let Some(Some(m)) = self.port_models.get((s.port - 1) as usize)
+        {
+            deferred.push(DeferredCall::EndpointStopped(
+                m.clone(),
+                EpAddr {
+                    num: dci >> 1,
+                    dir_in: dci & 1 == 1,
+                },
+            ));
         }
     }
 
@@ -737,11 +735,11 @@ impl XhciDevice {
                     }
                     let setup = SetupPacket::from_bytes(td.setup);
                     // Standard requests are answered by the controller itself.
-                    if setup.kind() == 0 {
-                        if let Some(outcome) = self.answer_standard(slot_id, &setup, &model) {
-                            self.post_control_result(mem, &td.events, outcome);
-                            continue;
-                        }
+                    if setup.kind() == 0
+                        && let Some(outcome) = self.answer_standard(slot_id, &setup, &model)
+                    {
+                        self.post_control_result(mem, &td.events, outcome);
+                        continue;
                     }
                     // Forward class/vendor (and unhandled standard) to the gadget.
                     let data_out = if !setup.is_in() {
@@ -2346,7 +2344,7 @@ mod tests {
             d.write(0, 0x1000 + 0x20 + 0x10, &0x2000u64.to_le_bytes()); // ERSTBA
             d.write(0, 0x1000 + 0x20 + 0x08, &16u32.to_le_bytes()); // ERSTSZ
             d.write(0, 0x1000 + 0x20 + 0x04, &0x40u32.to_le_bytes()); // IMOD
-            d.write(0, 0x1000 + 0x20 + 0x00, &0x2u32.to_le_bytes()); // IMAN.IE
+            d.write(0, 0x1000 + 0x20, &0x2u32.to_le_bytes()); // IMAN.IE
             d.write(0, 0x1000 + 0x20 + 0x18, &0x3010u64.to_le_bytes()); // ERDP, mid-ring
             d.next_address = 3;
             d.event_ring = Some(EventRing::new(0x3000, 16));
@@ -2767,7 +2765,7 @@ mod every_sequence {
         // The cases the walk exists for: an Address Device refused for a slot never enabled, and a
         // Configured slot taken back down.
         let (mut refused, mut unconfigured) = (0usize, 0usize);
-        let mut idx = vec![0usize; DEPTH];
+        let mut idx = [0usize; DEPTH];
         loop {
             let mut d = XhciDevice::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
             d.port_models[0] = Some(Arc::new(MockUsbDevice::new()));
