@@ -640,7 +640,7 @@ fn install_sweep_fault_handler() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sweep_fault_handler as usize;
+        sa.sa_sigaction = sweep_fault_handler as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         libc::sigemptyset(&mut sa.sa_mask);
         for (sig, slot) in [(libc::SIGBUS, &OLD_SIGBUS), (libc::SIGSEGV, &OLD_SIGSEGV)] {
