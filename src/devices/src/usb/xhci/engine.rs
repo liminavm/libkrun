@@ -907,17 +907,21 @@ impl XhciDevice {
                         ),
                     );
                 }
-                self.post_event(
-                    mem,
-                    transfer_event(ev.status_trb, 0, cc::SUCCESS, ev.slot_id, ev.ep_id, false),
-                );
+                if ev.status_ioc {
+                    self.post_event(
+                        mem,
+                        transfer_event(ev.status_trb, 0, cc::SUCCESS, ev.slot_id, ev.ep_id, false),
+                    );
+                }
             }
             // OUT / no-data: the Status stage completes the TD.
             XferOutcome::Ack => {
-                self.post_event(
-                    mem,
-                    transfer_event(ev.status_trb, 0, cc::SUCCESS, ev.slot_id, ev.ep_id, false),
-                );
+                if ev.status_ioc {
+                    self.post_event(
+                        mem,
+                        transfer_event(ev.status_trb, 0, cc::SUCCESS, ev.slot_id, ev.ep_id, false),
+                    );
+                }
             }
             // Endpoint stall: one error event on the offending (data or status) TRB.
             XferOutcome::Stall => {
@@ -1561,6 +1565,39 @@ mod tests {
         assert_eq!(
             e1.parameter, 0x4020,
             "completion event points at the Status TRB"
+        );
+    }
+
+    /// A Status stage without IOC asks for no event, so a transfer that completes
+    /// cleanly posts none. The field recording the guest's request was parsed and
+    /// then never read, so every TD posted its Status completion regardless.
+    #[test]
+    fn ep0_status_without_ioc_posts_no_event() {
+        let m = mem();
+        let dev = new_dev();
+        {
+            let mut d = dev.lock().unwrap();
+            prime(&mut d, 0x4000, 0x3000, 16);
+        }
+        // The whole 18-byte descriptor into an 18-byte buffer: no short packet.
+        lay_control_in(&m, 0x4000, 0x5000, 18, 18);
+        let mut status = Trb::read(&m, 0x4020).unwrap();
+        status.control &= !CTRL_IOC;
+        status.write(&m, 0x4020).unwrap();
+
+        let mut deferred = Vec::new();
+        {
+            let mut d = dev.lock().unwrap();
+            d.collect_ep0_work(&m, 1, &dev, &mut deferred);
+        }
+        let mut got = [0u8; 18];
+        m.read_slice(&mut got, GuestAddress(0x5000)).unwrap();
+        assert_eq!(got[0], 18, "the transfer itself still ran");
+        let ev = Trb::read(&m, 0x3000).unwrap();
+        assert_ne!(
+            ev.trb_type(),
+            trb_type::TRANSFER_EVENT,
+            "an event the guest did not ask for"
         );
     }
 
