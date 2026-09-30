@@ -752,6 +752,20 @@ impl RutabagaComponent for VirglRenderer {
         }
     }
 
+    /// limina: fence a flushed venus scanout and copy it on its context's queue, so a guest that
+    /// is not held off the scanout cannot draw into it before it is read. `Ok` is the surface to
+    /// present; `EINVAL` is "no ordered copy here" and nothing was fenced.
+    #[cfg(target_os = "macos")]
+    fn present_copy(&self, resource_id: u32, cookie: u64) -> RutabagaResult<u32> {
+        let handle = res(resource_id)?;
+        self.r
+            .lock()
+            .unwrap()
+            .resource_present_copy(handle, FenceId(cookie))
+            .map(|id| id.0)
+            .ok_or(RutabagaError::ComponentError(-libc::EINVAL))
+    }
+
     fn transfer_read(
         &self,
         ctx_id: u32,
