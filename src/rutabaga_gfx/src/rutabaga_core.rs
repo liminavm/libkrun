@@ -277,9 +277,15 @@ pub trait RutabagaComponent {
     /// limina: `present_fence`, copying the resource on its rendering context's queue as part of
     /// the fence, for a guest not held off its scanout. `Ok` is the surface to present instead of
     /// the resource's own; an error is "no ordered copy here; use `present_fence`", and nothing
-    /// was fenced. Only virgl implements it.
+    /// was fenced. `scanout_id` is the output it is presented on, whose copies are kept apart
+    /// from every other output's. Only virgl implements it.
     #[cfg(target_os = "macos")]
-    fn present_copy(&self, _resource_id: u32, _cookie: u64) -> RutabagaResult<u32> {
+    fn present_copy(
+        &self,
+        _resource_id: u32,
+        _scanout_id: u32,
+        _cookie: u64,
+    ) -> RutabagaResult<u32> {
         Err(RutabagaError::Unsupported)
     }
 
@@ -1224,14 +1230,20 @@ impl Rutabaga {
     /// guest's later work, into a surface of the renderer's own. `Ok` names that surface; the
     /// frame parked on `cookie` shows it when the fence retires. An error means no ordered copy
     /// could be taken, nothing was fenced, and the caller should use `present_fence`.
+    /// `scanout_id` is the output the resource is presented on.
     #[cfg(target_os = "macos")]
-    pub fn present_copy(&self, resource_id: u32, cookie: u64) -> RutabagaResult<u32> {
+    pub fn present_copy(
+        &self,
+        resource_id: u32,
+        scanout_id: u32,
+        cookie: u64,
+    ) -> RutabagaResult<u32> {
         let component = self
             .components
             .get(&self.default_component)
             .ok_or(RutabagaError::InvalidComponent)?;
 
-        component.present_copy(resource_id, cookie)
+        component.present_copy(resource_id, scanout_id, cookie)
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device
