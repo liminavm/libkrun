@@ -757,13 +757,14 @@ impl RutabagaComponent for VirglRenderer {
     /// present. Nothing is fenced on an error: `EBUSY` is every copy surface still in use, which
     /// passes and is best met by dropping the frame, and `EINVAL` is "no ordered copy here".
     #[cfg(target_os = "macos")]
-    fn present_copy(&self, resource_id: u32, cookie: u64) -> RutabagaResult<u32> {
+    fn present_copy(&self, resource_id: u32, scanout_id: u32, cookie: u64) -> RutabagaResult<u32> {
         let handle = res(resource_id)?;
+        let scanout = virglrenderer::ids::ScanoutId(scanout_id);
         match self
             .r
             .lock()
             .unwrap()
-            .resource_present_copy(handle, FenceId(cookie))
+            .resource_present_copy(handle, scanout, FenceId(cookie))
         {
             Ok(id) => Ok(id.0),
             Err(virglrenderer::venus::present_copy::CopyRefused::Busy) => {
