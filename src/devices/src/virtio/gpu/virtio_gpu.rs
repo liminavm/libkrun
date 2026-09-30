@@ -2966,7 +2966,7 @@ impl VirtioGpu {
         pf.flush_parked_cookies.push((cookie, scanout_id));
 
         if copy {
-            match rutabaga.present_copy(resource_id, cookie) {
+            match rutabaga.present_copy(resource_id, scanout_id, cookie) {
                 Ok(copied) => {
                     let pf = self.present_fence.as_mut().unwrap();
                     if let Some(p) = pf.parked.get_mut(&cookie) {
