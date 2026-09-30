@@ -754,16 +754,25 @@ impl RutabagaComponent for VirglRenderer {
 
     /// limina: fence a flushed venus scanout and copy it on its context's queue, so a guest that
     /// is not held off the scanout cannot draw into it before it is read. `Ok` is the surface to
-    /// present; `EINVAL` is "no ordered copy here" and nothing was fenced.
+    /// present. Nothing is fenced on an error: `EBUSY` is every copy surface still in use, which
+    /// passes and is best met by dropping the frame, and `EINVAL` is "no ordered copy here".
     #[cfg(target_os = "macos")]
     fn present_copy(&self, resource_id: u32, cookie: u64) -> RutabagaResult<u32> {
         let handle = res(resource_id)?;
-        self.r
+        match self
+            .r
             .lock()
             .unwrap()
             .resource_present_copy(handle, FenceId(cookie))
-            .map(|id| id.0)
-            .ok_or(RutabagaError::ComponentError(-libc::EINVAL))
+        {
+            Ok(id) => Ok(id.0),
+            Err(virglrenderer::venus::present_copy::CopyRefused::Busy) => {
+                Err(RutabagaError::ComponentError(-libc::EBUSY))
+            }
+            Err(virglrenderer::venus::present_copy::CopyRefused::NotOrderable) => {
+                Err(RutabagaError::ComponentError(-libc::EINVAL))
+            }
+        }
     }
 
     fn transfer_read(
