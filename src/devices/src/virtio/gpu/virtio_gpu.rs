@@ -451,6 +451,11 @@ struct ScanoutCopies {
     fenced: HashMap<u32, bool>,
     /// Whether the scanout's last parked present was a copy.
     copying: HashMap<u32, bool>,
+    /// Frames dropped because every copy surface was still in use, and presents that fell back to
+    /// the guest's own surface because no ordered copy could be taken. Counted so a run says how
+    /// often each happened.
+    dropped: u64,
+    refused: u64,
 }
 
 impl ScanoutCopies {
@@ -2975,7 +2980,35 @@ impl VirtioGpu {
                     }
                     return true;
                 }
+                Err(rutabaga_gfx::RutabagaError::ComponentError(e)) if e == -libc::EBUSY => {
+                    // Every copy surface is pending or on glass: the host is behind. The guest's
+                    // own surface must not go up in its place -- the display believes this scanout
+                    // shows copies the guest cannot reach -- so the frame is dropped, as a display
+                    // that falls behind drops frames anyway.
+                    let pf = self.present_fence.as_mut().unwrap();
+                    pf.parked.remove(&cookie);
+                    pf.flush_parked_cookies.retain(|(c, _)| *c != cookie);
+                    let copies = &mut self.scanout_copies;
+                    copies.dropped += 1;
+                    if copies.dropped == 1 || copies.dropped.is_multiple_of(1000) {
+                        warn!(
+                            "virtio-gpu: scanout {scanout_id} dropped a frame: every copy surface \
+                             was still in use ({} so far)",
+                            copies.dropped
+                        );
+                    }
+                    return true;
+                }
                 Err(_) => {
+                    let copies = &mut self.scanout_copies;
+                    copies.refused += 1;
+                    if copies.refused == 1 || copies.refused.is_multiple_of(1000) {
+                        info!(
+                            "virtio-gpu: scanout {scanout_id} could not be copied in order; \
+                             presenting the guest's own surface ({} such presents so far)",
+                            copies.refused
+                        );
+                    }
                     if self.scanout_copies.copying.insert(scanout_id, false) == Some(true) {
                         info!(
                             "virtio-gpu: scanout {scanout_id} can no longer be copied in order; \
