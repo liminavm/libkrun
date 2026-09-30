@@ -437,6 +437,33 @@ impl ScanoutHolds {
     }
 }
 
+/// Per scanout: whether the guest fences its flushes, and whether its presents are copies.
+///
+/// A guest whose flushes carry no fence is never held off the buffers it flips, and draws its
+/// next frame into the one the flip released. A venus scanout of such a guest is presented as a
+/// copy the renderer takes on the guest's own queue, ordered ahead of that next frame
+/// (`present_copy`); what is on glass is then out of the guest's reach, so the display is told the
+/// scanout is held and shows it as it is. A guest that fences is held until its frame has left
+/// glass, and needs no copy.
+#[derive(Default)]
+struct ScanoutCopies {
+    /// Whether the scanout's last flush that parked frames carried a fence. Unknown until one has.
+    fenced: HashMap<u32, bool>,
+    /// Whether the scanout's last parked present was a copy.
+    copying: HashMap<u32, bool>,
+}
+
+impl ScanoutCopies {
+    /// Whether a present of `scanout_id` should be a copy: unless the guest is known to fence.
+    fn wanted(&self, scanout_id: u32) -> bool {
+        self.fenced.get(&scanout_id) != Some(&true)
+    }
+
+    fn copying(&self, scanout_id: u32) -> bool {
+        self.copying.get(&scanout_id) == Some(&true)
+    }
+}
+
 pub struct VirtioGpuScanout {
     resource_id: u32,
     /// limina: the SET_SCANOUT rect dimensions — the visible region the guest scans out, and
@@ -590,6 +617,8 @@ pub struct VirtioGpu {
     scanout_ledger: ScanoutLedger,
     present_order: PresentOrder,
     held_scanouts: ScanoutHolds,
+    /// How each scanout's presents are kept from the guest: see [`ScanoutCopies`].
+    scanout_copies: ScanoutCopies,
     /// Whether a guest OS driver has taken the device over from boot firmware, reported to the
     /// display backend once per run. The firmware's virtio-gpu driver programs scanout 0 and
     /// never reads an EDID, so the first `GET_EDID` is the handover.
@@ -1100,6 +1129,7 @@ impl VirtioGpu {
             scanout_ledger: ScanoutLedger::default(),
             present_order: PresentOrder::default(),
             held_scanouts: ScanoutHolds::default(),
+            scanout_copies: ScanoutCopies::default(),
             guest_driver_seen: false,
         }
     }
@@ -2044,6 +2074,7 @@ impl VirtioGpu {
         self.scanout_ledger.live.clear();
         // The next session may run another kernel; its first flushes report afresh.
         self.held_scanouts = ScanoutHolds::default();
+        self.scanout_copies = ScanoutCopies::default();
         {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
@@ -2540,7 +2571,10 @@ impl VirtioGpu {
         if !unfenced.is_empty() {
             self.present_order.unfenced_flush();
             for scanout_id in unfenced {
-                self.note_scanout_held(scanout_id, false);
+                self.scanout_copies.fenced.insert(scanout_id, false);
+                // A copy on glass is out of the guest's reach, fence or not.
+                let held = self.scanout_copies.copying(scanout_id);
+                self.note_scanout_held(scanout_id, held);
             }
         }
         if resource_id == 0 {
@@ -2593,11 +2627,19 @@ impl VirtioGpu {
                     // decide, from what the guest attached the resource to; asking first and
                     // passing the answer back would be the same question answered twice.
                     let seq = self.present_order.stamp();
-                    if self.try_park_present(scanout_id, iosurface_id, resource_id, &rect, seq) {
+                    if self.try_park_present(
+                        scanout_id,
+                        iosurface_id,
+                        resource_id,
+                        &rect,
+                        seq,
+                        false,
+                    ) {
                         continue;
                     }
                     self.note_overtake(scanout_id, "parking refused");
                     // Presented at once, so no hold can form on this flush.
+                    self.scanout_copies.copying.insert(scanout_id, false);
                     self.note_scanout_held(scanout_id, false);
                     if let Err(e) = self
                         .rutabaga
@@ -2661,10 +2703,19 @@ impl VirtioGpu {
                     // retires (true GPU completion). Falls through to the immediate
                     // present if parking isn't possible.
                     let seq = self.present_order.stamp();
-                    if self.try_park_present(scanout_id, iosurface_id, resource_id, &rect, seq) {
+                    let copy = self.scanout_copies.wanted(scanout_id);
+                    if self.try_park_present(
+                        scanout_id,
+                        iosurface_id,
+                        resource_id,
+                        &rect,
+                        seq,
+                        copy,
+                    ) {
                         continue;
                     }
                     self.note_overtake(scanout_id, "parking refused");
+                    self.scanout_copies.copying.insert(scanout_id, false);
                     self.note_scanout_held(scanout_id, false);
                     match self.display_backend.present_surface(
                         scanout_id,
@@ -2871,6 +2922,10 @@ impl VirtioGpu {
     /// rendering context's reserved ring. Returns false when the frame must be
     /// presented immediately instead (knob off, no renderer, unknown context, or
     /// the injection failed).
+    ///
+    /// With `copy`, the fence also copies the scanout on the rendering context's queue and the
+    /// frame presents that copy (see [`ScanoutCopies`]). A renderer that cannot take an ordered
+    /// copy fences the present without one.
     #[cfg(target_os = "macos")]
     fn try_park_present(
         &mut self,
@@ -2879,6 +2934,7 @@ impl VirtioGpu {
         resource_id: u32,
         rect: &Rect,
         seq: u64,
+        copy: bool,
     ) -> bool {
         if !Self::fence_present_enabled() {
             return false;
@@ -2904,6 +2960,34 @@ impl VirtioGpu {
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
         pf.flush_parked_cookies.push((cookie, scanout_id));
 
+        if copy {
+            match rutabaga.present_copy(resource_id, cookie) {
+                Ok(copied) => {
+                    let pf = self.present_fence.as_mut().unwrap();
+                    if let Some(p) = pf.parked.get_mut(&cookie) {
+                        p.iosurface_id = copied;
+                    }
+                    if self.scanout_copies.copying.insert(scanout_id, true) != Some(true) {
+                        info!(
+                            "virtio-gpu: scanout {scanout_id} presents copies taken on the \
+                             guest's own queue, out of its reach"
+                        );
+                    }
+                    return true;
+                }
+                Err(_) => {
+                    if self.scanout_copies.copying.insert(scanout_id, false) == Some(true) {
+                        info!(
+                            "virtio-gpu: scanout {scanout_id} can no longer be copied in order; \
+                             presenting the guest's own surface"
+                        );
+                    }
+                }
+            }
+        }
+        let Some(rutabaga) = self.rutabaga.as_mut() else {
+            return false;
+        };
         if let Err(e) = rutabaga.present_fence(resource_id, cookie) {
             warn!("present fence injection failed (resource {resource_id}): {e}; presenting now");
             // Roll the cookie ALL the way back: leaving it in flush_parked_cookies
@@ -2929,10 +3013,12 @@ impl VirtioGpu {
         }
         info!(
             "virtio-gpu: scanout {scanout_id} {}",
-            if held {
-                "flushes are fenced; the guest is held off buffers on glass"
-            } else {
+            if !held {
                 "flushes carry no fence; nothing holds the guest off buffers on glass"
+            } else if self.scanout_copies.copying(scanout_id) {
+                "flushes carry no fence; glass shows copies the guest cannot reach"
+            } else {
+                "flushes are fenced; the guest is held off buffers on glass"
             }
         );
         let _ = self.display_backend.scanout_held(scanout_id, held);
@@ -3683,6 +3769,7 @@ impl VirtioGpu {
                 created_at: now,
             });
             for scanout_id in scanouts {
+                self.scanout_copies.fenced.insert(scanout_id, true);
                 self.note_scanout_held(scanout_id, true);
             }
             return Ok(OkNoData);
