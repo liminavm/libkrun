@@ -37,6 +37,10 @@ const KEY_POWER: u32 = 116;
 // HandleSuspendKey action (default: suspend), so pulsing this line makes a stock guest
 // enter suspend-to-idle with no guest agent (M9 freeze trigger, stock tier).
 const KEY_SLEEP: u32 = 142;
+// Linux input code for the wake key. Its gpio-keys node carries `wakeup-source`, so the guest
+// arms this line's irq for wake (`enable_irq_wake`) during s2idle — pulsing it is what brings the
+// guest OUT of suspend-to-idle (M9 restore: injected after reloading a quiesced snapshot).
+const KEY_WAKEUP: u32 = 143;
 
 // As per kvm tool and
 // https://www.kernel.org/doc/Documentation/devicetree/bindings/interrupt-controller/arm%2Cgic.txt
@@ -466,6 +470,16 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     let restart_gpios = [GPIO_PHANDLE, 5, 0];
     fdt.property_array_u32("gpios", &restart_gpios)?;
     fdt.end_node(gpio_keys_restart_node)?;
+    // Wake button (KEY_WAKEUP on GPIO line 6) — a `wakeup-source` so the guest arms its irq for
+    // wake during s2idle; pulsing it is the only line that brings the guest out of suspend-to-idle
+    // (M9 restore: the worker injects it after reloading a quiesced snapshot).
+    let gpio_keys_wake_node = fdt.begin_node("button@4")?;
+    fdt.property_string("label", "GPIO Key Wakeup")?;
+    fdt.property_u32("linux,code", KEY_WAKEUP)?;
+    fdt.property_null("wakeup-source")?;
+    let wake_gpios = [GPIO_PHANDLE, 6, 0];
+    fdt.property_array_u32("gpios", &wake_gpios)?;
+    fdt.end_node(gpio_keys_wake_node)?;
     fdt.end_node(gpio_keys_node)?;
 
     Ok(())
