@@ -14,6 +14,7 @@ members = [
     "src/hvf",
     "src/devices",
     "src/aws_nitro",
+    "src/rutabaga_gfx",
     "src/whp",
 ]
 exclude = [
