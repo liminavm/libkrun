@@ -442,6 +442,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         None,
         None, // no suspend-button trigger through the v2 builder (limina's worker drives M9)
         None, // no restart-button trigger through the v2 builder either
+        None, // nor a wake-button trigger
         sender.clone(),
         device_manager,
         None,
