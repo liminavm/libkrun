@@ -38,6 +38,13 @@ const GPIO_ID: [u8; 8] = [0x61, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 const GPIO_ID_LOW: u64 = 0xfe0;
 const GPIO_ID_HIGH: u64 = 0x1000;
 
+// GPIO lines wired to `gpio-keys` buttons in the FDT (see `create_gpio_node`).
+// Line 3 (bit 0x8) is the poweroff/restart key; line 4 (bit 0x10) is the suspend
+// (KEY_SLEEP) key — the host pulses it to ask a cooperative guest to enter
+// suspend-to-idle without a guest agent (M9 freeze trigger, stock tier).
+const POWEROFF_BIT: u32 = 0x8;
+const SUSPEND_BIT: u32 = 0x10;
+
 #[derive(Debug)]
 pub enum Error {
     BadWriteOffset(u64),
@@ -76,11 +83,12 @@ pub struct Gpio {
     intc: Option<IrqChip>,
     irq_line: Option<u32>,
     shutdown_efd: EventFd,
+    suspend_efd: EventFd,
 }
 
 impl Gpio {
     /// Constructs an PL061 GPIO device.
-    pub fn new(shutdown_efd: EventFd, interrupt_evt: EventFd) -> Self {
+    pub fn new(shutdown_efd: EventFd, suspend_efd: EventFd, interrupt_evt: EventFd) -> Self {
         Self {
             data: 0,
             dir: 0,
@@ -94,6 +102,7 @@ impl Gpio {
             intc: None,
             irq_line: None,
             shutdown_efd,
+            suspend_efd,
         }
     }
 
@@ -151,16 +160,31 @@ impl Gpio {
     }
 
     pub fn trigger_restart_key(&mut self, press: bool) {
-        if press {
-            debug!("Generate a restart key press event");
-            self.istate = 0x8;
-            self.data = 0x8;
-        } else {
-            debug!("Generate a restart key release event");
-            self.istate = 0x8;
-            self.data = 0x0;
-        }
+        debug!(
+            "Generate a restart key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(POWEROFF_BIT, press);
+    }
 
+    pub fn trigger_suspend_key(&mut self, press: bool) {
+        debug!(
+            "Generate a suspend key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(SUSPEND_BIT, press);
+    }
+
+    /// Drive a single GPIO line (`bit`) high (press) or low (release) and raise the
+    /// shared interrupt. Per-line so multiple `gpio-keys` buttons (poweroff + suspend)
+    /// can coexist on the one PL061 without clobbering each other's data-register state.
+    fn trigger_key(&mut self, bit: u32, press: bool) {
+        self.istate |= bit;
+        if press {
+            self.data |= bit;
+        } else {
+            self.data &= !bit;
+        }
         self.trigger_gpio_interrupt();
     }
 
@@ -187,8 +211,9 @@ impl BusDevice for Gpio {
         } else if offset < OFS_DATA {
             value = self.data & ((offset >> 2) as u32);
             if value != 0 {
-                // Now that the guest has read it, send a key release event.
-                self.trigger_restart_key(false);
+                // Now that the guest has read it, send a key release event for exactly
+                // the line(s) it just read (so poweroff and suspend release independently).
+                self.trigger_key(value, false);
             }
         } else {
             value = match offset {
@@ -241,17 +266,22 @@ impl Subscriber for Gpio {
         match source {
             _ if source == self.shutdown_efd.as_raw_fd() => {
                 _ = self.shutdown_efd.read();
-                // Send a key press event.
+                // Send a poweroff/restart key press event.
                 self.trigger_restart_key(true);
+            }
+            _ if source == self.suspend_efd.as_raw_fd() => {
+                _ = self.suspend_efd.read();
+                // Send a suspend (KEY_SLEEP) key press event.
+                self.trigger_suspend_key(true);
             }
             _ => warn!("Unexpected gpio event received: {source:?}"),
         }
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
-            EventSet::IN,
-            self.shutdown_efd.as_raw_fd() as u64,
-        )]
+        vec![
+            EpollEvent::new(EventSet::IN, self.shutdown_efd.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.suspend_efd.as_raw_fd() as u64),
+        ]
     }
 }

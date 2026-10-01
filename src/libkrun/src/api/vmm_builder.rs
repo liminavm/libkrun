@@ -440,6 +440,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
             .map(|efd| EventFd::try_clone(efd).expect("dup shutdown_efd")),
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         None,
+        None, // no suspend-button trigger through the v2 builder (limina's worker drives M9)
         sender.clone(),
         device_manager,
         None,
