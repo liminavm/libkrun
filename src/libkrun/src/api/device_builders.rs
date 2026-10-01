@@ -1179,6 +1179,31 @@ impl<'a> AttachDevice<'a> for I2cBatteryDevice {
     }
 }
 
+/// limina: native virtio-snd device (device ID 25) driving host audio. The guest's stock
+/// virtio_snd driver binds it and exposes an ALSA card (see `devices::virtio::snd`). Works
+/// on macOS (in-VMM, no vhost-user).
+#[cfg(feature = "snd")]
+pub struct SndDevice {}
+
+#[cfg(feature = "snd")]
+impl SndDevice {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[cfg(feature = "snd")]
+impl<'a> AttachDevice<'a> for SndDevice {
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        let snd =
+            devices::virtio::Snd::new().map_err(|e| VmmError::Internal(format!("snd: {e:?}")))?;
+        let inner = Arc::new(Mutex::new(snd));
+        ctx.subscribe_events(inner.clone())?;
+        let id = inner.lock().unwrap().id().to_string();
+        ctx.register(&id, inner)
+    }
+}
+
 /// A virtio entropy source (RNG) device.
 #[cfg(not(feature = "tee"))]
 pub struct RngDevice {
