@@ -1152,6 +1152,33 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
     }
 }
 
+/// limina: a virtio-i2c adapter carrying an emulated SBS smart battery that mirrors the host
+/// battery (see `devices::virtio::i2c`), answering register reads from the provider callback.
+/// Add it only when the host has a battery — battery-less hosts simply don't get the device.
+#[cfg(not(feature = "tee"))]
+pub struct I2cBatteryDevice {
+    provider: devices::virtio::BatteryProvider,
+}
+
+#[cfg(not(feature = "tee"))]
+impl I2cBatteryDevice {
+    pub fn new(provider: devices::virtio::BatteryProvider) -> Self {
+        Self { provider }
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl<'a> AttachDevice<'a> for I2cBatteryDevice {
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        let i2c = devices::virtio::I2c::new(self.provider)
+            .map_err(|e| VmmError::Internal(format!("i2c: {e:?}")))?;
+        let inner = Arc::new(Mutex::new(i2c));
+        ctx.subscribe_events(inner.clone())?;
+        let id = inner.lock().unwrap().id().to_string();
+        ctx.register(&id, inner)
+    }
+}
+
 /// A virtio entropy source (RNG) device.
 #[cfg(not(feature = "tee"))]
 pub struct RngDevice {
