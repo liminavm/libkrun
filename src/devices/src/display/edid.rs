@@ -21,9 +21,7 @@
 //! monitor range limits — everything a guest compositor needs to recognize the display across
 //! mode changes and to know its real refresh range. All of it is optional and defaults to the
 //! historical output byte for byte. See `docs/design/stable-edid-hotplug.md`.
-use super::types::{
-    EdidIdentity, EdidParams, PhysicalSize, RefreshRange, StandardTiming, StandardTimings,
-};
+use super::types::{EdidIdentity, EdidParams, PhysicalSize, RefreshRange, StandardTiming};
 
 const EDID_DATA_LENGTH: usize = 128;
 /// Offset of the first 18-byte descriptor block; there are four, back to back.
@@ -747,6 +745,7 @@ const fn gcd(x: u32, y: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::display::types::DetailedMode;
+    use crate::display::types::StandardTimings;
 
     /// Decode a 13-byte descriptor payload the way a parser would: up to the `0x0A` terminator.
     fn descriptor_text(block: &[u8]) -> String {
