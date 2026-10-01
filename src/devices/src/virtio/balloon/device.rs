@@ -273,7 +273,17 @@ pub struct Balloon {
 }
 
 impl Balloon {
-    pub fn new() -> super::Result<Balloon> {
+    /// Create a balloon device. `free_page_reporting` gates `VIRTIO_BALLOON_F_REPORTING` (the FRQ
+    /// fast-reclaim path): when false we do NOT advertise it, so the guest's `virtio_balloon` never
+    /// starts a page-reporting worker. This is masked by default because a Linux guest with the
+    /// feature enabled crashes on suspend-to-idle — upstream `virtballoon_freeze()` frees the balloon
+    /// virtqueues without stopping the page-reporting work (which runs on the non-freezable system
+    /// `events` workqueue), so the worker use-after-frees the dead reporting vq mid-s2idle and the
+    /// guest wedges in `dpm_resume`. limina re-enables it per-VM only for enhanced-tier guests that
+    /// carry the kernel fix (`virtballoon_freeze` unregisters page-reporting first). Stock guests keep
+    /// the coarser `MADV_FREE_REUSABLE`-on-inflate reclaim and s2idle safely (two-tier: degraded but
+    /// working).
+    pub fn new(free_page_reporting: bool) -> super::Result<Balloon> {
         let host_page = host_page_size();
         let sub = host_page / GUEST_PAGE;
         let full_mask = if sub >= 64 {
@@ -281,9 +291,14 @@ impl Balloon {
         } else {
             (1u64 << sub) - 1
         };
+        let avail_features = if free_page_reporting {
+            AVAIL_FEATURES
+        } else {
+            AVAIL_FEATURES & !(1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64)
+        };
         Ok(Balloon {
             queues: None,
-            avail_features: AVAIL_FEATURES,
+            avail_features,
             acked_features: 0,
             activate_evt: EventFd::new(EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
@@ -662,8 +677,15 @@ impl VirtioDevice for Balloon {
     /// and the balloon never comes back. Unlike net/block there's no dedicated worker to stop: the
     /// balloon runs under the shared EventManager and its queue eventfds are stable across a
     /// transport reset (the transport reuses `queue_evts`), so they stay registered and route to a
-    /// fresh `activate`. We keep the inflate bookkeeping intact — the guest RAM (and thus which host
-    /// pages are still ballooned) survives s2idle, so re-madvising nothing is correct.
+    /// fresh `activate`.
+    ///
+    /// Clear the inflate bookkeeping: the guest balloon driver deflates and resets its state at
+    /// suspend, so any deflate that hadn't been processed when the reset landed would otherwise be
+    /// lost while our `inflate_mask`/`ballooned_pages` persist — a later re-inflate could then
+    /// complete a host page whose other sub-pages hold live guest data and get `MADV_FREE_REUSABLE`d
+    /// (data loss). Clearing is conservative-safe: worst case an already-reclaimed page stays
+    /// resident until the guest inflates it again; it can never cause a wrong madvise. Also drop any
+    /// pending host target so a stale kick isn't applied to the freshly re-activated device.
     fn reset(&mut self) -> bool {
         #[cfg(target_os = "macos")]
         self.reclaim.reset();
@@ -675,6 +697,9 @@ impl VirtioDevice for Balloon {
         }
         while self.activate_evt.read().is_ok() {}
         self.acked_features = 0;
+        self.inflate_mask.clear();
+        self.ballooned_pages.clear();
+        *self.pending_target.lock().unwrap() = None;
         self.device_state = DeviceState::Inactive;
         true
     }
@@ -730,7 +755,7 @@ mod tests {
 
     #[test]
     fn test_reset_drains_queue_notifications_and_allows_reactivation() {
-        let balloon = Arc::new(Mutex::new(Balloon::new().unwrap()));
+        let balloon = Arc::new(Mutex::new(Balloon::new(true).unwrap()));
         let mut manager = EventManager::new().unwrap();
         manager.add_subscriber(balloon.clone()).unwrap();
         let events = queue_events();
@@ -755,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_reset_before_activation_event_drains_notifications() {
-        let balloon = Arc::new(Mutex::new(Balloon::new().unwrap()));
+        let balloon = Arc::new(Mutex::new(Balloon::new(true).unwrap()));
         let mut manager = EventManager::new().unwrap();
         manager.add_subscriber(balloon.clone()).unwrap();
         let events = queue_events();
@@ -775,7 +800,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_negotiated_features() {
-        let mut balloon = Balloon::new().unwrap();
+        let mut balloon = Balloon::new(true).unwrap();
         let version_1 = 1 << uapi::VIRTIO_F_VERSION_1;
         balloon.ack_features_by_page(0, 1 << uapi::VIRTIO_BALLOON_F_REPORTING);
         balloon.ack_features_by_page(1, 1);
@@ -864,7 +889,7 @@ mod tests {
             ],
         );
 
-        let mut balloon = Balloon::new().unwrap();
+        let mut balloon = Balloon::new(true).unwrap();
         let mut discarded = Vec::new();
         let in_flight = balloon
             .reclaim
