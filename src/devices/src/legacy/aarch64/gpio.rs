@@ -43,9 +43,15 @@ const GPIO_ID_HIGH: u64 = 0x1000;
 //   line 3 (0x8)  → KEY_POWER   (logind HandlePowerKey   → poweroff)   ← shutdown eventfd
 //   line 4 (0x10) → KEY_SLEEP   (logind HandleSuspendKey → suspend)    ← suspend eventfd
 //   line 5 (0x20) → KEY_RESTART (logind HandleRebootKey  → reboot)     ← restart eventfd
+//   line 6 (0x40) → KEY_WAKEUP  (a `wakeup-source` button)            ← wake eventfd
+// The wake button's FDT node carries `wakeup-source`, so the guest arms its irq for wake during
+// s2idle (`enable_irq_wake`); pulsing it is the only line that brings the guest OUT of suspend-to-idle
+// (M9 restore: the worker injects it after reloading a quiesced snapshot). The other buttons are not
+// wake sources — their edges are masked while suspended, so they do not wake the guest.
 const POWER_BIT: u32 = 0x8;
 const SUSPEND_BIT: u32 = 0x10;
 const RESTART_BIT: u32 = 0x20;
+const WAKE_BIT: u32 = 0x40;
 
 #[derive(Debug)]
 pub enum Error {
@@ -87,6 +93,7 @@ pub struct Gpio {
     shutdown_efd: EventFd,
     suspend_efd: EventFd,
     restart_efd: EventFd,
+    wake_efd: EventFd,
 }
 
 impl Gpio {
@@ -95,6 +102,7 @@ impl Gpio {
         shutdown_efd: EventFd,
         suspend_efd: EventFd,
         restart_efd: EventFd,
+        wake_efd: EventFd,
         interrupt_evt: EventFd,
     ) -> Self {
         Self {
@@ -112,6 +120,7 @@ impl Gpio {
             shutdown_efd,
             suspend_efd,
             restart_efd,
+            wake_efd,
         }
     }
 
@@ -190,6 +199,14 @@ impl Gpio {
             if press { "press" } else { "release" }
         );
         self.trigger_key(RESTART_BIT, press);
+    }
+
+    pub fn trigger_wake_key(&mut self, press: bool) {
+        debug!(
+            "Generate a wake key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(WAKE_BIT, press);
     }
 
     /// Drive a single GPIO line (`bit`) high (press) or low (release) and raise the
@@ -296,6 +313,11 @@ impl Subscriber for Gpio {
                 // Send a reboot (KEY_RESTART) key press event.
                 self.trigger_restart_key(true);
             }
+            _ if source == self.wake_efd.as_raw_fd() => {
+                _ = self.wake_efd.read();
+                // Send a wake (KEY_WAKEUP) key press event — brings the guest out of s2idle.
+                self.trigger_wake_key(true);
+            }
             _ => warn!("Unexpected gpio event received: {source:?}"),
         }
     }
@@ -305,6 +327,7 @@ impl Subscriber for Gpio {
             EpollEvent::new(EventSet::IN, self.shutdown_efd.as_raw_fd() as u64),
             EpollEvent::new(EventSet::IN, self.suspend_efd.as_raw_fd() as u64),
             EpollEvent::new(EventSet::IN, self.restart_efd.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.wake_efd.as_raw_fd() as u64),
         ]
     }
 }
