@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
+use utils::syscall::{retry_transient_efault, retry_transient_efault_io};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
 
@@ -80,7 +81,7 @@ impl PortInput for PortInputFd {
         // SAFETY: We got a valid file descriptor from `AsRawFd`. The memory pointed to by `dst` is
         // valid for writes of length `buf.len() by the invariants upheld by the constructor
         // of `VolatileSlice`.
-        let bytes_read = unsafe { libc::read(fd, dst, buf.len()) };
+        let bytes_read = retry_transient_efault(|| unsafe { libc::read(fd, dst, buf.len()) });
 
         if bytes_read < 0 {
             let err = std::io::Error::last_os_error();
@@ -136,12 +137,14 @@ impl AsRawFd for PortOutputFd {
 
 impl PortOutput for PortOutputFd {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
-        self.0.write_volatile(buf).map_err(|e| match e {
-            VolatileMemoryError::IOError(e) => e,
-            e => {
-                log::error!("Unsuported error from write_volatile: {e:?}");
-                io::Error::other(e)
-            }
+        retry_transient_efault_io(|| {
+            self.0.write_volatile(buf).map_err(|e| match e {
+                VolatileMemoryError::IOError(e) => e,
+                e => {
+                    log::error!("Unsuported error from write_volatile: {e:?}");
+                    io::Error::other(e)
+                }
+            })
         })
     }
 
