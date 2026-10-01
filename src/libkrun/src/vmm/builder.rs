@@ -1474,9 +1474,9 @@ pub fn build_microvm(
                          suspended with ({diff})"
                     );
                     error!("{why}");
-                    return Err(StartMicrovmError::Internal(crate::vmm::Error::RestoreRefused(
-                        why,
-                    )));
+                    return Err(StartMicrovmError::Internal(
+                        crate::vmm::Error::RestoreRefused(why),
+                    ));
                 }
             }
             None => warn!("restore: the snapshot predates the device-slot record; not checked"),
@@ -1617,13 +1617,13 @@ pub fn build_microvm(
         // whose venus state it re-creates. A failed replay is logged by the worker and the
         // guest gets the fresh-renderer behavior (session restart), never a wedge.
         #[cfg(feature = "gpu")]
-        if let Some(data) = gpu {
-            if vmm.restore_gpu(data.clone()) {
-                info!(
-                    "restore: staged {}-byte GPU re-creation payload for replay on thaw",
-                    data.len()
-                );
-            }
+        if let Some(data) = gpu
+            && vmm.restore_gpu(data.clone())
+        {
+            info!(
+                "restore: staged {}-byte GPU re-creation payload for replay on thaw",
+                data.len()
+            );
         }
         #[cfg(not(feature = "gpu"))]
         let _ = gpu;

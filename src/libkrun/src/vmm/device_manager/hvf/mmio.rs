@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-use devices::{BusDevice, DeviceType};
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
+use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
 use polly::event_manager::EventManager;
 #[cfg(target_arch = "aarch64")]
@@ -828,7 +828,10 @@ mod tests {
             .expect("the vsock device moved; the resume must be refused");
         assert!(diff.contains("virtio-input"), "{diff}");
         assert!(diff.contains("virtio-vsock"), "{diff}");
-        assert_eq!(crate::vmm::snapshot::slot_mismatch(&windowed, &windowed), None);
+        assert_eq!(
+            crate::vmm::snapshot::slot_mismatch(&windowed, &windowed),
+            None
+        );
     }
 
     #[test]

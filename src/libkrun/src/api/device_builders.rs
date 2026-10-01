@@ -1169,7 +1169,7 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
             #[cfg(target_os = "macos")]
             ctx.vmm.released_ram.clone(),
         )
-            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         let inner = Arc::new(Mutex::new(balloon));
         ctx.subscribe_events(inner.clone())?;
         // limina: capture the balloon control handle before the device is moved into the bus, so
@@ -1372,15 +1372,14 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         let unix_ipc_port_map =
             (!self.unix_ipc_port_map.is_empty()).then_some(self.unix_ipc_port_map);
 
-        let vsock =
-            devices::virtio::Vsock::new(
-                self.cid,
-                host_port_map,
-                unix_ipc_port_map,
-                self.tsi_flags,
-                self.timesync,
-            )
-            .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
+        let vsock = devices::virtio::Vsock::new(
+            self.cid,
+            host_port_map,
+            unix_ipc_port_map,
+            self.tsi_flags,
+            self.timesync,
+        )
+        .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
 
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;
