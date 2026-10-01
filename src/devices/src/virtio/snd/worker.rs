@@ -256,12 +256,8 @@ impl SndWorker {
         let mem = self.mem.clone();
         let mut have_used = false;
 
-        loop {
-            // Pop under a short borrow so the handler can take &mut self freely.
-            let head = match self.queues[defs::CONTROL_INDEX].queue.pop(&mem) {
-                Some(h) => h,
-                None => break,
-            };
+        // The pop's borrow ends with the scrutinee, so the handler can take &mut self freely.
+        while let Some(head) = self.queues[defs::CONTROL_INDEX].queue.pop(&mem) {
             let index = head.index;
             let written = self.handle_control_req(&mem, &head);
             if let Err(e) = self.queues[defs::CONTROL_INDEX]
@@ -541,11 +537,7 @@ impl SndWorker {
         {
             let bpf = self.params.bytes_per_frame();
             self.refresh_host_latency();
-            loop {
-                let head = match self.queues[defs::TX_INDEX].queue.pop(&mem) {
-                    Some(h) => h,
-                    None => break,
-                };
+            while let Some(head) = self.queues[defs::TX_INDEX].queue.pop(&mem) {
                 let index = head.index;
                 let frames = self.enqueue_tx(&mem, &head, bpf);
                 // Status is written now (it is always S_OK); the buffer is made visible
@@ -568,11 +560,7 @@ impl SndWorker {
         #[cfg(not(target_os = "macos"))]
         {
             let mut have_used = false;
-            loop {
-                let head = match self.queues[defs::TX_INDEX].queue.pop(&mem) {
-                    Some(h) => h,
-                    None => break,
-                };
+            while let Some(head) = self.queues[defs::TX_INDEX].queue.pop(&mem) {
                 let index = head.index;
                 let mut written = 0u32;
                 if let Ok(mut writer) = Writer::new(&mem, head.clone()) {
@@ -615,7 +603,9 @@ impl SndWorker {
                 if reader.read_exact(&mut data).is_ok() {
                     if self.tx_trace.is_some() || self.audibility.is_some() {
                         let peak = data
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
                             .max()
                             .unwrap_or(0);
@@ -628,7 +618,9 @@ impl SndWorker {
                     }
                     if let Some(a) = self.audio.as_ref() {
                         let samples: Vec<f32> = data
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                             .collect();
                         a.push_samples(&samples);
@@ -748,12 +740,8 @@ impl SndWorker {
         let status_sz = std::mem::size_of::<VirtioSndPcmStatus>();
         let mut used_any = false;
 
-        loop {
-            // No source yet (not prepared/started): leave rx buffers posted.
-            let avail_samples = match self.capture.as_ref() {
-                Some(c) => c.available(),
-                None => break,
-            };
+        // No source yet (not prepared/started): leave rx buffers posted.
+        while let Some(avail_samples) = self.capture.as_ref().map(|c| c.available()) {
             let head = match self.queues[defs::RX_INDEX].queue.pop(&mem) {
                 Some(h) => h,
                 None => break,
@@ -826,11 +814,7 @@ impl SndWorker {
         let status_sz = std::mem::size_of::<VirtioSndPcmStatus>();
         let mut used_any = false;
 
-        loop {
-            let head = match self.queues[defs::RX_INDEX].queue.pop(&mem) {
-                Some(h) => h,
-                None => break,
-            };
+        while let Some(head) = self.queues[defs::RX_INDEX].queue.pop(&mem) {
             let index = head.index;
             let mut written = 0u32;
             if let Ok(mut writer) = Writer::new(&mem, head.clone()) {
