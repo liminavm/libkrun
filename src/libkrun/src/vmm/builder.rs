@@ -1405,6 +1405,8 @@ pub fn build_microvm(
         paused_at: 0,
         #[cfg(target_os = "macos")]
         ram_in_blocks: payload_config.ram_in_blocks,
+        #[cfg(feature = "gpu")]
+        gpu_resize_handle: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
