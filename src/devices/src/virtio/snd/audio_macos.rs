@@ -79,8 +79,10 @@ struct AuRenderCallbackStruct {
 type AudioComponent = *mut c_void;
 type AudioComponentInstance = *mut c_void;
 
-#[link(name = "AudioToolbox", kind = "framework")]
 #[link(name = "CoreAudio", kind = "framework")]
+unsafe extern "C" {}
+
+#[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
     fn AudioComponentFindNext(
         in_component: AudioComponent,
