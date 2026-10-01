@@ -98,6 +98,8 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+    // The backend's frames already carry correct checksums; see `rx_data_valid`.
+    rx_csum_valid: bool,
 
     #[cfg(windows)]
     worker_socket: Option<OwnedSocket>,
@@ -125,6 +127,7 @@ impl Net {
         cfg_backend: VirtioNetBackend,
         mac: [u8; 6],
         features: u32,
+        rx_csum_valid: bool,
     ) -> Result<Self> {
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
@@ -146,6 +149,7 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+            rx_csum_valid,
             #[cfg(windows)]
             worker_socket: None,
             #[cfg(windows)]
@@ -308,7 +312,7 @@ impl VirtioDevice for Net {
                 self.id(),
                 reused
             );
-            let rx_data_valid = self.acked_features & (1 << VIRTIO_NET_F_GUEST_CSUM) != 0;
+            let rx_data_valid = rx_data_valid(self.rx_csum_valid, self.acked_features);
             let worker = NetWorker::new(
                 rx_q,
                 tx_q,
@@ -361,5 +365,36 @@ impl VirtioDevice for Net {
             self.device_state = DeviceState::Inactive;
             true
         }
+    }
+}
+
+/// Whether RX frames reach the guest marked `VIRTIO_NET_HDR_F_DATA_VALID`. Only the user can
+/// vouch that a backend's frames carry correct checksums (a proxy building them in its own stack
+/// does; one relaying a wire does not), and only a guest that negotiated GUEST_CSUM may be told.
+fn rx_data_valid(rx_csum_valid: bool, acked_features: u64) -> bool {
+    rx_csum_valid && acked_features & (1 << VIRTIO_NET_F_GUEST_CSUM) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUEST_CSUM: u64 = 1 << VIRTIO_NET_F_GUEST_CSUM;
+
+    #[test]
+    fn a_vouched_backend_marks_frames_valid_for_a_csum_guest() {
+        assert!(rx_data_valid(true, GUEST_CSUM));
+    }
+
+    #[test]
+    fn a_backend_nobody_vouched_for_never_marks_frames_valid() {
+        // A relay of LAN frames over the same socket type must not have the guest skip its
+        // checksum check.
+        assert!(!rx_data_valid(false, GUEST_CSUM));
+    }
+
+    #[test]
+    fn a_guest_without_guest_csum_is_never_told() {
+        assert!(!rx_data_valid(true, 0));
     }
 }
