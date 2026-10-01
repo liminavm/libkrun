@@ -1144,6 +1144,10 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         ctx.subscribe_events(self.inner.clone())?;
+        // limina: capture the balloon control handle before the device is moved into the bus, so
+        // limina-vmm can drive the dynamic-memory target on the live device (M6).
+        ctx.vmm
+            .set_balloon_control_handle(self.inner.lock().unwrap().balloon_control_handle());
         ctx.register("balloon", self.inner)
     }
 }

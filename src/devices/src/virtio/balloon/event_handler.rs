@@ -15,7 +15,7 @@ impl Balloon {
     }
 
     pub(crate) fn handle_ifq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported inflate queue event");
+        debug!("balloon: inflate queue event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
@@ -25,11 +25,13 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(IFQ_INDEX).read() {
             error!("Failed to read balloon inflate queue event: {e:?}");
+        } else if self.process_ifq() {
+            self.device_state.signal_used_queue();
         }
     }
 
     pub(crate) fn handle_dfq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported deflate queue event");
+        debug!("balloon: deflate queue event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
@@ -38,7 +40,18 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(DFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
+            error!("Failed to read balloon deflate queue event: {e:?}");
+        } else if self.process_dfq() {
+            self.device_state.signal_used_queue();
+        }
+    }
+
+    /// The host set a new balloon target via [`BalloonControlHandle`]. Apply it to `num_pages` and
+    /// raise a config-change interrupt so the guest balloon driver inflates/deflates toward it.
+    pub(crate) fn handle_target_event(&mut self) {
+        debug!("balloon: target event");
+        if self.apply_target() {
+            self.device_state.signal_config_change();
         }
     }
 
@@ -148,6 +161,17 @@ impl Balloon {
                 error!("Failed to register balloon frq with event manager: {e:?}");
             });
 
+        // limina: the host-driven target eventfd (kicked by BalloonControlHandle::set_target_pages).
+        event_manager
+            .register(
+                self.target_evt.as_raw_fd(),
+                EpollEvent::new(EventSet::IN, self.target_evt.as_raw_fd() as u64),
+                self_subscriber.clone(),
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to register balloon target evt with event manager: {e:?}");
+            });
+
         event_manager
             .unregister(self.activate_evt.as_raw_fd())
             .unwrap_or_else(|e| {
@@ -164,6 +188,7 @@ impl Subscriber for Balloon {
         let stq = self.queue_event(STQ_INDEX).as_raw_fd();
         let phq = self.queue_event(PHQ_INDEX).as_raw_fd();
         let frq = self.queue_event(FRQ_INDEX).as_raw_fd();
+        let target = self.target_evt.as_raw_fd();
         let activate_evt = self.activate_evt.as_raw_fd();
 
         if self.is_activated() {
@@ -173,6 +198,7 @@ impl Subscriber for Balloon {
                 _ if source == stq => self.handle_stq_event(event),
                 _ if source == phq => self.handle_phq_event(event),
                 _ if source == frq => self.handle_frq_event(event),
+                _ if source == target => self.handle_target_event(),
                 _ if source == activate_evt => {
                     self.handle_activate_event(event_manager);
                 }
