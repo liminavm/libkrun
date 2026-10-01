@@ -140,11 +140,11 @@ impl VirtioDevice for Snd {
         let config = self.config();
         let src = config.as_slice();
         let offset = offset as usize;
-        if let Some(end) = offset.checked_add(data.len()) {
-            if end <= src.len() {
-                data.copy_from_slice(&src[offset..end]);
-                return;
-            }
+        if let Some(end) = offset.checked_add(data.len())
+            && end <= src.len()
+        {
+            data.copy_from_slice(&src[offset..end]);
+            return;
         }
         error!(
             "snd: out-of-bounds config read (offset={offset}, len={})",
