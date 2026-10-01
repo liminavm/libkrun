@@ -229,7 +229,7 @@ impl InterruptTransport {
     /// use a direct, level-based injection (currently only riscv64's
     /// `KvmAia`), mirroring how QEMU's `virtio_mmio_update_irq()` recomputes
     /// and re-asserts the IRQ line's level on every ack.
-    fn on_ack(&self, acked: u32) -> Result<(), crate::Error> {
+    pub(crate) fn on_ack(&self, acked: u32) -> Result<(), crate::Error> {
         let mut guard = self.0.status.lock().unwrap();
         *guard &= !(acked as usize);
         if *guard == 0 {
