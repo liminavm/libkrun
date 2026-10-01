@@ -441,6 +441,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         None,
         None, // no suspend-button trigger through the v2 builder (limina's worker drives M9)
+        None, // no restart-button trigger through the v2 builder either
         sender.clone(),
         device_manager,
         None,
