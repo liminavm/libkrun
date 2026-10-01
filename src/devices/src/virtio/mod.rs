@@ -38,6 +38,8 @@ mod queue;
 pub mod rng;
 #[cfg(target_os = "linux")]
 pub mod rtc;
+#[cfg(feature = "snd")]
+pub mod snd;
 #[cfg(feature = "vhost-user")]
 pub mod vhost_user;
 pub mod vsock;
@@ -63,6 +65,8 @@ pub use self::queue::{Descriptor, DescriptorChain, Queue};
 pub use self::rng::*;
 #[cfg(target_os = "linux")]
 pub use self::rtc::*;
+#[cfg(feature = "snd")]
+pub use self::snd::*;
 #[cfg(feature = "vhost-user")]
 pub use self::vhost_user::VhostUserDevice;
 pub use self::vsock::*;
