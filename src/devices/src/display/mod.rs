@@ -13,7 +13,10 @@ pub mod types;
 pub mod display_backend;
 
 pub use edid::EdidInfo;
-pub use types::{DisplayInfo, DisplayInfoEdid, EdidParams, MAX_DISPLAYS, PhysicalSize};
+pub use types::{
+    DetailedMode, DisplayInfo, DisplayInfoEdid, EdidIdentity, EdidParams, MAX_DISPLAYS,
+    PhysicalSize, RefreshRange, StandardTiming, StandardTimings,
+};
 
 #[cfg(feature = "gpu")]
 pub use display_backend::NoopDisplayBackend;
