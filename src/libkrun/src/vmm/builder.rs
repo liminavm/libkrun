@@ -1460,6 +1460,7 @@ pub fn build_microvm(
         paused_counter: None,
         #[cfg(feature = "gpu")]
         gpu_resize_handle: None,
+        balloon_control_handle: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
