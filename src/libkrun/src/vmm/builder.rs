@@ -713,6 +713,7 @@ pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
+    _suspend_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     device_manager: Box<dyn crate::api::device_builders::DeviceManager<'_> + '_>,
     restore_from: Option<PathBuf>,
@@ -1208,6 +1209,7 @@ pub fn build_microvm(
             serial_devices,
             event_manager,
             _shutdown_efd,
+            _suspend_efd,
         )?;
     }
 
@@ -2315,6 +2317,7 @@ fn attach_legacy_devices(
     serial: Vec<Arc<Mutex<Serial>>>,
     event_manager: &mut EventManager,
     shutdown_efd: Option<EventFd>,
+    suspend_efd: Option<EventFd>,
 ) -> Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2333,9 +2336,18 @@ fn attach_legacy_devices(
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 
+    // The GPIO device carries both the poweroff and the suspend button. We synthesize a
+    // suspend eventfd when the caller didn't supply one so the button always exists (the
+    // guest side is harmless if never pulsed); the poweroff eventfd stays required.
     if let Some(shutdown_efd) = shutdown_efd {
+        let suspend_efd = match suspend_efd {
+            Some(efd) => efd,
+            None => EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                .map_err(Error::EventFd)
+                .map_err(StartMicrovmError::Internal)?,
+        };
         mmio_device_manager
-            .register_mmio_gpio(vm, intc.clone(), event_manager, shutdown_efd)
+            .register_mmio_gpio(vm, intc.clone(), event_manager, shutdown_efd, suspend_efd)
             .map_err(Error::RegisterMMIODevice)
             .map_err(StartMicrovmError::Internal)?;
     }
