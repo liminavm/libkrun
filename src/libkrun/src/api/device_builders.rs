@@ -1275,17 +1275,17 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
 /// A virtio balloon device for dynamic memory management.
 #[cfg(not(feature = "tee"))]
 pub struct BalloonDevice {
-    pub(crate) inner: Arc<Mutex<devices::virtio::Balloon>>,
+    free_page_reporting: bool,
+    free_page_reporting_mode: FreePageReportingMode,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl BalloonDevice {
     pub fn new() -> Result<Self, VmmError> {
-        let balloon = devices::virtio::Balloon::new()
-            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(balloon)),
+            free_page_reporting: false,
+            free_page_reporting_mode: FreePageReportingMode::Default,
         })
     }
 
@@ -1299,13 +1299,19 @@ impl BalloonDevice {
     /// the guest's next access to each page faults it in again. Other platforms don't implement
     /// [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
     pub fn set_free_page_reporting_mode(&mut self, mode: FreePageReportingMode) {
-        #[cfg(target_os = "macos")]
-        self.inner
-            .lock()
-            .unwrap()
-            .set_free_page_reporting_mode(mode);
-        #[cfg(not(target_os = "macos"))]
-        let _ = mode;
+        self.free_page_reporting_mode = mode;
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl BalloonDevice {
+    /// limina: advertise `VIRTIO_BALLOON_F_REPORTING` (FRQ fast-reclaim) to the guest. **Default
+    /// false**: a Linux guest with page-reporting enabled use-after-frees the reporting virtqueue on
+    /// suspend-to-idle (upstream `virtballoon_freeze` bug) and wedges. Enable only for enhanced-tier
+    /// guests carrying the kernel fix. See `devices::virtio::Balloon::new`.
+    pub fn free_page_reporting(mut self, enabled: bool) -> Self {
+        self.free_page_reporting = enabled;
+        self
     }
 }
 
@@ -1314,18 +1320,22 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
-        self.inner
-            .lock()
-            .unwrap()
-            .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+        let mut balloon = devices::virtio::Balloon::new(self.free_page_reporting)
             .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
-        ctx.subscribe_events(self.inner.clone())?;
+        #[cfg(target_os = "macos")]
+        {
+            balloon.set_free_page_reporting_mode(self.free_page_reporting_mode);
+            balloon
+                .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+                .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        }
+        let inner = Arc::new(Mutex::new(balloon));
+        ctx.subscribe_events(inner.clone())?;
         // limina: capture the balloon control handle before the device is moved into the bus, so
         // limina-vmm can drive the dynamic-memory target on the live device (M6).
         ctx.vmm
-            .set_balloon_control_handle(self.inner.lock().unwrap().balloon_control_handle());
-        ctx.register("balloon", self.inner)
+            .set_balloon_control_handle(inner.lock().unwrap().balloon_control_handle());
+        ctx.register("balloon", inner)
     }
 }
 

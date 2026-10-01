@@ -36,7 +36,7 @@ pub(super) struct TestDevice<'a> {
 impl<'a> TestDevice<'a> {
     /// Attaches and activates a balloon whose free page reporting queue is at the start of `mem`.
     pub(super) fn new(mem: &'a GuestMemoryMmap) -> Self {
-        Self::with_balloon(mem, Balloon::new().unwrap())
+        Self::with_balloon(mem, Balloon::new(true).unwrap())
     }
 
     pub(super) fn with_balloon(mem: &'a GuestMemoryMmap, mut balloon: Balloon) -> Self {
