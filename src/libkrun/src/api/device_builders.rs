@@ -1816,6 +1816,10 @@ export_bitflags! {
         pub struct NetFlags: u32 {
             /// Send the vfkit magic handshake on a unixgram socket.
             const VFKIT = 1;
+            /// The proxy's frames already carry correct checksums (it builds them in its own
+            /// network stack), so a guest that negotiated GUEST_CSUM may skip verifying them.
+            /// Never pass it for a proxy that relays frames from a wire.
+            const CSUM_VALID = 1 << 2;
         }
     }
 }
@@ -1844,6 +1848,7 @@ impl NetDevice {
             VirtioNetBackend::UnixgramPath(PathBuf::from(path), flags.contains(NetFlags::VFKIT)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1859,12 +1864,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixgramFd(std::os::fd::IntoRawFd::into_raw_fd(fd)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1877,12 +1882,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamPath(PathBuf::from(path)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1898,12 +1903,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamFd(std::os::fd::IntoRawFd::into_raw_fd(fd)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1919,6 +1924,8 @@ impl NetDevice {
                 VirtioNetBackend::Tap(tap_name.to_string()),
                 mac,
                 features,
+                // A tap relays the host kernel's own header; its flags are the kernel's to set.
+                NetFlags::empty(),
             )
         }
         #[cfg(not(target_os = "linux"))]
@@ -1942,12 +1949,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamPath(PathBuf::from(path)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1960,12 +1967,12 @@ impl NetDevice {
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
         use std::os::windows::io::RawSocket;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamFd(handle.as_raw_handle() as RawSocket),
             mac,
             features,
+            flags,
         )
     }
 }
@@ -1977,10 +1984,17 @@ impl NetDevice {
         backend: devices::virtio::net::device::VirtioNetBackend,
         mac: &[u8],
         features: u32,
+        flags: NetFlags,
     ) -> Result<Self, VmmError> {
         let mac: [u8; 6] = mac.try_into().map_err(|_| VmmError::InvalidParam())?;
-        let net = devices::virtio::Net::new(id.to_string(), backend, mac, features)
-            .map_err(|e| VmmError::Internal(format!("net: {e:?}")))?;
+        let net = devices::virtio::Net::new(
+            id.to_string(),
+            backend,
+            mac,
+            features,
+            flags.contains(NetFlags::CSUM_VALID),
+        )
+        .map_err(|e| VmmError::Internal(format!("net: {e:?}")))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(net)),
         })
