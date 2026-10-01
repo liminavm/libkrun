@@ -2455,7 +2455,15 @@ pub fn setup_terminal_raw_mode(
                 })));
             }
             Err(e) => {
-                log::error!("Failed to set terminal to raw mode: {e}")
+                // A serial fd that isn't a classic tty — e.g. a pty master, which doesn't
+                // support termios — can't be put in raw mode. That's expected and harmless
+                // (whatever attaches to the other end sets its own mode), so don't surface
+                // it as an error. Real failures still log loudly.
+                if e == nix::errno::Errno::ENOTTY {
+                    log::debug!("serial console fd does not support raw mode (not a tty): {e}")
+                } else {
+                    log::error!("Failed to set terminal to raw mode: {e}")
+                }
             }
         };
     }
