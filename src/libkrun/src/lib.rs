@@ -6,7 +6,7 @@ extern crate log;
 pub mod api;
 pub use api::*;
 
-pub(crate) mod vmm;
+pub mod vmm;
 
 #[cfg(feature = "ffi")]
 ffier::generate_bridge!(
