@@ -2175,6 +2175,7 @@ impl<'a> AttachDevice<'a> for VhostUserDevice {
 pub struct InputDevice<'a> {
     config_backend: krun_input::InputConfigBackend<'a>,
     events_backend: krun_input::InputEventProviderBackend<'a>,
+    id: Option<String>,
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -2217,6 +2218,7 @@ impl<'a> InputDevice<'a> {
         Ok(Self {
             config_backend,
             events_backend,
+            id: None,
             _lifetime: PhantomData,
         })
     }
@@ -2243,6 +2245,7 @@ impl<'a> InputDevice<'a> {
         Ok(Self {
             config_backend,
             events_backend,
+            id: None,
             _lifetime: PhantomData,
         })
     }
@@ -2258,8 +2261,17 @@ impl<'a> InputDevice<'a> {
         Self {
             config_backend,
             events_backend,
+            id: None,
             _lifetime: PhantomData,
         }
+    }
+
+    /// The device's bus id. Every input device reports the same `id()`, so without one each
+    /// would register under the same name and replace the last in the device manager's table;
+    /// the default is unique per device.
+    pub fn id(mut self, id: &str) -> Self {
+        self.id = Some(id.to_string());
+        self
     }
 }
 
@@ -2287,7 +2299,9 @@ impl<'a> AttachDevice<'a> for InputDevice<'a> {
         let input = Input::new(config_backend, events_backend)
             .map_err(|e| VmmError::Internal(format!("input: {e:?}")))?;
         let inner = Arc::new(Mutex::new(input));
-        let id = inner.lock().unwrap().id().to_string();
+        let id = self
+            .id
+            .unwrap_or_else(|| format!("input{}", ctx.device_index()));
         ctx.register(&id, inner)
     }
 }
