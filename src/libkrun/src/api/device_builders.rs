@@ -1183,12 +1183,23 @@ impl<'a> AttachDevice<'a> for I2cBatteryDevice {
 /// virtio_snd driver binds it and exposes an ALSA card (see `devices::virtio::snd`). Works
 /// on macOS (in-VMM, no vhost-user).
 #[cfg(feature = "snd")]
-pub struct SndDevice {}
+#[derive(Default)]
+pub struct SndDevice {
+    capture: bool,
+}
 
 #[cfg(feature = "snd")]
 impl SndDevice {
     pub fn new() -> Self {
-        Self {}
+        Self::default()
+    }
+
+    /// Advertise the mic-capture input stream. Opt-in and default-off for privacy (unlike
+    /// playback): enabling it lets the guest capture the host microphone (and triggers the
+    /// macOS mic TCC prompt on first PREPARE).
+    pub fn capture(mut self, enabled: bool) -> Self {
+        self.capture = enabled;
+        self
     }
 }
 
@@ -1196,7 +1207,7 @@ impl SndDevice {
 impl<'a> AttachDevice<'a> for SndDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let snd =
-            devices::virtio::Snd::new().map_err(|e| VmmError::Internal(format!("snd: {e:?}")))?;
+            devices::virtio::Snd::new(self.capture).map_err(|e| VmmError::Internal(format!("snd: {e:?}")))?;
         let inner = Arc::new(Mutex::new(snd));
         ctx.subscribe_events(inner.clone())?;
         let id = inner.lock().unwrap().id().to_string();
