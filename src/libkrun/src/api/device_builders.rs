@@ -1124,6 +1124,7 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
 #[cfg(not(feature = "tee"))]
 pub struct BalloonDevice {
     free_page_reporting: bool,
+    deflate_on_oom: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
@@ -1132,6 +1133,7 @@ impl BalloonDevice {
     pub fn new() -> Result<Self, VmmError> {
         Ok(Self {
             free_page_reporting: false,
+            deflate_on_oom: false,
         })
     }
 }
@@ -1146,6 +1148,14 @@ impl BalloonDevice {
         self.free_page_reporting = enabled;
         self
     }
+
+    /// limina: advertise `VIRTIO_BALLOON_F_DEFLATE_ON_OOM`. **Default false** (transparent
+    /// balloon accounting — see the AVAIL_FEATURES comment in devices::virtio::balloon):
+    /// the per-VM escape hatch re-advertises the guest kernel's OOM deflate net.
+    pub fn deflate_on_oom(mut self, enabled: bool) -> Self {
+        self.deflate_on_oom = enabled;
+        self
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
@@ -1153,7 +1163,7 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        let balloon = devices::virtio::Balloon::new(self.free_page_reporting)
+        let balloon = devices::virtio::Balloon::new(self.free_page_reporting, self.deflate_on_oom)
             .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         let inner = Arc::new(Mutex::new(balloon));
         ctx.subscribe_events(inner.clone())?;
