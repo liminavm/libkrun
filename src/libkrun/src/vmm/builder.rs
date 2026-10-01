@@ -1458,6 +1458,8 @@ pub fn build_microvm(
             any(target_arch = "aarch64", target_arch = "riscv64")
         ))]
         paused_counter: None,
+        #[cfg(feature = "gpu")]
+        gpu_resize_handle: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.

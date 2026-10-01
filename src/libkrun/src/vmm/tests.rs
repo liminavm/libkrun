@@ -86,6 +86,8 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         paused: resume,
         paused_at: unsafe { hvf::mach_absolute_time() },
         ram_in_blocks: false,
+        #[cfg(feature = "gpu")]
+        gpu_resize_handle: None,
     };
 
     match control {

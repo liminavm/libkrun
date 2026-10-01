@@ -222,6 +222,10 @@ pub struct Vmm {
         any(target_arch = "aarch64", target_arch = "riscv64")
     ))]
     pub(crate) paused_counter: Option<u64>,
+    /// limina: a handle for pushing runtime display resizes into the live virtio-gpu device,
+    /// captured when the GPU device is attached. `None` if no display/GPU is configured.
+    #[cfg(feature = "gpu")]
+    gpu_resize_handle: Option<devices::virtio::DisplayResizeHandle>,
 }
 
 #[cfg(target_os = "linux")]
@@ -245,6 +249,19 @@ pub enum VmCtl {
 }
 
 impl Vmm {
+    /// limina: the runtime display-resize handle for the live virtio-gpu (if a GPU is
+    /// attached). limina-vmm uses it to apply window-resize requests to the guest.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_resize_handle(&self) -> Option<devices::virtio::DisplayResizeHandle> {
+        self.gpu_resize_handle.clone()
+    }
+
+    /// limina: record the GPU resize handle at attach time (see [`Self::gpu_resize_handle`]).
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu_resize_handle(&mut self, handle: devices::virtio::DisplayResizeHandle) {
+        self.gpu_resize_handle = Some(handle);
+    }
+
     /// Starts the microVM vcpus.
     pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let vcpu_count = vcpus.len();
