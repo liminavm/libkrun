@@ -29,6 +29,10 @@ const SIZE_CELLS: u32 = 0x2;
 
 // System restart
 const KEY_RESTART: u32 = 0x198;
+// Linux input code for the "sleep"/suspend key. systemd-logind maps KEY_SLEEP to its
+// HandleSuspendKey action (default: suspend), so pulsing this line makes a stock guest
+// enter suspend-to-idle with no guest agent (M9 freeze trigger, stock tier).
+const KEY_SLEEP: u32 = 142;
 
 // As per kvm tool and
 // https://www.kernel.org/doc/Documentation/devicetree/bindings/interrupt-controller/arm%2Cgic.txt
@@ -440,6 +444,14 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     let gpios = [GPIO_PHANDLE, 3, 0];
     fdt.property_array_u32("gpios", &gpios)?;
     fdt.end_node(gpio_keys_poweroff_node)?;
+    // Suspend button (KEY_SLEEP on GPIO line 4) — the host pulses it to ask a cooperative
+    // guest to suspend-to-idle with no agent (M9 freeze trigger, stock tier).
+    let gpio_keys_suspend_node = fdt.begin_node("button@2")?;
+    fdt.property_string("label", "GPIO Key Suspend")?;
+    fdt.property_u32("linux,code", KEY_SLEEP)?;
+    let suspend_gpios = [GPIO_PHANDLE, 4, 0];
+    fdt.property_array_u32("gpios", &suspend_gpios)?;
+    fdt.end_node(gpio_keys_suspend_node)?;
     fdt.end_node(gpio_keys_node)?;
 
     Ok(())
