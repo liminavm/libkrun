@@ -1707,6 +1707,11 @@ impl<'a> AttachDevice<'a> for GpuDevice {
             inner.lock().unwrap().set_shm_region(region.into());
         }
 
+        // limina: capture the runtime display-resize handle before the device is moved into the
+        // bus, so limina-vmm can apply window-resize requests to the live device.
+        ctx.vmm
+            .set_gpu_resize_handle(inner.lock().unwrap().display_resize_handle());
+
         let id = inner.lock().unwrap().id().to_string();
         ctx.register(&id, inner)
     }
