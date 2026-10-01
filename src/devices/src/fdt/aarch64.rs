@@ -307,6 +307,7 @@ fn create_psci_node(fdt: &mut FdtWriter) -> Result<()> {
 fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
+    virtio_type: u32,
 ) -> Result<()> {
     let device_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
     #[cfg(target_os = "linux")]
@@ -323,6 +324,27 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property("reg", &device_reg_prop)?;
     fdt.property("interrupts", &irq)?;
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+
+    // The virtio-i2c adapter carries its bus topology in the DT (the virtio core
+    // adopts the transport's sole child node whose compatible is
+    // "virtio,device<ID hex>"; the i2c core then instantiates that node's own
+    // children as slaves — Documentation/devicetree/bindings/i2c/i2c-virtio.yaml).
+    // Declare the emulated SBS smart battery so a stock guest's sbs-battery
+    // driver binds it with no guest-side configuration.
+    #[cfg(not(feature = "tee"))]
+    if virtio_type == crate::virtio::TYPE_I2C {
+        let i2c_node = fdt.begin_node("i2c")?;
+        fdt.property_string("compatible", "virtio,device22")?;
+        fdt.property_u32("#address-cells", 0x1)?;
+        fdt.property_u32("#size-cells", 0x0)?;
+        let battery_node =
+            fdt.begin_node(&format!("battery@{:x}", crate::virtio::SBS_BATTERY_ADDR))?;
+        fdt.property_string("compatible", "sbs,sbs-battery")?;
+        fdt.property_u32("reg", u32::from(crate::virtio::SBS_BATTERY_ADDR))?;
+        fdt.end_node(battery_node)?;
+        fdt.end_node(i2c_node)?;
+    }
+
     fdt.end_node(virtio_node)?;
 
     Ok(())
@@ -421,23 +443,23 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &HashMap<(DeviceType, String), T>,
 ) -> Result<()> {
     // Create one temp Vec to store all virtio devices
-    let mut ordered_virtio_device: Vec<&T> = Vec::new();
+    let mut ordered_virtio_device: Vec<(&T, u32)> = Vec::new();
 
     for ((device_type, _device_id), info) in dev_info {
         match device_type {
             DeviceType::Gpio => create_gpio_node(fdt, info)?,
             DeviceType::RTC => create_rtc_node(fdt, info)?,
             DeviceType::Serial => create_serial_node(fdt, info)?,
-            DeviceType::Virtio(_) => {
-                ordered_virtio_device.push(info);
+            DeviceType::Virtio(virtio_type) => {
+                ordered_virtio_device.push((info, *virtio_type));
             }
         }
     }
 
     // Sort out virtio devices by address from low to high and insert them into fdt table.
-    ordered_virtio_device.sort_by_key(|a| a.addr());
-    for ordered_device_info in ordered_virtio_device.drain(..) {
-        create_virtio_node(fdt, ordered_device_info)?;
+    ordered_virtio_device.sort_by_key(|(a, _)| a.addr());
+    for (ordered_device_info, virtio_type) in ordered_virtio_device.drain(..) {
+        create_virtio_node(fdt, ordered_device_info, virtio_type)?;
     }
 
     Ok(())
