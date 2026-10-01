@@ -38,12 +38,14 @@ const GPIO_ID: [u8; 8] = [0x61, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 const GPIO_ID_LOW: u64 = 0xfe0;
 const GPIO_ID_HIGH: u64 = 0x1000;
 
-// GPIO lines wired to `gpio-keys` buttons in the FDT (see `create_gpio_node`).
-// Line 3 (bit 0x8) is the poweroff/restart key; line 4 (bit 0x10) is the suspend
-// (KEY_SLEEP) key — the host pulses it to ask a cooperative guest to enter
-// suspend-to-idle without a guest agent (M9 freeze trigger, stock tier).
-const POWEROFF_BIT: u32 = 0x8;
+// GPIO lines wired to `gpio-keys` buttons in the FDT (see `create_gpio_node`). Each is a
+// distinct key so the host can ask a cooperative guest to power off, suspend, or reboot:
+//   line 3 (0x8)  → KEY_POWER   (logind HandlePowerKey   → poweroff)   ← shutdown eventfd
+//   line 4 (0x10) → KEY_SLEEP   (logind HandleSuspendKey → suspend)    ← suspend eventfd
+//   line 5 (0x20) → KEY_RESTART (logind HandleRebootKey  → reboot)     ← restart eventfd
+const POWER_BIT: u32 = 0x8;
 const SUSPEND_BIT: u32 = 0x10;
+const RESTART_BIT: u32 = 0x20;
 
 #[derive(Debug)]
 pub enum Error {
@@ -84,11 +86,17 @@ pub struct Gpio {
     irq_line: Option<u32>,
     shutdown_efd: EventFd,
     suspend_efd: EventFd,
+    restart_efd: EventFd,
 }
 
 impl Gpio {
     /// Constructs an PL061 GPIO device.
-    pub fn new(shutdown_efd: EventFd, suspend_efd: EventFd, interrupt_evt: EventFd) -> Self {
+    pub fn new(
+        shutdown_efd: EventFd,
+        suspend_efd: EventFd,
+        restart_efd: EventFd,
+        interrupt_evt: EventFd,
+    ) -> Self {
         Self {
             data: 0,
             dir: 0,
@@ -103,6 +111,7 @@ impl Gpio {
             irq_line: None,
             shutdown_efd,
             suspend_efd,
+            restart_efd,
         }
     }
 
@@ -159,12 +168,12 @@ impl Gpio {
         Ok(())
     }
 
-    pub fn trigger_restart_key(&mut self, press: bool) {
+    pub fn trigger_power_key(&mut self, press: bool) {
         debug!(
-            "Generate a restart key {} event",
+            "Generate a power key {} event",
             if press { "press" } else { "release" }
         );
-        self.trigger_key(POWEROFF_BIT, press);
+        self.trigger_key(POWER_BIT, press);
     }
 
     pub fn trigger_suspend_key(&mut self, press: bool) {
@@ -173,6 +182,14 @@ impl Gpio {
             if press { "press" } else { "release" }
         );
         self.trigger_key(SUSPEND_BIT, press);
+    }
+
+    pub fn trigger_restart_key(&mut self, press: bool) {
+        debug!(
+            "Generate a restart key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(RESTART_BIT, press);
     }
 
     /// Drive a single GPIO line (`bit`) high (press) or low (release) and raise the
@@ -266,13 +283,18 @@ impl Subscriber for Gpio {
         match source {
             _ if source == self.shutdown_efd.as_raw_fd() => {
                 _ = self.shutdown_efd.read();
-                // Send a poweroff/restart key press event.
-                self.trigger_restart_key(true);
+                // Send a poweroff (KEY_POWER) key press event.
+                self.trigger_power_key(true);
             }
             _ if source == self.suspend_efd.as_raw_fd() => {
                 _ = self.suspend_efd.read();
                 // Send a suspend (KEY_SLEEP) key press event.
                 self.trigger_suspend_key(true);
+            }
+            _ if source == self.restart_efd.as_raw_fd() => {
+                _ = self.restart_efd.read();
+                // Send a reboot (KEY_RESTART) key press event.
+                self.trigger_restart_key(true);
             }
             _ => warn!("Unexpected gpio event received: {source:?}"),
         }
@@ -282,6 +304,7 @@ impl Subscriber for Gpio {
         vec![
             EpollEvent::new(EventSet::IN, self.shutdown_efd.as_raw_fd() as u64),
             EpollEvent::new(EventSet::IN, self.suspend_efd.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.restart_efd.as_raw_fd() as u64),
         ]
     }
 }
