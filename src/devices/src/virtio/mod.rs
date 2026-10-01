@@ -36,6 +36,8 @@ mod pci;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
+#[cfg(feature = "snd")]
+pub mod snd;
 #[cfg(feature = "vhost-user")]
 pub mod vhost_user;
 pub mod vsock;
@@ -59,6 +61,8 @@ pub use self::pci::*;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
+#[cfg(feature = "snd")]
+pub use self::snd::*;
 #[cfg(feature = "vhost-user")]
 pub use self::vhost_user::VhostUserDevice;
 pub use self::vsock::*;
