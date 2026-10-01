@@ -8,7 +8,7 @@ use std::thread;
 use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, ProxyMap, push_packet};
+use super::muxer::{MuxerRx, ProxyMap, push_packet, signal_rx};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
@@ -169,7 +169,7 @@ impl MuxerThread {
 
         if should_signal {
             debug!("signal IRQ");
-            self.interrupt.signal_used_queue();
+            signal_rx(&self.queue, &self.mem, &self.interrupt);
         }
     }
 
