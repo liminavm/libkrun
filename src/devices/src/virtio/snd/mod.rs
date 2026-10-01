@@ -8,10 +8,12 @@
 //! driver binds it and exposes an ALSA card; PipeWire/PulseAudio route to it with
 //! no guest-side limina components — so a stock Fedora guest gets sound too.
 //!
-//! Phase A (this commit) enumerates a single stereo playback stream and answers
-//! the full control-queue handshake, discarding tx frames into a null sink. Phase
-//! B replaces the null sink with a CoreAudio output unit driven from a dedicated
-//! worker thread, with tx-completion pacing.
+//! Playback (stream 0) is always advertised: guest tx frames feed a CoreAudio
+//! output unit with tx-completion pacing (S16→f32, paced by the host DAC). Mic
+//! capture (stream 1, `snd_capture`) is opt-in and default-off for privacy: when
+//! enabled it advertises a mono input stream whose rx buffers are filled from a
+//! CoreAudio input unit — creating that unit on PCM_PREPARE is what triggers the
+//! macOS mic TCC prompt. Capture is macOS-only; non-macOS keeps the null tx sink.
 
 #[cfg(target_os = "macos")]
 mod audio_macos;
@@ -31,7 +33,7 @@ mod defs {
     pub const CONTROL_INDEX: usize = 0;
     pub const _EVENT_INDEX: usize = 1;
     pub const TX_INDEX: usize = 2;
-    pub const _RX_INDEX: usize = 3;
+    pub const RX_INDEX: usize = 3;
     pub const NUM_QUEUES: usize = 4;
 
     const QUEUE_SIZE: u16 = 64;

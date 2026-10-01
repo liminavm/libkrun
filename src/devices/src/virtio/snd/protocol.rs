@@ -50,6 +50,7 @@ pub const VIRTIO_SND_PCM_RATE_44100: u8 = 6;
 pub const VIRTIO_SND_PCM_RATE_48000: u8 = 7;
 
 // Channel-map positions.
+pub const VIRTIO_SND_CHMAP_MONO: u8 = 2;
 pub const VIRTIO_SND_CHMAP_FL: u8 = 3;
 pub const VIRTIO_SND_CHMAP_FR: u8 = 4;
 pub const VIRTIO_SND_CHMAP_MAX_SIZE: usize = 18;
