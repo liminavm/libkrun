@@ -18,9 +18,10 @@ use crate::virtio::{DescriptorChain, InterruptTransport};
 // elements yet; guest/host volume stack instead).
 pub(crate) const AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
 
-// The single advertised playback stream (stream_id 0) and channel map (chmap_id 0).
-const NUM_STREAMS: u32 = 1;
-const NUM_CHMAPS: u32 = 1;
+// Stream / chmap identifiers. Playback (output) is always stream 0 / chmap 0; when
+// mic capture is enabled it adds an input stream 1 / chmap 1.
+const OUTPUT_STREAM_ID: u32 = 0;
+const CAPTURE_STREAM_ID: u32 = 1;
 
 /// Parameters the guest selected for a stream via SET_PARAMS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,13 +54,23 @@ pub struct Snd {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     pub(crate) params: StreamParams,
-    /// Kicked by the CoreAudio render callback when it consumes frames, so the device
-    /// thread reaps and completes the tx descriptors those frames belong to.
+    /// Whether the mic-capture input stream is advertised (opt-in; default off for
+    /// privacy). When false the device exposes playback only and never touches the mic.
+    pub(crate) capture_enabled: bool,
+    /// Parameters the guest selected for the capture stream via SET_PARAMS.
+    #[cfg(target_os = "macos")]
+    pub(crate) capture_params: StreamParams,
+    /// Kicked by the CoreAudio render callback when it consumes (playback) or produces
+    /// (capture) frames, so the device thread reaps tx completions and/or drains the
+    /// capture ring into rx buffers.
     #[cfg(target_os = "macos")]
     pub(crate) completion_evt: Arc<EventFd>,
-    /// The host CoreAudio output sink (created on PCM_PREPARE).
+    /// The host CoreAudio output sink (created on PCM_PREPARE for stream 0).
     #[cfg(target_os = "macos")]
     pub(crate) audio: Option<super::audio_macos::OutputStream>,
+    /// The host CoreAudio input source (created on PCM_PREPARE for stream 1).
+    #[cfg(target_os = "macos")]
+    pub(crate) capture: Option<super::audio_macos::InputStream>,
     /// Popped tx descriptors awaiting completion, each tagged with the cumulative
     /// frame count at which it becomes complete (paced by real playback).
     #[cfg(target_os = "macos")]
@@ -74,7 +85,7 @@ impl Snd {
         &self.queues.as_ref().expect("queues should exist")[idx].event
     }
 
-    pub fn new() -> super::Result<Snd> {
+    pub fn new(capture_enabled: bool) -> super::Result<Snd> {
         Ok(Snd {
             queues: None,
             avail_features: AVAIL_FEATURES,
@@ -82,12 +93,17 @@ impl Snd {
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(SndError::EventFd)?,
             device_state: DeviceState::Inactive,
             params: StreamParams::default(),
+            capture_enabled,
+            #[cfg(target_os = "macos")]
+            capture_params: StreamParams::default(),
             #[cfg(target_os = "macos")]
             completion_evt: Arc::new(
                 EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(SndError::EventFd)?,
             ),
             #[cfg(target_os = "macos")]
             audio: None,
+            #[cfg(target_os = "macos")]
+            capture: None,
             #[cfg(target_os = "macos")]
             in_flight: std::collections::VecDeque::new(),
             #[cfg(target_os = "macos")]
@@ -106,10 +122,12 @@ impl Snd {
     }
 
     fn config(&self) -> VirtioSndConfig {
+        // Playback stream 0 always; capture stream 1 only when the mic is enabled.
+        let n = if self.capture_enabled { 2 } else { 1 };
         VirtioSndConfig {
             jacks: 0,
-            streams: NUM_STREAMS,
-            chmaps: NUM_CHMAPS,
+            streams: n,
+            chmaps: n,
             controls: 0,
         }
     }
@@ -175,13 +193,16 @@ impl Snd {
             Err(_) => return 0,
         };
 
+        debug!("snd: control req code={code:#x}");
         match code {
             VIRTIO_SND_R_PCM_INFO => {
                 let q: VirtioSndQueryInfo = reader.read_obj().unwrap_or_default();
                 write_status(&mut writer, VIRTIO_SND_S_OK);
                 for id in q.start_id..q.start_id.saturating_add(q.count) {
-                    if id == 0 {
-                        let _ = writer.write_obj(pcm_info());
+                    if id == OUTPUT_STREAM_ID {
+                        let _ = writer.write_obj(output_pcm_info());
+                    } else if id == CAPTURE_STREAM_ID && self.capture_enabled {
+                        let _ = writer.write_obj(capture_pcm_info());
                     }
                 }
             }
@@ -189,8 +210,10 @@ impl Snd {
                 let q: VirtioSndQueryInfo = reader.read_obj().unwrap_or_default();
                 write_status(&mut writer, VIRTIO_SND_S_OK);
                 for id in q.start_id..q.start_id.saturating_add(q.count) {
-                    if id == 0 {
-                        let _ = writer.write_obj(chmap_info());
+                    if id == OUTPUT_STREAM_ID {
+                        let _ = writer.write_obj(output_chmap_info());
+                    } else if id == CAPTURE_STREAM_ID && self.capture_enabled {
+                        let _ = writer.write_obj(capture_chmap_info());
                     }
                 }
             }
@@ -201,14 +224,21 @@ impl Snd {
             }
             VIRTIO_SND_R_PCM_SET_PARAMS => {
                 let p: VirtioSndPcmSetParams = reader.read_obj().unwrap_or_default();
-                let status = if p.stream_id == 0 {
-                    self.params = StreamParams {
-                        buffer_bytes: p.buffer_bytes,
-                        period_bytes: p.period_bytes,
-                        channels: p.channels,
-                        format: p.format,
-                        rate: p.rate,
-                    };
+                let params = StreamParams {
+                    buffer_bytes: p.buffer_bytes,
+                    period_bytes: p.period_bytes,
+                    channels: p.channels,
+                    format: p.format,
+                    rate: p.rate,
+                };
+                let status = if p.stream_id == OUTPUT_STREAM_ID {
+                    self.params = params;
+                    VIRTIO_SND_S_OK
+                } else if p.stream_id == CAPTURE_STREAM_ID && self.capture_enabled {
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.capture_params = params;
+                    }
                     VIRTIO_SND_S_OK
                 } else {
                     VIRTIO_SND_S_BAD_MSG
@@ -220,8 +250,11 @@ impl Snd {
             | VIRTIO_SND_R_PCM_STOP
             | VIRTIO_SND_R_PCM_RELEASE => {
                 let h: VirtioSndPcmHdr = reader.read_obj().unwrap_or_default();
-                let status = if h.stream_id == 0 {
+                let status = if h.stream_id == OUTPUT_STREAM_ID {
                     self.handle_pcm_lifecycle(code);
+                    VIRTIO_SND_S_OK
+                } else if h.stream_id == CAPTURE_STREAM_ID && self.capture_enabled {
+                    self.handle_capture_lifecycle(code);
                     VIRTIO_SND_S_OK
                 } else {
                     VIRTIO_SND_S_BAD_MSG
@@ -291,6 +324,67 @@ impl Snd {
 
     #[cfg(not(target_os = "macos"))]
     fn handle_pcm_lifecycle(&mut self, _code: u32) {}
+
+    /// Drive the host mic source through the capture stream's PCM lifecycle (macOS).
+    /// Creating the input unit on PREPARE is what triggers the mic TCC prompt.
+    #[cfg(target_os = "macos")]
+    fn handle_capture_lifecycle(&mut self, code: u32) {
+        debug!("snd: capture lifecycle code={code:#x} enter (have_unit={})", self.capture.is_some());
+        match code {
+            VIRTIO_SND_R_PCM_PREPARE => {
+                if let Some(c) = self.capture.as_mut() {
+                    c.stop();
+                }
+                if self.capture.is_none() {
+                    let channels = if self.capture_params.channels == 0 {
+                        1
+                    } else {
+                        self.capture_params.channels as usize
+                    };
+                    debug!("snd: capture InputStream::new({channels}ch) begin");
+                    match super::audio_macos::InputStream::new(
+                        48_000.0,
+                        channels,
+                        self.completion_evt.clone(),
+                    ) {
+                        Ok(s) => self.capture = Some(s),
+                        Err(e) => error!("snd: CoreAudio input init failed ({e}); silent mic"),
+                    }
+                    debug!("snd: capture InputStream::new end (ok={})", self.capture.is_some());
+                }
+                if let Some(c) = self.capture.as_mut() {
+                    c.reset();
+                }
+            }
+            VIRTIO_SND_R_PCM_START => {
+                if let Some(c) = self.capture.as_mut() {
+                    c.start();
+                }
+            }
+            VIRTIO_SND_R_PCM_STOP => {
+                if let Some(c) = self.capture.as_mut() {
+                    c.stop();
+                }
+                // The guest stops queueing rx buffers after STOP; return any it already
+                // posted so its ring drains (the driver waits for them on release).
+                self.flush_rx();
+            }
+            VIRTIO_SND_R_PCM_RELEASE => {
+                debug!("snd: capture RELEASE — dropping InputStream begin");
+                self.capture = None; // Drop stops + disposes the unit.
+                // The Linux virtio_snd driver's PCM release blocks until every posted rx
+                // I/O buffer has been returned (msg_count == 0). Return them here, or the
+                // guest hangs and the NEXT open times out (device appears wedged).
+                self.flush_rx();
+                debug!("snd: capture RELEASE — dropped");
+            }
+            _ => {}
+        }
+        debug!("snd: capture lifecycle code={code:#x} done");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn handle_capture_lifecycle(&mut self, _code: u32) {}
 
     /// Playback path. On macOS: copy the guest frames into the sink's ring and record
     /// the descriptor for paced completion (do NOT complete here). Elsewhere: null sink
@@ -450,6 +544,150 @@ impl Snd {
         let end = self.submitted;
         self.complete_up_to(end);
     }
+
+    /// Capture path (macOS). Fill each posted rx buffer with a full period of captured
+    /// mic audio (S16_LE) drained from the CoreAudio input ring, and complete it. A
+    /// buffer is filled only once enough frames are queued — otherwise it is left posted
+    /// (put back) so the status word lands at the buffer's fixed tail offset and the
+    /// guest `hw_ptr` advances by whole periods. Called on the rx kick and the completion
+    /// eventfd. Non-macOS never advertises a capture stream, so there is no rx path there.
+    #[cfg(target_os = "macos")]
+    pub fn process_rx(&mut self) -> bool {
+        use std::io::Write;
+
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem.clone(),
+            DeviceState::Inactive => return false,
+        };
+        let bpf = self.capture_params.bytes_per_frame();
+        let status_sz = std::mem::size_of::<VirtioSndPcmStatus>();
+        let mut used_any = false;
+
+        loop {
+            // No source yet (not prepared/started): leave rx buffers posted.
+            let avail_samples = match self.capture.as_ref() {
+                Some(c) => c.available(),
+                None => break,
+            };
+            let head = match self.queues.as_mut().expect("queues exist")[defs::RX_INDEX]
+                .queue
+                .pop(&mem)
+            {
+                Some(h) => h,
+                None => break,
+            };
+            let index = head.index;
+            let mut writer = match Writer::new(&mem, head.clone()) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("snd: capture writer error: {e:?}");
+                    if let Err(e) = self.queues.as_mut().expect("queues exist")[defs::RX_INDEX]
+                        .queue
+                        .add_used(&mem, index, 0)
+                    {
+                        error!("snd: failed to add used rx descriptor: {e:?}");
+                    }
+                    used_any = true;
+                    continue;
+                }
+            };
+
+            // Writable region is [PCM data (period)] [status]; fill the whole PCM span.
+            let pcm_cap = writer.available_bytes().saturating_sub(status_sz);
+            let frames = pcm_cap / bpf;
+            let need_samples = frames * (bpf / 2); // bpf/2 == channels (S16)
+            if frames == 0 || avail_samples < need_samples {
+                // Not enough captured yet — put the buffer back and wait for more.
+                self.queues.as_mut().expect("queues exist")[defs::RX_INDEX]
+                    .queue
+                    .go_to_previous_position();
+                break;
+            }
+
+            let mut samples = vec![0f32; need_samples];
+            let got = self
+                .capture
+                .as_ref()
+                .expect("capture present")
+                .pull_samples(&mut samples);
+            // Fill the entire PCM region: real frames, zero-padded tail if non-aligned.
+            let mut pcm = vec![0u8; pcm_cap];
+            for (i, s) in samples[..got].iter().enumerate() {
+                let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                pcm[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            let _ = writer.write_all(&pcm);
+            let _ = writer.write_obj(VirtioSndPcmStatus {
+                status: VIRTIO_SND_S_OK,
+                latency_bytes: 0,
+            });
+            let written = writer.bytes_written() as u32;
+            if let Err(e) = self.queues.as_mut().expect("queues exist")[defs::RX_INDEX]
+                .queue
+                .add_used(&mem, index, written)
+            {
+                error!("snd: failed to add used rx descriptor: {e:?}");
+            }
+            used_any = true;
+        }
+
+        if used_any {
+            self.device_state.signal_used_queue();
+        }
+        used_any
+    }
+
+    /// Return every rx buffer the guest has posted, completing each with a silent period.
+    /// Called on capture STOP/RELEASE: the Linux virtio_snd driver's release path blocks
+    /// until all posted I/O buffers are back in the used ring, so leaving any outstanding
+    /// wedges the stream (the next open times out). Idempotent — a no-op if none are posted.
+    #[cfg(target_os = "macos")]
+    fn flush_rx(&mut self) {
+        use std::io::Write;
+
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem.clone(),
+            DeviceState::Inactive => return,
+        };
+        let status_sz = std::mem::size_of::<VirtioSndPcmStatus>();
+        let mut used_any = false;
+
+        loop {
+            let head = match self.queues.as_mut().expect("queues exist")[defs::RX_INDEX]
+                .queue
+                .pop(&mem)
+            {
+                Some(h) => h,
+                None => break,
+            };
+            let index = head.index;
+            let mut written = 0u32;
+            if let Ok(mut writer) = Writer::new(&mem, head.clone()) {
+                // Fill the whole PCM region with silence so the status word lands at the
+                // buffer's fixed tail offset, then write it.
+                let pcm_cap = writer.available_bytes().saturating_sub(status_sz);
+                let zeros = vec![0u8; pcm_cap];
+                let _ = writer.write_all(&zeros);
+                let _ = writer.write_obj(VirtioSndPcmStatus {
+                    status: VIRTIO_SND_S_OK,
+                    latency_bytes: 0,
+                });
+                written = writer.bytes_written() as u32;
+            }
+            if let Err(e) = self.queues.as_mut().expect("queues exist")[defs::RX_INDEX]
+                .queue
+                .add_used(&mem, index, written)
+            {
+                error!("snd: failed to add used rx descriptor on flush: {e:?}");
+            }
+            used_any = true;
+        }
+
+        if used_any {
+            self.device_state.signal_used_queue();
+            debug!("snd: flushed outstanding rx buffers");
+        }
+    }
 }
 
 fn write_status(writer: &mut Writer, code: u32) {
@@ -458,8 +696,8 @@ fn write_status(writer: &mut Writer, code: u32) {
     }
 }
 
-/// The single stereo playback stream we advertise: S16_LE @ 48 kHz, 2 channels.
-fn pcm_info() -> VirtioSndPcmInfo {
+/// The stereo playback stream (stream 0): S16_LE @ 48 kHz, 2 channels.
+fn output_pcm_info() -> VirtioSndPcmInfo {
     VirtioSndPcmInfo {
         hda_fn_nid: 0,
         features: 0,
@@ -473,7 +711,7 @@ fn pcm_info() -> VirtioSndPcmInfo {
 }
 
 /// Front-left / front-right stereo channel map for the playback stream.
-fn chmap_info() -> VirtioSndChmapInfo {
+fn output_chmap_info() -> VirtioSndChmapInfo {
     let mut positions = [0u8; VIRTIO_SND_CHMAP_MAX_SIZE];
     positions[0] = VIRTIO_SND_CHMAP_FL;
     positions[1] = VIRTIO_SND_CHMAP_FR;
@@ -481,6 +719,32 @@ fn chmap_info() -> VirtioSndChmapInfo {
         hda_fn_nid: 0,
         direction: VIRTIO_SND_D_OUTPUT,
         channels: 2,
+        positions,
+    }
+}
+
+/// The mono mic-capture stream (stream 1): S16_LE @ 48 kHz, 1 channel.
+fn capture_pcm_info() -> VirtioSndPcmInfo {
+    VirtioSndPcmInfo {
+        hda_fn_nid: 0,
+        features: 0,
+        formats: 1u64 << VIRTIO_SND_PCM_FMT_S16,
+        rates: 1u64 << VIRTIO_SND_PCM_RATE_48000,
+        direction: VIRTIO_SND_D_INPUT,
+        channels_min: 1,
+        channels_max: 1,
+        padding: [0; 5],
+    }
+}
+
+/// Mono channel map for the capture stream.
+fn capture_chmap_info() -> VirtioSndChmapInfo {
+    let mut positions = [0u8; VIRTIO_SND_CHMAP_MAX_SIZE];
+    positions[0] = VIRTIO_SND_CHMAP_MONO;
+    VirtioSndChmapInfo {
+        hda_fn_nid: 0,
+        direction: VIRTIO_SND_D_INPUT,
+        channels: 1,
         positions,
     }
 }
@@ -569,6 +833,8 @@ impl VirtioDevice for Snd {
         #[cfg(target_os = "macos")]
         {
             self.audio = None;
+            self.capture = None;
+            self.capture_params = StreamParams::default();
             self.in_flight.clear();
             self.submitted = 0;
         }
