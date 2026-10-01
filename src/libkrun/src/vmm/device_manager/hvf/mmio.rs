@@ -828,7 +828,10 @@ mod tests {
             .expect("the vsock device moved; the resume must be refused");
         assert!(diff.contains("virtio-input"), "{diff}");
         assert!(diff.contains("virtio-vsock"), "{diff}");
-        assert_eq!(crate::vmm::snapshot::slot_mismatch(&windowed, &windowed), None);
+        assert_eq!(
+            crate::vmm::snapshot::slot_mismatch(&windowed, &windowed),
+            None
+        );
     }
 
     #[test]
