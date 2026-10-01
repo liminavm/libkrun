@@ -126,7 +126,9 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
         }
         */
 
-        match recv(proxy.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
+        match crate::virtio::vsock::retry_transient_efault_nix(|| {
+            recv(proxy.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty())
+        }) {
             Ok(cnt) => {
                 debug!("recv cnt={cnt}");
                 if cnt > 0 {
@@ -227,7 +229,9 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> Pr
         #[cfg(target_os = "linux")]
         let flags = MsgFlags::MSG_NOSIGNAL;
 
-        match send(proxy.fd.as_raw_fd(), buf, flags) {
+        match crate::virtio::vsock::retry_transient_efault_nix(|| {
+            send(proxy.fd.as_raw_fd(), buf, flags)
+        }) {
             Ok(sent) => {
                 proxy.tx_cnt += Wrapping(sent as u32);
                 sent as i32
@@ -296,7 +300,9 @@ pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
             #[cfg(target_os = "linux")]
             let flags = MsgFlags::MSG_NOSIGNAL;
 
-            match sendto(proxy.fd.as_raw_fd(), buf, &addr, flags) {
+            match crate::virtio::vsock::retry_transient_efault_nix(|| {
+                sendto(proxy.fd.as_raw_fd(), buf, &addr, flags)
+            }) {
                 Ok(sent) => {
                     proxy.tx_cnt += Wrapping(sent as u32);
                 }
