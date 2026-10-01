@@ -689,6 +689,24 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
+    /// A *console* port (the guest sees it as `hvcN`, not a `vportNpM` data port) with
+    /// separate, non-tty input/output fds. Unlike [`add_tty_port`](Self::add_tty_port), the
+    /// fds need not be terminals (a file/FIFO is fine — a fixed terminal size is reported);
+    /// unlike [`add_inout_port`](Self::add_inout_port), the port is marked as a console so
+    /// `console=hvcN` binds to it. Pass `None` to disable that direction.
+    pub fn add_console_inout_port(
+        &mut self,
+        name: &str,
+        input_fd: Option<BorrowedFd<'a>>,
+        output_fd: Option<BorrowedFd<'a>>,
+    ) -> Result<u32, VmmError> {
+        let index = self.add_inout_port(name, input_fd, output_fd)?;
+        // Non-tty fds (file/FIFO) have no window size; report a fixed default. A console
+        // port (terminal = Some) is what makes the guest expose it as hvcN.
+        self.ports[index as usize].terminal = Some(port_io::term_fixed_size(0, 0));
+        Ok(index)
+    }
+
     /// Build the console device. At least one port must have been added.
     pub fn build(self) -> Result<ConsoleDevice<'a>, VmmError> {
         if self.ports.is_empty() {
