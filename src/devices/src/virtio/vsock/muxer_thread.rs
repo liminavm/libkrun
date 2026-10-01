@@ -8,7 +8,7 @@ use std::thread;
 use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, ProxyMap, push_packet};
+use super::muxer::{MuxerRx, ProxyMap, pop_rx, push_packet, signal_rx};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::packet::VsockPacket;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
@@ -79,7 +79,7 @@ impl MuxerThread {
         let mut drained = false;
 
         while let Some(rx) = rxq.pop() {
-            if let Some(head) = queue.pop(&self.mem) {
+            if let Some(head) = pop_rx(&mut queue, &self.mem) {
                 if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
                     rx_to_pkt(self.cid, rx, &mut pkt);
                     if let Err(e) =
@@ -195,7 +195,7 @@ impl MuxerThread {
 
         if should_signal {
             debug!("signal IRQ");
-            self.interrupt.signal_used_queue();
+            signal_rx(&self.queue, &self.mem, &self.interrupt);
         }
     }
 
@@ -234,7 +234,7 @@ impl MuxerThread {
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         'poll: loop {
             if self.drain_rxq() {
-                self.interrupt.signal_used_queue();
+                signal_rx(&self.queue, &self.mem, &self.interrupt);
             }
 
             match self
