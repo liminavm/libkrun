@@ -766,6 +766,7 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _suspend_efd: Option<EventFd>,
     _restart_efd: Option<EventFd>,
+    _wake_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     device_manager: Box<dyn crate::api::device_builders::DeviceManager<'_> + '_>,
     restore_from: Option<PathBuf>,
@@ -1333,6 +1334,7 @@ pub fn build_microvm(
             _shutdown_efd,
             _suspend_efd,
             _restart_efd,
+            _wake_efd,
         )?;
     }
 
@@ -2489,6 +2491,7 @@ fn attach_legacy_devices(
     shutdown_efd: Option<EventFd>,
     suspend_efd: Option<EventFd>,
     restart_efd: Option<EventFd>,
+    wake_efd: Option<EventFd>,
 ) -> Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2521,6 +2524,7 @@ fn attach_legacy_devices(
         };
         let suspend_efd = or_new(suspend_efd)?;
         let restart_efd = or_new(restart_efd)?;
+        let wake_efd = or_new(wake_efd)?;
         mmio_device_manager
             .register_mmio_gpio(
                 vm,
@@ -2529,6 +2533,7 @@ fn attach_legacy_devices(
                 shutdown_efd,
                 suspend_efd,
                 restart_efd,
+                wake_efd,
             )
             .map_err(Error::RegisterMMIODevice)
             .map_err(StartMicrovmError::Internal)?;
