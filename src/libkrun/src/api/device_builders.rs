@@ -1781,6 +1781,23 @@ impl DisplayBackend {
     }
 }
 
+/// limina: constructors for a Rust embedder, which holds a typed backend rather than a C vtable
+/// and needs [`DisplayInfo`] fields the builder does not expose (an EDID identity, a slot that
+/// boots disconnected).
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
+impl DisplayBackend {
+    pub fn from_backend(inner: krun_display::DisplayBackend<'static>) -> Self {
+        Self {
+            inner,
+            displays: Vec::new(),
+        }
+    }
+
+    pub fn add_display_info(&mut self, display: DisplayInfo) {
+        self.displays.push(display);
+    }
+}
+
 export_bitflags! {
     #[cfg(feature = "gpu")]
     bitflags::bitflags! {
@@ -2054,6 +2071,21 @@ impl<'a> InputDevice<'a> {
             events_backend,
             _lifetime: PhantomData,
         })
+    }
+}
+
+/// limina: a Rust embedder hands over typed backends rather than C vtables.
+#[cfg(feature = "input")]
+impl<'a> InputDevice<'a> {
+    pub fn from_backends(
+        config_backend: krun_input::InputConfigBackend<'a>,
+        events_backend: krun_input::InputEventProviderBackend<'a>,
+    ) -> Self {
+        Self {
+            config_backend,
+            events_backend,
+            _lifetime: PhantomData,
+        }
     }
 }
 
