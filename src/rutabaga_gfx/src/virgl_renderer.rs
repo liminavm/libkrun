@@ -303,6 +303,8 @@ impl VirglRenderer {
             vrend: flags & virglrenderer::abi::NO_VIRGL == 0,
             guest_vram: flags & virglrenderer::abi::USE_GUEST_VRAM != 0,
             video: flags & virglrenderer::abi::USE_VIDEO != 0,
+            // The renderer's own defaults for everything the flags do not carry.
+            ..Config::default()
         };
 
         // No context factory: limina has no GL of its own to lend, so vrend opens the renderer's
