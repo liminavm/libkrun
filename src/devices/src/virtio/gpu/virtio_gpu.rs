@@ -80,7 +80,7 @@ fn sglist_to_rutabaga_iovecs(
     Ok(rutabaga_iovecs)
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VirtioGpuRing {
     Global,
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
@@ -93,15 +93,92 @@ struct FenceDescriptor {
     len: u32,
     /// limina M9.3 trace: when the descriptor parked (age of an outstanding fence).
     created_at: std::time::Instant,
+    /// Where `create_fence` sent this fence, for the stale-fence report.
+    route: FenceRoute,
+    /// Whether the stale-fence watch has already reported this fence.
+    reported: bool,
 }
+
+/// Where `create_fence` sent a guest fence. A parked fence that never retires is stuck in a
+/// different place depending on this, which is what the stale-fence report needs to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceRoute {
+    /// Handed to the renderer, which signals it through the fence handler.
+    Renderer,
+    /// A fenced flush held until its parked frames present (`GuestFlushHold`).
+    FlushHold,
+    /// Completed at creation; such a fence never parks unless something is wrong.
+    Sync,
+    /// The renderer refused it and it was retired as lost.
+    Refused,
+}
+
+/// How old a parked guest fence must be before the stale-fence watch reports it. Comfortably
+/// past any healthy fence: a held flush fence completes by its 500 ms ceiling, and a GPU job
+/// that runs for two seconds is itself worth a line.
+pub(crate) const STALE_FENCE_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// At most this many stale fences are described per watch pass; the rest are counted, so a
+/// wedged ring the guest keeps fencing cannot flood the log.
+pub(crate) const STALE_FENCE_LINES: usize = 8;
 
 #[derive(Default)]
 pub struct FenceState {
     descs: Vec<FenceDescriptor>,
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
+    /// The highest fence id the renderer has signalled on each ring, recorded before the
+    /// handler knows whether there is a queue to retire it into. A parked fence at or below
+    /// this was signalled and never reached the guest.
+    signalled: BTreeMap<VirtioGpuRing, u64>,
 }
 
 impl FenceState {
+    /// Whether no guest fence is parked.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.descs.is_empty()
+    }
+
+    /// Mark every parked fence at least [`STALE_FENCE_AGE`] old and not yet reported as
+    /// reported, and describe them: up to [`STALE_FENCE_LINES`] lines, plus how many more there
+    /// were. Each line says where the fence is stuck — never handed to the renderer, handed and
+    /// never signalled, or signalled and never returned to the guest.
+    pub(crate) fn take_stale(&mut self, now: std::time::Instant) -> (Vec<String>, usize) {
+        let mut lines = Vec::new();
+        let mut more = 0;
+        for desc in self.descs.iter_mut() {
+            let age = now.duration_since(desc.created_at);
+            if desc.reported || age < STALE_FENCE_AGE {
+                continue;
+            }
+            desc.reported = true;
+            if lines.len() == STALE_FENCE_LINES {
+                more += 1;
+                continue;
+            }
+            let ring = match desc.ring {
+                VirtioGpuRing::Global => "global ring".to_string(),
+                VirtioGpuRing::ContextSpecific { ctx_id, ring_idx } => {
+                    format!("ctx {ctx_id} ring {ring_idx}")
+                }
+            };
+            let submitted = match desc.route {
+                FenceRoute::Renderer => "yes",
+                FenceRoute::FlushHold => "no (held for its flush's present)",
+                FenceRoute::Sync => "no (completed at creation)",
+                FenceRoute::Refused => "no (refused by the renderer)",
+            };
+            let signalled = self.signalled.get(&desc.ring).copied().unwrap_or(0) >= desc.fence_id;
+            lines.push(format!(
+                "virtio-gpu: fence {} {ring} age {} ms — submitted to renderer: {submitted}, \
+                 renderer signalled: {}, guest notified: no",
+                desc.fence_id,
+                age.as_millis(),
+                if signalled { "yes" } else { "no" },
+            ));
+        }
+        (lines, more)
+    }
+
     /// limina M9.3 trace: one-line summary of the outstanding (requested, never
     /// signaled) fences — count, oldest age, and up to 8 entries with ring + age.
     /// A post-restore wedge shows here as entries whose ages only ever climb.
@@ -583,6 +660,10 @@ pub struct VirtioGpu {
     /// limina software 2D resources, keyed by resource id (see [`Sw2dResource`]).
     sw2d: BTreeMap<u32, Sw2dResource>,
     fence_state: Arc<Mutex<FenceState>>,
+    /// Wakes the stale-fence watch when the first fence parks (it sleeps while none is).
+    fence_watch: Arc<std::sync::Condvar>,
+    /// The route `create_fence` took for the fence `process_fence` is about to park.
+    next_fence_route: FenceRoute,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
@@ -759,6 +840,22 @@ impl VirtioGpu {
                 return;
             }
 
+            let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                0 => VirtioGpuRing::Global,
+                _ => VirtioGpuRing::ContextSpecific {
+                    ctx_id: completed_fence.ctx_id,
+                    ring_idx: completed_fence.ring_idx,
+                },
+            };
+            // Recorded before the activation check below, which drops the completion: the
+            // stale-fence watch must be able to tell "signalled, never returned" from "never
+            // signalled".
+            {
+                let mut fence_state = fence_state.lock().unwrap();
+                let signalled = fence_state.signalled.entry(ring).or_insert(0);
+                *signalled = (*signalled).max(completed_fence.fence_id);
+            }
+
             // Retire the guest fence into the *current* activation's queue. If the device is
             // inactive (between reset and re-activate), there's nothing to retire into — drop
             // it (the descriptors it would have retired were cleared by `reset_session`).
@@ -774,14 +871,6 @@ impl VirtioGpu {
             let mut queue = control_queue.lock().unwrap();
             let mut fence_state = fence_state.lock().unwrap();
             let mut i = 0;
-
-            let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
-                0 => VirtioGpuRing::Global,
-                _ => VirtioGpuRing::ContextSpecific {
-                    ctx_id: completed_fence.ctx_id,
-                    ring_idx: completed_fence.ring_idx,
-                },
-            };
 
             let mut retired_any = false;
             while i < fence_state.descs.len() {
@@ -954,6 +1043,8 @@ impl VirtioGpu {
         // the opt-in tick reporter (LIMINA_GPU_TRACE=1).
         let trace: Arc<GpuTraceStats> = Arc::new(Default::default());
         super::trace::maybe_spawn_reporter(trace.clone(), fence_state.clone());
+        let fence_watch = Arc::new(std::sync::Condvar::new());
+        super::trace::spawn_stale_fence_watch(fence_state.clone(), fence_watch.clone());
 
         // limina (#8): present-fence plumbing — built up front because the fence handler
         // needs its endpoints.
@@ -1121,6 +1212,8 @@ impl VirtioGpu {
             resources: Default::default(),
             sw2d: Default::default(),
             fence_state,
+            fence_watch,
+            next_fence_route: FenceRoute::Renderer,
             scanouts: Default::default(),
             displays,
             display_backend,
@@ -2084,6 +2177,7 @@ impl VirtioGpu {
             let mut fs = self.fence_state.lock().unwrap();
             fs.descs.clear();
             fs.completed_fences.clear();
+            fs.signalled.clear();
         }
         if let Some(pf) = self.present_fence.as_mut() {
             // Drop parked frames and held flush fences: their cookies/descriptors belong to the
@@ -3805,6 +3899,7 @@ impl VirtioGpu {
                 self.scanout_copies.fenced.insert(scanout_id, true);
                 self.note_scanout_held(scanout_id, true);
             }
+            self.next_fence_route = FenceRoute::FlushHold;
             return Ok(OkNoData);
         }
         self.create_fence_inner(rutabaga_fence)
@@ -3891,8 +3986,10 @@ impl VirtioGpu {
                         rutabaga_fence.fence_id, rutabaga_fence.ctx_id, rutabaga_fence.ring_idx
                     );
                     mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                    self.next_fence_route = FenceRoute::Refused;
                     return Err(e.into());
                 }
+                self.next_fence_route = FenceRoute::Renderer;
             }
             Some(rutabaga) if self.vrend_ctx_seen => {
                 if let Err(e) = rutabaga.create_fence(rutabaga_fence) {
@@ -3903,9 +4000,15 @@ impl VirtioGpu {
                         rutabaga_fence.fence_id, rutabaga_fence.ctx_id
                     );
                     mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                    self.next_fence_route = FenceRoute::Refused;
+                } else {
+                    self.next_fence_route = FenceRoute::Renderer;
                 }
             }
-            _ => mark_fence_completed_sync(&self.fence_state, &rutabaga_fence),
+            _ => {
+                mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                self.next_fence_route = FenceRoute::Sync;
+            }
         }
         Ok(OkNoData)
     }
@@ -3927,7 +4030,12 @@ impl VirtioGpu {
                 desc_index,
                 len,
                 created_at: std::time::Instant::now(),
+                route: self.next_fence_route,
+                reported: false,
             });
+            if fence_state.descs.len() == 1 {
+                self.fence_watch.notify_one();
+            }
 
             false
         } else {
@@ -4482,6 +4590,120 @@ mod test {
     // guest requests on a 2D command must be retired synchronously, otherwise the
     // response is parked forever and the guest hangs (observed: GTK4/nautilus on
     // the tier-1 software-2D scanout). This guards mark_fence_completed_sync().
+    fn parked(
+        ring: super::VirtioGpuRing,
+        fence_id: u64,
+        age_ms: u64,
+        route: super::FenceRoute,
+        now: std::time::Instant,
+    ) -> super::FenceDescriptor {
+        super::FenceDescriptor {
+            ring,
+            fence_id,
+            desc_index: 0,
+            len: 0,
+            created_at: now - std::time::Duration::from_millis(age_ms),
+            route,
+            reported: false,
+        }
+    }
+
+    #[test]
+    fn a_stale_fence_is_reported_once_with_where_it_is_stuck() {
+        use super::{FenceRoute, FenceState, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let ring = VirtioGpuRing::ContextSpecific {
+            ctx_id: 3,
+            ring_idx: 0,
+        };
+        let mut fs = FenceState::default();
+        fs.descs
+            .push(parked(ring, 7, 2500, FenceRoute::Renderer, now));
+        fs.descs
+            .push(parked(ring, 8, 100, FenceRoute::Renderer, now));
+        let (lines, more) = fs.take_stale(now);
+        assert_eq!(more, 0);
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the fence past the threshold: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("fence 7 ctx 3 ring 0 age 2500 ms"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("submitted to renderer: yes"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("renderer signalled: no"), "{}", lines[0]);
+        assert!(fs.take_stale(now).0.is_empty(), "a fence is reported once");
+    }
+
+    #[test]
+    fn a_signalled_fence_that_never_returned_says_so() {
+        use super::{FenceRoute, FenceState, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let mut fs = FenceState::default();
+        fs.descs.push(parked(
+            VirtioGpuRing::Global,
+            5,
+            3000,
+            FenceRoute::Renderer,
+            now,
+        ));
+        fs.signalled.insert(VirtioGpuRing::Global, 9);
+        let (lines, _) = fs.take_stale(now);
+        assert!(lines[0].contains("global ring"), "{}", lines[0]);
+        assert!(lines[0].contains("renderer signalled: yes"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_fence_never_handed_on_names_its_route() {
+        use super::{FenceRoute, FenceState, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let mut fs = FenceState::default();
+        fs.descs.push(parked(
+            VirtioGpuRing::Global,
+            1,
+            3000,
+            FenceRoute::FlushHold,
+            now,
+        ));
+        let (lines, _) = fs.take_stale(now);
+        assert!(
+            lines[0].contains("submitted to renderer: no (held for its flush's present)"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_wedged_ring_is_described_in_bounded_lines() {
+        use super::{FenceRoute, FenceState, STALE_FENCE_LINES, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let mut fs = FenceState::default();
+        for id in 0..(STALE_FENCE_LINES as u64 + 5) {
+            fs.descs.push(parked(
+                VirtioGpuRing::Global,
+                id + 1,
+                4000,
+                FenceRoute::Renderer,
+                now,
+            ));
+        }
+        let (lines, more) = fs.take_stale(now);
+        assert_eq!(lines.len(), STALE_FENCE_LINES);
+        assert_eq!(more, 5);
+        assert_eq!(
+            fs.take_stale(now),
+            (Vec::new(), 0),
+            "and none of them again"
+        );
+    }
+
     #[test]
     fn test_software_2d_fence_retires_synchronously() {
         use super::{FenceState, RutabagaFence, VirtioGpuRing, mark_fence_completed_sync};

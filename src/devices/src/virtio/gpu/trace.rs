@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::protocol::GpuResponse;
-use super::virtio_gpu::FenceState;
+use super::virtio_gpu::{FenceState, STALE_FENCE_AGE};
 use rutabaga_gfx::RutabagaError;
 
 #[derive(Default)]
@@ -154,4 +154,38 @@ pub fn maybe_spawn_reporter(stats: Arc<GpuTraceStats>, fence_state: Arc<Mutex<Fe
             }
         })
         .expect("failed to spawn gpu trace thread");
+}
+
+/// Report guest fences that stay parked for [`STALE_FENCE_AGE`]: one warn line each, once,
+/// naming where the fence is stuck (`FenceState::take_stale`). Always on, because the fence a
+/// wedged guest is waiting on is the one fact a post-mortem needs and cannot recover from a
+/// per-fence log without drowning in it. Free while idle: the thread sleeps on `wake` until the
+/// first fence parks, and polls once a second only while any is parked.
+pub fn spawn_stale_fence_watch(fence_state: Arc<Mutex<FenceState>>, wake: Arc<std::sync::Condvar>) {
+    std::thread::Builder::new()
+        .name("gpu fence watch".into())
+        .spawn(move || {
+            let mut fs = fence_state.lock().unwrap();
+            loop {
+                if fs.is_idle() {
+                    fs = wake.wait(fs).unwrap();
+                    continue;
+                }
+                fs = wake.wait_timeout(fs, STALE_FENCE_AGE / 2).unwrap().0;
+                let (lines, more) = fs.take_stale(Instant::now());
+                if lines.is_empty() {
+                    continue;
+                }
+                // Log with the ledger unlocked: the fence handler takes it on every retire.
+                drop(fs);
+                for line in &lines {
+                    warn!("{line}");
+                }
+                if more > 0 {
+                    warn!("virtio-gpu: {more} more guest fence(s) went stale in the same pass");
+                }
+                fs = fence_state.lock().unwrap();
+            }
+        })
+        .expect("failed to spawn gpu fence watch thread");
 }
