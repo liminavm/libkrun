@@ -680,13 +680,11 @@ pub struct VirtioGpu {
     /// (pixels included), carried in the snapshot payload so a restored session
     /// keeps its cursor (UPDATE/MOVE_CURSOR are not journaled ops).
     cursor_state: Option<super::journal::CursorSnapshot>,
-    /// limina (vrend fence honesty): the renderer's poll eventfd, held for the device's
-    /// lifetime (it's a dup that closes on drop). vrend's sync thread parks in `wait_sync`
-    /// whenever GL queries are pending until someone pumps `virgl_renderer_poll()` on the
-    /// GL thread — the gpu worker registers this fd in its epoll and calls
-    /// [`Self::renderer_event_poll`] when it fires. venus never needed the pump (its
-    /// fences ride `write_context_fence` from the render server), which is why it was
-    /// never wired before Global-ring fences routed through virglrenderer.
+    /// limina (vrend fence honesty): the renderer's poll descriptor, held for the device's
+    /// lifetime (it's a dup that closes on drop). virglrs holds a context fence behind a GL
+    /// query that was not ready until someone pumps `poll()` on the GL thread — the gpu
+    /// worker registers this fd in its epoll and calls [`Self::renderer_event_poll`] when it
+    /// fires, and its fence drains pump it themselves. venus never needs the pump.
     renderer_poll: Option<rutabaga_gfx::RutabagaDescriptor>,
     /// limina: true once any non-venus (vrend/GL) 3D context exists this session. From
     /// that point Global-ring fences route through virglrenderer's GL timeline
@@ -1248,9 +1246,9 @@ impl VirtioGpu {
         self.renderer_poll.as_ref().map(|d| d.as_raw_descriptor())
     }
 
-    /// limina (vrend fence honesty): pump `virgl_renderer_poll()` — flushes the poll
-    /// eventfd, runs vrend's pending GL query checks on this (the GL) thread, and signals
-    /// the sync thread parked in `wait_sync`. Must be called from the gpu worker thread.
+    /// limina (vrend fence honesty): pump the renderer's `poll()` — drains the poll
+    /// descriptor, answers the GL queries parked since they were first asked for, and
+    /// releases the fences held for them. Must be called from the gpu worker thread.
     pub fn renderer_event_poll(&self) {
         if let Some(r) = self.rutabaga.as_ref() {
             r.event_poll();
