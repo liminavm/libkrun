@@ -578,12 +578,27 @@ impl RutabagaComponent for VirglRenderer {
         Ok(())
     }
 
-    /// Fences retire on the renderer's own thread and are delivered through [`Fences`], so there
-    /// is nothing here to poll and no descriptor to poll on.
-    fn event_poll(&self) {}
+    /// Fences retire on the renderer's own thread and are delivered through [`Fences`], except a
+    /// context fence behind a GL query that was not ready when the guest asked for it. The guest
+    /// reads that result by re-reading the query buffer until the host marks it done, and never
+    /// asks again, so the renderer holds the fence until this call, on the renderer thread, has
+    /// written the answer. Draining the descriptor is the renderer's job, and a spurious call is
+    /// cheap.
+    fn event_poll(&self) {
+        self.r.lock().unwrap().poll();
+    }
 
+    /// Asking for the descriptor is the promise to pump [`Self::event_poll`] whenever it is
+    /// readable. Without one, a fence behind a parked query finishes its work inline when it is
+    /// taken: still correct, but a GPU wait on the submitting thread.
     fn poll_descriptor(&self) -> Option<SafeDescriptor> {
-        None
+        match self.r.lock().unwrap().poll_descriptor() {
+            Ok(fd) => fd.map(|fd| SafeDescriptor::from(std::fs::File::from(fd))),
+            Err(e) => {
+                error!("virglrs: no poll descriptor, so GL queries finish at fence time: {e}");
+                None
+            }
+        }
     }
 
     fn create_3d(&self, resource_id: u32, c: ResourceCreate3D) -> RutabagaResult<RutabagaResource> {
