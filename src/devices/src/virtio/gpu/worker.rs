@@ -354,6 +354,9 @@ impl Worker {
         let deadline = start + std::time::Duration::from_millis(1500);
         loop {
             virtio_gpu.process_retired_presents();
+            // This loop has the worker thread, so the epoll pump is not running: a fence held
+            // for a GL query check retires only if we pump here.
+            virtio_gpu.renderer_event_poll();
             let (outstanding, _) = virtio_gpu.outstanding_fences();
             if outstanding == 0 && virtio_gpu.present_quiescent() {
                 info!("gpu worker: reset drain quiesced in {:?}", start.elapsed());
@@ -382,6 +385,9 @@ impl Worker {
         let start = std::time::Instant::now();
         let deadline = start + std::time::Duration::from_secs(5);
         loop {
+            // As in `drain_for_classify`: nothing else pumps the renderer while we hold the
+            // worker thread, and a fence held for a GL query check needs it.
+            virtio_gpu.renderer_event_poll();
             let (n, summary) = virtio_gpu.outstanding_fences();
             if n == 0 {
                 info!(
@@ -433,11 +439,10 @@ impl Worker {
         // limina (#8): retired present fences wake this fd; -1 (never matched) when
         // the renderer is absent.
         let present_ev_fd = virtio_gpu.present_event_fd().unwrap_or(-1);
-        // limina (vrend fence honesty): virglrenderer's poll eventfd. vrend's sync thread
-        // parks in `wait_sync` whenever GL queries are pending until this thread (the GL
-        // thread) pumps `virgl_renderer_poll()`; unpumped, every fence behind the parked
-        // one wedges — which matters now that a vrend session's Global-ring fences route
-        // through virglrenderer (see `vrend_ctx_seen`). -1 when there's no renderer.
+        // limina (vrend fence honesty): the renderer's poll descriptor. virglrs holds a context
+        // fence behind a GL query that was not ready until this thread (the GL thread) pumps
+        // `poll()`, which writes the result before the fence retires; unpumped, that fence and
+        // every one behind it wedges. -1 when there's no renderer.
         let renderer_poll_fd = virtio_gpu.renderer_poll_fd().unwrap_or(-1);
 
         // A stop signal left over from a Deactivate that arrived while we were inactive (the
@@ -721,19 +726,16 @@ impl Worker {
                 if present_ev_fd >= 0 && source == present_ev_fd {
                     virtio_gpu.process_retired_presents();
                 }
-                // limina (vrend fence honesty): vrend's sync thread asked for a GL-thread
-                // query check — pump virgl_renderer_poll() (flushes the eventfd, checks
-                // pending queries, signals the parked sync thread).
+                // limina (vrend fence honesty): the renderer asked for a GL-thread query
+                // check. `poll()` drains the descriptor, answers the parked queries and
+                // releases the fences held for them.
                 if renderer_poll_fd >= 0 && source == renderer_poll_fd {
                     virtio_gpu.renderer_event_poll();
                 }
             }
-            // limina (experiment): vrend's threaded sync creates the poll eventfd. With it
-            // disabled (VIRGL_DISABLE_MT=1) there is no descriptor to register, so nothing
-            // ever pumped virgl_renderer_poll() and no fence was ever retired -- the guest
-            // rendered into frames that never presented and the window froze on the last
-            // pre-desktop frame. Pump on every wake instead; that is what the non-threaded
-            // design expects the client to do.
+            // With no descriptor to register, pump on every wake instead: it costs nothing when
+            // the renderer has nothing parked, and a renderer without a fence waiter that
+            // still parks something must not be left waiting on a wake that never comes.
             if renderer_poll_fd < 0 {
                 virtio_gpu.renderer_event_poll();
             }
