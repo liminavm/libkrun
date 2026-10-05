@@ -775,6 +775,48 @@ impl<O: BandOs> BandGuard<O> {
     }
 }
 
+const THREAD_LATENCY_QOS_POLICY: u32 = 7;
+/// `LATENCY_QOS_TIER_0` from `mach/task_policy.h`; tier `n` is `(0xFF << 16) | (n + 1)`.
+const LATENCY_QOS_TIER_BASE: u32 = 0xFF << 16;
+
+/// Put the calling vCPU thread in latency-QoS tier `LIMINA_VCPU_LATENCY_QOS` (0-5), if set.
+///
+/// A host thread's timer wakes late by a fixed share of how long it slept: a third under the
+/// default QoS, a fifth at tier 0 (`spikes/launch-path-qos/`). A vCPU parked in `hv_vcpu_run`
+/// inherits that, so an idle guest's timers land about a quarter of their idle gap late. Tier 0 on
+/// every vCPU took a stock 8-vCPU guest from ~45 to ~58 fps (`spikes/guest-vcpu-qos/`). It is not a
+/// reservation: no priority changes and no core is promised, so it needs none of the band's guards.
+///
+/// Off unless the variable is set (limina sets it). A little vCPU is skipped, as it is by the band:
+/// it is meant to be slow and cheap. The band overrides the tier while armed, and the tier survives
+/// the band being taken back ([`tests::the_latency_tier_survives_the_band`]).
+pub fn set_latency_qos(vcpuid: u64) {
+    if is_little(vcpuid) {
+        return;
+    }
+    let Some(tier) = std::env::var("LIMINA_VCPU_LATENCY_QOS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|t| *t <= 5)
+    else {
+        return;
+    };
+    let mut policy = LATENCY_QOS_TIER_BASE | (tier + 1);
+    let ret = unsafe {
+        thread_policy_set(
+            mach_thread_self(),
+            THREAD_LATENCY_QOS_POLICY,
+            &mut policy,
+            1,
+        )
+    };
+    if ret == 0 {
+        log::info!("[VCPU-RT] vCPU {vcpuid} at latency QoS tier {tier}");
+    } else {
+        log::warn!("[VCPU-RT] vCPU {vcpuid}: latency QoS tier {tier} refused (kr={ret})");
+    }
+}
+
 /// Move the *calling* thread into whichever band was asked for. Must run on the vCPU thread
 /// itself, since both policies apply to the current thread.
 pub fn set_realtime_band(vcpuid: u64) -> Option<BandGuard> {
@@ -1034,6 +1076,55 @@ mod tests {
             Duration::from_secs(5),
             budget
         ));
+    }
+
+    /// The latency tier a vCPU thread is given at start must outlive the band: vCPU 0 is armed and
+    /// disarmed repeatedly, and a disarm resets the thread to timeshare. Measured on macOS 26.6.2:
+    /// the tier reads back unchanged through both. If a release changes that, vCPU 0 would lose
+    /// tier 0 silently after its first band cycle, and this is where it shows.
+    #[test]
+    fn the_latency_tier_survives_the_band() {
+        unsafe extern "C" {
+            fn thread_policy_get(
+                thread: u32,
+                flavor: u32,
+                info: *mut u32,
+                count: *mut u32,
+                get_default: *mut u32,
+            ) -> i32;
+        }
+        let tier = || {
+            let (mut policy, mut count, mut default) = (0u32, 1u32, 0u32);
+            let kr = unsafe {
+                thread_policy_get(
+                    mach_thread_self(),
+                    THREAD_LATENCY_QOS_POLICY,
+                    &mut policy,
+                    &mut count,
+                    &mut default,
+                )
+            };
+            assert_eq!(kr, 0, "thread_policy_get(THREAD_LATENCY_QOS_POLICY)");
+            policy
+        };
+        let tier0 = LATENCY_QOS_TIER_BASE | 1;
+        let std::thread::Result::Ok(()) = std::thread::spawn(move || {
+            let mut policy = tier0;
+            let port = unsafe { mach_thread_self() };
+            assert_eq!(
+                unsafe { thread_policy_set(port, THREAD_LATENCY_QOS_POLICY, &mut policy, 1) },
+                0
+            );
+            assert!(set_band_on(
+                port,
+                Band::RealTime(DEFAULT_PERIOD, DEFAULT_COMPUTATION, DEFAULT_CONSTRAINT)
+            ));
+            assert!(set_timeshare(port));
+            assert_eq!(tier(), tier0, "the band's disarm reset the latency tier");
+        })
+        .join() else {
+            panic!("the probe thread panicked");
+        };
     }
 
     #[test]
