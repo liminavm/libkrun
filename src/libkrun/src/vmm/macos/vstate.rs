@@ -578,6 +578,7 @@ impl Vcpu {
     pub fn run(&mut self, init_tls_sender: Sender<u64>) {
         // On this thread, before it ever enters the guest: the band applies to mach_thread_self().
         // The guard it hands back is this thread's own way out of the band — see `BandGuard`.
+        vcpu_sched::set_latency_qos(self.id as u64);
         let band_guard = vcpu_sched::set_realtime_band(self.id as u64);
         let mut hvf_vcpu =
             HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
