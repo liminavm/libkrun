@@ -559,6 +559,9 @@ impl<S: Stage2> ReleasedRam<S> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+        // Stamped before the bounds clear, so a handler that finds them cleared also finds
+        // the stamp of the close that cleared them.
+        SWEEP_LAST_CLOSE.store(unsafe { crate::mach_absolute_time() }, Ordering::Release);
         SWEEP_WINDOW_END.store(0, Ordering::Release);
         SWEEP_WINDOW_START.store(0, Ordering::Release);
     }
@@ -580,6 +583,18 @@ static SWEEP_REGIONS_LEN: AtomicU64 = AtomicU64::new(0);
 /// instance) because a signal handler can only reach statics; there is one guest per
 /// process. This is the field oracle for "something touches guest RAM during windows".
 static SWEEP_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// `mach_absolute_time` at the most recent window close; 0 before any window has closed.
+static SWEEP_LAST_CLOSE: AtomicU64 = AtomicU64::new(0);
+/// [`SWEEP_FAULT_GRACE_MS`] in `mach_absolute_time` ticks, set when the handler is installed
+/// (the timebase query is not something to do inside a signal handler).
+static SWEEP_GRACE_TICKS: AtomicU64 = AtomicU64::new(0);
+/// How long after a window closed a guest-address fault outside any open window is still
+/// taken for that window's late delivery. A fault taken inside a window normally reaches the
+/// handler microseconds later, but the faulting thread can be descheduled in between, and
+/// macOS has been measured holding a clamped process's threads off the CPU for 100 ms and
+/// more (Game Mode). The two ways to be wrong are not equal: too short kills a healthy VM by
+/// chaining a sweep fault, too long only delays the crash of a real one by the same amount.
+const SWEEP_FAULT_GRACE_MS: u64 = 1000;
 
 fn sweep_chunk_bytes() -> u64 {
     std::env::var("LIMINA_LEDGER_SWEEP_CHUNK_MIB")
@@ -636,9 +651,27 @@ unsafe impl Send for SavedAction {}
 static OLD_SIGBUS: OnceLock<SavedAction> = OnceLock::new();
 static OLD_SIGSEGV: OnceLock<SavedAction> = OnceLock::new();
 
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+unsafe extern "C" {
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
 fn install_sweep_fault_handler() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| unsafe {
+        let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+        let ticks = if mach_timebase_info(&mut timebase) == 0 && timebase.numer != 0 {
+            SWEEP_FAULT_GRACE_MS * 1_000_000 * timebase.denom as u64 / timebase.numer as u64
+        } else {
+            // Apple silicon's 24 MHz counter, should the query ever fail.
+            SWEEP_FAULT_GRACE_MS * 24_000
+        };
+        SWEEP_GRACE_TICKS.store(ticks, Ordering::Release);
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = sweep_fault_handler as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
@@ -658,18 +691,26 @@ fn install_sweep_fault_handler() {
 }
 
 /// SIGBUS/SIGSEGV handler covering worker-thread touches of guest RAM during a sweep
-/// window. Guest RAM is always mapped read-write outside a window, so ANY fault at a
-/// guest-region address is the sweep's doing: wait out the current window (it closes in
-/// microseconds) and return, retrying the faulting access. Everything else chains to the
-/// previously installed action (e.g. Rust's stack-overflow reporter).
+/// window. Guest RAM is mapped read-write outside a window, so a fault at a guest-region
+/// address while a sweep runs, or shortly after a window closed, is the sweep's doing: wait
+/// out the current window (it closes in microseconds) and return, retrying the faulting
+/// access. Everything else chains to the previously installed action (e.g. Rust's
+/// stack-overflow reporter), and so does a guest-address fault no window explains.
 ///
-/// The guest-region check deliberately does NOT require `SWEEP_ACTIVE`: a fault can land
-/// in the last window of a sweep and reach the handler after the sweep finished, and
-/// chaining it would restore `SIG_DFL` permanently (installation is `Once`) — the next
-/// sweep's first fielded fault would then kill the process. If the fault's window is
-/// already closed, the mapping is back to read-write and the plain return retries fine.
+/// The guest-region check does not require `SWEEP_ACTIVE` alone: a fault can land in the
+/// last window of a sweep and reach the handler after the sweep finished, and chaining it
+/// would restore `SIG_DFL` permanently (installation is `Once`) and kill the process on the
+/// retry. Such a fault arrives within [`SWEEP_FAULT_GRACE_MS`] of that window's close, so it
+/// is fielded; the mapping is back to read-write and the plain return retries fine.
 ///
-/// Async-signal-safety: atomic loads and `sched_yield` only.
+/// What the grace bounds is the opposite case: a fault at a guest address that is not a
+/// protection flip (a device bug's misaligned atomic, say) refaults on every return. With
+/// no sweep running and no recent close it is chained at once; during a sweep it is retried
+/// until the sweep ends and the grace runs out, then chained. `si_code` cannot tell the two
+/// apart: xnu reports every arm64 SIGBUS as `BUS_ADRALN`, sweep faults included
+/// (`bsd/dev/arm/unix_signal.c`).
+///
+/// Async-signal-safety: atomic loads, `mach_absolute_time` and `sched_yield` only.
 unsafe extern "C" fn sweep_fault_handler(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
@@ -680,7 +721,7 @@ unsafe extern "C" fn sweep_fault_handler(
     let len = SWEEP_REGIONS_LEN.load(Ordering::Acquire) as usize;
     if !ptr.is_null() {
         let regions = unsafe { std::slice::from_raw_parts(ptr, len) };
-        if regions.iter().any(|&(s, e)| addr >= s && addr < e) {
+        if regions.iter().any(|&(s, e)| addr >= s && addr < e) && sweep_explains_fault() {
             SWEEP_FAULTS.fetch_add(1, Ordering::Relaxed);
             while SWEEP_ACTIVE.load(Ordering::Acquire)
                 && addr >= SWEEP_WINDOW_START.load(Ordering::Acquire)
@@ -726,6 +767,17 @@ unsafe extern "C" fn sweep_fault_handler(
             }
         },
     }
+}
+
+/// Whether a sweep could have caused a fault at a guest address: one is running, or a window
+/// closed within the grace. Async-signal-safe.
+fn sweep_explains_fault() -> bool {
+    if SWEEP_ACTIVE.load(Ordering::Acquire) {
+        return true;
+    }
+    let last_close = SWEEP_LAST_CLOSE.load(Ordering::Acquire);
+    let now = unsafe { crate::mach_absolute_time() };
+    last_close != 0 && now.saturating_sub(last_close) < SWEEP_GRACE_TICKS.load(Ordering::Acquire)
 }
 
 /// Insert `[start, start + len)`, coalescing with any adjacent or overlapping ranges.
@@ -1039,6 +1091,77 @@ mod tests {
             );
         }
         unsafe { libc::munmap(host as *mut libc::c_void, len as usize) };
+    }
+
+    /// A fault at a guest address that no sweep window explains is a real fault, not a
+    /// sweep touch, and must reach the previous action instead of refaulting forever.
+    /// Exercised in a forked child, which writes a guest page that stays `PROT_NONE` with no
+    /// sweep running: the child has to die of the fault. Before the handler was bounded it
+    /// returned and retried the write for as long as the child lived.
+    #[test]
+    fn sweep_fault_handler_chains_a_fault_no_window_explains() {
+        let _serialize = SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let page = crate::host_page_size();
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page as usize,
+                libc::PROT_NONE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(host, libc::MAP_FAILED);
+        let host = host as u64;
+        // Everything the child needs is set up here: after fork it only writes the page.
+        super::install_sweep_fault_handler();
+        let regions: &'static [(u64, u64)] = Box::leak(Box::new([(host, host + page)]));
+        super::SWEEP_REGIONS.store(regions.as_ptr() as *mut (u64, u64), Ordering::Release);
+        super::SWEEP_REGIONS_LEN.store(1, Ordering::Release);
+        assert!(!super::SWEEP_ACTIVE.load(Ordering::Acquire));
+        // As if no window had ever closed: an earlier test's sweep may have left a grace
+        // running, and nothing sweeps while this test holds the lock.
+        super::SWEEP_LAST_CLOSE.store(0, Ordering::Release);
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                std::ptr::write_volatile(host as *mut u64, 1);
+                libc::_exit(0);
+            }
+        }
+        super::SWEEP_REGIONS_LEN.store(0, Ordering::Release);
+        super::SWEEP_REGIONS.store(std::ptr::null_mut(), Ordering::Release);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut status = 0;
+        let reaped = loop {
+            let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            if r == child {
+                break true;
+            }
+            assert_eq!(r, 0, "waitpid: {}", std::io::Error::last_os_error());
+            if std::time::Instant::now() > deadline {
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, &mut status, 0);
+                }
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        unsafe { libc::munmap(host as *mut libc::c_void, page as usize) };
+        assert!(
+            reaped,
+            "the child was still refaulting after 5 s: the handler never chained"
+        );
+        assert!(
+            libc::WIFSIGNALED(status)
+                && matches!(libc::WTERMSIG(status), libc::SIGBUS | libc::SIGSEGV),
+            "the child should die of its fault, got status {status:#x}"
+        );
     }
 }
 
