@@ -1673,6 +1673,12 @@ impl<'a> AttachDevice<'a> for NetDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let id = self.inner.lock().unwrap().id().to_string();
+        // The VMM leaves through `_exit`, which drops no backend: remove the socket files the
+        // datagram backends bound on the way out instead.
+        #[cfg(unix)]
+        ctx.push_exit_observer(Arc::new(Mutex::new(
+            devices::virtio::net::unlink_bound_sockets,
+        )));
         ctx.register(&id, self.inner)
     }
 }
