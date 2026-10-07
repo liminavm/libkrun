@@ -34,6 +34,10 @@ struct PerCPUInterruptControllerState {
     /// no guest instructions and is not going to until something wakes it. Distinct from
     /// "no recent vmexits", which a vCPU spinning in guest code also satisfies.
     parked: bool,
+    /// A wake for this vCPU's PSCI `SYSTEM_SUSPEND` park that arrived before it was waiting,
+    /// held until the park looks. On the in-kernel GIC nothing else would reach it: the park
+    /// blocks outside `hv_vcpu_run`, and the kick for a `Running` vCPU is an `hv_vcpus_exit`.
+    system_wake: bool,
 }
 
 impl PerCPUInterruptControllerState {
@@ -128,6 +132,7 @@ impl VcpuList {
                 wfe_sender: None,
                 online: true,
                 parked: false,
+                system_wake: false,
             }));
         }
 
@@ -183,11 +188,33 @@ impl VcpuList {
         self.park_holdouts().is_empty()
     }
 
-    /// Record that `vcpuid` has parked in PSCI `SYSTEM_SUSPEND`, or clear it on resume.
-    pub fn set_system_suspended(&self, vcpuid: Option<u64>) {
-        self.system_suspended
-            .store(vcpuid.map(|v| v as i64).unwrap_or(-1), Ordering::SeqCst);
+    /// Record that `vcpuid` has parked in PSCI `SYSTEM_SUSPEND`. A restored vCPU records it
+    /// before the restore returns, so a wake sent right after the restore finds its target.
+    pub fn set_system_suspended(&self, vcpuid: u64) {
+        self.system_suspended.store(vcpuid as i64, Ordering::SeqCst);
         self.power_watch.notify();
+    }
+
+    /// `vcpuid` has resumed from `SYSTEM_SUSPEND`. Cleared under the vCPU's lock, which
+    /// [`Self::wake_system_suspended`] holds while it checks the target, so a wake racing the
+    /// resume cannot leave a held wake behind for the next suspend.
+    pub fn end_system_suspend(&self, vcpuid: u64) {
+        let mut vcpu = self.vcpus[vcpuid as usize].lock().unwrap();
+        vcpu.system_wake = false;
+        self.system_suspended.store(-1, Ordering::SeqCst);
+        drop(vcpu);
+        self.power_watch.notify();
+    }
+
+    /// Whether `vcpuid`'s `SYSTEM_SUSPEND` park should block. False when a wake is already
+    /// held (consuming it) or an interrupt is pending; otherwise marks the vCPU waiting, in
+    /// the same locked step, so a wake from here on comes through its channel.
+    pub fn should_wait_system_suspended(&self, vcpuid: u64) -> bool {
+        let mut vcpu = self.vcpus[vcpuid as usize].lock().unwrap();
+        if std::mem::take(&mut vcpu.system_wake) {
+            return false;
+        }
+        vcpu.should_wait()
     }
 
     /// The guest power-state change counter shared by this VM's vCPUs and devices.
@@ -212,27 +239,32 @@ impl VcpuList {
     /// would normally see reaches nobody. Firmware — us — resumes the core; the guest then
     /// re-arms its GIC and sees the button afterwards, which is the same order real hardware
     /// produces.
+    ///
+    /// A target that is not waiting yet keeps the wake until its park looks
+    /// ([`Self::should_wait_system_suspended`]).
     pub fn wake_system_suspended(&self) -> bool {
-        match self.system_suspended() {
-            Some(vcpuid) => {
-                if let Some(vcpu) = self.vcpus.get(vcpuid as usize) {
-                    let mut vcpu = vcpu.lock().unwrap();
-                    info!(
-                        "wake: vCPU {vcpuid} is in SYSTEM_SUSPEND and {}",
-                        match vcpu.status {
-                            VcpuStatus::Waiting => "waiting",
-                            VcpuStatus::Running => "not yet waiting",
-                        }
-                    );
-                    vcpu.kick();
-                }
-                true
+        let Some(vcpuid) = self.system_suspended() else {
+            info!("wake: no vCPU is in SYSTEM_SUSPEND");
+            return false;
+        };
+        let mut vcpu = self.vcpus[vcpuid as usize].lock().unwrap();
+        if self.system_suspended() != Some(vcpuid) {
+            info!("wake: vCPU {vcpuid} resumed from SYSTEM_SUSPEND meanwhile");
+            return false;
+        }
+        match vcpu.status {
+            VcpuStatus::Waiting => {
+                info!("wake: vCPU {vcpuid} is in SYSTEM_SUSPEND and waiting");
+                vcpu.kick();
             }
-            None => {
-                info!("wake: no vCPU is in SYSTEM_SUSPEND");
-                false
+            VcpuStatus::Running => {
+                info!(
+                    "wake: vCPU {vcpuid} is in SYSTEM_SUSPEND, not yet waiting; holding the wake"
+                );
+                vcpu.system_wake = true;
             }
         }
+        true
     }
 
     /// The vcpuids still executing guest instructions. Empty iff [`Self::all_parked`].
@@ -430,5 +462,52 @@ impl Vcpus for VcpuList {
             | SYSREG_OSDLR_EL1 => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wake_before_the_park_waits_is_held_for_it() {
+        let vcpus = VcpuList::new(2);
+        vcpus.set_system_suspended(1);
+        assert!(vcpus.wake_system_suspended());
+        assert!(!vcpus.should_wait_system_suspended(1));
+        assert!(
+            vcpus.should_wait_system_suspended(1),
+            "a held wake is used once"
+        );
+    }
+
+    #[test]
+    fn a_wake_with_no_suspended_vcpu_is_not_held() {
+        let vcpus = VcpuList::new(1);
+        assert!(!vcpus.wake_system_suspended());
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.should_wait_system_suspended(0));
+    }
+
+    #[test]
+    fn resuming_drops_a_held_wake() {
+        let vcpus = VcpuList::new(1);
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.wake_system_suspended());
+        vcpus.end_system_suspend(0);
+        assert_eq!(vcpus.system_suspended(), None);
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.should_wait_system_suspended(0));
+    }
+
+    #[test]
+    fn a_waiting_park_is_woken_through_its_channel() {
+        let vcpus = VcpuList::new(1);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        vcpus.register(0, tx);
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.should_wait_system_suspended(0));
+        assert!(vcpus.wake_system_suspended());
+        assert_eq!(rx.try_recv(), Ok(0));
     }
 }
