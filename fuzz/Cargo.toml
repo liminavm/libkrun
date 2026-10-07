@@ -17,8 +17,8 @@ cargo-fuzz = true
 devices = { package = "krun-devices", path = "../src/devices", features = ["usb"] }
 libfuzzer-sys = "0.4"
 utils = { package = "krun-utils", path = "../src/utils" }
-vmm = { package = "krun-vmm", path = "../src/vmm", features = ["usb"] }
-vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
+krun = { package = "libkrun", path = "../src/libkrun", features = ["usb"] }
+vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap"] }
 
 [workspace]
 members = ["."]
