@@ -20,7 +20,10 @@
 
 use std::io::Error as SysError;
 use std::io::IoSliceMut;
+use std::mem::ManuallyDrop;
 use std::mem::size_of;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -52,7 +55,83 @@ use crate::rutabaga_utils::*;
 ///
 /// `Arc` because a `RutabagaContext` outlives the call that created it and must still reach the
 /// renderer; the C had the same sharing and spelled it as a global.
-type Shared = std::sync::Arc<Mutex<Renderer>>;
+type Shared = std::sync::Arc<Guarded<Renderer>>;
+
+/// The renderer behind its lock, and the one way in: [`Guarded::with`].
+///
+/// A panic inside virglrs ends the renderer, not the VM. The worker is built to unwind, so the
+/// panic is caught at this boundary, the renderer is marked dead, and every later call into it
+/// is refused with `EIO` without touching it. What a panic leaves behind is renderer state
+/// half-updated under the lock -- tables, the GL context, a venus decoder mid-command -- and
+/// nothing here can say which context that state belongs to: the renderer's tables are shared by
+/// every context, and vrend's GL context is one per process. So the containment is the whole
+/// renderer, never one context. The guest loses 3D (its fences behind the dead renderer never
+/// retire), and the VM process, its disks and its network stay up.
+///
+/// A dead renderer is also never dropped. Its teardown would run over the same half-updated
+/// state, and the host memory behind its mappable blobs is mapped into the guest, which still
+/// runs and may still touch it.
+struct Guarded<T> {
+    lock: ManuallyDrop<Mutex<T>>,
+    dead: AtomicBool,
+}
+
+/// What every call into a dead renderer returns.
+fn dead() -> RutabagaError {
+    RutabagaError::ComponentError(-libc::EIO)
+}
+
+impl<T> Guarded<T> {
+    fn new(inner: T) -> Self {
+        Guarded {
+            lock: ManuallyDrop::new(Mutex::new(inner)),
+            dead: AtomicBool::new(false),
+        }
+    }
+
+    /// Run `f` on the renderer under its lock; `what` names the call for the log.
+    ///
+    /// A panic in `f` unwinds through the guard, which poisons the lock; a poisoned lock is read
+    /// as dead too, though nothing but a caught panic can poison it.
+    fn with<R>(&self, what: &str, f: impl FnOnce(&mut T) -> R) -> RutabagaResult<R> {
+        self.contain(what, || match self.lock.lock() {
+            Ok(mut renderer) => Ok(f(&mut renderer)),
+            Err(_) => Err(dead()),
+        })?
+    }
+
+    /// Run `f`, which reaches into virglrs without the lock -- a wait the renderer handed back --
+    /// so that a panic there ends the renderer as one under the lock would.
+    fn contain<R>(&self, what: &str, f: impl FnOnce() -> R) -> RutabagaResult<R> {
+        if self.dead.load(Ordering::Acquire) {
+            return Err(dead());
+        }
+        // Unwind safety: whatever `f` leaves half-updated is reached only through `self`, and a
+        // caught panic marks `self` dead before anything can reach it again.
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                if !self.dead.swap(true, Ordering::AcqRel) {
+                    error!(
+                        "virglrs panicked in {what}; the 3D renderer is dead for the rest of \
+                         this VM's life and every call into it is refused (the panic message \
+                         is above, and in the panic log)"
+                    );
+                }
+                Err(dead())
+            }
+        }
+    }
+}
+
+impl<T> Drop for Guarded<T> {
+    fn drop(&mut self) {
+        if !*self.dead.get_mut() {
+            // SAFETY: `lock` is dropped here once, and `self` is never used again.
+            unsafe { ManuallyDrop::drop(&mut self.lock) };
+        }
+    }
+}
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct VirglRenderer {
@@ -168,19 +247,19 @@ impl RutabagaContext for VirglRendererContext {
         // reached it through create/attach_backing.
         resource.component_mask |= 1 << (RutabagaComponentType::VirglRenderer as u8);
         if let Ok(handle) = res(resource.resource_id) {
-            self.r
-                .lock()
-                .unwrap()
-                .ctx_attach_resource(self.ctx_id, handle);
+            let id = self.ctx_id;
+            let _ = self
+                .r
+                .with("ctx_attach_resource", |r| r.ctx_attach_resource(id, handle));
         }
     }
 
     fn detach(&mut self, resource: &RutabagaResource) {
         if let Ok(handle) = res(resource.resource_id) {
-            self.r
-                .lock()
-                .unwrap()
-                .ctx_detach_resource(self.ctx_id, handle);
+            let id = self.ctx_id;
+            let _ = self
+                .r
+                .with("ctx_detach_resource", |r| r.ctx_detach_resource(id, handle));
         }
     }
 
@@ -191,16 +270,19 @@ impl RutabagaContext for VirglRendererContext {
     fn context_create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
         let id = ctx(fence.ctx_id)?;
         self.r
-            .lock()
-            .unwrap()
-            .context_create_fence(id, RingIdx(fence.ring_idx as u32), FenceId(fence.fence_id))
+            .with("context_create_fence", |r| {
+                r.context_create_fence(id, RingIdx(fence.ring_idx as u32), FenceId(fence.fence_id))
+            })?
             .map_err(|e| refused("context_create_fence", e))
     }
 }
 
 impl Drop for VirglRendererContext {
+    /// Cannot panic: a panic in the destroy is caught like any other, and a dead renderer has no
+    /// context left to destroy.
     fn drop(&mut self) {
-        self.r.lock().unwrap().context_destroy(self.ctx_id);
+        let id = self.ctx_id;
+        let _ = self.r.with("context_destroy", |r| r.context_destroy(id));
     }
 }
 
@@ -221,8 +303,8 @@ fn submit_all(r: &Shared, id: ContextId, buf: &[u8]) -> RutabagaResult<()> {
     let mut answer: Option<Answered> = None;
     loop {
         let out = match answer.take() {
-            None => r.lock().unwrap().submit_cmd(id, &buf[at..]),
-            Some(a) => r.lock().unwrap().resume_cmd(id, &buf[at..], a),
+            None => r.with("submit_cmd", |r| r.submit_cmd(id, &buf[at..]))?,
+            Some(a) => r.with("resume_cmd", |r| r.resume_cmd(id, &buf[at..], a))?,
         };
         let waiter = match out {
             Err(e) => return Err(refused("submit_cmd", e)),
@@ -235,7 +317,7 @@ fn submit_all(r: &Shared, id: ContextId, buf: &[u8]) -> RutabagaResult<()> {
                 at += consumed;
                 // Fetched under the lock and waited on after it: the waiter holds only `Arc`s to
                 // things the ring thread also holds, so from here the renderer is not involved.
-                match r.lock().unwrap().ring_waiter(id, ring, seqno) {
+                match r.with("ring_waiter", |r| r.ring_waiter(id, ring, seqno))? {
                     Ok(w) => w,
                     Err(e) => return Err(refused("ring_waiter", e)),
                 }
@@ -247,10 +329,10 @@ fn submit_all(r: &Shared, id: ContextId, buf: &[u8]) -> RutabagaResult<()> {
                 on: Wait::Driver(wait),
             }) => {
                 at += consumed;
-                answer = Some(
+                answer = Some(r.contain("a driver wait", || {
                     wait.run(|| true)
-                        .expect("nothing stops a virtqueue-side wait"),
-                );
+                        .expect("nothing stops a virtqueue-side wait")
+                })?);
                 continue;
             }
             // A virtqueue wait is legal only on a ring's own stream, and this is the context's.
@@ -264,7 +346,7 @@ fn submit_all(r: &Shared, id: ContextId, buf: &[u8]) -> RutabagaResult<()> {
                 )
             }
         };
-        if !waiter.wait() {
+        if !r.contain("a ring wait", || waiter.wait())? {
             return Err(refused("ring wait", RendererError::Poisoned));
         }
     }
@@ -312,7 +394,7 @@ impl VirglRenderer {
         // itself and needs the texture names to be names in its own share group.
         match Renderer::new(Box::new(Fences(fence_handler)), config, None) {
             Ok(r) => Ok(Box::new(VirglRenderer {
-                r: std::sync::Arc::new(Mutex::new(r)),
+                r: std::sync::Arc::new(Guarded::new(r)),
             })),
             Err(e) => {
                 error!("virglrs: init: {e}");
@@ -329,7 +411,11 @@ impl VirglRenderer {
     /// entry points could disagree about that only by asking twice.
     fn mapping(&self, resource_id: u32) -> Option<(u64, u32)> {
         let handle = ResourceHandle::new(resource_id)?;
-        let m = self.r.lock().unwrap().resource_host_mapping(handle).ok()?;
+        let m = self
+            .r
+            .with("resource_host_mapping", |r| r.resource_host_mapping(handle))
+            .ok()?
+            .ok()?;
         let info = match m.caching {
             Caching::Cached => RUTABAGA_MAP_CACHE_CACHED,
             Caching::WriteCombining => RUTABAGA_MAP_CACHE_WC,
@@ -342,7 +428,9 @@ impl VirglRenderer {
     /// for: `virgl_renderer_execute`'s export query was an ABI ceremony around these constants.
     fn query(&self, resource_id: u32) -> Option<Resource3DInfo> {
         let handle = ResourceHandle::new(resource_id)?;
-        self.r.lock().unwrap().with_resource(handle, |_| ())?;
+        self.r
+            .with("with_resource", |r| r.with_resource(handle, |_| ()))
+            .ok()??;
         Some(Resource3DInfo {
             width: 0,
             height: 0,
@@ -359,9 +447,7 @@ impl RutabagaComponent for VirglRenderer {
     fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
         let handle = res(resource_id)?;
         self.r
-            .lock()
-            .unwrap()
-            .resource_surface_id(handle)
+            .with("resource_surface_id", |r| r.resource_surface_id(handle))?
             .map(|s| s.0)
             .ok_or(RutabagaError::Unsupported)
     }
@@ -383,20 +469,26 @@ impl RutabagaComponent for VirglRenderer {
     /// is no fill on this path to do the zeroing. Should a before-init caller ever appear here,
     /// the fix is `layout` AND the zeroing together, never `layout` alone.
     fn get_capset_info(&self, capset_id: u32) -> (u32, u32) {
+        let set = CapsetId::from_raw((capset_id & 0xff) as u8);
         self.r
-            .lock()
-            .unwrap()
-            .capset(CapsetId::from_raw((capset_id & 0xff) as u8))
-            .map(|c| (c.version(), c.as_bytes().len() as u32))
+            .with("capset", |r| {
+                r.capset(set)
+                    .map(|c| (c.version(), c.as_bytes().len() as u32))
+            })
+            .ok()
+            .flatten()
             .unwrap_or((0, 0))
     }
 
     fn get_capset(&self, capset_id: u32, _version: u32) -> Vec<u8> {
         let set = CapsetId::from_raw((capset_id & 0xff) as u8);
-        match self.r.lock().unwrap().capset(set) {
-            Some(caps) => caps.as_bytes().to_vec(),
-            None => Vec::new(),
-        }
+        self.r
+            .with("capset", |r| {
+                r.capset(set).map(|caps| caps.as_bytes().to_vec())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     /// The C ABI's implicit current context. There is no such thing here, which is the whole
@@ -404,25 +496,12 @@ impl RutabagaComponent for VirglRenderer {
     fn force_ctx_0(&self) {}
 
     fn limina_settle_video(&self) {
-        self.r.lock().unwrap().settle_video();
+        let _ = self.r.with("settle_video", |r| r.settle_video());
     }
 
     fn limina_dump_state(&self) {
-        let mut r = self.r.lock().unwrap();
-        let (resources, contexts) = r.counts();
-        error!("virglrs: {resources} resources, {contexts} contexts");
-        error!("virglrs: vrend journal: {}", r.journal_census());
-        for (ctx, bytes, entries) in r.vrend_journal_report() {
-            match entries {
-                Ok(n) => error!("virglrs:   ctx {ctx}: {bytes} bytes, {n} entries"),
-                Err(e) => error!("virglrs:   ctx {ctx}: {bytes} bytes, UNREADABLE: {e}"),
-            }
-        }
-        for (name, n) in r.venus_journal_transient() {
-            error!("virglrs:   journal kept nothing for {n:>8} x {name}");
-        }
-        for (name, n) in r.venus_todo() {
-            error!("virglrs:   unserved {n:>8} x {name}");
+        if self.r.with("dump_state", dump_state).is_err() {
+            error!("virglrs: the renderer is dead; nothing to dump");
         }
     }
 
@@ -431,12 +510,20 @@ impl RutabagaComponent for VirglRenderer {
     /// succeeded. Which renderer keeps the journal is the renderer's question, not this one's.
     fn limina_journal_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
         let id = ContextId::new(ctx_id)?;
-        self.r.lock().unwrap().journal_export(id)
+        self.r
+            .with("journal_export", |r| r.journal_export(id))
+            .ok()
+            .flatten()
     }
 
     fn limina_journal_seq(&self, ctx_id: u32) -> u64 {
         ContextId::new(ctx_id)
-            .and_then(|id| self.r.lock().unwrap().venus_journal_seq(id))
+            .and_then(|id| {
+                self.r
+                    .with("venus_journal_seq", |r| r.venus_journal_seq(id))
+                    .ok()
+                    .flatten()
+            })
             .unwrap_or(0)
     }
 
@@ -448,7 +535,10 @@ impl RutabagaComponent for VirglRenderer {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        self.r.lock().unwrap().replay_begin(id).is_ok()
+        matches!(
+            self.r.with("replay_begin", |r| r.replay_begin(id)),
+            Ok(Ok(_))
+        )
     }
 
     fn limina_journal_restore(&self, ctx_id: u32, blob: &[u8]) -> bool {
@@ -456,16 +546,21 @@ impl RutabagaComponent for VirglRenderer {
             return false;
         };
         // A refused journal is reported by the renderer, which names the half that refused it.
-        self.r.lock().unwrap().journal_restore(id, blob).is_ok()
+        matches!(
+            self.r
+                .with("journal_restore", |r| r.journal_restore(id, blob)),
+            Ok(Ok(_))
+        )
     }
 
     fn limina_journal_replay_upto(&self, ctx_id: u32, upto: u64) -> bool {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        match self.r.lock().unwrap().replay_upto(id, upto) {
-            Ok(()) => true,
-            Err(why) => {
+        match self.r.with("replay_upto", |r| r.replay_upto(id, upto)) {
+            Ok(Ok(())) => true,
+            Err(_) => false,
+            Ok(Err(why)) => {
                 error!("virglrs: ctx {ctx_id}: replay to {upto} failed: {why}");
                 false
             }
@@ -476,7 +571,11 @@ impl RutabagaComponent for VirglRenderer {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        self.r.lock().unwrap().venus_replay_cmd(id, cmd).is_ok()
+        matches!(
+            self.r
+                .with("venus_replay_cmd", |r| r.venus_replay_cmd(id, cmd)),
+            Ok(Ok(_))
+        )
     }
 
     fn limina_replay_ring_cmd(&self, ctx_id: u32, ring_id: u64, cmd: &mut [u8]) -> bool {
@@ -489,35 +588,46 @@ impl RutabagaComponent for VirglRenderer {
         let Some(ring) = RingId::new(ring_id) else {
             return false;
         };
-        self.r
-            .lock()
-            .unwrap()
-            .venus_replay_ring_cmd(id, ring, cmd)
-            .is_ok()
+        matches!(
+            self.r.with("venus_replay_ring_cmd", |r| r
+                .venus_replay_ring_cmd(id, ring, cmd)),
+            Ok(Ok(_))
+        )
     }
 
     fn limina_replay_end(&self, ctx_id: u32) -> bool {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        self.r.lock().unwrap().replay_end(id).is_ok()
+        matches!(self.r.with("replay_end", |r| r.replay_end(id)), Ok(Ok(_)))
     }
 
     fn limina_sync_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
         let id = ContextId::new(ctx_id)?;
-        self.r.lock().unwrap().venus_sync_export(id).ok()
+        self.r
+            .with("venus_sync_export", |r| r.venus_sync_export(id))
+            .ok()?
+            .ok()
     }
 
     fn limina_sync_restore(&self, ctx_id: u32, data: &[u8]) -> bool {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        self.r.lock().unwrap().venus_sync_restore(id, data).is_ok()
+        matches!(
+            self.r
+                .with("venus_sync_restore", |r| r.venus_sync_restore(id, data)),
+            Ok(Ok(_))
+        )
     }
 
     fn limina_memory_census(&self, ctx_id: u32) -> Option<Vec<(u64, u64)>> {
         let id = ContextId::new(ctx_id)?;
-        let census = self.r.lock().unwrap().venus_memory_census(id).ok()?;
+        let census = self
+            .r
+            .with("venus_memory_census", |r| r.venus_memory_census(id))
+            .ok()?
+            .ok()?;
         Some(census.into_iter().map(|a| (a.id.0, a.size)).collect())
     }
 
@@ -526,11 +636,11 @@ impl RutabagaComponent for VirglRenderer {
             return false;
         };
         let mem = virglrenderer::venus::cs::ObjectId(mem_id);
-        self.r
-            .lock()
-            .unwrap()
-            .venus_memory_read(id, mem, buf)
-            .is_ok()
+        matches!(
+            self.r
+                .with("venus_memory_read", |r| r.venus_memory_read(id, mem, buf)),
+            Ok(Ok(_))
+        )
     }
 
     fn limina_memory_write(&self, ctx_id: u32, mem_id: u64, buf: &[u8]) -> bool {
@@ -538,19 +648,19 @@ impl RutabagaComponent for VirglRenderer {
             return false;
         };
         let mem = virglrenderer::venus::cs::ObjectId(mem_id);
-        self.r
-            .lock()
-            .unwrap()
-            .venus_memory_write(id, mem, buf)
-            .is_ok()
+        matches!(
+            self.r
+                .with("venus_memory_write", |r| r.venus_memory_write(id, mem, buf)),
+            Ok(Ok(_))
+        )
     }
 
     fn limina_classic_content_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
         let id = ContextId::new(ctx_id)?;
         self.r
-            .lock()
-            .unwrap()
-            .vrend_content_export(id)
+            .with("vrend_content_export", |r| r.vrend_content_export(id))
+            .ok()
+            .flatten()
             .map(|(bytes, _)| bytes)
     }
 
@@ -558,11 +668,11 @@ impl RutabagaComponent for VirglRenderer {
         let Some(id) = ContextId::new(ctx_id) else {
             return false;
         };
-        self.r
-            .lock()
-            .unwrap()
-            .vrend_content_restore(id, data)
-            .is_ok()
+        matches!(
+            self.r.with("vrend_content_restore", |r| r
+                .vrend_content_restore(id, data)),
+            Ok(Ok(_))
+        )
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
@@ -571,11 +681,12 @@ impl RutabagaComponent for VirglRenderer {
         // to be current -- right by luck, and wrong whenever the last thing the worker did was a
         // ctx0 operation. Zero is the global ring naming no context, which the renderer answers by
         // finishing everything instead.
-        self.r.lock().unwrap().create_fence(
-            ClientFenceId(fence.fence_id as u32),
-            ContextId::new(fence.ctx_id),
-        );
-        Ok(())
+        self.r.with("create_fence", |r| {
+            r.create_fence(
+                ClientFenceId(fence.fence_id as u32),
+                ContextId::new(fence.ctx_id),
+            )
+        })
     }
 
     /// Fences retire on the renderer's own thread and are delivered through [`Fences`], except a
@@ -585,14 +696,18 @@ impl RutabagaComponent for VirglRenderer {
     /// written the answer. Draining the descriptor is the renderer's job, and a spurious call is
     /// cheap.
     fn event_poll(&self) {
-        self.r.lock().unwrap().poll();
+        let _ = self.r.with("poll", |r| r.poll());
     }
 
     /// Asking for the descriptor is the promise to pump [`Self::event_poll`] whenever it is
     /// readable. Without one, a fence behind a parked query finishes its work inline when it is
     /// taken: still correct, but a GPU wait on the submitting thread.
     fn poll_descriptor(&self) -> Option<SafeDescriptor> {
-        match self.r.lock().unwrap().poll_descriptor() {
+        match self
+            .r
+            .with("poll_descriptor", |r| r.poll_descriptor())
+            .ok()?
+        {
             Ok(fd) => fd.map(|fd| SafeDescriptor::from(std::fs::File::from(fd))),
             Err(e) => {
                 error!("virglrs: no poll descriptor, so GL queries finish at fence time: {e}");
@@ -619,9 +734,9 @@ impl RutabagaComponent for VirglRenderer {
             flags: ResourceFlags(c.flags),
         };
         self.r
-            .lock()
-            .unwrap()
-            .resource_create(handle, args, Vec::new())
+            .with("resource_create", |r| {
+                r.resource_create(handle, args, Vec::new())
+            })?
             .map_err(|e| refused("create_3d", e))?;
 
         Ok(RutabagaResource {
@@ -649,22 +764,25 @@ impl RutabagaComponent for VirglRenderer {
         vecs: &mut Vec<RutabagaIovec>,
     ) -> RutabagaResult<()> {
         let handle = res(resource_id)?;
+        let iov = iovs(vecs);
         self.r
-            .lock()
-            .unwrap()
-            .resource_attach_iov(handle, iovs(vecs))
+            .with("resource_attach_iov", |r| {
+                r.resource_attach_iov(handle, iov)
+            })?
             .map_err(|e| refused("attach_backing", e))
     }
 
     fn detach_backing(&self, resource_id: u32) {
         if let Ok(handle) = res(resource_id) {
-            self.r.lock().unwrap().resource_detach_iov(handle);
+            let _ = self
+                .r
+                .with("resource_detach_iov", |r| r.resource_detach_iov(handle));
         }
     }
 
     fn unref_resource(&self, resource_id: u32) {
         if let Ok(handle) = res(resource_id) {
-            self.r.lock().unwrap().resource_unref(handle);
+            let _ = self.r.with("resource_unref", |r| r.resource_unref(handle));
         }
     }
 
@@ -679,15 +797,15 @@ impl RutabagaComponent for VirglRenderer {
         }
         let handle = res(resource.resource_id)?;
         self.r
-            .lock()
-            .unwrap()
-            .transfer(
-                handle,
-                ContextId::new(ctx_id),
-                transfer::Direction::ToHost,
-                &info_of(&t, false),
-                Vec::new(),
-            )
+            .with("transfer_write", |r| {
+                r.transfer(
+                    handle,
+                    ContextId::new(ctx_id),
+                    transfer::Direction::ToHost,
+                    &info_of(&t, false),
+                    Vec::new(),
+                )
+            })?
             .map_err(|e| refused("transfer_write", e))
     }
 
@@ -703,12 +821,9 @@ impl RutabagaComponent for VirglRenderer {
         height: u32,
     ) -> RutabagaResult<()> {
         let handle = res(resource_id)?;
-        match self
-            .r
-            .lock()
-            .unwrap()
-            .resource_read_surface(handle, dst, dst_stride as usize, height)
-        {
+        match self.r.with("resource_read_surface", |r| {
+            r.resource_read_surface(handle, dst, dst_stride as usize, height)
+        })? {
             Some(rows) if rows == height => Ok(()),
             other => {
                 error!(
@@ -725,7 +840,10 @@ impl RutabagaComponent for VirglRenderer {
     #[cfg(target_os = "macos")]
     fn sync_iosurface(&self, resource_id: u32) -> RutabagaResult<()> {
         let handle = res(resource_id)?;
-        if self.r.lock().unwrap().resource_sync_surface(handle) {
+        if self
+            .r
+            .with("resource_sync_surface", |r| r.resource_sync_surface(handle))?
+        {
             Ok(())
         } else {
             Err(RutabagaError::ComponentError(-libc::EINVAL))
@@ -741,9 +859,9 @@ impl RutabagaComponent for VirglRenderer {
     fn present_waits_on(&self, resource_id: u32) -> RutabagaResult<u32> {
         let handle = res(resource_id)?;
         self.r
-            .lock()
-            .unwrap()
-            .resource_present_waits_on(handle)
+            .with("resource_present_waits_on", |r| {
+                r.resource_present_waits_on(handle)
+            })?
             .map(|ctx| ctx.get())
             .ok_or(RutabagaError::ComponentError(-libc::EINVAL))
     }
@@ -757,12 +875,9 @@ impl RutabagaComponent for VirglRenderer {
     #[cfg(target_os = "macos")]
     fn present_fence(&self, resource_id: u32, cookie: u64) -> RutabagaResult<()> {
         let handle = res(resource_id)?;
-        if self
-            .r
-            .lock()
-            .unwrap()
-            .resource_present_fence(handle, FenceId(cookie))
-        {
+        if self.r.with("resource_present_fence", |r| {
+            r.resource_present_fence(handle, FenceId(cookie))
+        })? {
             Ok(())
         } else {
             Err(RutabagaError::ComponentError(-libc::EINVAL))
@@ -777,12 +892,9 @@ impl RutabagaComponent for VirglRenderer {
     fn present_copy(&self, resource_id: u32, scanout_id: u32, cookie: u64) -> RutabagaResult<u32> {
         let handle = res(resource_id)?;
         let scanout = virglrenderer::ids::ScanoutId(scanout_id);
-        match self
-            .r
-            .lock()
-            .unwrap()
-            .resource_present_copy(handle, scanout, FenceId(cookie))
-        {
+        match self.r.with("resource_present_copy", |r| {
+            r.resource_present_copy(handle, scanout, FenceId(cookie))
+        })? {
             Ok(id) => Ok(id.0),
             Err(virglrenderer::venus::present_copy::CopyRefused::Busy) => {
                 Err(RutabagaError::ComponentError(-libc::EBUSY))
@@ -816,15 +928,15 @@ impl RutabagaComponent for VirglRenderer {
             None => Vec::new(),
         };
         self.r
-            .lock()
-            .unwrap()
-            .transfer(
-                handle,
-                ContextId::new(ctx_id),
-                transfer::Direction::ToGuest,
-                &info_of(&t, false),
-                iov,
-            )
+            .with("transfer_read", |r| {
+                r.transfer(
+                    handle,
+                    ContextId::new(ctx_id),
+                    transfer::Direction::ToGuest,
+                    &info_of(&t, false),
+                    iov,
+                )
+            })?
             .map_err(|e| refused("transfer_read", e))
     }
 
@@ -856,9 +968,9 @@ impl RutabagaComponent for VirglRenderer {
         };
         let iov = iovec_opt.as_deref().map(iovs).unwrap_or_default();
         self.r
-            .lock()
-            .unwrap()
-            .resource_create_blob(handle, desc, iov)
+            .with("resource_create_blob", |r| {
+                r.resource_create_blob(handle, desc, iov)
+            })?
             .map_err(|e| refused("create_blob", e))?;
 
         let mapping = self.mapping(resource_id);
@@ -896,9 +1008,7 @@ impl RutabagaComponent for VirglRenderer {
         let handle = res(resource_id)?;
         let m = self
             .r
-            .lock()
-            .unwrap()
-            .resource_host_mapping(handle)
+            .with("resource_host_mapping", |r| r.resource_host_mapping(handle))?
             .map_err(|e| refused("map", e))?;
         Ok(RutabagaMapping {
             ptr: m.addr as u64,
@@ -934,14 +1044,33 @@ impl RutabagaComponent for VirglRenderer {
             other => CapsetId::from_raw((other & 0xff) as u8),
         };
         self.r
-            .lock()
-            .unwrap()
-            .context_create(id, capset, name.to_string())
+            .with("context_create", |r| {
+                r.context_create(id, capset, name.to_string())
+            })?
             .map_err(|e| refused("create_context", e))?;
         Ok(Box::new(VirglRendererContext {
             ctx_id: id,
             r: self.r.clone(),
         }))
+    }
+}
+
+/// The renderer's census, for the VMM's state dump.
+fn dump_state(r: &mut Renderer) {
+    let (resources, contexts) = r.counts();
+    error!("virglrs: {resources} resources, {contexts} contexts");
+    error!("virglrs: vrend journal: {}", r.journal_census());
+    for (ctx, bytes, entries) in r.vrend_journal_report() {
+        match entries {
+            Ok(n) => error!("virglrs:   ctx {ctx}: {bytes} bytes, {n} entries"),
+            Err(e) => error!("virglrs:   ctx {ctx}: {bytes} bytes, UNREADABLE: {e}"),
+        }
+    }
+    for (name, n) in r.venus_journal_transient() {
+        error!("virglrs:   journal kept nothing for {n:>8} x {name}");
+    }
+    for (name, n) in r.venus_todo() {
+        error!("virglrs:   unserved {n:>8} x {name}");
     }
 }
 
@@ -957,5 +1086,71 @@ pub fn republish_iosurface(iosurface_id: u32) -> RutabagaResult<()> {
         Ok(())
     } else {
         Err(RutabagaError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A renderer stand-in that records whether it was dropped.
+    struct Probe(Arc<AtomicBool>);
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn probe() -> (Guarded<Probe>, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        (Guarded::new(Probe(dropped.clone())), dropped)
+    }
+
+    fn is_dead<R>(r: &RutabagaResult<R>) -> bool {
+        matches!(r, Err(RutabagaError::ComponentError(e)) if *e == -libc::EIO)
+    }
+
+    /// A panic under the lock is an error for that call and for every call after it, none of
+    /// which reaches the renderer again, and the dead renderer is leaked rather than dropped.
+    #[test]
+    fn a_panic_under_the_lock_ends_the_renderer_and_not_the_caller() {
+        let (g, dropped) = probe();
+        assert_eq!(g.with("a live call", |_| 7).ok(), Some(7));
+
+        let r: RutabagaResult<u32> = g.with("a panicking call", |_| panic!("deliberate"));
+        assert!(is_dead(&r), "the panic came back as an error");
+
+        let mut reached = false;
+        assert!(is_dead(&g.with("a later call", |_| reached = true)));
+        assert!(!reached, "a dead renderer is not touched again");
+
+        drop(g);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "a dead renderer is never dropped"
+        );
+    }
+
+    /// A panic in virglrs code run outside the lock -- a wait the renderer handed back -- ends
+    /// the renderer the same way.
+    #[test]
+    fn a_panic_outside_the_lock_ends_the_renderer_too() {
+        let (g, dropped) = probe();
+        let r: RutabagaResult<bool> = g.contain("a ring wait", || panic!("deliberate"));
+        assert!(is_dead(&r));
+        assert!(is_dead(&g.with("a later call", |_| ())));
+        drop(g);
+        assert!(!dropped.load(Ordering::SeqCst));
+    }
+
+    /// Nothing changes for a renderer that never panicked: it is dropped with the last owner.
+    #[test]
+    fn a_live_renderer_is_dropped() {
+        let (g, dropped) = probe();
+        assert!(g.with("a live call", |_| ()).is_ok());
+        drop(g);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
