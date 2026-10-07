@@ -338,6 +338,11 @@ impl VirtioDevice for Console {
         Some(size_of::<VirtioConsoleConfig>() as u32)
     }
 
+    fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
+        let ports = self.config.max_nr_ports;
+        vec![("ports", ports as u64)]
+    }
+
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config_slice = self.config.as_slice();
         let config_len = config_slice.len() as u64;
