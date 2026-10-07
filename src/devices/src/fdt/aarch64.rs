@@ -586,6 +586,21 @@ fn create_cpufreq_node<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(())
 }
 
+/// The TPM (`Documentation/devicetree/bindings/tpm/tcg,tpm-tis-mmio.yaml`'s binding, as QEMU's
+/// `virt` machine emits it): compatible + reg. No `interrupts`: the device has none, and Linux's
+/// `tpm_tis` polls when the node names no interrupt.
+fn create_tpm_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
+    let node = fdt.begin_node(&format!("tpm@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "tcg,tpm-tis-mmio")?;
+    fdt.property("reg", &reg_prop)?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
 fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &HashMap<(DeviceType, String), T>,
@@ -600,6 +615,7 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
             DeviceType::Serial => create_serial_node(fdt, info)?,
             DeviceType::Xhci => create_xhci_node(fdt, info)?,
             DeviceType::CpuFreq => create_cpufreq_node(fdt, info)?,
+            DeviceType::Tpm => create_tpm_node(fdt, info)?,
             DeviceType::Virtio(virtio_type) => {
                 ordered_virtio_device.push((info, *virtio_type));
             }
