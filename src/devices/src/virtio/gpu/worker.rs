@@ -503,6 +503,13 @@ impl Worker {
         // LIMINA_RING_WAKE_PROFILE, which covers everything after cnd_signal.
         let mut wake_probe = crate::virtio::wake_probe::Profile::new();
         let dump_gate = self.dump_gate.clone();
+        // Test aid (LIMINA_GPU_TEST_DRAIN_DELAY_MS): hold each control-queue drain back, so
+        // the guest still has commands in flight when it suspends and the snapshot's fence
+        // drain completes them behind its back.
+        let drain_delay = std::env::var("LIMINA_GPU_TEST_DRAIN_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis);
         loop {
             let ev_cnt = match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(n) => n,
@@ -601,6 +608,9 @@ impl Worker {
                     // Nothing else on this thread runs until the drain below returns -- retired
                     // presents included -- so a long one is a frozen window. Measured here, where
                     // the time goes, rather than inferred from the presents it delays.
+                    if let Some(d) = drain_delay {
+                        thread::sleep(d);
+                    }
                     let drain_began = std::time::Instant::now();
                     let mut drain_passes = 0u32;
                     loop {
