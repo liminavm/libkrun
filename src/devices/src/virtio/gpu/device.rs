@@ -402,6 +402,19 @@ impl VirtioDevice for Gpu {
         &QUEUE_CONFIG
     }
 
+    fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
+        let mut config = [0u8; std::mem::size_of::<virtio_gpu_config>()];
+        self.read_config(0, &mut config);
+        let config = virtio_gpu_config::from_slice(&config)
+            .copied()
+            .unwrap_or_default();
+        vec![
+            ("scanouts", config.num_scanouts as u64),
+            ("capsets", config.num_capsets as u64),
+            ("blob alignment", config.blob_alignment as u64),
+        ]
+    }
+
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config = virtio_gpu_config {
             // limina: the guest reads this after a config-change interrupt; a set

@@ -196,6 +196,16 @@ pub trait VirtioDevice: AsAny + Send {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
     }
+
+    /// limina: the config fields that decide what the guest's driver builds around this device,
+    /// by name -- a console's port count, a GPU's scanouts. A snapshot records them beside the
+    /// offered features and the queue count, and a restore whose device reports different values
+    /// is refused: the guest's driver set itself up for the old ones. Only fields fixed when the
+    /// device is built belong here; anything that changes while the VM runs would refuse a
+    /// restore on the same build. The default reports none.
+    fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
 }
 
 pub trait VmmExitObserver: Send {
