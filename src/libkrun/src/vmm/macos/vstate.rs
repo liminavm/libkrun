@@ -586,6 +586,16 @@ impl Vcpu {
             hvf_vcpu.set_released_ram(released_ram);
         }
         let hvf_vcpuid = hvf_vcpu.id();
+        // A vCPU restored into its SYSTEM_SUSPEND park is the wake target from the moment the
+        // restore returns, which is before this thread can reach the park; recorded ahead of
+        // the handshake below, which `start_vcpus` waits on.
+        if let Some(VcpuState {
+            power: VcpuPower::SystemSuspended { .. },
+            ..
+        }) = &self.restore_state
+        {
+            self.vcpu_list.set_system_suspended(hvf_vcpuid);
+        }
 
         // Report the HVF-assigned vCPU id (creation order is not deterministic)
         // so the coordinator can break this vCPU out of HVF to pause it.
@@ -907,11 +917,11 @@ impl Vcpu {
     /// vCPU — the last one still running — until the host sends [`VcpuEvent::SystemWake`], then
     /// re-arm it at the resume entry point the guest handed us and return to the run loop.
     ///
-    /// Two things wake it, and both must, because both are real: a **wakeup-source IRQ** (the
-    /// `KEY_WAKEUP` GPIO — PSCI defines SYSTEM_SUSPEND as resuming on a wakeup event, so this is
-    /// the architectural path and the one every existing in-place wake already uses), and the
-    /// host's explicit [`VcpuEvent::SystemWake`]. Supporting only the latter silently strands
-    /// every caller that pulses the wake key, which is what the in-place s2idle tests do.
+    /// Two things wake it: the host's explicit [`VcpuEvent::SystemWake`], and the `KEY_WAKEUP`
+    /// GPIO, whose device wakes this vCPU through [`VcpuList::wake_system_suspended`] before it
+    /// raises the line. The line itself cannot: on the in-kernel GIC an SPI is injected inside
+    /// HVF and never reaches this thread, which is parked outside `hv_vcpu_run`. A wake that
+    /// arrives before the park is waiting is held for it, so none is lost to the order.
     ///
     /// The re-arm is the CPU_ON reset shape ([`HvfVcpu::reonline`]): entry is a PHYSICAL address
     /// with the MMU and caches off, which is exactly the contract arm64's `cpu_resume` expects
@@ -930,16 +940,16 @@ impl Vcpu {
         let hvf_vcpuid = hvf_vcpu.id();
         debug!("vCPU {hvf_vcpuid} parked (PSCI SYSTEM_SUSPEND), resume entry 0x{entry:x}");
         self.vcpu_list.set_parked(hvf_vcpuid, true);
-        self.vcpu_list.set_system_suspended(Some(hvf_vcpuid));
+        self.vcpu_list.set_system_suspended(hvf_vcpuid);
         hvf_vcpu.set_power(VcpuPower::SystemSuspended { entry, context_id });
         // Clone so the select does not borrow `self` across pause_and_park/handle_snapshot.
         let events = self.event_receiver.clone();
         loop {
-            // Mark this vCPU WFx-waiting so a device IRQ arrives over the wfe channel: it is
-            // parked in a `recv`, not in `hv_vcpu_run`, so the `hv_vcpus_exit` kick a running
-            // vCPU gets would reach nobody. `should_wait` returning false means an IRQ is
-            // already pending — a wakeup event that beat us here, so resume immediately.
-            let wake = if !self.vcpu_list.should_wait(hvf_vcpuid) {
+            // Mark this vCPU waiting so a wake arrives over the wfe channel: it is parked in a
+            // `recv`, not in `hv_vcpu_run`, so the `hv_vcpus_exit` kick a running vCPU gets
+            // would reach nobody. False means a wake (or, on the userspace GIC, an IRQ) beat us
+            // here, so resume immediately.
+            let wake = if !self.vcpu_list.should_wait_system_suspended(hvf_vcpuid) {
                 true
             } else {
                 select! {
@@ -962,7 +972,7 @@ impl Vcpu {
                 .unwrap_or_else(|e| {
                     panic!("system-suspend resume of vCPU {hvf_vcpuid} failed: {e:?}")
                 });
-            self.vcpu_list.set_system_suspended(None);
+            self.vcpu_list.end_system_suspend(hvf_vcpuid);
             hvf_vcpu.set_power(VcpuPower::Running);
             info!("vCPU {hvf_vcpuid} resumed from PSCI SYSTEM_SUSPEND at 0x{entry:x}");
             return;
