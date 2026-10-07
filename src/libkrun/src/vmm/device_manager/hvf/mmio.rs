@@ -410,6 +410,33 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    #[cfg(target_arch = "aarch64")]
+    /// Register a TPM 2.0 behind the TIS MMIO interface (`tcg,tpm-tis-mmio`): five 4 KiB
+    /// locality windows, page-aligned so locality `n` sits at `base + n * 0x1000` as the guest
+    /// driver computes it. Takes **no interrupt** — the guest polls — and so, like cpufreq, is
+    /// registered after every interrupt-carrying device.
+    pub fn register_mmio_tpm<B: devices::tpm::TpmBackend + 'static>(
+        &mut self,
+        tpm: devices::tpm::TpmTis<B>,
+    ) -> Result<()> {
+        let len = devices::tpm::MMIO_LEN;
+        let base = self.mmio_base.next_multiple_of(devices::tpm::LOCALITY_SIZE);
+        self.bus
+            .insert(Arc::new(Mutex::new(tpm)), base, len)
+            .map_err(Error::BusError)?;
+        self.id_to_dev_info.insert(
+            (DeviceType::Tpm, "tpm".to_string()),
+            MMIODeviceInfo {
+                addr: base,
+                len,
+                // No interrupt line: `create_tpm_node` emits none.
+                irq: 0,
+            },
+        );
+        self.mmio_base = base + len;
+        Ok(())
+    }
+
     /// Register a MMIO GIC device.
     pub fn register_mmio_gic(&mut self, _vm: &Vm, intc: IrqChip) -> Result<()> {
         let (mmio_addr, mmio_size) = {

@@ -18,6 +18,7 @@ pub mod display;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod fdt;
 pub mod legacy;
+pub mod tpm;
 #[cfg(all(feature = "usb", target_arch = "aarch64"))]
 pub mod usb;
 /// Snapshot-carried xHCI controller state. Deliberately NOT behind the `usb` feature gate: the
@@ -61,6 +62,9 @@ pub enum DeviceType {
     /// Device Type: virtual cpufreq (`qemu,virtual-cpufreq`).
     #[cfg(target_arch = "aarch64")]
     CpuFreq,
+    /// Device Type: TPM 2.0 over the TIS MMIO interface (`tcg,tpm-tis-mmio`).
+    #[cfg(target_arch = "aarch64")]
+    Tpm,
 }
 
 impl fmt::Display for DeviceType {
