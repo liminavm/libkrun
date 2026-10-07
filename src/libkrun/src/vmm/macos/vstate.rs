@@ -635,6 +635,14 @@ impl Vcpu {
             if let Some(gate) = self.restore_gate.take() {
                 gate.wait();
             }
+            // Test aid (LIMINA_TEST_RESTORE_VCPU_DELAY_MS): hold this vCPU back after the gate,
+            // so the host's post-restore wake lands before the vCPU is back in its park.
+            if let Some(delay) = std::env::var("LIMINA_TEST_RESTORE_VCPU_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                thread::sleep(Duration::from_millis(delay));
+            }
             hvf_vcpu
                 .restore_state(&state)
                 .unwrap_or_else(|e| panic!("Can't restore HVF vCPU {hvf_vcpuid} state: {e}"));
