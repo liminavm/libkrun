@@ -2,25 +2,36 @@
 
 //! The janus TPM 2.0 engine as a [`TpmBackend`] (limina).
 
+use std::time::Instant;
+
 use super::{Locality, TpmBackend};
 
-/// Randomness from the host's CSPRNG.
-struct HostRandom;
+/// Randomness from the host's CSPRNG, and time from its monotonic clock.
+struct Host {
+    /// When the device was made: the TPM only uses differences between readings.
+    epoch: Instant,
+}
 
-impl janus::Platform for HostRandom {
+impl janus::Platform for Host {
     fn fill_random(&mut self, buf: &mut [u8]) {
         // The host CSPRNG failing is not something a TPM can answer around: every key, nonce
         // and seed would be predictable. Stop loudly.
         getrandom::fill(buf).expect("the host CSPRNG failed");
     }
+
+    fn now_ms(&mut self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// A freshly manufactured janus TPM. Its state lives in memory for the life of the VM.
-pub struct JanusBackend(janus::Janus<HostRandom>);
+pub struct JanusBackend(janus::Janus<Host>);
 
 impl JanusBackend {
     pub fn new() -> Self {
-        JanusBackend(janus::Janus::manufacture(HostRandom))
+        JanusBackend(janus::Janus::manufacture(Host {
+            epoch: Instant::now(),
+        }))
     }
 }
 
