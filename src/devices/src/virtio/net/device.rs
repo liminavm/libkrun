@@ -9,8 +9,8 @@ use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    TYPE_NET, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, DumpGate, InterruptTransport,
+    QueueConfig, TYPE_NET, VirtioDevice,
 };
 
 #[cfg(not(windows))]
@@ -30,6 +30,7 @@ use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::{AsSocket, BorrowedSocket, OwnedSocket, RawSocket};
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(not(windows))]
 use std::thread::JoinHandle;
 #[cfg(not(windows))]
@@ -118,6 +119,8 @@ pub struct Net {
     // `reset`. Lazily opened on first activate.
     #[cfg(not(windows))]
     backend: Option<Box<dyn NetBackend + Send>>,
+    /// Held closed by a snapshot while it copies guest RAM; every worker passes through it.
+    dump_gate: Arc<DumpGate>,
 }
 
 impl Net {
@@ -160,6 +163,7 @@ impl Net {
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?,
             #[cfg(not(windows))]
             backend: None,
+            dump_gate: Arc::default(),
         })
     }
 
@@ -322,6 +326,8 @@ impl VirtioDevice for Net {
                 stop_fd,
                 rx_data_valid,
             );
+            #[cfg(unix)]
+            let worker = worker.with_dump_gate(self.dump_gate.clone());
             self.worker_thread = Some(worker.run());
             self.device_state = DeviceState::Activated(mem, interrupt);
             Ok(())
@@ -365,6 +371,11 @@ impl VirtioDevice for Net {
             self.device_state = DeviceState::Inactive;
             true
         }
+    }
+
+    #[cfg(unix)]
+    fn dump_gate(&self) -> Option<Arc<DumpGate>> {
+        Some(self.dump_gate.clone())
     }
 }
 

@@ -4,7 +4,7 @@ use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
 use crate::virtio::DescriptorChain;
 
-use crate::virtio::InterruptTransport;
+use crate::virtio::{DumpGate, InterruptTransport};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::TryReserveError;
 use std::io::{self, Write};
@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -228,9 +228,11 @@ pub struct BlockWorker {
     stop_fd: EventFd,
     parallel_reads: bool,
     read_pool_size: Option<NonZeroUsize>,
+    dump_gate: Arc<DumpGate>,
 }
 
 impl BlockWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_queue: DeviceQueue,
         interrupt: InterruptTransport,
@@ -239,6 +241,7 @@ impl BlockWorker {
         stop_fd: EventFd,
         parallel_reads: bool,
         read_pool_size: Option<NonZeroUsize>,
+        dump_gate: Arc<DumpGate>,
     ) -> Self {
         Self {
             device_queue,
@@ -248,6 +251,7 @@ impl BlockWorker {
             stop_fd,
             parallel_reads,
             read_pool_size,
+            dump_gate,
         }
     }
 
@@ -294,9 +298,11 @@ impl BlockWorker {
         }
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        let dump_gate = self.dump_gate.clone();
         loop {
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
+                    let _section = dump_gate.enter();
                     for epoll_event in &epoll_events[0..ev_cnt] {
                         let source = epoll_event.fd();
                         let event_set = epoll_event.event_set();
@@ -709,6 +715,7 @@ mod tests {
                 EventFd::new(EFD_NONBLOCK).unwrap(),
                 parallel,
                 None,
+                Arc::default(),
             );
             let mut pool = parallel.then(|| ReadPool::new(2, &worker.disk));
             worker.dispatch_request(&mem, pool.as_mut(), head);

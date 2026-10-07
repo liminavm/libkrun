@@ -45,7 +45,7 @@ use super::{GpuError, Result};
 use crate::display::{DisplayInfo, DisplayInfoEdid, EdidParams};
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
-use crate::virtio::{InterruptTransport, VirtioShmRegion};
+use crate::virtio::{DumpGate, InterruptTransport, VirtioShmRegion};
 
 /// Hand a scanout IOSurface back to the supervisor after it dropped ours from its bounded store.
 /// Only meaningful on macOS, where the surfaces exist at all.
@@ -810,6 +810,7 @@ impl VirtioGpu {
         present_retired: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
         present_event: utils::eventfd::EventFd,
         trace: Arc<GpuTraceStats>,
+        dump_gate: Arc<DumpGate>,
     ) -> RutabagaFenceHandler {
         // limina wake-trace (LIMINA_WAKE_TRACE=1): guest-fence callback/signal rates,
         // ~5s cadence — see docs/perf/overhead-inventory.md. Shared across the fence
@@ -838,6 +839,8 @@ impl VirtioGpu {
                 }
                 return;
             }
+            // Everything below may retire the fence into the used ring.
+            let _section = dump_gate.enter();
 
             let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                 0 => VirtioGpuRing::Global,
@@ -1035,6 +1038,7 @@ impl VirtioGpu {
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend,
+        dump_gate: Arc<DumpGate>,
     ) -> Self {
         let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(Default::default()));
 
@@ -1061,6 +1065,7 @@ impl VirtioGpu {
             present_retired.clone(),
             present_event.try_clone().expect("eventfd clone"),
             trace.clone(),
+            dump_gate,
         );
 
         // limina software-2D-only mode: skip renderer init entirely (no virglrenderer/Metal).
