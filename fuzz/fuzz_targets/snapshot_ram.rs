@@ -14,7 +14,7 @@
 use krun_fuzz::snapshot::{RAM_GPA, RAM_LEN};
 use libfuzzer_sys::fuzz_target;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
-use vmm::snapshot::read_bytes;
+use krun::vmm::snapshot::read_bytes;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(file) = read_bytes(data.to_vec()) else {
