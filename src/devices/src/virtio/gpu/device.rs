@@ -13,7 +13,7 @@ use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, DumpGate, QueueConfig, VirtioDevice,
     VirtioShmRegion, fs::ExportTable,
 };
 use super::defs;
@@ -200,6 +200,10 @@ pub struct Gpu {
     /// real driver re-init). Forwarded to the worker so it can classify a parked session —
     /// adopt it on a thaw, run the deferred `reset_session` on a re-init.
     thaw_activation: bool,
+    /// Held closed by a snapshot while it copies guest RAM. The worker passes through it on
+    /// every wake, and the fence handler (called from the renderer's own threads as well) for
+    /// every fence it retires into the used ring.
+    dump_gate: Arc<DumpGate>,
 }
 
 impl Gpu {
@@ -238,6 +242,7 @@ impl Gpu {
             pending_restore: Arc::new(Mutex::new(None)),
             restore_done: Arc::new((Mutex::new(true), Condvar::new())),
             thaw_activation: false,
+            dump_gate: Arc::default(),
         })
     }
 
@@ -349,6 +354,7 @@ impl Gpu {
                 self.resize_pending.clone(),
                 self.pending_restore.clone(),
                 self.restore_done.clone(),
+                self.dump_gate.clone(),
             );
             self.worker_thread = Some(worker.run());
             self.worker_tx = Some(tx);
@@ -405,6 +411,10 @@ impl VirtioDevice for Gpu {
 
     fn config_len(&self) -> Option<u32> {
         Some(size_of::<virtio_gpu_config>() as u32)
+    }
+
+    fn dump_gate(&self) -> Option<Arc<DumpGate>> {
+        Some(self.dump_gate.clone())
     }
 
     fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
