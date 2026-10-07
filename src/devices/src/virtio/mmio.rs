@@ -408,12 +408,20 @@ impl MmioTransport {
     /// completed stays completed, and any entries the guest queued past that are (re)processed.
     /// A queue that fails validation is left un-ready (logged) — no worse than the dead queue the
     /// spec-faithful behavior would have produced.
-    fn rearm_queues_from_stash(&mut self) {
+    ///
+    /// Returns whether a re-armed queue holds completions the driver has not been told about:
+    /// under EVENT_IDX, a `used_event` other than `used.idx`. That happens when the device
+    /// completed entries while the guest was suspended (the snapshot's fence drain does exactly
+    /// this) — the interrupt that announced them is gone, because the guest's own reset in
+    /// `virtio_device_restore` cleared the ISR. No later completion can make up for it:
+    /// `used_event` now trails `next_used`, so `needs_notification` stays false until the 16-bit
+    /// index wraps, and the driver never looks at the queue again. The caller interrupts once.
+    fn rearm_queues_from_stash(&mut self, event_idx: bool) -> bool {
         use vm_memory::Bytes;
         let mem = self.mem.clone();
         let regs = self.activated_queue_regs.clone();
         let Some(queues) = self.queues.as_mut() else {
-            return;
+            return false;
         };
         if queues.len() != regs.len() {
             warn!(
@@ -422,8 +430,9 @@ impl MmioTransport {
                 regs.len(),
                 queues.len()
             );
-            return;
+            return false;
         }
+        let mut unannounced = false;
         for (i, (q, r)) in queues.iter_mut().zip(regs.iter()).enumerate() {
             if !r.ready {
                 continue;
@@ -453,6 +462,26 @@ impl MmioTransport {
                     self.trace_name
                 );
                 q.ready = false;
+                continue;
+            }
+            // avail.idx is the u16 at avail_ring + 2; used_event follows the avail ring's
+            // `size` entries.
+            let avail_idx = mem.read_obj::<u16>(GuestAddress(r.avail + 2)).ok();
+            let used_event = mem
+                .read_obj::<u16>(GuestAddress(r.avail + 4 + 2 * u64::from(r.size)))
+                .ok();
+            info!(
+                "{}: queue {i} re-armed at used.idx {used_idx} (avail.idx {avail_idx:?}, \
+                 used_event {used_event:?})",
+                self.trace_name
+            );
+            if event_idx && used_event.is_some_and(|e| e != used_idx) {
+                warn!(
+                    "{}: queue {i} holds completions the driver was never told about \
+                     (used_event {used_event:?} behind used.idx {used_idx}); interrupting once",
+                    self.trace_name
+                );
+                unannounced = true;
             }
         }
         warn!(
@@ -460,6 +489,7 @@ impl MmioTransport {
              re-armed queue register file from the previous activation",
             self.trace_name
         );
+        unannounced
     }
 
     fn activate(&mut self) {
@@ -473,9 +503,9 @@ impl MmioTransport {
                 .as_ref()
                 .is_some_and(|qs| qs.iter().all(|q| !q.ready))
             && self.activated_queue_regs.iter().any(|r| r.ready);
-        if rearmed {
-            self.rearm_queues_from_stash();
-        }
+        let event_idx =
+            (self.locked_device().acked_features() & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+        let unannounced = rearmed && self.rearm_queues_from_stash(event_idx);
 
         let Some(queues) = self.queues.take() else {
             return;
@@ -510,6 +540,10 @@ impl MmioTransport {
         locked_device
             .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
             .expect("Failed to activate device");
+        drop(locked_device);
+        if unannounced {
+            self.interrupt.signal_used_queue();
+        }
     }
 
     /// M9.3 snapshot: the transport state a restore needs to re-activate this device. Meaningful for
@@ -821,6 +855,8 @@ pub(crate) mod tests {
         /// The queue `notify_inline` services, if any; every notification it saw.
         inline_queue: Option<u32>,
         inline_notified: Vec<u32>,
+        /// Whether a guest reset deactivates it, as a real device's `reset` does.
+        resettable: bool,
     }
 
     impl DummyDevice {
@@ -832,6 +868,7 @@ pub(crate) mod tests {
                 config_bytes: [0; 0xeff],
                 inline_queue: None,
                 inline_notified: Vec::new(),
+                resettable: false,
             }
         }
 
@@ -887,6 +924,13 @@ pub(crate) mod tests {
 
         fn is_activated(&self) -> bool {
             self.device_activated
+        }
+
+        fn reset(&mut self) -> bool {
+            if self.resettable {
+                self.device_activated = false;
+            }
+            self.resettable
         }
 
         fn notify_inline(&mut self, queue: u32) -> bool {
@@ -1242,6 +1286,115 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK
         );
         assert!(d.locked_device().is_activated());
+    }
+
+    /// Ring layout for the re-arm tests: queue 0 (16 entries) and queue 1 (16 of its 32), each
+    /// with its descriptor table, avail ring and used ring inside the 0x1000 test memory.
+    const REARM_RINGS: [(u64, u64, u64); 2] = [(0x000, 0x200, 0x400), (0x600, 0x800, 0xa00)];
+
+    /// `used_event` lives after the avail ring's 16 entries: flags(2) + idx(2) + 16 * 2.
+    const REARM_USED_EVENT_OFF: u64 = 4 + 16 * 2;
+
+    /// Negotiate EVENT_IDX and program both queues at `REARM_RINGS`, then DRIVER_OK.
+    fn negotiate_event_idx(d: &mut MmioTransport, program_queues: bool) {
+        let mut buf = [0; 4];
+        set_device_status(d, device_status::ACKNOWLEDGE);
+        set_device_status(d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+        write_le_u32(&mut buf[..], 0);
+        d.write(0, 0x24, &buf[..]);
+        write_le_u32(&mut buf[..], 1 << VIRTIO_RING_F_EVENT_IDX);
+        d.write(0, 0x20, &buf[..]);
+        set_device_status(
+            d,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        );
+        if program_queues {
+            for (q, (desc, avail, used)) in REARM_RINGS.iter().enumerate() {
+                d.queue_select = q as u32;
+                for (reg, v) in [
+                    (0x38, 16),
+                    (0x80, *desc as u32),
+                    (0x90, *avail as u32),
+                    (0xa0, *used as u32),
+                    (0x44, 1),
+                ] {
+                    write_le_u32(&mut buf[..], v);
+                    d.write(0, reg, &buf[..]);
+                }
+            }
+        }
+        set_device_status(
+            d,
+            device_status::ACKNOWLEDGE
+                | device_status::DRIVER
+                | device_status::FEATURES_OK
+                | device_status::DRIVER_OK,
+        );
+    }
+
+    /// Set queue 0's `used.idx` and the driver's `used_event` in guest memory.
+    fn set_ring_indices(m: &GuestMemoryMmap, used_idx: u16, used_event: u16) {
+        use vm_memory::Bytes;
+        let (_, avail, used) = REARM_RINGS[0];
+        m.write_obj(used_idx, GuestAddress(used + 2)).unwrap();
+        m.write_obj(used_event, GuestAddress(avail + REARM_USED_EVENT_OFF))
+            .unwrap();
+    }
+
+    /// A no-PM-ops driver's resume (reset, features, DRIVER_OK with no queue writes) re-arms the
+    /// queues at `used.idx`. If the device completed entries the driver never consumed — the
+    /// snapshot's fence drain completes commands after the guest suspended, and the guest's own
+    /// reset at `virtio_device_restore` wipes the ISR that announced them — the driver's
+    /// `used_event` is behind `used.idx`. Under EVENT_IDX no later completion can then interrupt
+    /// (`used_event` is never between the old and new `next_used` again until the 16-bit index
+    /// wraps), so the driver never consumes the queue again. The re-arm must interrupt once.
+    #[test]
+    fn test_rearm_interrupts_for_completions_the_driver_never_consumed() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_avail_features(1 << VIRTIO_RING_F_EVENT_IDX);
+        dummy.resettable = true;
+        let mut d = MmioTransport::new(
+            m.clone(),
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+        )
+        .unwrap();
+        negotiate_event_idx(&mut d, true);
+        assert!(d.locked_device().is_activated());
+
+        // The device completed through used.idx 9; the driver asked to hear about entry 4 and
+        // never did.
+        set_ring_indices(&m, 9, 3);
+        set_device_status(&mut d, 0);
+        assert_eq!(d.interrupt.status().load(Ordering::SeqCst), 0);
+
+        negotiate_event_idx(&mut d, false);
+        assert_eq!(
+            d.interrupt.status().load(Ordering::SeqCst) & VIRTIO_MMIO_INT_VRING as usize,
+            VIRTIO_MMIO_INT_VRING as usize,
+            "re-armed queue holds completions the driver never saw; no interrupt announced them"
+        );
+    }
+
+    /// The same resume with nothing outstanding (`used_event == used.idx`) raises nothing.
+    #[test]
+    fn test_rearm_is_quiet_when_the_driver_consumed_everything() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_avail_features(1 << VIRTIO_RING_F_EVENT_IDX);
+        dummy.resettable = true;
+        let mut d = MmioTransport::new(
+            m.clone(),
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+        )
+        .unwrap();
+        negotiate_event_idx(&mut d, true);
+        set_ring_indices(&m, 9, 9);
+        set_device_status(&mut d, 0);
+        negotiate_event_idx(&mut d, false);
+        assert_eq!(d.interrupt.status().load(Ordering::SeqCst), 0);
     }
 
     fn activate_device(d: &mut MmioTransport) {
