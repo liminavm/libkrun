@@ -16,7 +16,7 @@ use std::path::Path;
 
 use krun_fuzz::snapshot::{RAM_GPA, RAM_LEN};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
-use vmm::snapshot::{encode_head_for_fuzzing, read, write_streaming};
+use krun::vmm::snapshot::{encode_head_for_fuzzing, read, write_streaming};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
