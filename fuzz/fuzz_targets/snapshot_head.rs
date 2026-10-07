@@ -15,7 +15,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vmm::snapshot::{encode_head_for_fuzzing, read_bytes};
+use krun::vmm::snapshot::{encode_head_for_fuzzing, read_bytes};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(file) = read_bytes(data.to_vec()) else {
