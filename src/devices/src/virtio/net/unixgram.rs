@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
+use super::backend::{ConnectError, NetBackend, ReadError, Reconnect, WriteError};
 use super::write_virtio_net_hdr;
 #[cfg(target_os = "macos")]
 use super::{MAX_BUFFER_SIZE, VNET_HDR_LEN};
@@ -40,6 +40,46 @@ const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 pub struct Unixgram {
     fd: OwnedFd,
     retries: u64,
+    /// Where the proxy listens, for a backend opened by path. `None` for one handed over as a
+    /// descriptor, which has nothing to reconnect to.
+    peer: Option<Peer>,
+    /// The proxy went away: every frame is dropped until [`NetBackend::reconnect`] succeeds.
+    lost: bool,
+}
+
+struct Peer {
+    addr: UnixAddr,
+    path: PathBuf,
+    vfkit_magic: bool,
+}
+
+impl Peer {
+    /// Connect `fd` to the proxy and introduce ourselves. A datagram socket can be connected
+    /// again after its peer went away, so a reconnect keeps the descriptor (and with it the
+    /// worker's registration and our bound address).
+    fn connect(&self, fd: &OwnedFd) -> Result<(), ConnectError> {
+        connect(fd.as_raw_fd(), &self.addr).map_err(ConnectError::Binding)?;
+        if self.vfkit_magic {
+            send(fd.as_raw_fd(), &VFKIT_MAGIC, MsgFlags::empty())
+                .map_err(ConnectError::SendingMagic)?;
+        }
+        Ok(())
+    }
+}
+
+/// Errors a send on a connected datagram socket returns once the proxy is gone. macOS reports
+/// nothing on the socket when the peer closes: the next send fails with `ECONNRESET`, and every
+/// send after it with `EDESTADDRREQ`, because the reset also disconnected us.
+fn proxy_gone(e: nix::Error) -> bool {
+    matches!(
+        e,
+        nix::Error::ECONNRESET
+            | nix::Error::EDESTADDRREQ
+            | nix::Error::ENOTCONN
+            | nix::Error::ECONNREFUSED
+            | nix::Error::ENOENT
+            | nix::Error::EPIPE
+    )
 }
 
 impl Unixgram {
@@ -73,7 +113,12 @@ impl Unixgram {
             };
         }
 
-        Self { fd, retries: 0 }
+        Self {
+            fd,
+            retries: 0,
+            peer: None,
+            lost: false,
+        }
     }
 
     /// Create the backend opening a connection to the userspace network proxy.
@@ -101,12 +146,12 @@ impl Unixgram {
 
         // Connect so we don't need to use the peer address again. This also
         // allows the server to remove the socket after the connection.
-        connect(fd.as_raw_fd(), &peer_addr).map_err(ConnectError::Binding)?;
-
-        if send_vfkit_magic {
-            send(fd.as_raw_fd(), &VFKIT_MAGIC, MsgFlags::empty())
-                .map_err(ConnectError::SendingMagic)?;
-        }
+        let peer = Peer {
+            addr: peer_addr,
+            path,
+            vfkit_magic: send_vfkit_magic,
+        };
+        peer.connect(&fd)?;
 
         if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &SOCKET_SNDBUF) {
             log::warn!("Failed to set SO_SNDBUF: {e}");
@@ -121,7 +166,10 @@ impl Unixgram {
             getsockopt(&fd, sockopt::RcvBuf)
         );
 
-        Ok(Self::new(fd))
+        Ok(Self {
+            peer: Some(peer),
+            ..Self::new(fd)
+        })
     }
 }
 
@@ -145,6 +193,9 @@ impl NetBackend for Unixgram {
 
     /// Try to write a frame to the proxy.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
+        if self.lost {
+            return Err(WriteError::ProcessNotRunning);
+        }
         let ret = match send(self.fd.as_raw_fd(), &buf[hdr_len..], MsgFlags::empty()) {
             Ok(ret) => ret,
             // macOS returns ENOBUFS when the kernel socket buffer is full,
@@ -155,6 +206,19 @@ impl NetBackend for Unixgram {
                 }
                 self.retries += 1;
                 return Err(WriteError::NothingWritten);
+            }
+            Err(e) if proxy_gone(e) => {
+                warn!(
+                    "write_frame: the network proxy at {} went away ({e})",
+                    self.peer
+                        .as_ref()
+                        .map_or("a handed-over socket".into(), |p| p
+                            .path
+                            .display()
+                            .to_string())
+                );
+                self.lost = true;
+                return Err(WriteError::ProcessNotRunning);
             }
             Err(e) => return Err(WriteError::Internal(e)),
         };
@@ -185,5 +249,95 @@ impl NetBackend for Unixgram {
     #[cfg(target_os = "macos")]
     fn write_retry_delay_us(&self) -> u64 {
         50
+    }
+
+    fn reconnect(&mut self) -> Reconnect {
+        let Some(peer) = &self.peer else {
+            return Reconnect::Unsupported;
+        };
+        match peer.connect(&self.fd) {
+            Ok(()) => {
+                self.lost = false;
+                Reconnect::Done
+            }
+            Err(ConnectError::Binding(e) | ConnectError::SendingMagic(e)) => Reconnect::NotYet(e),
+            Err(e) => unreachable!("a reconnect only connects and sends: {e:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::{recvfrom, sendto};
+    use std::os::unix::net::UnixDatagram;
+
+    /// A proxy bound at `path`, as gvproxy binds its vfkit socket.
+    fn proxy(path: &std::path::Path) -> OwnedFd {
+        let _ = std::fs::remove_file(path);
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        bind(fd.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
+        fd
+    }
+
+    /// What the proxy received next, and from where.
+    fn take(proxy: &OwnedFd) -> (Vec<u8>, UnixAddr) {
+        let mut buf = [0u8; 256];
+        let (n, from) = recvfrom::<UnixAddr>(proxy.as_raw_fd(), &mut buf).unwrap();
+        (buf[..n].to_vec(), from.unwrap())
+    }
+
+    /// The proxy exits and a new one binds the same path later: the backend drops frames while
+    /// it is gone, cannot reconnect while the path is absent, and once it is back reconnects on
+    /// the same descriptor, introduces itself again, and carries frames both ways.
+    #[test]
+    fn a_proxy_that_goes_away_and_comes_back_is_reconnected() {
+        let path = std::env::temp_dir().join(format!("krun-gw-{}.sock", process::id()));
+        let first = proxy(&path);
+        let mut backend = Unixgram::open(path.clone(), true).unwrap();
+        assert_eq!(take(&first).0, VFKIT_MAGIC);
+
+        drop(first);
+        std::fs::remove_file(&path).unwrap();
+        let mut frame = [0u8; 16];
+        assert!(matches!(
+            backend.write_frame(4, &mut frame),
+            Err(WriteError::ProcessNotRunning)
+        ));
+        assert!(
+            matches!(
+                backend.write_frame(4, &mut frame),
+                Err(WriteError::ProcessNotRunning)
+            ),
+            "and so does every frame after it, until a reconnect"
+        );
+        assert!(matches!(backend.reconnect(), Reconnect::NotYet(_)));
+
+        let second = proxy(&path);
+        assert!(matches!(backend.reconnect(), Reconnect::Done));
+        let (magic, us) = take(&second);
+        assert_eq!(magic, VFKIT_MAGIC, "the new proxy is told who we are");
+
+        frame[4..].copy_from_slice(&[7; 12]);
+        backend.write_frame(4, &mut frame).unwrap();
+        assert_eq!(take(&second).0, [7; 12]);
+        sendto(second.as_raw_fd(), &[9; 20], &us, MsgFlags::empty()).unwrap();
+        let mut buf = [0u8; 64];
+        let n = backend.read_frame(&mut buf).unwrap();
+        assert_eq!(&buf[n - 20..n], &[9; 20]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_backend_handed_over_as_a_descriptor_cannot_reconnect() {
+        let (ours, _theirs) = UnixDatagram::pair().unwrap();
+        let mut backend = Unixgram::new(OwnedFd::from(ours));
+        assert!(matches!(backend.reconnect(), Reconnect::Unsupported));
     }
 }

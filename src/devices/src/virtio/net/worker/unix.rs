@@ -1,7 +1,8 @@
 use std::cmp;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::result;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -9,7 +10,7 @@ use virtio_bindings::virtio_net::VIRTIO_NET_HDR_F_DATA_VALID;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::virtio::net::backend::ConnectError;
-use crate::virtio::net::backend::{NetBackend, ReadError, WriteError};
+use crate::virtio::net::backend::{NetBackend, ReadError, Reconnect, WriteError};
 use crate::virtio::net::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
@@ -18,8 +19,20 @@ use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, VNET_HDR_LEN};
 use crate::virtio::{DeviceQueue, InterruptTransport};
 
-#[cfg(target_os = "macos")]
-use std::os::fd::RawFd;
+/// The first wait before reconnecting to a proxy that went away, doubled after every failed
+/// attempt up to [`RECONNECT_MAX`]. The supervisor respawns gvproxy within about a second, so
+/// most outages end on one of the first few attempts.
+const RECONNECT_FIRST: Duration = Duration::from_millis(100);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
+
+/// The backend's proxy went away; the worker drops the guest's frames and retries the
+/// connection.
+struct Lost {
+    next_try: Instant,
+    delay: Duration,
+    /// The backend cannot reconnect, so nothing is retried.
+    for_good: bool,
+}
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -42,6 +55,8 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    lost: Option<Lost>,
 }
 
 /// Open the network backend from its config. Kept separate from [`NetWorker`] so the backend
@@ -107,6 +122,8 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            lost: None,
         }
     }
 
@@ -125,7 +142,7 @@ impl NetWorker {
 
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
-        let backend_socket = self.backend.raw_socket_fd();
+        let mut backend_socket = self.backend.raw_socket_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
         let mut epoll = Epoll::new().unwrap();
@@ -145,18 +162,12 @@ impl NetWorker {
             virtq_tx_ev_fd,
             &EpollEvent::new(EventSet::IN, virtq_tx_ev_fd as u64),
         );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            backend_socket,
-            &EpollEvent::new(
-                EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
-                backend_socket as u64,
-            ),
-        );
+        register_backend(&epoll, backend_socket);
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         'poll: loop {
-            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+            let timeout = self.reconnect_timeout(Instant::now());
+            match epoll.wait(epoll_events.len(), timeout, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
@@ -178,12 +189,7 @@ impl NetWorker {
                                 if event_set.contains(EventSet::HANG_UP)
                                     || event_set.contains(EventSet::READ_HANG_UP)
                                 {
-                                    log::error!(
-                                        "Got {event_set:?} on backend fd, virtio-net will stop working"
-                                    );
-                                    eprintln!(
-                                        "LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!"
-                                    );
+                                    self.backend_lost(&format!("{event_set:?} on its socket"));
                                 } else {
                                     if event_set.contains(EventSet::IN) {
                                         self.process_backend_socket_readable()
@@ -206,6 +212,21 @@ impl NetWorker {
                         }
                     }
 
+                    if self.try_reconnect(Instant::now()) {
+                        let fd = self.backend.raw_socket_fd();
+                        if fd != backend_socket {
+                            let _ = epoll.ctl(
+                                ControlOperation::Delete,
+                                backend_socket,
+                                &EpollEvent::new(EventSet::empty(), backend_socket as u64),
+                            );
+                            backend_socket = fd;
+                            register_backend(&epoll, backend_socket);
+                        }
+                        self.process_tx_loop();
+                        self.process_backend_socket_readable();
+                    }
+
                     // Arm the retry timer after processing all events, so it
                     // reflects the final state of tx_has_deferred_frame.
                     #[cfg(target_os = "macos")]
@@ -225,6 +246,66 @@ impl NetWorker {
         // The poll loop broke on `stop_fd` (reset): hand the backend connection back so the device
         // can reuse it when the guest re-activates the NIC on resume, instead of reconnecting.
         self.backend
+    }
+
+    /// The proxy went away: drop the guest's frames from here on and start reconnecting.
+    fn backend_lost(&mut self, why: &str) {
+        if self.lost.is_some() {
+            return;
+        }
+        log::warn!(
+            "virtio-net: the network backend went away ({why}); the guest's frames are dropped \
+             until it can be reconnected"
+        );
+        self.lost = Some(Lost {
+            next_try: Instant::now(),
+            delay: RECONNECT_FIRST,
+            for_good: false,
+        });
+    }
+
+    /// The epoll timeout that wakes the worker for the next reconnect attempt, or -1.
+    fn reconnect_timeout(&self, now: Instant) -> i32 {
+        match &self.lost {
+            Some(lost) if !lost.for_good => {
+                lost.next_try.saturating_duration_since(now).as_millis() as i32
+            }
+            _ => -1,
+        }
+    }
+
+    /// Reconnect a lost backend if an attempt is due. True when the backend is back.
+    fn try_reconnect(&mut self, now: Instant) -> bool {
+        let Some(lost) = &mut self.lost else {
+            return false;
+        };
+        if lost.for_good || now < lost.next_try {
+            return false;
+        }
+        match self.backend.reconnect() {
+            Reconnect::Done => {
+                log::info!("virtio-net: reconnected to the network backend");
+                self.lost = None;
+                true
+            }
+            Reconnect::NotYet(e) => {
+                log::debug!(
+                    "virtio-net: the network backend is not back yet ({e}); retrying in {:?}",
+                    lost.delay
+                );
+                lost.next_try = now + lost.delay;
+                lost.delay = cmp::min(lost.delay * 2, RECONNECT_MAX);
+                false
+            }
+            Reconnect::Unsupported => {
+                log::error!(
+                    "virtio-net: the network backend was handed over as a descriptor and cannot \
+                     be reconnected; networking is now disabled"
+                );
+                lost.for_good = true;
+                false
+            }
+        }
     }
 
     fn process_rx_queue_event(&mut self) {
@@ -348,6 +429,9 @@ impl NetWorker {
     }
 
     fn process_tx(&mut self) -> result::Result<(), TxError> {
+        if self.lost.is_some() && self.try_reconnect(Instant::now()) {
+            self.process_backend_socket_readable();
+        }
         let tx_queue = &mut self.tx_q.queue;
 
         if self.backend.has_unfinished_write()
@@ -362,6 +446,7 @@ impl NetWorker {
 
         let mut raise_irq = false;
         let mut result = Ok(());
+        let mut went_away = false;
 
         while let Some(head) = tx_queue.pop(&self.mem) {
             let head_index = head.index;
@@ -433,7 +518,17 @@ impl NetWorker {
                     raise_irq = true;
                     break;
                 }
-                Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
+                // The frame is lost, as on a cable with nobody at the other end, but its
+                // descriptor goes back to the guest: one kept would shrink the TX ring for good.
+                Err(WriteError::ProcessNotRunning) => {
+                    self.tx_frame_len = 0;
+                    tx_queue
+                        .add_used(&self.mem, head_index, 0)
+                        .map_err(TxError::QueueError)?;
+                    raise_irq = true;
+                    went_away = true;
+                }
+                Err(e @ WriteError::Internal(_)) => {
                     return Err(TxError::Backend(e));
                 }
             }
@@ -443,6 +538,9 @@ impl NetWorker {
             self.interrupt
                 .try_signal_used_queue()
                 .map_err(TxError::DeviceError)?;
+        }
+        if went_away {
+            self.backend_lost("a write found the proxy gone");
         }
 
         result
@@ -530,11 +628,22 @@ impl NetWorker {
     }
 }
 
+fn register_backend(epoll: &Epoll, fd: RawFd) {
+    let _ = epoll.ctl(
+        ControlOperation::Add,
+        fd,
+        &EpollEvent::new(
+            EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
+            fd as u64,
+        ),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use utils::eventfd::EFD_NONBLOCK;
     use vm_memory::GuestAddress;
@@ -551,6 +660,14 @@ mod tests {
     struct Proxy {
         frames: VecDeque<Vec<u8>>,
         synthesizes: bool,
+        link: Arc<Link>,
+    }
+
+    /// Whether the proxy is there, and what reached it.
+    #[derive(Default)]
+    struct Link {
+        down: AtomicBool,
+        written: AtomicUsize,
     }
 
     impl NetBackend for Proxy {
@@ -564,7 +681,18 @@ mod tests {
             Ok(hdr_len + frame.len())
         }
         fn write_frame(&mut self, _: usize, _: &mut [u8]) -> result::Result<(), WriteError> {
+            if self.link.down.load(Ordering::SeqCst) {
+                return Err(WriteError::ProcessNotRunning);
+            }
+            self.link.written.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+        fn reconnect(&mut self) -> Reconnect {
+            if self.link.down.load(Ordering::SeqCst) {
+                Reconnect::NotYet(nix::Error::ENOENT)
+            } else {
+                Reconnect::Done
+            }
         }
         fn has_unfinished_write(&self) -> bool {
             false
@@ -617,6 +745,7 @@ mod tests {
         let proxy = Proxy {
             frames: (0..frames).map(|_| vec![0xab; 60]).collect(),
             synthesizes,
+            link: Arc::default(),
         };
         let worker = NetWorker::new(
             queue(rx),
@@ -710,5 +839,101 @@ mod tests {
             take_interrupt(&interrupt),
             "used index 2 passes used_event 0"
         );
+    }
+
+    /// Queue `count` guest frames on the TX ring, after the `posted` already there.
+    fn post_tx(tx: &GuestQueue, posted: u16, count: u16) {
+        for i in posted..posted + count {
+            tx.dtable[i as usize].set(0x10000 + i as u64 * 0x100, 0x60, 0, 0);
+            tx.avail.ring[i as usize].set(i);
+        }
+        tx.avail.idx.set(posted + count);
+    }
+
+    /// A proxy that goes away loses the guest's frames but not its descriptors, and once it is
+    /// back the worker reconnects on the backoff and frames reach it again.
+    #[test]
+    fn frames_sent_while_the_proxy_is_gone_are_dropped_and_returned_to_the_guest() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let link = Arc::new(Link::default());
+        let (mut worker, _interrupt) = worker(&mem, &rx, &tx, 0, 0);
+        worker.backend = Box::new(Proxy {
+            frames: VecDeque::new(),
+            synthesizes: true,
+            link: link.clone(),
+        });
+
+        link.down.store(true, Ordering::SeqCst);
+        post_tx(&tx, 0, 4);
+        worker.process_tx_loop();
+        assert_eq!(
+            tx.used.idx.get(),
+            4,
+            "every frame's descriptor went back to the guest"
+        );
+        assert_eq!(link.written.load(Ordering::SeqCst), 0);
+        assert!(
+            worker.lost.is_some(),
+            "and the worker knows the proxy is gone"
+        );
+
+        let now = Instant::now();
+        assert!(!worker.try_reconnect(now), "the proxy is not back yet");
+        link.down.store(false, Ordering::SeqCst);
+        assert!(
+            !worker.try_reconnect(now),
+            "the next attempt waits for the backoff"
+        );
+        assert!(worker.try_reconnect(now + RECONNECT_FIRST));
+        assert!(worker.lost.is_none());
+
+        post_tx(&tx, 4, 2);
+        worker.process_tx_loop();
+        assert_eq!(tx.used.idx.get(), 6);
+        assert_eq!(
+            link.written.load(Ordering::SeqCst),
+            2,
+            "frames reach the proxy again"
+        );
+    }
+
+    /// A backend that cannot reconnect is given up on once, not retried.
+    #[test]
+    fn a_backend_that_cannot_reconnect_is_given_up_on() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, _interrupt) = worker(&mem, &rx, &tx, 0, 0);
+        worker.backend_lost("a test");
+        // The default `reconnect` of a backend that does not override it.
+        struct Fd;
+        impl NetBackend for Fd {
+            fn read_frame(&mut self, _: &mut [u8]) -> result::Result<usize, ReadError> {
+                Err(ReadError::NothingRead)
+            }
+            fn write_frame(&mut self, _: usize, _: &mut [u8]) -> result::Result<(), WriteError> {
+                Err(WriteError::ProcessNotRunning)
+            }
+            fn has_unfinished_write(&self) -> bool {
+                false
+            }
+            fn try_finish_write(&mut self, _: usize, _: &[u8]) -> result::Result<(), WriteError> {
+                Ok(())
+            }
+            fn raw_socket_fd(&self) -> RawFd {
+                -1
+            }
+        }
+        worker.backend = Box::new(Fd);
+        let now = Instant::now();
+        assert!(!worker.try_reconnect(now));
+        assert_eq!(
+            worker.reconnect_timeout(now),
+            -1,
+            "nothing left to wake up for"
+        );
+        assert!(!worker.try_reconnect(now + RECONNECT_MAX));
     }
 }
