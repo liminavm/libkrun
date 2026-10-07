@@ -65,7 +65,7 @@ use crossbeam_channel::Sender;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt;
 use devices::legacy::IrqChip;
-use devices::virtio::VmmExitObserver;
+use devices::virtio::{DumpGate, VmmExitObserver};
 use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
@@ -126,6 +126,9 @@ pub enum Error {
     Snapshot,
     /// A snapshot file read/write failed.
     SnapshotIo(std::io::Error),
+    /// A device's threads kept writing guest RAM past the snapshot's wait for them; the message
+    /// names the device.
+    SnapshotDeviceBusy(String),
     /// The snapshot was taken on a machine whose devices differ from this one's; the message
     /// says how.
     RestoreRefused(String),
@@ -155,6 +158,7 @@ impl Display for Error {
             VcpuPause => write!(f, "vCPUs pause failed."),
             Snapshot => write!(f, "VM snapshot save/restore failed."),
             SnapshotIo(e) => write!(f, "VM snapshot file I/O failed: {e}"),
+            SnapshotDeviceBusy(e) => write!(f, "VM snapshot could not hold a device still: {e}"),
             RestoreRefused(why) => write!(f, "{why}"),
             Vm(e) => write!(f, "Vm error: {e}"),
         }
@@ -620,29 +624,6 @@ impl Vmm {
             info!("snapshot: virtio device type={type_id} id={id} device_status=0x{status:x}");
         }
         let vcpus = self.snapshot_vcpus()?;
-        // M9.3: capture each DRIVER_OK device's transport state — for diagnostics (the per-snapshot
-        // record of which devices were sticky) and the restore-side layout/feature validation. We do
-        // NOT drain the queues: the guest re-negotiates (resets) every virtio device itself on s2idle
-        // thaw (`virtio_device_restore`), which discards in-flight ring state and old fences, so there
-        // is no "completed used entry with no matching completion IRQ" hazard for a restore to hit —
-        // the drain that once guarded that is gone. (A drain also cannot be a general oracle: RX-style
-        // queues sit at avail>used at idle with pre-posted buffers and never reach avail==used.)
-        //
-        // The one thing the drain accidentally provided — quiescing device workers so none writes guest
-        // RAM mid-`dump_ram` (torn dump; loudest as net RX from gvproxy on the raw path) — is a separate
-        // concern tracked in docs/design/m9-suspend-resume.md (worker-quiesce during the dump). It is
-        // narrow on the production s2idle path (the guest froze net/blk/etc. to INIT before we snapshot;
-        // only the GPU worker is live) and pre-dates this change.
-        let devices = self.mmio_device_manager.capture_transport_states();
-        for d in &devices {
-            info!(
-                "snapshot: capturing transport for virtio type={} @0x{:x} status=0x{:x} {} queue(s)",
-                d.type_id,
-                d.mmio_base,
-                d.device_status,
-                d.queues.len()
-            );
-        }
         // M9.3 venus snapshot-replay: the GPU worker serializes its re-creation state (rutabaga
         // journal + venus wire journals + mapped-blob contents). This runs BEFORE the GIC save
         // and the RAM dump on purpose: the worker first DRAINS in-flight guest fences (the guest
@@ -670,6 +651,30 @@ impl Vmm {
         };
         #[cfg(not(feature = "gpu"))]
         let gpu: Option<Vec<u8>> = None;
+        // Parked vCPUs stop new requests, not the device threads still serving old ones (a block
+        // read landing, a frame from the network proxy, a fence retiring from a renderer thread):
+        // any of them writing guest RAM during the dump below tears it. Hold them off until this
+        // function returns, whichever way. After the GPU capture, whose fence drain needs the
+        // renderer's threads retiring fences into the used ring.
+        let _held =
+            hold_device_writers(self.mmio_device_manager.dump_gates(), DEVICE_HOLD_TIMEOUT)?;
+        // M9.3: capture each DRIVER_OK device's transport state — for diagnostics (the per-snapshot
+        // record of which devices were sticky) and the restore-side layout/feature validation. We do
+        // NOT drain the queues: the guest re-negotiates (resets) every virtio device itself on s2idle
+        // thaw (`virtio_device_restore`), which discards in-flight ring state and old fences, so there
+        // is no "completed used entry with no matching completion IRQ" hazard for a restore to hit.
+        // (A drain also cannot be a general oracle: RX-style queues sit at avail>used at idle with
+        // pre-posted buffers and never reach avail==used.)
+        let devices = self.mmio_device_manager.capture_transport_states();
+        for d in &devices {
+            info!(
+                "snapshot: capturing transport for virtio type={} @0x{:x} status=0x{:x} {} queue(s)",
+                d.type_id,
+                d.mmio_base,
+                d.device_status,
+                d.queues.len()
+            );
+        }
         // GIC saved after the fence drain so it carries any line the drain-time completions
         // raised.
         let gic = hvf::save_gic_state().map_err(|_| Error::Snapshot)?;
@@ -1001,6 +1006,44 @@ impl Subscriber for Vmm {
     }
 }
 
+/// How long a snapshot waits for one device's threads to finish the work they are doing. A
+/// block worker can be in the middle of a large request; a device that takes longer than this
+/// fails the snapshot (recoverably) rather than holding it forever.
+const DEVICE_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Device threads held off guest RAM ([`DumpGate`]); they go on when this drops.
+struct HeldDeviceWriters(Vec<Arc<DumpGate>>);
+
+impl Drop for HeldDeviceWriters {
+    fn drop(&mut self) {
+        for gate in &self.0 {
+            gate.open();
+        }
+    }
+}
+
+/// Close every device's dump gate in turn. A device whose threads do not come to rest in
+/// `timeout` fails the whole hold, and the devices already held go on again.
+fn hold_device_writers(
+    gates: Vec<(u32, String, Arc<DumpGate>)>,
+    timeout: Duration,
+) -> Result<HeldDeviceWriters> {
+    let mut held = HeldDeviceWriters(Vec::with_capacity(gates.len()));
+    for (type_id, id, gate) in gates {
+        if let Err(running) = gate.close(timeout) {
+            warn!(
+                "snapshot: virtio device type={type_id} id={id} still had {running} thread(s) \
+                 writing guest RAM after {timeout:?}; giving up the snapshot"
+            );
+            return Err(Error::SnapshotDeviceBusy(format!(
+                "virtio device type={type_id} id={id}"
+            )));
+        }
+        held.0.push(gate);
+    }
+    Ok(held)
+}
+
 /// Whether one virtio-mmio device is a quiesce holdout — the predicate behind
 /// [`Vmm::quiesce_holdouts`], separated out because it carries the two exceptions that make the
 /// oracle correct, and both were learned from a guest rather than a spec.
@@ -1171,5 +1214,60 @@ mod quiesce_tests {
             last_driver_transition([(BLK, INIT, 0), (GPU, DRIVER_OK, 5)]),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod device_hold_tests {
+    use super::{DumpGate, Error, hold_device_writers};
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn gates(n: usize) -> Vec<Arc<DumpGate>> {
+        (0..n).map(|_| Arc::new(DumpGate::new())).collect()
+    }
+
+    fn named(gates: &[Arc<DumpGate>]) -> Vec<(u32, String, Arc<DumpGate>)> {
+        gates
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (2, format!("dev{i}"), g.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn every_device_is_held_until_the_hold_drops() {
+        let gates = gates(3);
+        let held = hold_device_writers(named(&gates), Duration::from_secs(1)).unwrap();
+        assert!(gates.iter().all(|g| g.is_closed()));
+        drop(held);
+        assert!(gates.iter().all(|g| !g.is_closed()));
+    }
+
+    /// One device that does not come to rest fails the hold, and nothing stays held: the
+    /// devices before it go on again and the ones after it were never stopped.
+    #[test]
+    fn a_device_that_will_not_rest_fails_the_hold_and_lets_the_others_go() {
+        let gates = gates(3);
+        let (entered_tx, entered) = mpsc::channel();
+        let (finish, finish_rx) = mpsc::channel::<()>();
+        let busy = {
+            let gate = gates[1].clone();
+            thread::spawn(move || {
+                let _section = gate.enter();
+                entered_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+        };
+        entered.recv().unwrap();
+
+        let result = hold_device_writers(named(&gates), Duration::from_millis(100));
+        assert!(matches!(result, Err(Error::SnapshotDeviceBusy(ref d)) if d.contains("dev1")));
+        assert!(gates.iter().all(|g| !g.is_closed()));
+
+        finish.send(()).unwrap();
+        busy.join().unwrap();
     }
 }

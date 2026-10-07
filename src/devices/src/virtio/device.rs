@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::{ActivateResult, InterruptTransport, Queue};
+use super::{ActivateResult, DumpGate, InterruptTransport, Queue};
 use crate::virtio::AsAny;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
@@ -205,6 +205,13 @@ pub trait VirtioDevice: AsAny + Send {
     /// restore on the same build. The default reports none.
     fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
         Vec::new()
+    }
+
+    /// limina: the gate this device's own threads pass through to write guest RAM, so a snapshot
+    /// can hold them off while it copies guest RAM. The default `None` leaves the device's
+    /// threads running through the copy.
+    fn dump_gate(&self) -> Option<Arc<DumpGate>> {
+        None
     }
 }
 
