@@ -507,6 +507,39 @@ impl MMIODeviceManager {
         slots
     }
 
+    /// What every virtio-mmio device offers the guest, in address order -- what a snapshot records
+    /// so a restore can refuse a device that changed under a driver bound to it.
+    pub fn device_fingerprints(&self) -> Vec<crate::vmm::snapshot::DeviceFingerprint> {
+        use devices::virtio::MmioTransport;
+        let mut prints: Vec<_> = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((dtype, id), info)| {
+                let DeviceType::Virtio(type_id) = *dtype else {
+                    return None;
+                };
+                let dev = self.get_device(*dtype, id)?;
+                let mut guard = dev.lock().unwrap();
+                let dev_ref: &mut dyn devices::BusDevice = &mut *guard;
+                let mmio = dev_ref.as_mut_any().downcast_mut::<MmioTransport>()?;
+                let device = mmio.locked_device();
+                Some(crate::vmm::snapshot::DeviceFingerprint {
+                    type_id,
+                    mmio_base: info.addr,
+                    features: device.avail_features(),
+                    queues: device.queue_config().len() as u32,
+                    topology: device
+                        .snapshot_topology()
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value))
+                        .collect(),
+                })
+            })
+            .collect();
+        prints.sort_by_key(|f| f.mmio_base);
+        prints
+    }
+
     /// limina M9.3: capture the transport state of every virtio-mmio device the guest left
     /// `device_status != 0` at quiesce (today exactly virtio-gpu — it has no s2idle PM ops so it never
     /// resets/re-negotiates, unlike every other device which the guest reset to INIT). Those are the
@@ -567,9 +600,8 @@ impl MMIODeviceManager {
     /// its snapshot base/irq means the restore worker's device topology diverged, which would silently
     /// corrupt guest driver state — and (b) logs the captured transport for diagnostics.
     ///
-    /// TODO(feature-drift, Fable): the one way the guest's self-revival can go wrong is a features_ok
-    /// mismatch when a newer limina restores an older snapshot offering different device features. Add
-    /// a fail-closed compare of `st.acked_features` against the fresh device's offered feature set here.
+    /// A newer limina offering different device features than the snapshot's is refused earlier,
+    /// against the snapshot's device fingerprints (`snapshot::fingerprint_mismatch`, v10 files).
     pub fn validate_transport_states(
         &self,
         states: &[crate::vmm::snapshot::DeviceTransportState],
@@ -683,6 +715,8 @@ mod tests {
     struct DummyDevice {
         dummy: u32,
         queue_config: Vec<QueueConfig>,
+        /// A port count to report as topology, as a console does.
+        ports: Option<u64>,
     }
 
     impl DummyDevice {
@@ -690,6 +724,7 @@ mod tests {
             DummyDevice {
                 dummy: 0,
                 queue_config: QUEUE_SIZES.iter().map(|&s| QueueConfig::new(s)).collect(),
+                ports: None,
             }
         }
     }
@@ -715,6 +750,10 @@ mod tests {
 
         fn queue_config(&self) -> &[QueueConfig] {
             &self.queue_config
+        }
+
+        fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
+            self.ports.map(|n| vec![("ports", n)]).unwrap_or_default()
         }
 
         fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -800,6 +839,11 @@ mod tests {
     }
 
     fn machine(types: &[u32]) -> MMIODeviceManager {
+        machine_with_ports(types, None)
+    }
+
+    /// A machine whose devices all report `ports` as their topology.
+    fn machine_with_ports(types: &[u32], ports: Option<u64>) -> MMIODeviceManager {
         let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x1000)]).unwrap();
         let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
@@ -807,7 +851,10 @@ mod tests {
             manager
                 .register_virtio_device(
                     guest_mem.clone(),
-                    Arc::new(Mutex::new(DummyDevice::new())),
+                    Arc::new(Mutex::new(DummyDevice {
+                        ports,
+                        ..DummyDevice::new()
+                    })),
                     &mut cmdline,
                     type_id,
                     &format!("dev{i}"),
@@ -830,6 +877,32 @@ mod tests {
         assert!(diff.contains("virtio-vsock"), "{diff}");
         assert_eq!(
             crate::vmm::snapshot::slot_mismatch(&windowed, &windowed),
+            None
+        );
+    }
+
+    /// The same devices at the same slots, one of them with another port count: the slot check
+    /// passes it, and the fingerprints read off the real transports name the change.
+    #[test]
+    fn a_resume_onto_a_device_with_other_ports_sees_the_change() {
+        let before = machine_with_ports(&[3, 19], Some(1));
+        let after = machine_with_ports(&[3, 19], Some(2));
+        assert_eq!(
+            crate::vmm::snapshot::slot_mismatch(&before.device_slots(), &after.device_slots()),
+            None
+        );
+        let prints = before.device_fingerprints();
+        assert_eq!(prints.len(), 2);
+        assert_eq!(prints[0].queues as usize, QUEUE_SIZES.len());
+        assert_eq!(prints[0].topology, vec![("ports".to_string(), 1)]);
+        let diff =
+            crate::vmm::snapshot::fingerprint_mismatch(&prints, &after.device_fingerprints())
+                .expect("the port count changed; the resume must be refused");
+        assert!(diff.contains("virtio-console"), "{diff}");
+        assert!(diff.contains("ports 1, and now offers"), "{diff}");
+        assert!(diff.ends_with("ports 2"), "{diff}");
+        assert_eq!(
+            crate::vmm::snapshot::fingerprint_mismatch(&prints, &before.device_fingerprints()),
             None
         );
     }
