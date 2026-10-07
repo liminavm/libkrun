@@ -3,11 +3,12 @@ use crate::virtio::descriptor_utils::{Reader, Writer};
 use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
 
-use crate::virtio::InterruptTransport;
+use crate::virtio::{DumpGate, InterruptTransport};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
+use std::sync::Arc;
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -64,6 +65,7 @@ pub struct BlockWorker {
     mem: GuestMemoryMmap,
     disk: DiskProperties,
     stop_fd: EventFd,
+    dump_gate: Arc<DumpGate>,
 }
 
 impl BlockWorker {
@@ -73,6 +75,7 @@ impl BlockWorker {
         mem: GuestMemoryMmap,
         disk: DiskProperties,
         stop_fd: EventFd,
+        dump_gate: Arc<DumpGate>,
     ) -> Self {
         Self {
             device_queue,
@@ -80,6 +83,7 @@ impl BlockWorker {
             mem,
             disk,
             stop_fd,
+            dump_gate,
         }
     }
 
@@ -109,9 +113,11 @@ impl BlockWorker {
         );
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        let dump_gate = self.dump_gate.clone();
         loop {
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
+                    let _section = dump_gate.enter();
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();

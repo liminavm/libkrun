@@ -540,6 +540,29 @@ impl MMIODeviceManager {
         prints
     }
 
+    /// limina: the dump gate of every virtio-mmio device that has one (see
+    /// `VirtioDevice::dump_gate`), with the device's type and id.
+    pub fn dump_gates(&self) -> Vec<(u32, String, Arc<devices::virtio::DumpGate>)> {
+        use devices::virtio::MmioTransport;
+        let mut out = Vec::new();
+        for (dtype, id) in self.id_to_dev_info.keys() {
+            let DeviceType::Virtio(type_id) = *dtype else {
+                continue;
+            };
+            let Some(dev) = self.get_device(*dtype, id) else {
+                continue;
+            };
+            let mut guard = dev.lock().unwrap();
+            let dev_ref: &mut dyn BusDevice = &mut *guard;
+            if let Some(mmio) = dev_ref.as_mut_any().downcast_mut::<MmioTransport>()
+                && let Some(gate) = mmio.locked_device().dump_gate()
+            {
+                out.push((type_id, id.clone(), gate));
+            }
+        }
+        out
+    }
+
     /// limina M9.3: capture the transport state of every virtio-mmio device the guest left
     /// `device_status != 0` at quiesce (today exactly virtio-gpu — it has no s2idle PM ops so it never
     /// resets/re-negotiates, unlike every other device which the guest reset to INIT). Those are the

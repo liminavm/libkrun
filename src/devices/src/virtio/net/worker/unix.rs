@@ -1,6 +1,7 @@
 use std::cmp;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::result;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, VNET_HDR_LEN};
-use crate::virtio::{DeviceQueue, InterruptTransport};
+use crate::virtio::{DeviceQueue, DumpGate, InterruptTransport};
 
 /// The first wait before reconnecting to a proxy that went away, doubled after every failed
 /// attempt up to [`RECONNECT_MAX`]. The supervisor respawns gvproxy within about a second, so
@@ -57,6 +58,9 @@ pub struct NetWorker {
     tx_has_deferred_frame: bool,
 
     lost: Option<Lost>,
+
+    /// Held closed by a snapshot while it copies guest RAM.
+    dump_gate: Arc<DumpGate>,
 }
 
 /// Open the network backend from its config. Kept separate from [`NetWorker`] so the backend
@@ -124,7 +128,14 @@ impl NetWorker {
             tx_has_deferred_frame: false,
 
             lost: None,
+
+            dump_gate: Arc::default(),
         }
+    }
+
+    /// Pass every wake's work through `gate`, the device's, instead of a gate of its own.
+    pub fn with_dump_gate(self, dump_gate: Arc<DumpGate>) -> Self {
+        Self { dump_gate, ..self }
     }
 
     /// Run the worker on its own thread. The join handle yields the backend back when the worker
@@ -165,10 +176,12 @@ impl NetWorker {
         register_backend(&epoll, backend_socket);
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        let dump_gate = self.dump_gate.clone();
         'poll: loop {
             let timeout = self.reconnect_timeout(Instant::now());
             match epoll.wait(epoll_events.len(), timeout, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
+                    let _section = dump_gate.enter();
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();
@@ -661,6 +674,8 @@ mod tests {
         frames: VecDeque<Vec<u8>>,
         synthesizes: bool,
         link: Arc<Link>,
+        /// A descriptor for the worker's epoll to watch, for a test that runs the worker loop.
+        socket: Option<std::os::unix::net::UnixDatagram>,
     }
 
     /// Whether the proxy is there, and what reached it.
@@ -701,7 +716,7 @@ mod tests {
             Ok(())
         }
         fn raw_socket_fd(&self) -> RawFd {
-            -1
+            self.socket.as_ref().map_or(-1, |s| s.as_raw_fd())
         }
     }
 
@@ -746,6 +761,7 @@ mod tests {
             frames: (0..frames).map(|_| vec![0xab; 60]).collect(),
             synthesizes,
             link: Arc::default(),
+            socket: None,
         };
         let worker = NetWorker::new(
             queue(rx),
@@ -841,6 +857,50 @@ mod tests {
         );
     }
 
+    /// While a snapshot holds the device's gate, the running worker writes nothing into the
+    /// guest's RX ring, however much the proxy has waiting; once the gate opens it catches up.
+    #[test]
+    fn a_held_worker_leaves_guest_ram_alone_until_released() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, _interrupt) = worker(&mem, &rx, &tx, 8, 0);
+        let (ours, _theirs) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        worker.backend = Box::new(Proxy {
+            frames: (0..2).map(|_| vec![0xab; 60]).collect(),
+            synthesizes: true,
+            link: Arc::default(),
+            socket: Some(ours),
+        });
+        let gate = Arc::new(DumpGate::new());
+        let worker = worker.with_dump_gate(gate.clone());
+        let rx_kick = worker.rx_q.event.clone();
+        let stop = worker.stop_fd.try_clone().unwrap();
+        gate.close(Duration::ZERO).unwrap();
+
+        let thread = worker.run();
+        rx_kick.write(1).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            rx.used.idx.get(),
+            0,
+            "the worker wrote guest RAM through a held gate"
+        );
+
+        gate.open();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rx.used.idx.get() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            rx.used.idx.get(),
+            2,
+            "the released worker delivered the frames"
+        );
+        stop.write(1).unwrap();
+        thread.join().unwrap();
+    }
+
     /// Queue `count` guest frames on the TX ring, after the `posted` already there.
     fn post_tx(tx: &GuestQueue, posted: u16, count: u16) {
         for i in posted..posted + count {
@@ -863,6 +923,7 @@ mod tests {
             frames: VecDeque::new(),
             synthesizes: true,
             link: link.clone(),
+            socket: None,
         });
 
         link.down.store(true, Ordering::SeqCst);

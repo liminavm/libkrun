@@ -45,7 +45,7 @@ use super::{
 };
 
 use crate::virtio::{
-    ActivateError, InterruptTransport,
+    ActivateError, DumpGate, InterruptTransport,
     block::{DiskFormat, SyncMode},
 };
 
@@ -246,6 +246,8 @@ pub struct Block {
     disk_image_id: Vec<u8>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    /// Held closed by a snapshot while it copies guest RAM; every worker passes through it.
+    dump_gate: Arc<DumpGate>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -362,6 +364,7 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            dump_gate: Arc::default(),
         })
     }
 
@@ -459,6 +462,7 @@ impl VirtioDevice for Block {
             mem.clone(),
             disk,
             self.worker_stopfd.try_clone().unwrap(),
+            self.dump_gate.clone(),
         );
         self.worker_thread = Some(worker.run());
 
@@ -476,13 +480,98 @@ impl VirtioDevice for Block {
         self.device_state = DeviceState::Inactive;
         true
     }
+
+    fn dump_gate(&self) -> Option<Arc<DumpGate>> {
+        Some(self.dump_gate.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::time::{Duration, Instant};
+
     use utils::tempfile::TempFile;
+    use vm_memory::{Bytes, GuestAddress};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue as GuestQueue;
+    use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+
+    /// While a snapshot holds the device's gate, a read the guest queued is not answered: the
+    /// worker writes neither the data nor the used ring until the gate opens.
+    #[test]
+    fn a_held_worker_leaves_guest_ram_alone_until_released() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(16 * SECTOR_SIZE)
+            .expect("size backing file");
+        let mut block = Block::new(
+            "held".to_string(),
+            None,
+            CacheType::Unsafe,
+            backing.as_path().to_str().unwrap().to_string(),
+            DiskFormat::Raw,
+            false,
+            false,
+            SyncMode::None,
+        )
+        .unwrap();
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let vq = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        // A one-sector read: header, data buffer, status byte.
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(0x8000))
+            .unwrap();
+        mem.write_obj(0u64, GuestAddress(0x8008)).unwrap();
+        mem.write_obj(0xffu8, GuestAddress(0xa000)).unwrap();
+        vq.dtable[0].set(0x8000, 16, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable[1].set(
+            0x9000,
+            SECTOR_SIZE as u32,
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            2,
+        );
+        vq.dtable[2].set(0xa000, 1, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+        let kick = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let queue = DeviceQueue::new(vq.create_queue(), kick.clone());
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "blk-test".to_string()).unwrap();
+
+        let gate = block.dump_gate().unwrap();
+        gate.close(Duration::ZERO).unwrap();
+        block
+            .activate(mem.clone(), interrupt.clone(), vec![queue])
+            .unwrap();
+        kick.write(1).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            vq.used.idx.get(),
+            0,
+            "the worker answered through a held gate"
+        );
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0xa000)).unwrap(), 0xff);
+
+        gate.open();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vq.used.idx.get() < 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            vq.used.idx.get(),
+            1,
+            "the released worker answered the read"
+        );
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(0xa000)).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        assert!(block.reset());
+    }
 
     #[test]
     fn disk_image_id_prefers_supplied_block_id() {
