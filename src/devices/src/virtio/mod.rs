@@ -19,6 +19,7 @@ pub mod block;
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
+pub mod dump_gate;
 pub mod file_traits;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
@@ -50,6 +51,7 @@ pub use self::balloon::*;
 pub use self::block::{Block, CacheType};
 pub use self::console::*;
 pub use self::device::*;
+pub use self::dump_gate::{DumpGate, DumpSection};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use self::fs::*;
 #[cfg(feature = "gpu")]
