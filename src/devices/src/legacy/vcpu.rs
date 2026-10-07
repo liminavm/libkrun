@@ -216,11 +216,22 @@ impl VcpuList {
         match self.system_suspended() {
             Some(vcpuid) => {
                 if let Some(vcpu) = self.vcpus.get(vcpuid as usize) {
-                    vcpu.lock().unwrap().kick();
+                    let mut vcpu = vcpu.lock().unwrap();
+                    info!(
+                        "wake: vCPU {vcpuid} is in SYSTEM_SUSPEND and {}",
+                        match vcpu.status {
+                            VcpuStatus::Waiting => "waiting",
+                            VcpuStatus::Running => "not yet waiting",
+                        }
+                    );
+                    vcpu.kick();
                 }
                 true
             }
-            None => false,
+            None => {
+                info!("wake: no vCPU is in SYSTEM_SUSPEND");
+                false
+            }
         }
     }
 
