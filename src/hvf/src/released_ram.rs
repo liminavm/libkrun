@@ -544,6 +544,8 @@ impl<S: Stage2> ReleasedRam<S> {
                 std::io::Error::last_os_error()
             );
         } else {
+            #[cfg(test)]
+            hold_window::until_touched();
             let mut tries = 0;
             while unsafe { libc::mprotect(p, len as usize, libc::PROT_READ | libc::PROT_WRITE) }
                 != 0
@@ -564,6 +566,48 @@ impl<S: Stage2> ReleasedRam<S> {
         SWEEP_LAST_CLOSE.store(unsafe { crate::mach_absolute_time() }, Ordering::Release);
         SWEEP_WINDOW_END.store(0, Ordering::Release);
         SWEEP_WINDOW_START.store(0, Ordering::Release);
+    }
+}
+
+/// A test's hold on the next sweep window: kept `PROT_NONE` until a touch has faulted in it,
+/// so a test of the fault handler gets its collision every time rather than when a racing
+/// write happens to land in a window.
+#[cfg(test)]
+mod hold_window {
+    use super::SWEEP_FAULTS;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    /// Hold the next window that opens.
+    pub fn arm() {
+        TIMED_OUT.store(false, Ordering::Relaxed);
+        ARMED.store(true, Ordering::Release);
+    }
+
+    /// Whether the held window gave up waiting for a touch.
+    pub fn timed_out() -> bool {
+        TIMED_OUT.load(Ordering::Acquire)
+    }
+
+    /// Called with a window just made `PROT_NONE`. Gives up after [`LIMIT`] rather than
+    /// hanging: the window still closes and the test reads [`timed_out`].
+    pub(super) fn until_touched() {
+        if !ARMED.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let before = SWEEP_FAULTS.load(Ordering::Acquire);
+        let started = Instant::now();
+        while SWEEP_FAULTS.load(Ordering::Acquire) == before {
+            if started.elapsed() > LIMIT {
+                TIMED_OUT.store(true, Ordering::Release);
+                return;
+            }
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -1022,17 +1066,17 @@ mod tests {
     }
 
     /// The sweep fault handler must actually FIELD concurrent touches, not merely exist:
-    /// a toucher thread writes every page of the region in a tight loop while sweeps flip
-    /// windows over it. Any write landing in an open window faults; a broken handler kills
-    /// the process on the default disposition, and `sweep_faults` proves collisions really
-    /// happened rather than the timing never producing one. The toucher finishes each full
-    /// pass before checking its stop flag, so afterwards every page must hold the final
-    /// pass's value — a write torn or lost in a window would leave a mismatch.
+    /// a toucher thread writes every page of the region in a tight loop while a sweep flips
+    /// the region's one window. The window is held `PROT_NONE` until the toucher has faulted
+    /// in it, so the collision happens on every run; a broken handler kills the process on
+    /// the default disposition. The toucher finishes each full pass before checking its stop
+    /// flag, so afterwards every page must hold the final pass's value — a write torn or lost
+    /// in the window would leave a mismatch.
     #[test]
     fn sweep_fault_handler_fields_concurrent_touches() {
         let _serialize = SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let page = crate::host_page_size();
-        let len = 4096 * page;
+        let len = 64 * page;
         let host = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1064,30 +1108,22 @@ mod tests {
         });
 
         let faults0 = rr.stats().sweep_faults;
-        // Bounded by time, not a sweep count: a toucher starved by a busy host (the tests run
-        // in parallel) can manage a single pass in 50 sweeps.
-        let started = std::time::Instant::now();
-        let mut sweeps = 0;
-        while rr.stats().sweep_faults == faults0
-            && started.elapsed() < std::time::Duration::from_secs(10)
-        {
-            rr.settle_sweep()
-                .expect("nothing else sweeps under the test lock");
-            sweeps += 1;
-        }
+        super::hold_window::arm();
+        rr.settle_sweep()
+            .expect("nothing else sweeps under the test lock");
         STOP.store(true, Ordering::Relaxed);
         let final_pass = toucher.join().unwrap() - 1;
 
         assert!(
-            rr.stats().sweep_faults > faults0,
-            "no toucher write collided with a sweep window in {sweeps} sweeps \
-             ({final_pass} toucher passes) — the windows never opened under load"
+            !super::hold_window::timed_out(),
+            "the toucher never faulted in the held window"
         );
+        assert!(rr.stats().sweep_faults > faults0);
         for i in 0..pages {
             let v = unsafe { std::ptr::read_volatile((base + i * step) as *const u64) };
             assert_eq!(
                 v, final_pass,
-                "page {i} lost the final pass's write across the sweep windows"
+                "page {i} lost the final pass's write across the sweep window"
             );
         }
         unsafe { libc::munmap(host as *mut libc::c_void, len as usize) };
