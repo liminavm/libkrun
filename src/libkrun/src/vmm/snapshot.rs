@@ -60,7 +60,12 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // to those slots, and slots are handed out in attach order, so one device more or fewer shifts
 // every device after it. Restore refuses a machine whose slots differ. A v8 file carries no
 // record and is restored unchecked.
-const VERSION: u32 = 9;
+// v10 appends what each virtio-mmio device offered the guest: its feature bits, its queue count and
+// the config fields that shape the driver's view of it (a console's port count, a GPU's scanouts).
+// A build that changes any of them for a device at the same slot leaves the guest's driver bound to
+// a device that is no longer the one it negotiated with; restore refuses it beside the slot check.
+// A v9 file carries no fingerprint and is restored with only the slot check, and a warning.
+const VERSION: u32 = 10;
 const OLDEST_READABLE_VERSION: u32 = 8;
 
 /// v6 RAM chunk size: 4 MiB — large enough to amortize per-frame overhead, small enough to spread
@@ -141,6 +146,33 @@ pub struct DeviceSlot {
     pub irq: u32,
 }
 
+/// What one virtio-mmio device offered the guest on the captured machine, beyond where it sits.
+///
+/// Only what is fixed when the device is built: its offered features, its queue count, and the
+/// config fields that decide what the guest's driver builds around it ([`topology`]). Config that
+/// moves while the VM runs -- a disk's capacity, a balloon's target, a display's mode -- is not
+/// part of it, or a restore on the same build would be refused.
+///
+/// [`topology`]: devices::virtio::VirtioDevice::snapshot_topology
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DeviceFingerprint {
+    pub type_id: u32,
+    pub mmio_base: u64,
+    pub features: u64,
+    pub queues: u32,
+    pub topology: Vec<(String, u64)>,
+}
+
+impl DeviceFingerprint {
+    fn offers(&self) -> String {
+        let mut s = format!("features 0x{:x}, {} queues", self.features, self.queues);
+        for (name, value) in &self.topology {
+            s.push_str(&format!(", {name} {value}"));
+        }
+        s
+    }
+}
+
 fn virtio_name(type_id: u32) -> String {
     match type_id {
         1 => "virtio-net".into(),
@@ -191,6 +223,33 @@ pub fn slot_mismatch(captured: &[DeviceSlot], here: &[DeviceSlot]) -> Option<Str
     Some(parts.join("; "))
 }
 
+/// How the devices of the machine being restored into differ from the captured ones in what they
+/// offer the guest, or `None` if every device at a captured slot offers what it did. A device at
+/// a slot only one side has is [`slot_mismatch`]'s to report.
+pub fn fingerprint_mismatch(
+    captured: &[DeviceFingerprint],
+    here: &[DeviceFingerprint],
+) -> Option<String> {
+    let parts: Vec<String> = captured
+        .iter()
+        .filter_map(|c| {
+            let h = here
+                .iter()
+                .find(|h| h.type_id == c.type_id && h.mmio_base == c.mmio_base)?;
+            (h != c).then(|| {
+                format!(
+                    "{} @0x{:x} was suspended offering {}, and now offers {}",
+                    virtio_name(c.type_id),
+                    c.mmio_base,
+                    c.offers(),
+                    h.offers()
+                )
+            })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// Everything in a snapshot except the guest RAM (v6: RAM is streamed separately as chunked
 /// frames — see [`write_streaming`] / [`SnapshotFile::apply_ram`]).
 pub struct SnapshotHead {
@@ -214,6 +273,8 @@ pub struct SnapshotHead {
     pub usb: Option<XhciState>,
     /// v9: every virtio-mmio device's slot. `None` for a v8 file, which never recorded them.
     pub slots: Option<Vec<DeviceSlot>>,
+    /// v10: what every virtio-mmio device offered the guest. `None` for a file older than v10.
+    pub fingerprints: Option<Vec<DeviceFingerprint>>,
 }
 
 /// CRC-32 (IEEE 802.3, reflected): the head's and every RAM frame's integrity check.
@@ -285,9 +346,15 @@ fn encode_vcpu(v: &mut Vec<u8>, s: &VcpuState) {
 }
 
 fn encode_head(head: &SnapshotHead) -> Vec<u8> {
+    encode_head_as(head, VERSION)
+}
+
+/// The head as version `version` lays it out. Only [`VERSION`] is ever written to a file; the
+/// tests write older layouts to check how they are read.
+fn encode_head_as(head: &SnapshotHead, version: u32) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(MAGIC);
-    put_u32(&mut v, VERSION);
+    put_u32(&mut v, version);
     put_u32(&mut v, head.vcpus.len() as u32);
     for s in &head.vcpus {
         encode_vcpu(&mut v, s);
@@ -365,6 +432,21 @@ fn encode_head(head: &SnapshotHead) -> Vec<u8> {
         put_u32(&mut v, s.type_id);
         put_u64(&mut v, s.mmio_base);
         put_u32(&mut v, s.irq);
+    }
+    if version >= 10 {
+        let prints = head.fingerprints.as_deref().unwrap_or_default();
+        put_u32(&mut v, prints.len() as u32);
+        for f in prints {
+            put_u32(&mut v, f.type_id);
+            put_u64(&mut v, f.mmio_base);
+            put_u64(&mut v, f.features);
+            put_u32(&mut v, f.queues);
+            put_u32(&mut v, f.topology.len() as u32);
+            for (name, value) in &f.topology {
+                put_bytes(&mut v, name.as_bytes());
+                put_u64(&mut v, *value);
+            }
+        }
     }
     v
 }
@@ -1410,6 +1492,33 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
     } else {
         None
     };
+    let fingerprints = if version >= 10 {
+        let n = bounded_count(&mut r, 1024, "device fingerprint")?;
+        let mut prints = Vec::with_capacity(n);
+        for _ in 0..n {
+            let type_id = r.u32()?;
+            let mmio_base = r.u64()?;
+            let features = r.u64()?;
+            let queues = r.u32()?;
+            let fields = bounded_count(&mut r, 64, "topology field")?;
+            let mut topology = Vec::with_capacity(fields);
+            for _ in 0..fields {
+                let name = String::from_utf8(r.bytes()?)
+                    .map_err(|_| corrupt("a topology field name is not UTF-8"))?;
+                topology.push((name, r.u64()?));
+            }
+            prints.push(DeviceFingerprint {
+                type_id,
+                mmio_base,
+                features,
+                queues,
+                topology,
+            });
+        }
+        Some(prints)
+    } else {
+        None
+    };
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
     let head_end = r.pos;
     let stored = r.u32()?;
@@ -1429,6 +1538,7 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
             gpu,
             usb,
             slots,
+            fingerprints,
         },
         raw,
         ram_off,
@@ -1631,6 +1741,7 @@ mod tests {
             gpu: Some(vec![0x4c, 0x47, 0x50, 0x55, 9, 9]),
             usb: Some(sample_usb()),
             slots: Some(windowed_slots()),
+            fingerprints: Some(windowed_fingerprints()),
         }
     }
 
@@ -1651,6 +1762,81 @@ mod tests {
             slot(18, 0x0a00_b000, 50),
             slot(19, 0x0a00_c000, 51),
         ]
+    }
+
+    fn console(ports: u64, queues: u32) -> DeviceFingerprint {
+        DeviceFingerprint {
+            type_id: 3,
+            mmio_base: 0x0a00_0000,
+            features: 0x1_0000_0003,
+            queues,
+            topology: vec![("ports".into(), ports)],
+        }
+    }
+
+    fn windowed_fingerprints() -> Vec<DeviceFingerprint> {
+        vec![
+            console(2, 6),
+            DeviceFingerprint {
+                type_id: 16,
+                mmio_base: 0x0a00_8000,
+                features: 0x1_0000_0019,
+                queues: 2,
+                topology: vec![("scanouts".into(), 1), ("capsets".into(), 2)],
+            },
+        ]
+    }
+
+    #[test]
+    fn identical_fingerprints_match() {
+        assert_eq!(
+            fingerprint_mismatch(&windowed_fingerprints(), &windowed_fingerprints()),
+            None
+        );
+    }
+
+    /// A console that gained a port is the same device at the same slot, so the slot check
+    /// passes it; the guest's multiport driver set up its queues for the old count.
+    #[test]
+    fn a_console_with_another_port_count_is_named_with_both_sides() {
+        let mut here = windowed_fingerprints();
+        here[0] = console(3, 8);
+        let diff = fingerprint_mismatch(&windowed_fingerprints(), &here).expect("must differ");
+        assert_eq!(
+            diff,
+            "virtio-console @0xa000000 was suspended offering features 0x100000003, 6 queues, \
+             ports 2, and now offers features 0x100000003, 8 queues, ports 3"
+        );
+    }
+
+    #[test]
+    fn a_changed_feature_set_is_named_with_both_sides() {
+        let mut here = windowed_fingerprints();
+        here[1].features |= 1 << 2;
+        let diff = fingerprint_mismatch(&windowed_fingerprints(), &here).expect("must differ");
+        assert!(diff.starts_with("virtio-gpu @0xa008000"), "{diff}");
+        assert!(diff.contains("offering features 0x100000019,"), "{diff}");
+        assert!(diff.contains("now offers features 0x10000001d,"), "{diff}");
+    }
+
+    /// A device on only one side is the slot check's to report, not this one's.
+    #[test]
+    fn a_device_on_one_side_only_is_left_to_the_slot_check() {
+        let fewer = vec![windowed_fingerprints()[1].clone()];
+        assert_eq!(fingerprint_mismatch(&windowed_fingerprints(), &fewer), None);
+        assert_eq!(fingerprint_mismatch(&fewer, &windowed_fingerprints()), None);
+    }
+
+    /// A v9 file has slots and no fingerprints, and reads as exactly that.
+    #[test]
+    fn a_v9_head_reads_without_fingerprints() {
+        let mut v = encode_head_as(&sample_head(), 9);
+        let crc = crc32(&v);
+        put_u32(&mut v, crc);
+        put_u32(&mut v, 0); // no RAM regions
+        let file = parse(StreamedFile::landed(v)).expect("a v9 head reads");
+        assert_eq!(file.head.slots, Some(windowed_slots()));
+        assert_eq!(file.head.fingerprints, None);
     }
 
     #[test]
@@ -1739,6 +1925,7 @@ mod tests {
         // register, ring position, slot and endpoint — a dropped field fails here).
         assert_eq!(head.usb, want.usb);
         assert_eq!(head.slots, want.slots);
+        assert_eq!(head.fingerprints, want.fingerprints);
 
         // Restore into memory pre-filled with garbage: data frames AND holes must both overwrite.
         let mem2 = test_mem();
@@ -1767,6 +1954,7 @@ mod tests {
             gpu: None,
             usb: None,
             slots: Some(vec![]),
+            fingerprints: Some(vec![]),
         };
         let mem = test_mem();
         let path =
@@ -1847,6 +2035,7 @@ mod tests {
             gpu: None,
             usb: None,
             slots: Some(vec![]),
+            fingerprints: Some(vec![]),
         };
         let mut v = encode_head(&head);
         let crc = crc32(&v);
@@ -1882,6 +2071,7 @@ mod tests {
             gpu: None,
             usb: None,
             slots: Some(vec![]),
+            fingerprints: Some(vec![]),
         };
         let mut v = encode_head(&head);
         let crc = crc32(&v);

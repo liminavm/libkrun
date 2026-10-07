@@ -1481,6 +1481,29 @@ pub fn build_microvm(
             }
             None => warn!("restore: the snapshot predates the device-slot record; not checked"),
         }
+        // The same devices at the same slots can still offer the guest something else: a build
+        // that adds a console port or a feature bit leaves the guest's driver set up for the old
+        // device. Checked after the slots, so a moved device is reported as moved.
+        match &snap.head.fingerprints {
+            Some(captured) => {
+                let here = vmm.mmio_device_manager.device_fingerprints();
+                if let Some(diff) = crate::vmm::snapshot::fingerprint_mismatch(captured, &here) {
+                    let why = format!(
+                        "restore refused: this VM's devices offer the guest something other than \
+                         what it was suspended with ({diff})"
+                    );
+                    error!("{why}");
+                    return Err(StartMicrovmError::Internal(
+                        crate::vmm::Error::RestoreRefused(why),
+                    ));
+                }
+            }
+            None if snap.head.slots.is_some() => warn!(
+                "restore: the snapshot predates the device fingerprint; device features and \
+                 ports not checked"
+            ),
+            None => {}
+        }
         let gate = Arc::new(crate::vmm::vstate::RestoreGate::default());
         let vcpu_states = std::mem::take(&mut snap.head.vcpus);
         let vcpus = vcpus

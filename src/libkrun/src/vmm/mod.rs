@@ -715,6 +715,7 @@ impl Vmm {
             gpu,
             usb,
             slots: Some(self.mmio_device_manager.device_slots()),
+            fingerprints: Some(self.mmio_device_manager.device_fingerprints()),
         };
         // v6: stream chunked RAM frames straight out of guest memory (zero-chunk holes + lz4),
         // written by a worker pool — no whole-RAM intermediate copy, no serial multi-GB CRC.
