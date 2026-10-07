@@ -28,7 +28,7 @@ use crate::virtio::gpu::protocol::{
     VIRTIO_GPU_EVENT_DISPLAY, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
 };
 use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
-use crate::virtio::{InterruptTransport, VirtioShmRegion};
+use crate::virtio::{DumpGate, InterruptTransport, VirtioShmRegion};
 use krun_display::DisplayBackend;
 use krun_display::Rect;
 
@@ -107,6 +107,9 @@ pub struct Worker {
     /// control-queue drain service it: a driver that never uses the queue (the firmware's) may
     /// leave it unconfigured, and servicing one writes to wherever its rings point.
     cursor_kicked: bool,
+    /// Held closed by a snapshot while it copies guest RAM; each wake of the service loop
+    /// passes through it.
+    dump_gate: Arc<DumpGate>,
 }
 
 impl Worker {
@@ -127,6 +130,7 @@ impl Worker {
         resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
         pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
         restore_done: Arc<(Mutex<bool>, Condvar)>,
+        dump_gate: Arc<DumpGate>,
     ) -> Self {
         Self {
             stop_fd,
@@ -146,6 +150,7 @@ impl Worker {
             pending_restore,
             restore_done,
             cursor_kicked: false,
+            dump_gate,
         }
     }
 
@@ -170,6 +175,7 @@ impl Worker {
             self.export_table.take(),
             self.displays.clone(),
             self.display_backend,
+            self.dump_gate.clone(),
         );
 
         // limina (host-sleep s2idle, defer-and-classify): a device reset no longer wipes the
@@ -496,6 +502,7 @@ impl Worker {
         // vkr_ring_notify happens) -> used-queue interrupt raised. Joins virglrenderer's
         // LIMINA_RING_WAKE_PROFILE, which covers everything after cnd_signal.
         let mut wake_probe = crate::virtio::wake_probe::Profile::new();
+        let dump_gate = self.dump_gate.clone();
         loop {
             let ev_cnt = match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(n) => n,
@@ -511,6 +518,7 @@ impl Worker {
             } else {
                 0
             };
+            let _section = dump_gate.enter();
             if let Some((last, counts)) = wake_trace.as_mut() {
                 counts[0] += 1;
                 for event in &epoll_events[0..ev_cnt] {
