@@ -31,6 +31,8 @@ fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
 }
 
 pub use self::device::Net;
+#[cfg(unix)]
+pub use self::unixgram::unlink_bound_sockets;
 #[derive(Debug)]
 pub enum Error {
     /// EventFd error.

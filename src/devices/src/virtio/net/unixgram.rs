@@ -7,6 +7,7 @@ use nix::unistd::unlink;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::backend::{ConnectError, NetBackend, ReadError, Reconnect, WriteError};
@@ -23,6 +24,48 @@ const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
 /// is longer than our fixed-format name for any reasonably-named machine, keeping
 /// the local path within macOS's 104-byte unix socket limit.
 static NET_SOCK_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// The local socket files this process has bound and not yet removed.
+///
+/// A backend removes its own file when it drops, but the VMM ends the process with `_exit`
+/// (`Vmm::stop`), which runs no destructors: the files of every backend still alive then are
+/// removed through [`unlink_bound_sockets`], which the VMM calls on its way out.
+static BOUND_SOCKETS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Remove every local socket file a live backend has bound. For the VMM's exit path, where the
+/// backends are never dropped; the backends stay usable for receiving nothing more, which is all
+/// an exiting process needs.
+pub fn unlink_bound_sockets() {
+    let paths = std::mem::take(&mut *BOUND_SOCKETS.lock().unwrap_or_else(|e| e.into_inner()));
+    for path in paths {
+        _ = unlink(&path);
+    }
+}
+
+/// The bound local socket file, removed when the backend that owns it drops.
+struct LocalSocket(PathBuf);
+
+impl LocalSocket {
+    fn register(path: PathBuf) -> Self {
+        BOUND_SOCKETS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.clone());
+        Self(path)
+    }
+}
+
+impl Drop for LocalSocket {
+    fn drop(&mut self) {
+        let mut bound = BOUND_SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+        // Not registered any more means the exit path already removed it; a file at the path
+        // now is someone else's.
+        if let Some(i) = bound.iter().position(|p| *p == self.0) {
+            bound.swap_remove(i);
+            _ = unlink(&self.0);
+        }
+    }
+}
 
 const DEFAULT_SOCKET_BUF_SIZE: usize = 7 * 1024 * 1024;
 
@@ -45,6 +88,10 @@ pub struct Unixgram {
     peer: Option<Peer>,
     /// The proxy went away: every frame is dropped until [`NetBackend::reconnect`] succeeds.
     lost: bool,
+    /// The file our end is bound to, for a backend opened by path. Declared after `fd` so the
+    /// socket closes before its file goes. Held for its `Drop`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    local: Option<LocalSocket>,
 }
 
 struct Peer {
@@ -118,7 +165,14 @@ impl Unixgram {
             retries: 0,
             peer: None,
             lost: false,
+            local: None,
         }
+    }
+
+    /// The file our end of the socket is bound to, if we bound one.
+    #[cfg(test)]
+    fn local_path(&self) -> Option<&std::path::Path> {
+        self.local.as_ref().map(|l| l.0.as_path())
     }
 
     /// Create the backend opening a connection to the userspace network proxy.
@@ -143,6 +197,9 @@ impl Unixgram {
             _ = unlink(path);
         }
         bind(fd.as_raw_fd(), &local_addr).map_err(ConnectError::Binding)?;
+        // Owned from here on, so every way out below (a proxy that is not listening yet among
+        // them) removes the file again.
+        let local = LocalSocket::register(local_path);
 
         // Connect so we don't need to use the peer address again. This also
         // allows the server to remove the socket after the connection.
@@ -168,6 +225,7 @@ impl Unixgram {
 
         Ok(Self {
             peer: Some(peer),
+            local: Some(local),
             ..Self::new(fd)
         })
     }
@@ -293,14 +351,76 @@ mod tests {
         (buf[..n].to_vec(), from.unwrap())
     }
 
+    /// Serializes the tests that bind sockets: they share one process, so one test's
+    /// [`unlink_bound_sockets`] would remove the files of every other test's backends.
+    static BINDING: Mutex<()> = Mutex::new(());
+
+    fn binding() -> std::sync::MutexGuard<'static, ()> {
+        BINDING.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A proxy path unique to `test`.
+    fn proxy_path(test: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("krun-gw-{}-{test}.sock", process::id()))
+    }
+
+    #[test]
+    fn a_dropped_backend_removes_its_socket_file() {
+        let _binding = binding();
+        let path = proxy_path("drop");
+        let _proxy = proxy(&path);
+        let backend = Unixgram::open(path.clone(), false).unwrap();
+        let local = backend.local_path().unwrap().to_owned();
+        assert!(local.exists(), "the backend is bound to {local:?}");
+
+        drop(backend);
+        assert!(!local.exists(), "{local:?} outlived its backend");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Opening before the proxy listens fails after our end is already bound.
+    #[test]
+    fn a_proxy_that_is_not_there_leaves_no_socket_file() {
+        let _binding = binding();
+        let path = proxy_path("absent");
+        let _ = std::fs::remove_file(&path);
+        let next = NET_SOCK_COUNTER.load(Ordering::Relaxed);
+        let local = std::env::temp_dir().join(format!("krun-net-{}-{next}.sock", process::id()));
+
+        assert!(Unixgram::open(path, false).is_err());
+        assert!(!local.exists(), "{local:?} outlived a failed open");
+    }
+
+    /// The VMM exits with `_exit`, so the backends are never dropped: its exit path removes the
+    /// files instead, and a backend dropped after that leaves a file at the path alone.
+    #[test]
+    fn the_exit_path_removes_the_socket_files_of_live_backends() {
+        let _binding = binding();
+        let path = proxy_path("exit");
+        let _proxy = proxy(&path);
+        let backend = Unixgram::open(path.clone(), false).unwrap();
+        let local = backend.local_path().unwrap().to_owned();
+
+        unlink_bound_sockets();
+        assert!(!local.exists(), "{local:?} survived the exit path");
+
+        std::fs::write(&local, b"someone else's").unwrap();
+        drop(backend);
+        assert!(local.exists(), "a file that is no longer ours was removed");
+        let _ = std::fs::remove_file(&local);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The proxy exits and a new one binds the same path later: the backend drops frames while
     /// it is gone, cannot reconnect while the path is absent, and once it is back reconnects on
     /// the same descriptor, introduces itself again, and carries frames both ways.
     #[test]
     fn a_proxy_that_goes_away_and_comes_back_is_reconnected() {
-        let path = std::env::temp_dir().join(format!("krun-gw-{}.sock", process::id()));
+        let _binding = binding();
+        let path = proxy_path("reconnect");
         let first = proxy(&path);
         let mut backend = Unixgram::open(path.clone(), true).unwrap();
+        let local = backend.local_path().unwrap().to_owned();
         assert_eq!(take(&first).0, VFKIT_MAGIC);
 
         drop(first);
@@ -331,6 +451,12 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = backend.read_frame(&mut buf).unwrap();
         assert_eq!(&buf[n - 20..n], &[9; 20]);
+
+        // A reconnect keeps the bound address rather than binding a second one.
+        assert_eq!(backend.local_path(), Some(local.as_path()));
+        assert_eq!(us.path(), Some(local.as_path()));
+        drop(backend);
+        assert!(!local.exists(), "{local:?} outlived its backend");
         let _ = std::fs::remove_file(&path);
     }
 
