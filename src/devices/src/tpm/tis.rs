@@ -569,10 +569,13 @@ mod tests {
         assert_eq!(rd(&mut d, 1, 0x14, 4), u64::from(INTF_CAPABILITY));
         assert_eq!(rd(&mut d, 1, 0x30, 4), u64::from(INTERFACE_ID));
         assert_eq!(rd(&mut d, 1, 0x00, 1) as u8 & access::ACTIVE_LOCALITY, 0);
-        // And its writes to STS and the FIFO do nothing.
+        // And its writes to STS and the FIFO do nothing to the active locality's transaction.
+        let before = sts(&mut d, 0);
         wr(&mut d, 1, 0x18, u64::from(sts::COMMAND_READY), 4);
         wr(&mut d, 1, 0x24, 0x80, 1);
-        assert_eq!(sts(&mut d, 0) & sts::COMMAND_READY, 0);
+        wr(&mut d, 1, 0x18, u64::from(sts::TPM_GO), 4);
+        assert_eq!(sts(&mut d, 0), before);
+        assert!(d.backend().delivered.is_empty());
     }
 
     #[test]
