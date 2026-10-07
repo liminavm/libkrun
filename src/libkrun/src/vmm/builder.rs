@@ -1269,6 +1269,16 @@ pub fn build_microvm(
                 .map_err(Error::RegisterMMIODevice)
                 .map_err(StartMicrovmError::Internal)?;
         }
+
+        // limina: TPM 2.0 (opt-in). No IRQ either, so it goes last for the same reason.
+        #[cfg(feature = "tpm")]
+        if vm_resources.tpm {
+            let tpm = devices::tpm::TpmTis::new(devices::tpm::JanusBackend::new());
+            mmio_device_manager
+                .register_mmio_tpm(tpm)
+                .map_err(Error::RegisterMMIODevice)
+                .map_err(StartMicrovmError::Internal)?;
+        }
     }
 
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]

@@ -50,3 +50,10 @@ path = "fuzz_targets/gpu_snapshot.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tpm_tis"
+path = "fuzz_targets/tpm_tis.rs"
+test = false
+doc = false
+bench = false

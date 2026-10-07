@@ -140,6 +140,11 @@ pub struct VmResources {
     /// exists so the guest gains cpufreq policies and a frequency-invariance source, which are
     /// two of the preconditions for Energy Aware Scheduling (see devices::legacy::VirtCpuFreq).
     pub cpufreq: bool,
+    /// limina: attach a TPM 2.0 (the TIS interface over MMIO, `tcg,tpm-tis-mmio`), backed by the
+    /// janus engine. Default off. Exists only in a build with the `tpm` feature, so a VMM cannot
+    /// ask for a TPM it was built without. Its state lives in memory for the life of the VM.
+    #[cfg(feature = "tpm")]
+    pub tpm: bool,
     /// limina: how many of the vCPUs are "little" — advertised to the guest with a lower
     /// `capacity-dmips-mhz` and their own perf domain, and backed on the host by a vCPU thread
     /// at a macOS QoS class that lands it on an efficiency core. The last `little_vcpus` vCPUs
@@ -301,6 +306,8 @@ mod tests {
             kernel_console: None,
             usb: false,
             cpufreq: false,
+            #[cfg(feature = "tpm")]
+            tpm: false,
             little_vcpus: 0,
             #[cfg(feature = "usb")]
             usb_devices: Vec::new(),
