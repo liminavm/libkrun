@@ -142,9 +142,13 @@ pub struct VmResources {
     pub cpufreq: bool,
     /// limina: attach a TPM 2.0 (the TIS interface over MMIO, `tcg,tpm-tis-mmio`), backed by the
     /// janus engine. Default off. Exists only in a build with the `tpm` feature, so a VMM cannot
-    /// ask for a TPM it was built without. Its state lives in memory for the life of the VM.
+    /// ask for a TPM it was built without.
     #[cfg(feature = "tpm")]
     pub tpm: bool,
+    /// limina: the file the TPM's NV lives in across runs, made with a new TPM when absent.
+    /// `None` keeps it in memory for the life of the VM.
+    #[cfg(feature = "tpm")]
+    pub tpm_state: Option<std::path::PathBuf>,
     /// limina: how many of the vCPUs are "little" — advertised to the guest with a lower
     /// `capacity-dmips-mhz` and their own perf domain, and backed on the host by a vCPU thread
     /// at a macOS QoS class that lands it on an efficiency core. The last `little_vcpus` vCPUs
@@ -308,6 +312,8 @@ mod tests {
             cpufreq: false,
             #[cfg(feature = "tpm")]
             tpm: false,
+            #[cfg(feature = "tpm")]
+            tpm_state: None,
             little_vcpus: 0,
             #[cfg(feature = "usb")]
             usb_devices: Vec::new(),
