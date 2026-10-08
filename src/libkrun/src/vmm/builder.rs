@@ -95,7 +95,6 @@ use utils::eventfd::EventFd;
 use utils::worker_message::RECLAIM_BLOCK_SIZE;
 use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemoryRegion;
@@ -179,6 +178,8 @@ pub enum StartMicrovmError {
     /// limina: the TPM's state file could not be read, restored or first written.
     #[cfg(feature = "tpm")]
     TpmState(io::Error),
+    /// limina: the UEFI variable store's file could not be opened, made or used.
+    EfiVars(io::Error),
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// The kernel doesn't fit into the microVM memory.
@@ -377,6 +378,7 @@ impl Display for StartMicrovmError {
             Internal(ref err) => write!(f, "Internal error while starting microVM: {err:?}"),
             #[cfg(feature = "tpm")]
             TpmState(ref err) => write!(f, "Cannot load the TPM's state: {err}"),
+            EfiVars(ref err) => write!(f, "Cannot map the UEFI variable store: {err}"),
             InvalidKernelBundle(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -875,6 +877,7 @@ pub fn build_microvm(
         #[cfg(feature = "tee")]
         vm_resources.initrd_bundle.as_ref(),
         vm_resources.firmware_config.as_ref(),
+        vm_resources.efi_vars.as_deref(),
         &fs_shm_sizes,
         gpu_shm_size,
         use_vhost_user,
@@ -2321,6 +2324,66 @@ fn map_ram_in_blocks(
     }
 }
 
+/// limina: the guest region a firmware's UEFI variable store lives in, backed by `path` so every
+/// variable write reaches the file. A missing or empty file is made the store's size, zero-filled,
+/// for the firmware to format; a file of any other size is refused, never truncated, since it is
+/// some other store's variables.
+#[cfg(target_arch = "aarch64")]
+fn efi_vars_region(
+    path: &std::path::Path,
+    firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    use arch::aarch64::layout::{EFI_VARS_SIZE, EFI_VARS_START};
+
+    let refuse = |what: String| {
+        StartMicrovmError::EfiVars(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: {what}", path.display()),
+        ))
+    };
+    if !firmware {
+        return Err(refuse("a variable store needs a firmware boot".into()));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(StartMicrovmError::EfiVars)?;
+    let len = file.metadata().map_err(StartMicrovmError::EfiVars)?.len();
+    if len == 0 {
+        file.set_len(EFI_VARS_SIZE as u64)
+            .map_err(StartMicrovmError::EfiVars)?;
+    } else if len != EFI_VARS_SIZE as u64 {
+        return Err(refuse(format!(
+            "is {len} bytes, and a variable store is {EFI_VARS_SIZE}"
+        )));
+    }
+    Ok((
+        GuestAddress(EFI_VARS_START),
+        EFI_VARS_SIZE,
+        Some(FileOffset::new(file, 0)),
+    ))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn efi_vars_region(
+    path: &std::path::Path,
+    _firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    Err(StartMicrovmError::EfiVars(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{}: a file-backed variable store is aarch64-only",
+            path.display()
+        ),
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_guest_memory(
     mem_size: usize,
@@ -2332,6 +2395,7 @@ pub fn create_guest_memory(
         &crate::vmm::vmm_config::kernel_bundle::InitrdBundle,
     >,
     firmware_config: Option<&crate::vmm::vmm_config::firmware::FirmwareConfig>,
+    efi_vars: Option<&std::path::Path>,
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
     use_vhost_user: bool,
@@ -2484,7 +2548,17 @@ pub fn create_guest_memory(
         #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
         unreachable!()
     } else {
-        GuestMemoryMmap::from_ranges(&arch_mem_regions)
+        let mut regions: Vec<_> = arch_mem_regions
+            .iter()
+            .map(|&(addr, size)| (addr, size, None))
+            .collect();
+        if let Some(path) = efi_vars {
+            regions.push(efi_vars_region(path, firmware_config.is_some())?);
+            // Guest memory takes its regions in address order, and the store sits between the
+            // firmware and RAM.
+            regions.sort_by_key(|&(addr, _, _)| addr);
+        }
+        GuestMemoryMmap::from_ranges_with_files(&regions)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
 
@@ -3088,6 +3162,93 @@ pub mod tests {
     use super::*;
     use crate::vmm::vmm_config::kernel_bundle::KernelBundle;
 
+    /// A firmware boot with a variable store has guest memory there, in address order between
+    /// the firmware and RAM, and what the guest writes into it is in the file.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_firmware_boot_maps_its_variable_store_from_the_file() {
+        use arch::aarch64::layout::{EFI_VARS_SIZE, EFI_VARS_START};
+
+        let dir = std::env::temp_dir().join(format!("krun-efi-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let firmware = dir.join("fw.fd");
+        std::fs::write(&firmware, vec![0u8; 0x10000]).unwrap();
+        let vars = dir.join("efi.vars");
+
+        let (mem, _, _, _) = create_guest_memory(
+            64,
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            Some(&crate::vmm::vmm_config::firmware::FirmwareConfig {
+                path: firmware.clone(),
+            }),
+            Some(&vars),
+            &[],
+            None,
+            false,
+            &Payload::Firmware,
+            #[cfg(target_os = "macos")]
+            false,
+            #[cfg(feature = "tee")]
+            None,
+        )
+        .unwrap();
+
+        let at = GuestAddress(EFI_VARS_START + 0x100);
+        mem.write_slice(b"BootOrder", at).unwrap();
+        let file = std::fs::read(&vars).unwrap();
+        assert_eq!(file.len(), EFI_VARS_SIZE);
+        assert_eq!(&file[0x100..0x109], b"BootOrder");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A new variable store is made the store's size and owner-only; a store already there keeps
+    /// its bytes; one of another size is refused and left alone; and without a firmware there is
+    /// nothing to give it to.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn efi_vars_region_makes_keeps_or_refuses_a_store() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use arch::aarch64::layout::{EFI_VARS_SIZE, EFI_VARS_START};
+
+        let dir = std::env::temp_dir().join(format!("krun-efi-vars-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("efi.vars");
+
+        let (addr, size, file) = efi_vars_region(&path, true).unwrap();
+        assert_eq!((addr, size), (GuestAddress(EFI_VARS_START), EFI_VARS_SIZE));
+        assert!(file.is_some());
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), EFI_VARS_SIZE as u64);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        let mut kept = vec![0u8; EFI_VARS_SIZE];
+        kept[..4].copy_from_slice(b"vars");
+        std::fs::write(&path, &kept).unwrap();
+        efi_vars_region(&path, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), kept);
+
+        std::fs::write(&path, b"short").unwrap();
+        assert!(matches!(
+            efi_vars_region(&path, true),
+            Err(StartMicrovmError::EfiVars(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+
+        assert!(matches!(
+            efi_vars_region(&dir.join("other.vars"), false),
+            Err(StartMicrovmError::EfiVars(_))
+        ));
+        assert!(!dir.join("other.vars").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[allow(unused)]
     fn default_guest_memory(
         mem_size_mib: usize,
@@ -3110,6 +3271,7 @@ pub mod tests {
             #[cfg(feature = "tee")]
             None,
             None,
+            None,
             &[],
             None,
             false,
@@ -3128,6 +3290,7 @@ pub mod tests {
         for (ram_in_blocks, entry_size) in [(true, RECLAIM_BLOCK_SIZE), (false, 64 * MIB)] {
             let (guest_memory, info, _shm_manager, payload_config) = create_guest_memory(
                 64,
+                None,
                 None,
                 None,
                 &[],
@@ -3150,8 +3313,18 @@ pub mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
-        let (guest_memory, info, _shm_manager, _payload_config) =
-            create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, false).unwrap();
+        let (guest_memory, info, _shm_manager, _payload_config) = create_guest_memory(
+            64,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            &Payload::Empty,
+            false,
+        )
+        .unwrap();
 
         let mut asked = None;
         let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
