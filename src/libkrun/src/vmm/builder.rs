@@ -1485,6 +1485,17 @@ pub fn build_microvm(
             );
             return Err(StartMicrovmError::Internal(crate::vmm::Error::Snapshot));
         }
+        // limina: a guest suspended with a TPM holds keys, sessions and sealed secrets in it, and
+        // its driver is bound to the device. Refused by name, before the slots: the TPM's window
+        // happens to sit below the virtio devices, so they move too, but that is no guarantee.
+        if snap.head.tpm.is_some() && vmm.mmio_device_manager.tpm.is_none() {
+            let why =
+                "restore refused: this VM was suspended with a TPM and has none now".to_string();
+            error!("{why}");
+            return Err(StartMicrovmError::Internal(
+                crate::vmm::Error::RestoreRefused(why),
+            ));
+        }
         // Every device is attached by now, and a guest driver bound to a slot that now holds a
         // different device spins on it (a vsock driver rings an input device and floods the log
         // with HdrDescTooSmall). Refused before the RAM is applied, so a refusal costs nothing.
@@ -1641,8 +1652,7 @@ pub fn build_microvm(
         if let Some(usb) = &snap.head.usb {
             vmm.restore_xhci_state(usb);
         }
-        // limina: the TPM as the guest left it. Fail closed: a guest resumed onto no TPM, or onto
-        // a fresh one, loses every key and session it holds there.
+        // limina: the TPM as the guest left it. A VM without one was refused above.
         if let Some(tpm) = &snap.head.tpm {
             vmm.restore_tpm_state(tpm).map_err(|e| {
                 error!("restore: {e}");
