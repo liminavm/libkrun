@@ -146,6 +146,11 @@ impl TpmBackend for JanusBackend {
         let locality =
             janus::Locality::new(locality.get()).expect("the device has five localities");
         let response = self.tpm.execute(locality, command);
+        trace!(
+            "tpm: command {:#x} -> {:#x}",
+            word(command, 6),
+            word(&response, 6)
+        );
         self.persist();
         response
     }
@@ -153,6 +158,14 @@ impl TpmBackend for JanusBackend {
     fn init(&mut self) {
         self.tpm.init();
     }
+}
+
+/// The big-endian `u32` at `at`, or 0 where there is none: a command or response code, for
+/// the trace.
+fn word(bytes: &[u8], at: usize) -> u32 {
+    bytes
+        .get(at..at + 4)
+        .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()))
 }
 
 #[cfg(test)]
