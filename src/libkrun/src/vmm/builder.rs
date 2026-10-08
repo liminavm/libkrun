@@ -167,6 +167,9 @@ pub enum StartMicrovmError {
     Internal(Error),
     /// Cannot inject the kernel into the guest memory due to a problem with the bundle.
     InvalidKernelBundle(vm_memory::mmap::MmapRegionError),
+    /// limina: the TPM's state file could not be read, restored or first written.
+    #[cfg(feature = "tpm")]
+    TpmState(io::Error),
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// The kernel doesn't fit into the microVM memory.
@@ -345,6 +348,8 @@ impl Display for StartMicrovmError {
             ),
             InitrdRead(ref err) => write!(f, "Cannot load initrd due to an invalid image: {err}"),
             Internal(ref err) => write!(f, "Internal error while starting microVM: {err:?}"),
+            #[cfg(feature = "tpm")]
+            TpmState(ref err) => write!(f, "Cannot load the TPM's state: {err}"),
             InvalidKernelBundle(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -1273,7 +1278,12 @@ pub fn build_microvm(
         // limina: TPM 2.0 (opt-in). No IRQ either, so it goes last for the same reason.
         #[cfg(feature = "tpm")]
         if vm_resources.tpm {
-            let tpm = devices::tpm::TpmTis::new(devices::tpm::JanusBackend::new());
+            let backend = match &vm_resources.tpm_state {
+                Some(path) => devices::tpm::JanusBackend::with_state_file(path)
+                    .map_err(StartMicrovmError::TpmState)?,
+                None => devices::tpm::JanusBackend::new(),
+            };
+            let tpm = devices::tpm::TpmTis::new(backend);
             mmio_device_manager
                 .register_mmio_tpm(tpm)
                 .map_err(Error::RegisterMMIODevice)
