@@ -14,6 +14,24 @@ mod janus_backend;
 
 pub use tis::{BUFFER_SIZE, LOCALITY_SIZE, Locality, MMIO_LEN, Reg, TpmTis, decode};
 
+/// A TPM device as the VMM sees it when it snapshots the machine, whatever its backend.
+pub trait TpmDevice: Send {
+    /// See [`TpmTis::save_state`].
+    fn save_state(&self) -> Vec<u8>;
+    /// See [`TpmTis::restore_state`].
+    fn restore_state(&mut self, saved: &[u8]) -> std::io::Result<()>;
+}
+
+impl<B: TpmBackend> TpmDevice for TpmTis<B> {
+    fn save_state(&self) -> Vec<u8> {
+        TpmTis::save_state(self)
+    }
+
+    fn restore_state(&mut self, saved: &[u8]) -> std::io::Result<()> {
+        TpmTis::restore_state(self, saved)
+    }
+}
+
 #[cfg(feature = "tpm")]
 pub use janus_backend::JanusBackend;
 
@@ -27,6 +45,14 @@ pub trait TpmBackend: Send {
     /// `_TPM_Init`: the platform was reset. The device signals it once at power-on; libkrun has
     /// no in-process reset (a guest reboot builds a new VM, and so a new device).
     fn init(&mut self);
+
+    /// Everything the backend holds, for a snapshot of the machine: what [`TpmBackend::resume`]
+    /// needs to carry on as though the machine had never stopped, volatile state included.
+    fn snapshot(&self) -> Vec<u8>;
+
+    /// Becomes the backend `snapshot` came from, in place of the one it was made as. A snapshot
+    /// it cannot resume is an error, which leaves it as it was.
+    fn resume(&mut self, snapshot: &[u8]) -> std::io::Result<()>;
 }
 
 #[cfg(any(test, kani, fuzzing))]
@@ -41,6 +67,8 @@ pub mod echo {
         /// Every command delivered, with its locality.
         pub delivered: Vec<(u8, Vec<u8>)>,
         pub inits: usize,
+        /// The snapshot it last resumed from.
+        pub resumed: Option<Vec<u8>>,
     }
 
     /// The response `Echo` gives to `command` at `locality`: a `TPM_ST_NO_SESSIONS` header, then
@@ -64,6 +92,16 @@ pub mod echo {
 
         fn init(&mut self) {
             self.inits += 1;
+        }
+
+        /// The number of commands delivered so far, which a test can find again in `resumed`.
+        fn snapshot(&self) -> Vec<u8> {
+            (self.delivered.len() as u32).to_le_bytes().to_vec()
+        }
+
+        fn resume(&mut self, snapshot: &[u8]) -> std::io::Result<()> {
+            self.resumed = Some(snapshot.to_vec());
+            Ok(())
         }
     }
 }

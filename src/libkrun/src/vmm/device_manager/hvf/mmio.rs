@@ -89,6 +89,10 @@ pub struct MMIODeviceManager {
     /// `register_mmio_xhci` runs, i.e. unless USB is enabled.
     #[cfg(feature = "usb")]
     pub xhci: Option<Arc<Mutex<devices::usb::XhciDevice>>>,
+    /// limina: handle to the live TPM, for snapshot save/restore of everything it holds: a
+    /// restored guest resumes with the TPM it suspended with, running. `None` unless
+    /// `register_mmio_tpm` ran.
+    pub tpm: Option<Arc<Mutex<dyn devices::tpm::TpmDevice>>>,
     /// limina: one `capacity-dmips-mhz` per vCPU, for the FDT's CPU nodes. Empty unless the
     /// virtual cpufreq device was registered with an asymmetric topology.
     vcpu_capacities: Vec<u32>,
@@ -114,6 +118,7 @@ impl MMIODeviceManager {
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
             gpio: None,
+            tpm: None,
             vcpu_capacities: Vec::new(),
             #[cfg(feature = "usb")]
             xhci: None,
@@ -421,9 +426,11 @@ impl MMIODeviceManager {
     ) -> Result<()> {
         let len = devices::tpm::MMIO_LEN;
         let base = self.mmio_base.next_multiple_of(devices::tpm::LOCALITY_SIZE);
+        let tpm = Arc::new(Mutex::new(tpm));
         self.bus
-            .insert(Arc::new(Mutex::new(tpm)), base, len)
+            .insert(tpm.clone(), base, len)
             .map_err(Error::BusError)?;
+        self.tpm = Some(tpm);
         self.id_to_dev_info.insert(
             (DeviceType::Tpm, "tpm".to_string()),
             MMIODeviceInfo {

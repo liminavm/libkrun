@@ -711,6 +711,13 @@ impl Vmm {
                 u.slots.iter().map(|s| s.eps.len()).sum::<usize>(),
             );
         }
+        // limina: the TPM, volatile state and all. The guest resumes without a firmware run or
+        // a TPM2_Startup, so it expects the TPM it suspended with: PCRs, loaded keys, sessions.
+        let tpm = self
+            .mmio_device_manager
+            .tpm
+            .as_ref()
+            .map(|t| t.lock().unwrap().save_state());
         let head = snapshot::SnapshotHead {
             vcpus,
             gic,
@@ -721,6 +728,7 @@ impl Vmm {
             usb,
             slots: Some(self.mmio_device_manager.device_slots()),
             fingerprints: Some(self.mmio_device_manager.device_fingerprints()),
+            tpm,
         };
         // v6: stream chunked RAM frames straight out of guest memory (zero-chunk holes + lz4),
         // written by a worker pool — no whole-RAM intermediate copy, no serial multi-GB CRC.
@@ -792,6 +800,19 @@ impl Vmm {
             None => warn!(
                 "restore: the snapshot carries xHCI state but this worker has no USB controller"
             ),
+        }
+    }
+
+    /// limina restore: load the TPM the snapshot carries into the fresh device before the guest
+    /// resumes. A snapshot with a TPM restored into a VM without one is refused: the guest's
+    /// driver is bound to that device, and what it sealed to that TPM.
+    #[cfg(target_os = "macos")]
+    pub fn restore_tpm_state(&self, saved: &[u8]) -> std::io::Result<()> {
+        match &self.mmio_device_manager.tpm {
+            Some(t) => t.lock().unwrap().restore_state(saved),
+            None => Err(std::io::Error::other(
+                "the snapshot carries a TPM, and this VM has none",
+            )),
         }
     }
 
