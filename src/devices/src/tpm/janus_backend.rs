@@ -158,6 +158,22 @@ impl TpmBackend for JanusBackend {
     fn init(&mut self) {
         self.tpm.init();
     }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.tpm.snapshot().to_vec()
+    }
+
+    /// The TPM the snapshot holds replaces this one, and its NV replaces the state file's: a
+    /// restored machine rolls its TPM back to the snapshot as it does its RAM, so what the
+    /// guest believes is sealed, persistent or counted is what the TPM holds.
+    fn resume(&mut self, snapshot: &[u8]) -> io::Result<()> {
+        let tpm = janus::Janus::resume(Host::new(), snapshot).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("TPM snapshot: {e}"))
+        })?;
+        self.tpm = tpm;
+        self.persist();
+        Ok(())
+    }
 }
 
 /// The big-endian `u32` at `at`, or 0 where there is none: a command or response code, for
@@ -220,6 +236,39 @@ mod tests {
         second.init();
         assert_eq!(rc(&second.command(Locality::new(0).unwrap(), &STARTUP)), 0);
         assert!(!path.with_file_name("tpm.state.tmp").exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A snapshot resumes the TPM running, with no Startup, and rolls the state file back to
+    /// the NV it held then; one that is not a snapshot is refused and changes nothing.
+    #[test]
+    fn a_snapshot_resumes_the_running_tpm_and_its_state_file() {
+        let path = scratch("snapshot");
+        let mut tpm = JanusBackend::with_state_file(&path).unwrap();
+        tpm.init();
+        assert_eq!(rc(&tpm.command(Locality::new(0).unwrap(), &STARTUP)), 0);
+        let snapshot = tpm.snapshot();
+        let then = fs::read(&path).unwrap();
+        assert_eq!(rc(&tpm.command(Locality::new(0).unwrap(), &SHUTDOWN)), 0);
+        drop(tpm);
+
+        let mut resumed = JanusBackend::with_state_file(&path).unwrap();
+        assert_ne!(
+            fs::read(&path).unwrap(),
+            then,
+            "the Shutdown was not written"
+        );
+        let refused = resumed.resume(&fs::read(&path).unwrap()).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        resumed.resume(&snapshot).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            then,
+            "the state file was not rolled back"
+        );
+        // Running: a second Startup is TPM_RC_INITIALIZE.
+        let again = resumed.command(Locality::new(0).unwrap(), &STARTUP);
+        assert_eq!(rc(&again), 0x100);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
