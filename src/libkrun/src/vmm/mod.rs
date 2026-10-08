@@ -804,8 +804,7 @@ impl Vmm {
     }
 
     /// limina restore: load the TPM the snapshot carries into the fresh device before the guest
-    /// resumes. A snapshot with a TPM restored into a VM without one is refused: the guest's
-    /// driver is bound to that device, and what it sealed to that TPM.
+    /// resumes. The builder refuses a VM without one before it gets here.
     #[cfg(target_os = "macos")]
     pub fn restore_tpm_state(&self, saved: &[u8]) -> std::io::Result<()> {
         match &self.mmio_device_manager.tpm {
