@@ -65,7 +65,11 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // A build that changes any of them for a device at the same slot leaves the guest's driver bound to
 // a device that is no longer the one it negotiated with; restore refuses it beside the slot check.
 // A v9 file carries no fingerprint and is restored with only the slot check, and a warning.
-const VERSION: u32 = 10;
+// v11 appends the TPM: the device's registers and its backend's whole state, opaque here
+// (`devices::tpm::TpmTis::save_state`). The guest resumes with no firmware run and no
+// TPM2_Startup, so without it a restored TPM is a fresh one that has not started, and every
+// command the guest sends it fails. A v10 file carries no TPM.
+const VERSION: u32 = 11;
 const OLDEST_READABLE_VERSION: u32 = 8;
 
 /// v6 RAM chunk size: 4 MiB — large enough to amortize per-frame overhead, small enough to spread
@@ -275,6 +279,9 @@ pub struct SnapshotHead {
     pub slots: Option<Vec<DeviceSlot>>,
     /// v10: what every virtio-mmio device offered the guest. `None` for a file older than v10.
     pub fingerprints: Option<Vec<DeviceFingerprint>>,
+    /// v11: the TPM, as `devices::tpm::TpmTis::save_state` saved it. `None` when the VM has no
+    /// TPM, and for a file older than v11.
+    pub tpm: Option<Vec<u8>>,
 }
 
 /// CRC-32 (IEEE 802.3, reflected): the head's and every RAM frame's integrity check.
@@ -446,6 +453,15 @@ fn encode_head_as(head: &SnapshotHead, version: u32) -> Vec<u8> {
                 put_bytes(&mut v, name.as_bytes());
                 put_u64(&mut v, *value);
             }
+        }
+    }
+    if version >= 11 {
+        match &head.tpm {
+            Some(t) => {
+                v.push(1);
+                put_bytes(&mut v, t);
+            }
+            None => v.push(0),
         }
     }
     v
@@ -1519,6 +1535,15 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
     } else {
         None
     };
+    let tpm = if version >= 11 {
+        match r.u8()? {
+            0 => None,
+            1 => Some(r.bytes()?),
+            _ => return Err(corrupt("bad tpm presence byte")),
+        }
+    } else {
+        None
+    };
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
     let head_end = r.pos;
     let stored = r.u32()?;
@@ -1539,6 +1564,7 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
             usb,
             slots,
             fingerprints,
+            tpm,
         },
         raw,
         ram_off,
@@ -1742,6 +1768,7 @@ mod tests {
             usb: Some(sample_usb()),
             slots: Some(windowed_slots()),
             fingerprints: Some(windowed_fingerprints()),
+            tpm: Some(b"TIS1 and a backend".to_vec()),
         }
     }
 
@@ -1825,6 +1852,18 @@ mod tests {
         let fewer = vec![windowed_fingerprints()[1].clone()];
         assert_eq!(fingerprint_mismatch(&windowed_fingerprints(), &fewer), None);
         assert_eq!(fingerprint_mismatch(&fewer, &windowed_fingerprints()), None);
+    }
+
+    /// A v10 file has fingerprints and no TPM, and reads as exactly that.
+    #[test]
+    fn a_v10_head_reads_without_a_tpm() {
+        let mut v = encode_head_as(&sample_head(), 10);
+        let crc = crc32(&v);
+        put_u32(&mut v, crc);
+        put_u32(&mut v, 0); // no RAM regions
+        let file = parse(StreamedFile::landed(v)).expect("a v10 head reads");
+        assert_eq!(file.head.fingerprints, Some(windowed_fingerprints()));
+        assert_eq!(file.head.tpm, None);
     }
 
     /// A v9 file has slots and no fingerprints, and reads as exactly that.
@@ -1926,6 +1965,7 @@ mod tests {
         assert_eq!(head.usb, want.usb);
         assert_eq!(head.slots, want.slots);
         assert_eq!(head.fingerprints, want.fingerprints);
+        assert_eq!(head.tpm, want.tpm);
 
         // Restore into memory pre-filled with garbage: data frames AND holes must both overwrite.
         let mem2 = test_mem();
@@ -1955,6 +1995,7 @@ mod tests {
             usb: None,
             slots: Some(vec![]),
             fingerprints: Some(vec![]),
+            tpm: None,
         };
         let mem = test_mem();
         let path =
@@ -2036,6 +2077,7 @@ mod tests {
             usb: None,
             slots: Some(vec![]),
             fingerprints: Some(vec![]),
+            tpm: None,
         };
         let mut v = encode_head(&head);
         let crc = crc32(&v);
@@ -2072,6 +2114,7 @@ mod tests {
             usb: None,
             slots: Some(vec![]),
             fingerprints: Some(vec![]),
+            tpm: None,
         };
         let mut v = encode_head(&head);
         let crc = crc32(&v);

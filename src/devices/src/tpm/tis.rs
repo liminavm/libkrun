@@ -44,7 +44,6 @@ impl Locality {
         self.0
     }
 
-    #[cfg(any(test, kani, fuzzing))]
     pub const fn new(n: u8) -> Option<Locality> {
         if n < LOCALITIES {
             Some(Locality(n))
@@ -388,6 +387,144 @@ impl<B: TpmBackend> TpmTis<B> {
     }
 }
 
+/// The first bytes of a saved device, and its format.
+const SAVED_MAGIC: [u8; 4] = *b"TIS1";
+
+impl<B: TpmBackend> TpmTis<B> {
+    /// The device as it stands between two register accesses, for a snapshot of the machine: the
+    /// localities, the transaction in flight, and the backend's own snapshot. A guest can be
+    /// stopped anywhere in a command or a response, so all of it is saved.
+    pub fn save_state(&self) -> Vec<u8> {
+        let mut v = SAVED_MAGIC.to_vec();
+        v.push(self.active.map_or(0xFF, |l| l.0));
+        for f in &self.flags {
+            v.push(u8::from(f.request_use));
+            v.push(u8::from(f.been_seized));
+            v.extend_from_slice(&f.int_enable.to_le_bytes());
+        }
+        let put = |v: &mut Vec<u8>, b: &[u8]| {
+            v.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            v.extend_from_slice(b);
+        };
+        match &self.phase {
+            Phase::Idle => v.push(0),
+            Phase::Ready => v.push(1),
+            Phase::Reception { command, expect } => {
+                v.push(2);
+                put(&mut v, command);
+                v.push(u8::from(*expect));
+            }
+            Phase::Completion { response, read } => {
+                v.push(3);
+                put(&mut v, response);
+                v.extend_from_slice(&(*read as u32).to_le_bytes());
+            }
+        }
+        put(&mut v, &self.backend.snapshot());
+        v
+    }
+
+    /// Becomes the device [`TpmTis::save_state`] saved, backend included. Saved bytes this
+    /// build cannot have written are refused, and the device is left as it was.
+    pub fn restore_state(&mut self, saved: &[u8]) -> std::io::Result<()> {
+        let mut r = Saved(
+            saved
+                .strip_prefix(&SAVED_MAGIC[..])
+                .ok_or_else(|| bad("not a saved TPM device"))?,
+        );
+        let active = match r.u8()? {
+            0xFF => None,
+            l => Some(Locality::new(l).ok_or_else(|| bad("no such locality"))?),
+        };
+        let mut flags = [LocalityFlags::default(); LOCALITIES as usize];
+        for f in &mut flags {
+            f.request_use = r.flag()?;
+            f.been_seized = r.flag()?;
+            f.int_enable = r.u32()?;
+        }
+        let phase = match r.u8()? {
+            0 => Phase::Idle,
+            1 => Phase::Ready,
+            2 => Phase::Reception {
+                command: r.buffer()?.to_vec(),
+                expect: r.flag()?,
+            },
+            3 => {
+                let response = r.buffer()?.to_vec();
+                let read = r.u32()? as usize;
+                if read > response.len() {
+                    return Err(bad("more of the response read than it holds"));
+                }
+                Phase::Completion { response, read }
+            }
+            _ => return Err(bad("no such transaction phase")),
+        };
+        if active.is_none() && phase != Phase::Idle {
+            return Err(bad("a transaction with no active locality"));
+        }
+        let n = r.u32()? as usize;
+        let backend = r.take(n)?;
+        if !r.0.is_empty() {
+            return Err(bad("trailing bytes"));
+        }
+        self.backend.resume(backend)?;
+        self.active = active;
+        self.flags = flags;
+        self.phase = phase;
+        Ok(())
+    }
+}
+
+fn bad(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("saved TPM device: {what}"),
+    )
+}
+
+/// What is left of a saved device to read.
+struct Saved<'a>(&'a [u8]);
+
+impl<'a> Saved<'a> {
+    fn take(&mut self, n: usize) -> std::io::Result<&'a [u8]> {
+        if self.0.len() < n {
+            return Err(bad("truncated"));
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn u8(&mut self) -> std::io::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> std::io::Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn flag(&mut self) -> std::io::Result<bool> {
+        flag(self.u8()?).ok_or_else(|| bad("a flag is not 0 or 1"))
+    }
+
+    /// A FIFO's contents: no more than it holds.
+    fn buffer(&mut self) -> std::io::Result<&'a [u8]> {
+        let n = self.u32()? as usize;
+        if n > BUFFER_SIZE {
+            return Err(bad("a buffer larger than the FIFO"));
+        }
+        self.take(n)
+    }
+}
+
+fn flag(b: u8) -> Option<bool> {
+    match b {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
 impl<B: TpmBackend + 'static> BusDevice for TpmTis<B> {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
         data.fill(0xFF);
@@ -670,6 +807,69 @@ mod tests {
         wr(&mut d, 0, 0x18, u64::from(sts::TPM_GO), 4);
         assert_eq!(d.backend().delivered[0].1.len(), BUFFER_SIZE);
     }
+
+    /// A guest stopped halfway through writing a command, and again halfway through reading
+    /// the response, carries on in a device restored from the saved one as if nothing had
+    /// happened; the backend gets its own snapshot back.
+    #[test]
+    fn a_device_saved_mid_transaction_restores_where_it_stood() {
+        let mut d = TpmTis::new(Echo::default());
+        transact(&mut d, 0, &CMD);
+        wr(&mut d, 3, 0x00, u64::from(access::REQUEST_USE), 1);
+        wr(&mut d, 3, 0x18, u64::from(sts::COMMAND_READY), 4);
+        for b in &CMD[..7] {
+            wr(&mut d, 3, 0x24, u64::from(*b), 1);
+        }
+        let mut e = TpmTis::new(Echo::default());
+        e.restore_state(&d.save_state()).unwrap();
+        assert_eq!(e.backend().resumed, Some(1u32.to_le_bytes().to_vec()));
+        for b in &CMD[7..] {
+            wr(&mut e, 3, 0x24, u64::from(*b), 1);
+        }
+        wr(&mut e, 3, 0x18, u64::from(sts::TPM_GO), 4);
+        assert_eq!(e.backend().delivered, vec![(3, CMD.to_vec())]);
+        let want = response(Locality(3), &CMD);
+        let mut got: Vec<u8> = (0..5).map(|_| rd(&mut e, 3, 0x24, 1) as u8).collect();
+        let mut f = TpmTis::new(Echo::default());
+        f.restore_state(&e.save_state()).unwrap();
+        while sts(&mut f, 3) & sts::DATA_AVAIL != 0 {
+            got.push(rd(&mut f, 3, 0x24, 1) as u8);
+        }
+        assert_eq!(got, want);
+    }
+
+    /// Saved bytes that this build could not have written are refused, whatever is wrong with
+    /// them, and the device is left exactly as it was.
+    #[test]
+    fn a_saved_device_that_is_not_one_is_refused_and_changes_nothing() {
+        let mut d = TpmTis::new(Echo::default());
+        wr(&mut d, 1, 0x00, u64::from(access::REQUEST_USE), 1);
+        wr(&mut d, 1, 0x18, u64::from(sts::COMMAND_READY), 4);
+        let good = d.save_state();
+        let mut source = TpmTis::new(Echo::default());
+        transact(&mut source, 2, &CMD);
+        wr(&mut source, 2, 0x00, u64::from(access::REQUEST_USE), 1);
+        wr(&mut source, 2, 0x18, u64::from(sts::COMMAND_READY), 4);
+        let other = source.save_state();
+        let mut bad: Vec<Vec<u8>> = (0..other.len()).map(|n| other[..n].to_vec()).collect();
+        bad.push([&other[..], &[0]].concat());
+        let at_active = SAVED_MAGIC.len();
+        let at_phase = at_active + 1 + 6 * LOCALITIES as usize;
+        for (at, v) in [(0, b'X'), (at_active, 5), (at_active + 1, 2), (at_phase, 4)] {
+            let mut b = other.clone();
+            b[at] = v;
+            bad.push(b);
+        }
+        // A phase with no locality to own it.
+        let mut b = other.clone();
+        b[at_active] = 0xFF;
+        bad.push(b);
+        for b in bad {
+            assert!(d.restore_state(&b).is_err(), "{b:02x?}");
+            assert_eq!(d.save_state(), good);
+            assert_eq!(d.backend().resumed, None);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -743,6 +943,28 @@ mod every_sequence {
         assert!(actives <= 1, "{actives} active localities after {trace:?}");
     }
 
+    /// A device restored from `d` reads like `d` through every register a driver polls, and
+    /// runs a whole command as `d` does. Both are driven, so `d` has run that command too.
+    fn restores_identically(d: &mut TpmTis<Echo>, trace: &[Op]) {
+        let mut e = TpmTis::new(Echo::default());
+        e.restore_state(&d.save_state()).unwrap();
+        let probe = |d: &mut TpmTis<Echo>| {
+            let mut seen = Vec::new();
+            for l in 0..LOCALITIES {
+                for (reg, width) in [(0x00, 1), (0x08, 4), (0x18, 4)] {
+                    let mut b = [0u8; 4];
+                    d.read(0, u64::from(l) * LOCALITY_SIZE + reg, &mut b[..width]);
+                    seen.push(b);
+                }
+            }
+            for l in 0..LOCALITIES {
+                d.write(0, u64::from(l) * LOCALITY_SIZE, &[access::ACTIVE_LOCALITY]);
+            }
+            (seen, transact(d, 4, &CMD))
+        };
+        assert_eq!(probe(d), probe(&mut e), "after {trace:?}");
+    }
+
     #[test]
     fn every_sequence_keeps_the_invariants_and_recovers() {
         const DEPTH: u32 = 4;
@@ -760,8 +982,9 @@ mod every_sequence {
                 apply(&mut d, op);
                 check(&mut d, &trace);
             }
+            sent_from_reception |= !d.backend().delivered.is_empty();
+            restores_identically(&mut d, &trace);
             let before = d.backend().delivered.len();
-            sent_from_reception |= before > 0;
             // Whoever holds the TPM lets go; then locality 2 runs a whole command.
             for l in 0..LOCALITIES {
                 d.write(0, u64::from(l) * LOCALITY_SIZE, &[access::ACTIVE_LOCALITY]);
