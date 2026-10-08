@@ -149,6 +149,10 @@ pub struct VmResources {
     /// `None` keeps it in memory for the life of the VM.
     #[cfg(feature = "tpm")]
     pub tpm_state: Option<std::path::PathBuf>,
+    /// limina: the file a firmware's UEFI variables live in across runs, mapped into the guest
+    /// at `EFI_VARS_START` (aarch64, firmware boot only). Created when absent. `None` leaves the
+    /// firmware's variables in RAM for one run.
+    pub efi_vars: Option<std::path::PathBuf>,
     /// limina: how many of the vCPUs are "little" — advertised to the guest with a lower
     /// `capacity-dmips-mhz` and their own perf domain, and backed on the host by a vCPU thread
     /// at a macOS QoS class that lands it on an efficiency core. The last `little_vcpus` vCPUs
@@ -314,6 +318,7 @@ mod tests {
             tpm: false,
             #[cfg(feature = "tpm")]
             tpm_state: None,
+            efi_vars: None,
             little_vcpus: 0,
             #[cfg(feature = "usb")]
             usb_devices: Vec::new(),

@@ -12,10 +12,14 @@ use std::{io, result};
 use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::gic::GICDevice;
-use arch::aarch64::layout::{GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT};
+use arch::aarch64::layout::{
+    EFI_VARS_SIZE, EFI_VARS_START, GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT,
+};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
+};
 
 // This is a value for uniquely identifying the FDT node declaring the interrupt controller.
 const GIC_PHANDLE: u32 = 1;
@@ -114,6 +118,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
     create_cpu_nodes(&mut fdt, &vcpu_mpidr, vcpu_capacities)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
+    create_efi_vars_node(&mut fdt, guest_mem)?;
     create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
@@ -249,6 +254,26 @@ fn create_memory_node(
     fdt.property_string("device_type", "memory")?;
     fdt.property("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;
+    Ok(())
+}
+
+/// limina: when guest memory holds a file-backed UEFI variable store, tell the firmware where.
+/// It is not RAM for the OS to use: the firmware reserves it as runtime memory, and an OS booted
+/// through it takes its memory map from UEFI, not from this tree.
+fn create_efi_vars_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Result<()> {
+    if guest_mem
+        .find_region(GuestAddress(EFI_VARS_START))
+        .is_none()
+    {
+        return Ok(());
+    }
+    let node = fdt.begin_node(&format!("efi-vars@{EFI_VARS_START:x}"))?;
+    fdt.property_string("compatible", "libkrun,efi-variable-store")?;
+    fdt.property(
+        "reg",
+        &generate_prop64(&[EFI_VARS_START, EFI_VARS_SIZE as u64]),
+    )?;
+    fdt.end_node(node)?;
     Ok(())
 }
 
