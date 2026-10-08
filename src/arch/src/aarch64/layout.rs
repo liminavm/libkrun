@@ -96,3 +96,12 @@ pub const RESET_VECTOR: u64 = 0x0;
 
 /// The address to load the firmware, if present.
 pub const FIRMWARE_START: u64 = 0;
+
+/// limina: where a firmware's UEFI variable store is mapped from a file, when the VMM is given
+/// one: above any firmware image, below the GIC and the MMIO devices. The firmware finds it
+/// through the `libkrun,efi-variable-store` device-tree node.
+pub const EFI_VARS_START: u64 = 0x0400_0000;
+
+/// limina: the variable store's size, the firmware's `PcdVariableStoreSize`. A multiple of the
+/// 16 KiB host page, which every guest mapping is.
+pub const EFI_VARS_SIZE: usize = 0x4_0000;
