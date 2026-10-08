@@ -593,7 +593,19 @@ pub fn write_streaming(
 ) -> io::Result<SaveStats> {
     use std::sync::atomic::AtomicU64;
     use std::time::{Duration, Instant};
-    let file = fs::File::create(path)?;
+    // Owner-only: the file holds guest RAM, and with a TPM the TPM's seeds. Set as well as
+    // created so: a file left by an interrupted save keeps the mode it was made with.
+    let file = {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file
+    };
     let mut out = io::BufWriter::with_capacity(4 << 20, file);
     let t = Instant::now();
     let mut hv = encode_head(head);
@@ -1929,6 +1941,12 @@ mod tests {
         assert!(stats.lz4_frames >= 1, "the pattern chunk must compress");
         // The hole + compression must shrink the file well below the raw RAM size.
         assert!(stats.written_bytes < stats.ram_bytes);
+        // Guest RAM and the TPM's seeds: readable by the owner only, whatever the umask.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the snapshot is not owner-only");
+        }
 
         let got = read(&path).expect("read");
         let head = &got.head;
