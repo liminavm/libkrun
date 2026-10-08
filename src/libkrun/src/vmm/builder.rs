@@ -1641,6 +1641,14 @@ pub fn build_microvm(
         if let Some(usb) = &snap.head.usb {
             vmm.restore_xhci_state(usb);
         }
+        // limina: the TPM as the guest left it. Fail closed: a guest resumed onto no TPM, or onto
+        // a fresh one, loses every key and session it holds there.
+        if let Some(tpm) = &snap.head.tpm {
+            vmm.restore_tpm_state(tpm).map_err(|e| {
+                error!("restore: {e}");
+                StartMicrovmError::Internal(crate::vmm::Error::Snapshot)
+            })?;
+        }
         // M9.3: validate + log the captured device transports. We do NOT re-drive them: RED-first +
         // R4 (2026-07-18) proved the guest re-negotiates every virtio device ITSELF on s2idle thaw
         // (`virtio_device_restore` resets + re-drives DRIVER_OK; the fresh worker activates from the
