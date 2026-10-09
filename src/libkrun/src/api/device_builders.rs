@@ -1999,6 +1999,7 @@ pub struct GpuDevice {
     software_2d: bool,
     backend: DisplayBackend,
     shm_size: usize,
+    pipeline_cache_key: Option<devices::virtio::PipelineCacheKey>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
@@ -2012,6 +2013,7 @@ impl GpuDevice {
             software_2d: false,
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
+            pipeline_cache_key: None,
         }
     }
 
@@ -2025,6 +2027,16 @@ impl GpuDevice {
     /// floor (tier-1) for GL-less hosts. When false, the device inits the renderer normally.
     pub fn software_2d(mut self, software_2d: bool) -> Self {
         self.software_2d = software_2d;
+        self
+    }
+
+    /// limina: the 32-byte key the renderer signs the pipeline-cache data it hands the guest
+    /// with, and checks a guest's initial data against. Pass the same key on every launch of a
+    /// VM and its saved caches stay warm across boots; without one the renderer makes a key per
+    /// process, so a cache saved in an earlier boot is ignored. Keep it host-only.
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    pub fn pipeline_cache_key(mut self, key: [u8; 32]) -> Self {
+        self.pipeline_cache_key = Some(devices::virtio::PipelineCacheKey::new(key));
         self
     }
 }
@@ -2044,7 +2056,7 @@ impl<'a> AttachDevice<'a> for GpuDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let displays: Box<[DisplayInfo]> = self.backend.displays.into_boxed_slice();
 
-        let gpu = devices::virtio::Gpu::new(
+        let mut gpu = devices::virtio::Gpu::new(
             self.virgl_flags,
             self.software_2d,
             displays,
@@ -2053,6 +2065,9 @@ impl<'a> AttachDevice<'a> for GpuDevice {
             ctx.map_sender().expect("macOS requires map_sender for GPU"),
         )
         .map_err(|e| VmmError::Internal(format!("gpu: {e:?}")))?;
+        if let Some(key) = self.pipeline_cache_key {
+            gpu.set_pipeline_cache_key(key);
+        }
 
         let inner = Arc::new(Mutex::new(gpu));
 
