@@ -165,6 +165,9 @@ pub struct Gpu {
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
+    /// limina: signs the pipeline-cache data the renderer hands the guest; see
+    /// [`Self::set_pipeline_cache_key`].
+    pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     blob_alignment: u32,
@@ -227,6 +230,7 @@ impl Gpu {
             #[cfg(target_os = "macos")]
             map_sender,
             export_table: None,
+            pipeline_cache_key: None,
             displays,
             display_backend,
             // Blobs are mapped into the guest in host pages, which can be
@@ -266,6 +270,13 @@ impl Gpu {
 
     pub fn set_export_table(&mut self, export_table: ExportTable) {
         self.export_table = Some(export_table);
+    }
+
+    /// limina: the key the renderer signs the guest's pipeline-cache data with. The same key on
+    /// every launch keeps a VM's saved caches warm across boots; without one the renderer makes
+    /// a key per process. Read when the worker starts, so set it before the first activation.
+    pub fn set_pipeline_cache_key(&mut self, key: rutabaga_gfx::PipelineCacheKey) {
+        self.pipeline_cache_key = Some(key);
     }
 
     /*
@@ -346,6 +357,7 @@ impl Gpu {
                 #[cfg(target_os = "macos")]
                 self.map_sender.clone(),
                 self.export_table.take(),
+                self.pipeline_cache_key.take(),
                 self.displays.clone(),
                 self.display_backend,
                 self.events_read.clone(),

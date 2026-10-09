@@ -38,3 +38,6 @@ pub use crate::rutabaga_os::SafeDescriptor as RutabagaDescriptor;
 pub use crate::rutabaga_utils::*;
 #[cfg(all(feature = "virgl_renderer", target_os = "macos"))]
 pub use crate::virgl_renderer::republish_iosurface;
+/// The key virglrs signs the pipeline-cache data it hands a guest with; see
+/// [`RutabagaBuilder::set_pipeline_cache_key`].
+pub use virglrenderer::config::PipelineCacheKey;

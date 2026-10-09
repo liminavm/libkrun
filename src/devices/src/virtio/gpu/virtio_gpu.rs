@@ -964,6 +964,7 @@ impl VirtioGpu {
     pub fn create_rutabaga(
         virgl_flags: u32,
         export_table: Option<ExportTable>,
+        pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
         fence: RutabagaFenceHandler,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
@@ -1018,6 +1019,11 @@ impl VirtioGpu {
         } else {
             builder
         };
+        let builder = if let Some(key) = pipeline_cache_key {
+            builder.set_pipeline_cache_key(key)
+        } else {
+            builder
+        };
 
         match builder.clone().build(fence.clone(), None) {
             Ok(r) => Some(r),
@@ -1035,6 +1041,7 @@ impl VirtioGpu {
         software_2d: bool,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
+        pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend,
         dump_gate: Arc<DumpGate>,
@@ -1077,7 +1084,12 @@ impl VirtioGpu {
         let rutabaga = if software_2d {
             None
         } else {
-            match Self::create_rutabaga(virgl_flags, export_table.clone(), fence_handler.clone()) {
+            match Self::create_rutabaga(
+                virgl_flags,
+                export_table.clone(),
+                pipeline_cache_key,
+                fence_handler.clone(),
+            ) {
                 Some(rutabaga) => Some(rutabaga),
                 None => {
                     warn!("virtio-gpu: renderer init failed; degrading to software-2D (no 3D)");

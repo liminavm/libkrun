@@ -9,6 +9,7 @@ use super::descriptor_utils::Error as DescriptorError;
 
 pub use self::defs::uapi::VIRTIO_ID_GPU as TYPE_GPU;
 pub use self::device::{DisplayResizeHandle, DisplayUpdate, Gpu};
+pub use rutabaga_gfx::PipelineCacheKey;
 
 mod defs {
     pub const GPU_DEV_ID: &str = "virtio_gpu";
