@@ -32,7 +32,7 @@ use log::error;
 use log::warn;
 
 use virglrenderer::abi::{GuestIov, VmmPtr};
-use virglrenderer::config::{CapsetId, Config};
+use virglrenderer::config::{CapsetId, Config, PipelineCacheKey};
 use virglrenderer::fence::FenceSink;
 use virglrenderer::ids::{
     BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingId, RingIdx,
@@ -357,6 +357,7 @@ impl VirglRenderer {
         virglrenderer_flags: VirglRendererFlags,
         fence_handler: RutabagaFenceHandler,
         _render_server_fd: Option<SafeDescriptor>,
+        pipeline_cache_key: Option<PipelineCacheKey>,
     ) -> RutabagaResult<Box<dyn RutabagaComponent>> {
         if cfg!(debug_assertions) {
             let ret = unsafe { libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) };
@@ -385,6 +386,7 @@ impl VirglRenderer {
             vrend: flags & virglrenderer::abi::NO_VIRGL == 0,
             guest_vram: flags & virglrenderer::abi::USE_GUEST_VRAM != 0,
             video: flags & virglrenderer::abi::USE_VIDEO != 0,
+            pipeline_cache_key,
             // The renderer's own defaults for everything the flags do not carry.
             ..Config::default()
         };

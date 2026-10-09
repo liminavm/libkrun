@@ -85,6 +85,7 @@ pub struct Worker {
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
+    pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     /// limina runtime resize: config-space `events_read`, shared with the device. The worker
@@ -123,6 +124,7 @@ impl Worker {
         active: Arc<Mutex<Option<GpuActivation>>>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
+        pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
         events_read: Arc<AtomicU32>,
@@ -142,6 +144,7 @@ impl Worker {
             #[cfg(target_os = "macos")]
             map_sender,
             export_table,
+            pipeline_cache_key,
             displays,
             display_backend,
             events_read,
@@ -173,6 +176,7 @@ impl Worker {
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
+            self.pipeline_cache_key.take(),
             self.displays.clone(),
             self.display_backend,
             self.dump_gate.clone(),
