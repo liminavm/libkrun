@@ -1442,6 +1442,7 @@ pub struct RutabagaBuilder {
     channels: Option<Vec<RutabagaChannel>>,
     debug_handler: Option<RutabagaDebugHandler>,
     export_table: Option<ExportTable>,
+    pipeline_cache_key: Option<crate::PipelineCacheKey>,
 }
 
 impl RutabagaBuilder {
@@ -1462,6 +1463,7 @@ impl RutabagaBuilder {
             channels: None,
             debug_handler: None,
             export_table: None,
+            pipeline_cache_key: None,
         }
     }
 
@@ -1566,6 +1568,15 @@ impl RutabagaBuilder {
         self
     }
 
+    /// limina: the key virglrs signs the pipeline-cache data it hands the guest with, and checks
+    /// a guest's initial data against. Pass the same key on every launch of a VM and its saved
+    /// caches stay warm across boots; without one virglrs makes a key per process, so a cache
+    /// from an earlier boot is ignored (created empty, which Vulkan allows).
+    pub fn set_pipeline_cache_key(mut self, key: crate::PipelineCacheKey) -> RutabagaBuilder {
+        self.pipeline_cache_key = Some(key);
+        self
+    }
+
     /// Builds Rutabaga and returns a handle to it.
     ///
     /// This should be only called once per every virtual machine instance.  Rutabaga tries to
@@ -1658,6 +1669,7 @@ impl RutabagaBuilder {
                     self.virglrenderer_flags,
                     fence_handler.clone(),
                     rutabaga_server_descriptor,
+                    self.pipeline_cache_key.take(),
                 )?;
                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
 
