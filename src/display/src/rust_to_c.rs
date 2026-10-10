@@ -116,6 +116,18 @@ pub trait DisplayBackendBasicFramebuffer {
     fn scanout_held(&mut self, _scanout_id: u32, _held: bool) -> Result<(), DisplayBackendError> {
         Err(DisplayBackendError::MethodNotSupported)
     }
+
+    /// (Optional, limina) The next present on `scanout_id` shows guest resource `resource_id`
+    /// (never 0): the resource whose flush produced it. Called immediately before
+    /// `present_frame`/`present_surface`; a present with no such call before it shows no guest
+    /// resource. Default: unsupported.
+    fn frame_resource(
+        &mut self,
+        _scanout_id: u32,
+        _resource_id: u32,
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -303,6 +315,14 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             from_rust_result(cast_instance::<I>(instance).scanout_held(scanout_id, held != 0))
         }
 
+        extern "C" fn frame_resource_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            resource_id: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).frame_resource(scanout_id, resource_id))
+        }
+
         DisplayBackend {
             create_userdata: userdata.map_or(null(), |t| ptr::from_ref(t) as *const c_void),
             create_userdata_lifetime: PhantomData,
@@ -322,6 +342,7 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     republish_surface: Some(republish_surface_fn::<I>),
                     guest_driver_ready: Some(guest_driver_ready_fn::<I>),
                     scanout_held: Some(scanout_held_fn::<I>),
+                    frame_resource: Some(frame_resource_fn::<I>),
                 },
             },
         }
