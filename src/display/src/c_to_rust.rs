@@ -209,6 +209,18 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
             }
         }
     }
+
+    fn frame_resource(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+    ) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.frame_resource(scanout_id, resource_id)
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
