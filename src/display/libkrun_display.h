@@ -304,6 +304,30 @@ typedef int32_t (*krun_display_guest_driver_ready_fn)(void *instance);
 typedef int32_t (*krun_display_scanout_held_fn)(void *instance, uint32_t scanout_id, uint32_t held);
 
 /**
+ * (limina extension, optional) The guest resource the next present on a scanout shows.
+ *
+ * Called immediately before present_frame or present_surface with the id of the guest resource
+ * whose flush produced the frame: the one the guest's driver knows the buffer by (virtio-gpu's
+ * resource id, a DRM client's res_handle). A consumer that records frames can then say which
+ * guest buffer reached the display, which the presented surface alone cannot: a surface may be a
+ * host copy, or the backend's own staging buffer.
+ *
+ * A present not preceded by this call shows no guest resource (for instance, saved pixels put
+ * back on a restore), so a backend should forget the id once the present it was named for has
+ * happened.
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id"  - The scanout the next present is on.
+ *  "resource_id" - The guest resource id; never 0.
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise. The device ignores
+ *  the result.
+ */
+typedef int32_t (*krun_display_frame_resource_fn)(void *instance, uint32_t scanout_id, uint32_t resource_id);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -333,6 +357,7 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_republish_surface_fn   republish_surface; // (optional) limina: hand a surface over again
     krun_display_guest_driver_ready_fn  guest_driver_ready; // (optional) limina: OS driver took over
     krun_display_scanout_held_fn        scanout_held; // (optional) limina: guest held off presented buffers
+    krun_display_frame_resource_fn      frame_resource; // (optional) limina: guest resource of the next present
 };
 
 union krun_display_vtable {

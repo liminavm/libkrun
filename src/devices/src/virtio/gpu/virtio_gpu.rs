@@ -2793,6 +2793,7 @@ impl VirtioGpu {
                                 s.sync_failures
                             );
                         }
+                        self.name_frame_resource(scanout_id, resource_id);
                         match self.display_backend.present_surface(
                             scanout_id,
                             iosurface_id,
@@ -2831,6 +2832,7 @@ impl VirtioGpu {
                     self.note_overtake(scanout_id, "parking refused");
                     self.scanout_copies.copying.insert(scanout_id, false);
                     self.note_scanout_held(scanout_id, false);
+                    self.name_frame_resource(scanout_id, resource_id);
                     match self.display_backend.present_surface(
                         scanout_id,
                         iosurface_id,
@@ -2962,6 +2964,7 @@ impl VirtioGpu {
                     let _ = std::fs::write(format!("/tmp/limina-staging-{n:03}.raw"), &buffer[..]);
                 }
             }
+            self.name_frame_resource(scanout_id, resource_id);
             self.display_backend
                 .present_frame(scanout_id, frame_id, Some(&rect))?
         }
@@ -3145,6 +3148,13 @@ impl VirtioGpu {
             return false;
         }
         true
+    }
+
+    /// Tell the display which guest resource the next present on `scanout_id` shows: the one
+    /// whose flush produced it. Called right before each present of a guest flush, and only
+    /// then, so a present of anything else (a restore's saved pixels) names none.
+    fn name_frame_resource(&mut self, scanout_id: u32, resource_id: u32) {
+        let _ = self.display_backend.frame_resource(scanout_id, resource_id);
     }
 
     /// Tell the display whether the guest is held off `scanout_id`'s presented buffers, when
@@ -3344,6 +3354,7 @@ impl VirtioGpu {
                     "[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})"
                 );
             }
+            self.name_frame_resource(scanout_id, resource_id);
             match self
                 .display_backend
                 .present_surface(scanout_id, iosurface_id, Some(&rect))
@@ -3399,6 +3410,7 @@ impl VirtioGpu {
             error!("deferred readback: read_iosurface failed for resource {resource_id}: {e}");
             return;
         }
+        self.name_frame_resource(scanout_id, resource_id);
         if let Err(e) = self
             .display_backend
             .present_frame(scanout_id, frame_id, Some(rect))
