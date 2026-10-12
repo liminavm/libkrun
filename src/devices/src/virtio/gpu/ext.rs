@@ -26,7 +26,7 @@
 //! a doorbell means is the embedder's, through [`GpuExtension`]. A guest that does not negotiate the
 //! feature sees a plain virtio-gpu.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
@@ -61,9 +61,11 @@ pub const VIRTIO_GPU_CMD_LIMINA_RING_ATTACH: u32 = 0x4c04;
 pub const VIRTIO_GPU_CMD_LIMINA_ARENA_IMPORT: u32 = 0x4c05;
 pub const VIRTIO_GPU_CMD_LIMINA_FENCE: u32 = 0x4c06;
 pub const VIRTIO_GPU_CMD_LIMINA_SURFACE_CREATE: u32 = 0x4c07;
+pub const VIRTIO_GPU_CMD_LIMINA_SURFACE_IMPORT: u32 = 0x4c08;
 
 pub const VIRTIO_GPU_RESP_OK_LIMINA_CTX: u32 = 0x1180;
 pub const VIRTIO_GPU_RESP_OK_LIMINA_ARENA: u32 = 0x1181;
+pub const VIRTIO_GPU_RESP_OK_LIMINA_SURFACE: u32 = 0x1182;
 
 /// `CTX_CREATE`: the context is `hdr.ctx_id`, in the extension's own namespace.
 #[derive(Copy, Clone, Debug, Default)]
@@ -140,6 +142,29 @@ pub struct virtio_gpu_limina_surface_create {
 }
 // SAFETY: plain integers, no padding.
 unsafe impl ByteValued for virtio_gpu_limina_surface_create {}
+
+/// `SURFACE_IMPORT`: `hdr.ctx_id` is given the surface resource `resource_id` is presented from,
+/// whichever renderer made it. Answered with its shape.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct virtio_gpu_limina_surface_import {
+    pub resource_id: u32,
+    pub padding: u32,
+}
+// SAFETY: plain integers, no padding.
+unsafe impl ByteValued for virtio_gpu_limina_surface_import {}
+
+/// What a successful `SURFACE_IMPORT` answers, after the header.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct virtio_gpu_limina_resp_surface {
+    pub width: u32,
+    pub height: u32,
+    pub drm_fourcc: u32,
+    pub stride: u32,
+}
+// SAFETY: plain integers, no padding.
+unsafe impl ByteValued for virtio_gpu_limina_resp_surface {}
 
 /// What a successful `CTX_CREATE` answers, after the header.
 #[derive(Copy, Clone, Debug, Default)]
@@ -291,8 +316,9 @@ pub struct ExtState {
     /// Blob resources that are exported arenas, with where the blob is mapped in the
     /// host-visible region.
     exports: HashMap<u32, Export>,
-    /// Resources that are surfaces given to a context, with that context.
-    surfaces: HashMap<u32, u32>,
+    /// Surfaces given to contexts, as (context, resource): one resource is held by the context
+    /// that made it and by every one that imported it.
+    surfaces: HashSet<(u32, u32)>,
 }
 
 impl ExtState {
@@ -307,7 +333,7 @@ impl ExtState {
             contexts: HashMap::new(),
             used: Vec::new(),
             exports: HashMap::new(),
-            surfaces: HashMap::new(),
+            surfaces: HashSet::new(),
         }
     }
 
@@ -348,7 +374,7 @@ impl ExtState {
         }
         self.cfg.ext.destroy_context(ctx);
         // The embedder's context took its surfaces with it; the resources live on.
-        self.surfaces.retain(|_, c| *c != ctx);
+        self.surfaces.retain(|&(c, _)| c != ctx);
         for f in c.fences {
             f.fire();
         }
@@ -441,12 +467,12 @@ impl ExtState {
         }
     }
 
-    /// Resource `resource`, a surface the device minted, is given to `ctx` through `port`.
+    /// Resource `resource`, a surface, is given to `ctx` through `port`.
     pub fn bind_surface(&mut self, ctx: u32, resource: u32, port: u32) -> Result<(), ExtError> {
         if !self.contexts.contains_key(&ctx) {
             return Err(ExtError::InvalidContext);
         }
-        if self.surfaces.contains_key(&resource) {
+        if self.surfaces.contains(&(ctx, resource)) {
             return Err(ExtError::InvalidParameter);
         }
         self.cfg
@@ -456,14 +482,31 @@ impl ExtState {
                 warn!("limina ext: ctx {ctx} surface {resource}: {e}");
                 ExtError::Unspec
             })?;
-        self.surfaces.insert(resource, ctx);
+        self.surfaces.insert((ctx, resource));
         Ok(())
     }
 
-    /// The resource is gone; a surface given to a context is taken back from it.
-    pub fn release_surface(&mut self, resource: u32) {
-        if let Some(ctx) = self.surfaces.remove(&resource) {
+    pub fn holds_surface(&self, ctx: u32, resource: u32) -> bool {
+        self.surfaces.contains(&(ctx, resource))
+    }
+
+    /// `ctx` let go of the resource; the others holding it keep it.
+    pub fn detach_surface(&mut self, ctx: u32, resource: u32) {
+        if self.surfaces.remove(&(ctx, resource)) {
             self.cfg.ext.release_surface(ctx, resource);
+        }
+    }
+
+    /// The resource is gone; every context holding it gives it back.
+    pub fn release_surface(&mut self, resource: u32) {
+        let holders: Vec<u32> = self
+            .surfaces
+            .iter()
+            .filter(|&&(_, r)| r == resource)
+            .map(|&(c, _)| c)
+            .collect();
+        for ctx in holders {
+            self.detach_surface(ctx, resource);
         }
     }
 
@@ -945,7 +988,7 @@ mod tests {
         assert_eq!(
             s.bind_surface(1, 50, 8).err(),
             Some(ExtError::InvalidParameter),
-            "one resource, one surface"
+            "a context holds a surface once"
         );
         s.release_surface(50);
         s.release_surface(50);
@@ -967,6 +1010,33 @@ mod tests {
             !log(&f, "-surface 51 of 1"),
             "the context took its surfaces with it"
         );
+    }
+
+    #[test]
+    fn an_imported_surface_has_a_holder_per_context() {
+        let (f, mut s) = state();
+        let gone =
+            |f: &Arc<Fake>, line: &str| f.log.lock().unwrap().iter().filter(|l| *l == line).count();
+        s.create_context(1).unwrap();
+        s.create_context(2).unwrap();
+        s.create_context(3).unwrap();
+        s.bind_surface(1, 60, 7).unwrap();
+        s.bind_surface(2, 60, 8).unwrap();
+        s.bind_surface(3, 60, 9).unwrap();
+
+        s.detach_surface(2, 60);
+        s.detach_surface(2, 60);
+        assert_eq!(gone(&f, "-surface 60 of 2"), 1, "the importer let go, once");
+        assert_eq!(gone(&f, "-surface 60 of 1"), 0, "the others still hold it");
+
+        s.release_surface(60);
+        assert_eq!(gone(&f, "-surface 60 of 1"), 1);
+        assert_eq!(
+            gone(&f, "-surface 60 of 3"),
+            1,
+            "every holder, when the resource goes"
+        );
+        assert_eq!(gone(&f, "-surface 60 of 2"), 1);
     }
 
     #[test]

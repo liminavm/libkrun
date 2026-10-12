@@ -245,6 +245,13 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// limina: a send right to the IOSurface `resource_id` is presented from, with its shape, for
+    /// the embedder's own renderer to import. Only virgl implements it.
+    #[cfg(target_os = "macos")]
+    fn surface_port(&self, _resource_id: u32) -> RutabagaResult<(u32, SurfaceDesc)> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// limina tier-2 (macOS): the IOSurface id currently backing `resource_id`, or 0 once the
     /// surface it was created with has been freed. Only virgl implements it.
     #[cfg(target_os = "macos")]
@@ -1181,6 +1188,19 @@ impl Rutabaga {
         let (resource, port) = component.create_surface(resource_id, surface)?;
         self.resources.insert(resource_id, resource);
         Ok(port)
+    }
+
+    /// The surface resource `resource_id` is presented from, by send right, with its shape.
+    #[cfg(target_os = "macos")]
+    pub fn resource_surface_port(&self, resource_id: u32) -> RutabagaResult<(u32, SurfaceDesc)> {
+        if !self.resources.contains_key(&resource_id) {
+            return Err(RutabagaError::InvalidResourceId);
+        }
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+        component.surface_port(resource_id)
     }
 
     #[cfg(target_os = "macos")]
