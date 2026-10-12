@@ -660,6 +660,8 @@ pub struct VirtioGpu {
     /// limina software 2D resources, keyed by resource id (see [`Sw2dResource`]).
     sw2d: BTreeMap<u32, Sw2dResource>,
     fence_state: Arc<Mutex<FenceState>>,
+    /// Retires guest fences from any thread; the extension answers its fences through it.
+    fence_handler: RutabagaFenceHandler,
     /// Wakes the stale-fence watch when the first fence parks (it sleeps while none is).
     fence_watch: Arc<std::sync::Condvar>,
     /// The route `create_fence` took for the fence `process_fence` is about to park.
@@ -1227,6 +1229,7 @@ impl VirtioGpu {
             resources: Default::default(),
             sw2d: Default::default(),
             fence_state,
+            fence_handler: fence_handler.clone(),
             fence_watch,
             next_fence_route: FenceRoute::Renderer,
             scanouts: Default::default(),
@@ -4405,6 +4408,12 @@ impl VirtioGpu {
         resource.shmem_offset = None;
 
         Ok(OkNoData)
+    }
+}
+
+impl VirtioGpu {
+    pub fn fence_handler(&self) -> RutabagaFenceHandler {
+        self.fence_handler.clone()
     }
 }
 
