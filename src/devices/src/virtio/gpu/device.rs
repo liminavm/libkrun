@@ -18,6 +18,7 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
+use super::ext::{GpuExtConfig, SHM_ID_ARENAS, SHM_ID_DOORBELLS, VIRTIO_GPU_F_LIMINA_EXT};
 use super::protocol::VIRTIO_GPU_EVENT_DISPLAY;
 use super::virtio_gpu::GpuActivation;
 use super::worker::{Worker, WorkerCmd};
@@ -199,6 +200,8 @@ pub struct Gpu {
     /// real driver re-init). Forwarded to the worker so it can classify a parked session —
     /// adopt it on a thaw, run the deferred `reset_session` on a re-init.
     thaw_activation: bool,
+    /// limina: the native-context extension's windows and embedder, if configured.
+    ext: Option<GpuExtConfig>,
 }
 
 impl Gpu {
@@ -237,6 +240,7 @@ impl Gpu {
             pending_restore: Arc::new(Mutex::new(None)),
             restore_done: Arc::new((Mutex::new(true), Condvar::new())),
             thaw_activation: false,
+            ext: None,
         })
     }
 
@@ -257,6 +261,16 @@ impl Gpu {
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         debug!("virtio_gpu: set_shm_region");
         self.shm_region = Some(shm_region);
+    }
+
+    /// limina: offer the native-context extension (see [`super::ext`]). A software-2D device has
+    /// no renderer to extend, so it ignores this.
+    pub fn set_extension(&mut self, cfg: GpuExtConfig) {
+        if self.software_2d {
+            return;
+        }
+        self.avail_features |= 1u64 << VIRTIO_GPU_F_LIMINA_EXT;
+        self.ext = Some(cfg);
     }
 
     pub fn set_export_table(&mut self, export_table: ExportTable) {
@@ -348,6 +362,7 @@ impl Gpu {
                 self.resize_pending.clone(),
                 self.pending_restore.clone(),
                 self.restore_done.clone(),
+                self.ext.clone(),
             );
             self.worker_thread = Some(worker.run());
             self.worker_tx = Some(tx);
@@ -569,6 +584,24 @@ impl VirtioDevice for Gpu {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         debug!("virtio_gpu: GET_shm_region");
         self.shm_region.as_ref()
+    }
+
+    fn shm_region_by_id(&self, id: u32) -> Option<VirtioShmRegion> {
+        let ext = self.ext.as_ref();
+        match id {
+            SHM_ID_ARENAS => ext.map(|e| VirtioShmRegion {
+                host_addr: 0,
+                guest_addr: e.arenas_guest_addr,
+                size: e.arenas_size as usize,
+            }),
+            SHM_ID_DOORBELLS => ext.map(|e| VirtioShmRegion {
+                host_addr: 0,
+                guest_addr: e.doorbells_guest_addr,
+                size: e.doorbells_size as usize,
+            }),
+            0 | 1 => self.shm_region.clone(),
+            _ => None,
+        }
     }
 }
 

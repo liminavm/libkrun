@@ -196,6 +196,15 @@ pub trait VirtioDevice: AsAny + Send {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
     }
+
+    /// The SHM region the driver selected by `id`. Devices with one region answer it for ids 0
+    /// and 1, as the transport always did; devices with more override this.
+    fn shm_region_by_id(&self, id: u32) -> Option<VirtioShmRegion> {
+        if id > 1 {
+            return None;
+        }
+        self.shm_region().cloned()
+    }
 }
 
 pub trait VmmExitObserver: Send {

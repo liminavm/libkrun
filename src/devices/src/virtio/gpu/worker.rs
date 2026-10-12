@@ -17,6 +17,7 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
+use super::ext::{ExtError, ExtState, GpuExtConfig};
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
@@ -107,6 +108,8 @@ pub struct Worker {
     /// control-queue drain service it: a driver that never uses the queue (the firmware's) may
     /// leave it unconfigured, and servicing one writes to wherever its rings point.
     cursor_kicked: bool,
+    /// limina: the device-side state of the native-context extension, if configured.
+    ext: Option<ExtState>,
 }
 
 impl Worker {
@@ -127,8 +130,14 @@ impl Worker {
         resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
         pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
         restore_done: Arc<(Mutex<bool>, Condvar)>,
+        ext: Option<GpuExtConfig>,
     ) -> Self {
+        #[cfg(target_os = "macos")]
+        let ext = ext.map(|cfg| ExtState::new(cfg, map_sender.clone()));
+        #[cfg(not(target_os = "macos"))]
+        let ext = ext.map(ExtState::new);
         Self {
+            ext,
             stop_fd,
             cmd_rx,
             active,
@@ -195,6 +204,7 @@ impl Worker {
                 Ok(WorkerCmd::Shutdown) | Err(_) => {
                     if parked_session {
                         virtio_gpu.reset_session();
+                        self.reset_ext();
                     }
                     return;
                 }
@@ -221,6 +231,7 @@ impl Worker {
                          its queues (real driver re-init)"
                     );
                     virtio_gpu.reset_session();
+                    self.reset_ext();
                 }
             }
 
@@ -330,12 +341,14 @@ impl Worker {
                             virtio_gpu.present_pending_summary()
                         );
                         virtio_gpu.reset_session();
+                        self.reset_ext();
                     }
                     continue;
                 }
                 InnerExit::Shutdown => {
                     *self.active.lock().unwrap() = None;
                     virtio_gpu.reset_session();
+                    self.reset_ext();
                     return;
                 }
             }
@@ -745,6 +758,44 @@ impl Worker {
         }
     }
 
+    /// The guest driver went away: its extension contexts and arenas go with it.
+    fn reset_ext(&mut self) {
+        if let Some(ext) = self.ext.as_mut() {
+            ext.reset();
+        }
+    }
+
+    fn process_ext_command(
+        &mut self,
+        hdr: virtio_gpu_ctrl_hdr,
+        cmd: GpuCommand,
+    ) -> VirtioGpuResult {
+        let Some(ext) = self.ext.as_mut() else {
+            return Err(GpuResponse::ErrUnspec);
+        };
+        let ctx = hdr.ctx_id;
+        let r = match cmd {
+            GpuCommand::LiminaCtxCreate(_) => ext.create_context(ctx).map(GpuResponse::OkLiminaCtx),
+            GpuCommand::LiminaCtxDestroy => ext.destroy_context(ctx).map(|_| GpuResponse::OkNoData),
+            GpuCommand::LiminaArenaCreate(req) => {
+                ext.create_arena(ctx, req).map(GpuResponse::OkLiminaArena)
+            }
+            GpuCommand::LiminaArenaDestroy(req) => ext
+                .destroy_arena(ctx, req.arena_id)
+                .map(|_| GpuResponse::OkNoData),
+            GpuCommand::LiminaRingAttach(req) => {
+                ext.attach_ring(ctx, req).map(|_| GpuResponse::OkNoData)
+            }
+            _ => unreachable!("not an extension command"),
+        };
+        r.map_err(|e| match e {
+            ExtError::InvalidContext => GpuResponse::ErrInvalidContextId,
+            ExtError::InvalidParameter => GpuResponse::ErrInvalidParameter,
+            ExtError::OutOfMemory => GpuResponse::ErrOutOfMemory,
+            ExtError::Unspec => GpuResponse::ErrUnspec,
+        })
+    }
+
     fn process_gpu_command(
         &mut self,
         virtio_gpu: &mut VirtioGpu,
@@ -756,6 +807,11 @@ impl Worker {
         virtio_gpu.force_ctx_0();
 
         match cmd {
+            GpuCommand::LiminaCtxCreate(_)
+            | GpuCommand::LiminaCtxDestroy
+            | GpuCommand::LiminaArenaCreate(_)
+            | GpuCommand::LiminaArenaDestroy(_)
+            | GpuCommand::LiminaRingAttach(_) => self.process_ext_command(hdr, cmd),
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
