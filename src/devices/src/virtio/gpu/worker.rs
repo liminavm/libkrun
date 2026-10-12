@@ -817,6 +817,15 @@ impl Worker {
             GpuCommand::LiminaArenaImport(req) => {
                 ext.import_arena(ctx, req).map(GpuResponse::OkLiminaArena)
             }
+            // The fence itself is taken with the response, in `process_queue`.
+            GpuCommand::LiminaFence(_) if hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 => {
+                if ext.has_context(ctx) {
+                    Ok(GpuResponse::OkNoData)
+                } else {
+                    Err(ExtError::InvalidContext)
+                }
+            }
+            GpuCommand::LiminaFence(_) => Err(ExtError::InvalidParameter),
             _ => unreachable!("not an extension command"),
         };
         r.map_err(|e| match e {
@@ -843,7 +852,8 @@ impl Worker {
             | GpuCommand::LiminaArenaCreate(_)
             | GpuCommand::LiminaArenaDestroy(_)
             | GpuCommand::LiminaRingAttach(_)
-            | GpuCommand::LiminaArenaImport(_) => self.process_ext_command(hdr, cmd),
+            | GpuCommand::LiminaArenaImport(_)
+            | GpuCommand::LiminaFence(_) => self.process_ext_command(hdr, cmd),
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
@@ -1417,13 +1427,26 @@ impl Worker {
                                 );
                             }
                             let is_flush = matches!(cmd, GpuCommand::ResourceFlush(_));
-                            gpu_response = match virtio_gpu.create_fence(fence, is_flush) {
-                                Ok(_) => gpu_response,
-                                Err(fence_resp) => {
-                                    warn!("create_fence {fence_id} -> {fence_resp:?}");
-                                    fence_resp
-                                }
-                            };
+                            if let (GpuCommand::LiminaFence(req), Some(ext)) =
+                                (cmd, self.ext.as_mut())
+                            {
+                                // An extension fence never reaches the renderer: the extension
+                                // answers it through the fence handler when its ring gets there.
+                                let handler = virtio_gpu.fence_handler();
+                                let _ = ext.fence(
+                                    ctx_id,
+                                    req.seqno,
+                                    Box::new(move || handler.call(fence)),
+                                );
+                            } else {
+                                gpu_response = match virtio_gpu.create_fence(fence, is_flush) {
+                                    Ok(_) => gpu_response,
+                                    Err(fence_resp) => {
+                                        warn!("create_fence {fence_id} -> {fence_resp:?}");
+                                        fence_resp
+                                    }
+                                };
+                            }
                         }
                     }
 
