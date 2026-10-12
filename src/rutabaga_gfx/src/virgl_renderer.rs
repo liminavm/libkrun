@@ -520,11 +520,9 @@ impl RutabagaComponent for VirglRenderer {
             .is_ok()
     }
 
-    fn limina_replay_end(&self, ctx_id: u32) -> bool {
-        let Some(id) = ContextId::new(ctx_id) else {
-            return false;
-        };
-        self.r.lock().unwrap().replay_end(id).is_ok()
+    fn limina_replay_end(&self, ctx_id: u32) -> Option<u64> {
+        let id = ContextId::new(ctx_id)?;
+        self.r.lock().unwrap().replay_end(id).ok()
     }
 
     fn limina_sync_export(&self, ctx_id: u32) -> Option<Vec<u8>> {

@@ -1906,13 +1906,23 @@ impl VirtioGpu {
             {
                 warn!("gpu restore: sync fast-forward failed for ctx {ctx_id}");
             }
-            if !self
+            // A dropped command is state the guest holds and the host lost: the restore fails
+            // here, rather than at the first frame that touches what was lost. The renderer has
+            // named each one in its log.
+            match self
                 .rutabaga
                 .as_ref()
-                .is_some_and(|r| r.limina_replay_end(ctx_id))
+                .and_then(|r| r.limina_replay_end(ctx_id))
             {
-                error!("gpu restore: replay_end {ctx_id} failed");
-                op_failed += 1;
+                Some(0) => {}
+                Some(dropped) => {
+                    error!("gpu restore: ctx {ctx_id}: the replay dropped {dropped} commands");
+                    op_failed += 1;
+                }
+                None => {
+                    error!("gpu restore: replay_end {ctx_id} failed");
+                    op_failed += 1;
+                }
             }
         }
         if content_failed > 0 {
