@@ -34,6 +34,8 @@ use devices::virtio::balloon::FreePageReportingMode;
 use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+#[cfg(feature = "gpu")]
+use devices::virtio::gpu::ext::{DOORBELL_STRIDE, DoorbellDevice, GpuExtConfig, GpuExtension};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::passthrough::PermissionSemantics;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
@@ -58,6 +60,9 @@ pub struct DeviceRequirements {
     /// GPU shared memory size, if this is a GPU device.
     #[cfg(feature = "gpu")]
     pub gpu_shm: Option<usize>,
+    /// limina: sizes of the GPU extension's (doorbell, arena) windows, if it is enabled.
+    #[cfg(feature = "gpu")]
+    pub gpu_ext: Option<(usize, usize)>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
 }
@@ -209,6 +214,33 @@ impl<'a> AttachContext<'a> {
                 size: r.size,
             }
         })
+    }
+
+    /// limina: the GPU extension's (doorbell, arena) windows as (guest address, size), if they
+    /// were allocated based on [`DeviceRequirements::gpu_ext`].
+    #[cfg(feature = "gpu")]
+    pub fn gpu_ext_windows(&self) -> Option<((u64, u64), (u64, u64))> {
+        self.shm_manager.gpu_ext_regions().map(|(d, a)| {
+            (
+                (d.guest_addr.raw_value(), d.size as u64),
+                (a.guest_addr.raw_value(), a.size as u64),
+            )
+        })
+    }
+
+    /// Put a device on the MMIO bus at `[base, base + len)`. Accesses there exit to the VMM on
+    /// the vCPU thread and reach the device directly.
+    pub fn insert_mmio_device(
+        &mut self,
+        device: Arc<Mutex<dyn devices::BusDevice>>,
+        base: u64,
+        len: u64,
+    ) -> Result<(), VmmError> {
+        self.vmm
+            .mmio_device_manager
+            .bus
+            .insert(device, base, len)
+            .map_err(|e| VmmError::Internal(format!("mmio insert: {e:?}")))
     }
 
     /// The index of the current device within its device manager.
@@ -1992,6 +2024,10 @@ export_bitflags! {
     }
 }
 
+/// limina: doorbell slots the GPU extension offers (one per guest context).
+#[cfg(feature = "gpu")]
+const EXT_DOORBELL_WINDOW: usize = 256 * DOORBELL_STRIDE as usize;
+
 /// A virtio GPU device with virgl 3D acceleration.
 #[cfg(feature = "gpu")]
 pub struct GpuDevice {
@@ -2000,6 +2036,8 @@ pub struct GpuDevice {
     backend: DisplayBackend,
     shm_size: usize,
     pipeline_cache_key: Option<devices::virtio::PipelineCacheKey>,
+    /// limina: the native-context extension's embedder and arena window size.
+    ext: Option<(Arc<dyn GpuExtension>, usize)>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
@@ -2014,6 +2052,7 @@ impl GpuDevice {
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
             pipeline_cache_key: None,
+            ext: None,
         }
     }
 
@@ -2039,6 +2078,14 @@ impl GpuDevice {
         self.pipeline_cache_key = Some(devices::virtio::PipelineCacheKey::new(key));
         self
     }
+
+    /// limina: offer the native-context extension (`devices::virtio::gpu::ext`), served by
+    /// `ext`, with an arena window of `arena_window` bytes of guest-physical space.
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    pub fn extension(mut self, ext: Arc<dyn GpuExtension>, arena_window: usize) -> Self {
+        self.ext = Some((ext, arena_window));
+        self
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
@@ -2048,6 +2095,11 @@ impl<'a> AttachDevice<'a> for GpuDevice {
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
             gpu_shm: Some(self.shm_size),
+            gpu_ext: self
+                .ext
+                .as_ref()
+                .filter(|_| !self.software_2d)
+                .map(|(_, arenas)| (EXT_DOORBELL_WINDOW, *arenas)),
             ..Default::default()
         }
     }
@@ -2073,6 +2125,20 @@ impl<'a> AttachDevice<'a> for GpuDevice {
 
         if let Some(region) = ctx.resolved_gpu_shm_region() {
             inner.lock().unwrap().set_shm_region(region.into());
+        }
+
+        if let (Some((ext, _)), Some(((db_addr, db_len), (ar_addr, ar_len)))) =
+            (self.ext, ctx.gpu_ext_windows())
+        {
+            let bell = Arc::new(Mutex::new(DoorbellDevice::new(ext.clone())));
+            ctx.insert_mmio_device(bell, db_addr, db_len)?;
+            inner.lock().unwrap().set_extension(GpuExtConfig {
+                ext,
+                arenas_guest_addr: ar_addr,
+                arenas_size: ar_len,
+                doorbells_guest_addr: db_addr,
+                doorbells_size: db_len,
+            });
         }
 
         // limina: capture the runtime display-resize handle before the device is moved into the
