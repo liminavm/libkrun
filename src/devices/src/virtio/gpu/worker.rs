@@ -935,7 +935,17 @@ impl Worker {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = virtio_gpu;
-        s.to_bytes()
+        let bytes = s.to_bytes();
+        info!(
+            "gpu snapshot: extension: {} contexts ({} with rings), {} arenas, {} surfaces made, \
+             {} MiB",
+            s.contexts.len(),
+            s.contexts.iter().filter(|c| c.ring.is_some()).count(),
+            s.arenas.len(),
+            s.made.len(),
+            bytes.len() >> 20
+        );
+        bytes
     }
 
     /// limina restore, before the other renderers' replay: the extension's contexts, arenas,
@@ -1015,7 +1025,15 @@ impl Worker {
             }
         }
         match ext.restore_rings(s) {
-            Ok(()) => true,
+            Ok(()) => {
+                info!(
+                    "gpu restore: extension: {} contexts, {} arenas, {} surfaces back",
+                    s.contexts.len(),
+                    s.arenas.len(),
+                    s.held.len()
+                );
+                true
+            }
             Err(e) => {
                 error!("gpu restore: extension rings: {e}");
                 false
