@@ -19,7 +19,10 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
-use super::ext::{ExtError, ExtState, GpuExtConfig, virtio_gpu_limina_surface_create};
+use super::ext::{
+    ExtError, ExtState, GpuExtConfig, virtio_gpu_limina_resp_surface,
+    virtio_gpu_limina_surface_create, virtio_gpu_limina_surface_import,
+};
 use super::protocol::{
     GpuCommand, GpuResponse, VIRTIO_GPU_BLOB_MEM_HOST3D, VirtioGpuResult, virtio_gpu_ctrl_hdr,
     virtio_gpu_mem_entry,
@@ -818,6 +821,49 @@ impl Worker {
         Ok(GpuResponse::OkNoData)
     }
 
+    /// `SURFACE_IMPORT`: the surface a resource is presented from, made by any renderer, is given
+    /// to extension context `ctx`. A resource with none is refused, never a fault of the context.
+    #[cfg(target_os = "macos")]
+    fn import_ext_surface(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        ctx: u32,
+        req: virtio_gpu_limina_surface_import,
+    ) -> VirtioGpuResult {
+        let Some(ext) = self.ext.as_mut() else {
+            return Err(GpuResponse::ErrUnspec);
+        };
+        if !ext.has_context(ctx) {
+            return Err(GpuResponse::ErrInvalidContextId);
+        }
+        // Asked before a send right is made: one made and then refused would have no one to
+        // give it back to.
+        if ext.holds_surface(ctx, req.resource_id) {
+            return Err(GpuResponse::ErrInvalidParameter);
+        }
+        let (port, desc) = virtio_gpu.resource_surface_port(req.resource_id)?;
+        ext.bind_surface(ctx, req.resource_id, port)
+            .map_err(|_| GpuResponse::ErrUnspec)?;
+        Ok(GpuResponse::OkLiminaSurface(
+            virtio_gpu_limina_resp_surface {
+                width: desc.width,
+                height: desc.height,
+                drm_fourcc: desc.drm_fourcc,
+                stride: desc.stride,
+            },
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn import_ext_surface(
+        &mut self,
+        _virtio_gpu: &mut VirtioGpu,
+        _ctx: u32,
+        _req: virtio_gpu_limina_surface_import,
+    ) -> VirtioGpuResult {
+        Err(GpuResponse::ErrUnspec)
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn create_ext_surface(
         &mut self,
@@ -898,6 +944,9 @@ impl Worker {
             | GpuCommand::LiminaFence(_) => self.process_ext_command(hdr, cmd),
             GpuCommand::LiminaSurfaceCreate(req) => {
                 self.create_ext_surface(virtio_gpu, hdr.ctx_id, req)
+            }
+            GpuCommand::LiminaSurfaceImport(req) => {
+                self.import_ext_surface(virtio_gpu, hdr.ctx_id, req)
             }
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
@@ -1063,6 +1112,10 @@ impl Worker {
                 r
             }
             GpuCommand::CtxDetachResource(info) => {
+                // An extension context that imported the resource's surface lets go of it too.
+                if let Some(ext) = self.ext.as_mut() {
+                    ext.detach_surface(hdr.ctx_id, info.resource_id);
+                }
                 let r = virtio_gpu.context_detach_resource(hdr.ctx_id, info.resource_id);
                 if r.is_ok() {
                     virtio_gpu
