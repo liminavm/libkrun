@@ -121,8 +121,9 @@ pub trait RutabagaComponent {
     fn limina_replay_ring_cmd(&self, _ctx_id: u32, _ring_id: u64, _cmd: &mut [u8]) -> bool {
         false
     }
-    fn limina_replay_end(&self, _ctx_id: u32) -> bool {
-        false
+    /// limina: finishes a context's rebuild; `Some` with how many retained commands it dropped.
+    fn limina_replay_end(&self, _ctx_id: u32) -> Option<u64> {
+        None
     }
 
     /// limina M9.3 P2: device-memory content capture (virglrenderer implements).
@@ -772,10 +773,10 @@ impl Rutabaga {
             .is_some_and(|c| c.limina_replay_ring_cmd(ctx_id, ring_id, cmd))
     }
 
-    pub fn limina_replay_end(&self, ctx_id: u32) -> bool {
+    pub fn limina_replay_end(&self, ctx_id: u32) -> Option<u64> {
         self.components
             .get(&self.default_component)
-            .is_some_and(|c| c.limina_replay_end(ctx_id))
+            .and_then(|c| c.limina_replay_end(ctx_id))
     }
 
     pub fn limina_sync_export(&self, ctx_id: u32) -> Option<Vec<u8>> {
