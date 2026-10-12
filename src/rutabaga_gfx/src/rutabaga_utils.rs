@@ -84,6 +84,16 @@ pub struct ResourceCreateBlob {
     pub size: u64,
 }
 
+/// A surface to mint for the embedder's renderer: its extent, its DRM fourcc and the pitch its
+/// rows must have.
+#[derive(Copy, Clone, Debug)]
+pub struct SurfaceDesc {
+    pub width: u32,
+    pub height: u32,
+    pub drm_fourcc: u32,
+    pub stride: u32,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct RutabagaMapping {
