@@ -19,7 +19,8 @@ use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::ext::{ExtError, ExtState, GpuExtConfig};
 use super::protocol::{
-    GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
+    GpuCommand, GpuResponse, VIRTIO_GPU_BLOB_MEM_HOST3D, VirtioGpuResult, virtio_gpu_ctrl_hdr,
+    virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::{GpuActivation, VirtioGpu};
 use crate::display::DisplayInfo;
@@ -758,6 +759,11 @@ impl Worker {
         }
     }
 
+    /// Whether `resource` is a blob wrapping an extension arena.
+    fn is_ext_blob(&self, resource: u32) -> bool {
+        self.ext.as_ref().is_some_and(|e| e.is_export(resource))
+    }
+
     /// The guest driver went away: its extension contexts and arenas go with it.
     fn reset_ext(&mut self) {
         if let Some(ext) = self.ext.as_mut() {
@@ -786,6 +792,9 @@ impl Worker {
             GpuCommand::LiminaRingAttach(req) => {
                 ext.attach_ring(ctx, req).map(|_| GpuResponse::OkNoData)
             }
+            GpuCommand::LiminaArenaImport(req) => {
+                ext.import_arena(ctx, req).map(GpuResponse::OkLiminaArena)
+            }
             _ => unreachable!("not an extension command"),
         };
         r.map_err(|e| match e {
@@ -811,7 +820,8 @@ impl Worker {
             | GpuCommand::LiminaCtxDestroy
             | GpuCommand::LiminaArenaCreate(_)
             | GpuCommand::LiminaArenaDestroy(_)
-            | GpuCommand::LiminaRingAttach(_) => self.process_ext_command(hdr, cmd),
+            | GpuCommand::LiminaRingAttach(_)
+            | GpuCommand::LiminaArenaImport(_) => self.process_ext_command(hdr, cmd),
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
@@ -833,6 +843,14 @@ impl Worker {
                     );
                 }
                 r
+            }
+            GpuCommand::ResourceUnref(info) if self.is_ext_blob(info.resource_id) => {
+                let ext = self.ext.as_mut().expect("is_ext_blob checked it");
+                if let Some((a, Some(offset))) = ext.export(info.resource_id) {
+                    let _ = virtio_gpu.unmap_ext_blob(a.size, &self.shm_region, offset);
+                }
+                ext.release_export(info.resource_id);
+                Ok(GpuResponse::OkNoData)
             }
             GpuCommand::ResourceUnref(info) => {
                 let r = virtio_gpu.unref_resource(info.resource_id);
@@ -1130,6 +1148,19 @@ impl Worker {
                     Ok(GpuResponse::OkNoData)
                 }
             }
+            // A host3d blob from an extension context wraps one of its shared arenas; rutabaga
+            // never sees an extension context.
+            GpuCommand::ResourceCreateBlob(info)
+                if self.ext.as_ref().is_some_and(|e| e.has_context(hdr.ctx_id)) =>
+            {
+                let ext = self.ext.as_mut().expect("checked above");
+                if info.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D || info.blob_id > u32::MAX as u64 {
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
+                ext.export_arena(hdr.ctx_id, info.blob_id as u32, info.resource_id, info.size)
+                    .map(|_| GpuResponse::OkNoData)
+                    .map_err(|_| GpuResponse::ErrInvalidParameter)
+            }
             GpuCommand::ResourceCreateBlob(info) => {
                 let resource_id = info.resource_id;
                 let ctx_id = hdr.ctx_id;
@@ -1214,6 +1245,32 @@ impl Worker {
                     let _ = info;
                     Err(GpuResponse::ErrUnspec)
                 }
+            }
+            GpuCommand::ResourceMapBlob(info) if self.is_ext_blob(info.resource_id) => {
+                let ext = self.ext.as_mut().expect("is_ext_blob checked it");
+                let (a, mapped) = ext
+                    .export(info.resource_id)
+                    .expect("is_ext_blob checked it");
+                if mapped.is_some() {
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
+                let r = virtio_gpu.map_ext_blob(a.host_addr, a.size, &self.shm_region, info.offset);
+                if r.is_ok() {
+                    ext.set_mapped(info.resource_id, Some(info.offset));
+                }
+                r
+            }
+            GpuCommand::ResourceUnmapBlob(info) if self.is_ext_blob(info.resource_id) => {
+                let ext = self.ext.as_mut().expect("is_ext_blob checked it");
+                let (a, mapped) = ext
+                    .export(info.resource_id)
+                    .expect("is_ext_blob checked it");
+                let offset = mapped.ok_or(GpuResponse::ErrInvalidParameter)?;
+                let r = virtio_gpu.unmap_ext_blob(a.size, &self.shm_region, offset);
+                if r.is_ok() {
+                    ext.set_mapped(info.resource_id, None);
+                }
+                r
             }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;

@@ -4379,6 +4379,70 @@ impl VirtioGpu {
     }
 }
 
+/// limina: blob resources that are exported extension arenas (`ext`). Their pages belong to the
+/// extension, not to rutabaga, so they are mapped here from the address it gives.
+impl VirtioGpu {
+    #[cfg(target_os = "macos")]
+    pub fn map_ext_blob(
+        &self,
+        host_addr: u64,
+        size: u64,
+        shm_region: &VirtioShmRegion,
+        offset: u64,
+    ) -> VirtioGpuResult {
+        let guest_addr =
+            checked_blob_map_addr(shm_region.guest_addr, offset, size, shm_region.size as u64)
+                .ok_or(ErrUnspec)?;
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                host_addr,
+                guest_addr,
+                size,
+            ))
+            .map_err(|_| ErrUnspec)?;
+        if !reply_receiver.recv().unwrap_or(false) {
+            return Err(ErrUnspec);
+        }
+        // Arenas are shared-storage memory on a unified-memory host.
+        Ok(OkMapInfo {
+            map_info: rutabaga_gfx::RUTABAGA_MAP_CACHE_CACHED,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn unmap_ext_blob(
+        &self,
+        size: u64,
+        shm_region: &VirtioShmRegion,
+        offset: u64,
+    ) -> VirtioGpuResult {
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuRemoveMapping(
+                reply_sender,
+                shm_region.guest_addr + offset,
+                size,
+            ))
+            .map_err(|_| ErrUnspec)?;
+        if !reply_receiver.recv().unwrap_or(false) {
+            return Err(ErrUnspec);
+        }
+        Ok(OkNoData)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn map_ext_blob(&self, _: u64, _: u64, _: &VirtioShmRegion, _: u64) -> VirtioGpuResult {
+        Err(ErrUnspec)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn unmap_ext_blob(&self, _: u64, _: &VirtioShmRegion, _: u64) -> VirtioGpuResult {
+        Err(ErrUnspec)
+    }
+}
+
 // A guest-controlled `offset` that wraps `offset + size` or `base + offset` would
 // otherwise pass the size guard and place the mmap(MAP_FIXED) out of bounds.
 fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Option<u64> {
