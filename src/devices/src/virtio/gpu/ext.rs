@@ -155,7 +155,7 @@ pub struct virtio_gpu_limina_surface_import {
 unsafe impl ByteValued for virtio_gpu_limina_surface_import {}
 
 /// What a successful `SURFACE_IMPORT` answers, after the header.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct virtio_gpu_limina_resp_surface {
     pub width: u32,
@@ -224,6 +224,30 @@ pub trait GpuExtension: Send + Sync {
     fn bind_surface(&self, ctx: u32, surface: u32, port: u32) -> Result<(), String>;
     /// `ctx` gives up `surface`; what it already made over it keeps it.
     fn release_surface(&self, ctx: u32, surface: u32);
+    /// `ctx` as it travels across a snapshot, opaque to the device. Answered once its committed
+    /// work has finished or been given up on; given up on, the context is lost and its fences are
+    /// answered.
+    fn export_context(&self, ctx: u32) -> Result<Vec<u8>, String>;
+    /// Arena `arena` of `ctx` again, `size` bytes at `gpu_base`, in a restore. Arenas come in
+    /// address order, before any ring restarts. `ctx` 0 is an arena only its export still held.
+    fn restore_arena(
+        &self,
+        ctx: u32,
+        arena: u32,
+        size: u64,
+        gpu_base: u64,
+    ) -> Result<ExtArena, String>;
+    /// `ctx`'s ring restarted where [`Self::export_context`] left it, with what that exported.
+    fn restore_ring(
+        &self,
+        ctx: u32,
+        arena: u32,
+        offset: u64,
+        data_size: u32,
+        export: &[u8],
+    ) -> Result<(), String>;
+    /// Every arena and ring of a restore stands.
+    fn restore_done(&self);
 }
 
 /// What answers a fence; see [`GpuExtension::fence`].
@@ -287,13 +311,67 @@ struct Context {
     doorbell: u32,
     /// Fences not answered yet, answered when the context goes away.
     fences: Vec<PendingFence>,
-    /// arena id → its (window offset, size), or `None` for one shared through a blob resource.
-    arenas: HashMap<u32, Option<(u64, u64)>>,
+    arenas: HashMap<u32, ContextArena>,
+    /// Where the ring is: (arena, offset, data size).
+    ring: Option<(u32, u64, u32)>,
+}
+
+#[derive(Clone, Copy)]
+struct ContextArena {
+    arena: ExtArena,
+    /// Its window offset, or `None` for one shared through a blob resource.
+    window: Option<u64>,
+    /// The blob resource it was imported from.
+    import: Option<u32>,
 }
 
 struct Export {
     arena: ExtArena,
     mapped: Option<u64>,
+    /// The context and arena id it was exported from.
+    origin: (u32, u32),
+}
+
+/// The shape of a surface, as `SURFACE_CREATE` gave it and `SURFACE_IMPORT` answers it.
+pub type SurfaceShape = virtio_gpu_limina_resp_surface;
+
+/// One arena in an [`ExtSnapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArenaSnapshot {
+    /// The context that made it, or 0 for one only its export still holds (`arena` is then the
+    /// export's resource).
+    pub ctx: u32,
+    pub arena: u32,
+    pub size: u64,
+    pub gpu_base: u64,
+    pub window: Option<u64>,
+    pub contents: Vec<u8>,
+}
+
+/// One context in an [`ExtSnapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextSnapshot {
+    pub ctx: u32,
+    pub doorbell: u32,
+    /// (arena, offset, data size) and what [`GpuExtension::export_context`] answered.
+    pub ring: Option<(u32, u64, u32, Vec<u8>)>,
+}
+
+/// The extension across a snapshot: the device's books, the arenas' contents and each
+/// context's export.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtSnapshot {
+    pub contexts: Vec<ContextSnapshot>,
+    /// In address order.
+    pub arenas: Vec<ArenaSnapshot>,
+    /// (resource, ctx, arena, where its blob is mapped), with `ctx` 0 as in [`ArenaSnapshot`].
+    pub exports: Vec<(u32, u32, u32, Option<u64>)>,
+    /// (ctx, arena, resource).
+    pub imports: Vec<(u32, u32, u32)>,
+    /// Surfaces contexts made: (resource, ctx, shape, rows).
+    pub made: Vec<(u32, u32, SurfaceShape, Vec<u8>)>,
+    /// Every context holding a surface: (ctx, resource).
+    pub held: Vec<(u32, u32)>,
 }
 
 /// Why a command failed, as the guest sees it.
@@ -319,6 +397,8 @@ pub struct ExtState {
     /// Surfaces given to contexts, as (context, resource): one resource is held by the context
     /// that made it and by every one that imported it.
     surfaces: HashSet<(u32, u32)>,
+    /// Surfaces contexts made, by resource: the context and the shape.
+    made: HashMap<u32, (u32, SurfaceShape)>,
 }
 
 impl ExtState {
@@ -334,6 +414,7 @@ impl ExtState {
             used: Vec::new(),
             exports: HashMap::new(),
             surfaces: HashSet::new(),
+            made: HashMap::new(),
         }
     }
 
@@ -355,6 +436,7 @@ impl ExtState {
                 doorbell,
                 fences: Vec::new(),
                 arenas: HashMap::new(),
+                ring: None,
             },
         );
         Ok(virtio_gpu_limina_resp_ctx {
@@ -365,9 +447,9 @@ impl ExtState {
 
     pub fn destroy_context(&mut self, ctx: u32) -> Result<(), ExtError> {
         let c = self.contexts.remove(&ctx).ok_or(ExtError::InvalidContext)?;
-        for (arena, window) in c.arenas {
-            if let Some((off, size)) = window {
-                self.unmap(off, size);
+        for (arena, a) in c.arenas {
+            if let Some(off) = a.window {
+                self.unmap(off, a.arena.size);
                 self.release(off);
             }
             self.cfg.ext.destroy_arena(ctx, arena);
@@ -424,7 +506,11 @@ impl ExtState {
         size: u64,
     ) -> Result<ExtArena, ExtError> {
         let c = self.contexts.get(&ctx).ok_or(ExtError::InvalidContext)?;
-        if c.arenas.get(&arena) != Some(&None) || self.exports.contains_key(&resource) {
+        let shareable = c
+            .arenas
+            .get(&arena)
+            .is_some_and(|a| a.window.is_none() && a.import.is_none());
+        if !shareable || self.exports.contains_key(&resource) {
             return Err(ExtError::InvalidParameter);
         }
         let a = self
@@ -444,6 +530,7 @@ impl ExtState {
             Export {
                 arena: a,
                 mapped: None,
+                origin: (ctx, arena),
             },
         );
         Ok(a)
@@ -465,6 +552,19 @@ impl ExtState {
         if self.exports.remove(&resource).is_some() {
             self.cfg.ext.release_export(resource);
         }
+    }
+
+    /// Resource `resource`, a surface `ctx` made with `shape`, is given to it through `port`.
+    pub fn bind_made_surface(
+        &mut self,
+        ctx: u32,
+        resource: u32,
+        port: u32,
+        shape: SurfaceShape,
+    ) -> Result<(), ExtError> {
+        self.bind_surface(ctx, resource, port)?;
+        self.made.insert(resource, (ctx, shape));
+        Ok(())
     }
 
     /// Resource `resource`, a surface, is given to `ctx` through `port`.
@@ -499,6 +599,7 @@ impl ExtState {
 
     /// The resource is gone; every context holding it gives it back.
     pub fn release_surface(&mut self, resource: u32) {
+        self.made.remove(&resource);
         let holders: Vec<u32> = self
             .surfaces
             .iter()
@@ -534,11 +635,14 @@ impl ExtState {
                 );
                 ExtError::InvalidParameter
             })?;
-        self.contexts
-            .get_mut(&ctx)
-            .unwrap()
-            .arenas
-            .insert(req.arena_id, None);
+        self.contexts.get_mut(&ctx).unwrap().arenas.insert(
+            req.arena_id,
+            ContextArena {
+                arena: a,
+                window: None,
+                import: Some(req.resource_id),
+            },
+        );
         Ok(virtio_gpu_limina_resp_arena {
             shm_offset: NOT_IN_WINDOW,
             size: a.size,
@@ -625,11 +729,14 @@ impl ExtState {
                 ExtError::OutOfMemory
             })?;
         if req.flags & ARENA_FLAG_BLOB != 0 {
-            self.contexts
-                .get_mut(&ctx)
-                .unwrap()
-                .arenas
-                .insert(req.arena_id, None);
+            self.contexts.get_mut(&ctx).unwrap().arenas.insert(
+                req.arena_id,
+                ContextArena {
+                    arena: a,
+                    window: None,
+                    import: None,
+                },
+            );
             return Ok(virtio_gpu_limina_resp_arena {
                 shm_offset: NOT_IN_WINDOW,
                 size: a.size,
@@ -645,11 +752,14 @@ impl ExtState {
             return Err(ExtError::Unspec);
         }
         self.reserve(off, a.size);
-        self.contexts
-            .get_mut(&ctx)
-            .unwrap()
-            .arenas
-            .insert(req.arena_id, Some((off, a.size)));
+        self.contexts.get_mut(&ctx).unwrap().arenas.insert(
+            req.arena_id,
+            ContextArena {
+                arena: a,
+                window: Some(off),
+                import: None,
+            },
+        );
         Ok(virtio_gpu_limina_resp_arena {
             shm_offset: off,
             size: a.size,
@@ -662,9 +772,12 @@ impl ExtState {
             .contexts
             .get_mut(&ctx)
             .ok_or(ExtError::InvalidContext)?;
-        let window = c.arenas.remove(&arena).ok_or(ExtError::InvalidParameter)?;
-        if let Some((off, size)) = window {
-            self.unmap(off, size);
+        let a = c.arenas.remove(&arena).ok_or(ExtError::InvalidParameter)?;
+        if c.ring.is_some_and(|(r, _, _)| r == arena) {
+            c.ring = None;
+        }
+        if let Some(off) = a.window {
+            self.unmap(off, a.arena.size);
             self.release(off);
         }
         self.cfg.ext.destroy_arena(ctx, arena);
@@ -677,7 +790,11 @@ impl ExtState {
         req: virtio_gpu_limina_ring_attach,
     ) -> Result<(), ExtError> {
         let c = self.contexts.get(&ctx).ok_or(ExtError::InvalidContext)?;
-        if !matches!(c.arenas.get(&req.arena_id), Some(Some(_))) {
+        if !c
+            .arenas
+            .get(&req.arena_id)
+            .is_some_and(|a| a.window.is_some())
+        {
             return Err(ExtError::InvalidParameter);
         }
         self.cfg
@@ -686,8 +803,370 @@ impl ExtState {
             .map_err(|e| {
                 warn!("limina ext: ring {}/{}: {e}", ctx, req.arena_id);
                 ExtError::InvalidParameter
-            })
+            })?;
+        self.contexts.get_mut(&ctx).unwrap().ring = Some((req.arena_id, req.offset, req.data_size));
+        Ok(())
     }
+
+    /// The extension as a snapshot carries it. Call with the vCPUs quiesced: each context is
+    /// exported, which waits for its committed work, before the arenas' contents are read.
+    /// Surfaces' rows are the caller's to fill in.
+    pub fn snapshot(&self) -> ExtSnapshot {
+        let mut s = ExtSnapshot::default();
+        let mut ctxs: Vec<u32> = self.contexts.keys().copied().collect();
+        ctxs.sort_unstable();
+        for &ctx in &ctxs {
+            let c = &self.contexts[&ctx];
+            let ring = c.ring.map(|(arena, off, size)| {
+                let export = self.cfg.ext.export_context(ctx).unwrap_or_else(|e| {
+                    warn!("limina ext: export of context {ctx}: {e}; restored lost");
+                    Vec::new()
+                });
+                (arena, off, size, export)
+            });
+            s.contexts.push(ContextSnapshot {
+                ctx,
+                doorbell: c.doorbell,
+                ring,
+            });
+        }
+        for &ctx in &ctxs {
+            for (&arena, a) in &self.contexts[&ctx].arenas {
+                if let Some(resource) = a.import {
+                    s.imports.push((ctx, arena, resource));
+                    continue;
+                }
+                s.arenas.push(ArenaSnapshot {
+                    ctx,
+                    arena,
+                    size: a.arena.size,
+                    gpu_base: a.arena.gpu_base,
+                    window: a.window,
+                    contents: read(&a.arena),
+                });
+            }
+        }
+        for (&resource, e) in &self.exports {
+            let (ctx, arena) = e.origin;
+            let alive = self
+                .contexts
+                .get(&ctx)
+                .and_then(|c| c.arenas.get(&arena))
+                .is_some_and(|a| a.import.is_none() && a.arena.gpu_base == e.arena.gpu_base);
+            let (ctx, arena) = if alive {
+                (ctx, arena)
+            } else {
+                s.arenas.push(ArenaSnapshot {
+                    ctx: 0,
+                    arena: resource,
+                    size: e.arena.size,
+                    gpu_base: e.arena.gpu_base,
+                    window: None,
+                    contents: read(&e.arena),
+                });
+                (0, resource)
+            };
+            s.exports.push((resource, ctx, arena, e.mapped));
+        }
+        s.arenas.sort_by_key(|a| a.gpu_base);
+        s.exports.sort_unstable();
+        s.imports.sort_unstable();
+        s.made = self
+            .made
+            .iter()
+            .map(|(&r, &(ctx, shape))| (r, ctx, shape, Vec::new()))
+            .collect();
+        s.made.sort_by_key(|m| m.0);
+        s.held = self.surfaces.iter().copied().collect();
+        s.held.sort_unstable();
+        s
+    }
+
+    /// Puts back what [`Self::snapshot`] took, into a fresh device, up to the surfaces: contexts
+    /// with their doorbells, arenas at their addresses with their contents (window arenas mapped
+    /// where they were), exports and imports. Answers the exports, for the caller to map their
+    /// blobs where [`ExtSnapshot::exports`] says. The caller then restores surfaces, replays the
+    /// other renderers, and calls [`Self::restore_rings`].
+    pub fn restore(&mut self, s: &ExtSnapshot) -> Result<Vec<(u32, ExtArena)>, String> {
+        for c in &s.contexts {
+            self.cfg.ext.create_context(c.ctx, c.doorbell)?;
+            self.contexts.insert(
+                c.ctx,
+                Context {
+                    doorbell: c.doorbell,
+                    fences: Vec::new(),
+                    arenas: HashMap::new(),
+                    ring: c.ring.as_ref().map(|r| (r.0, r.1, r.2)),
+                },
+            );
+        }
+        let mut orphans = HashMap::new();
+        for a in &s.arenas {
+            let got = self
+                .cfg
+                .ext
+                .restore_arena(a.ctx, a.arena, a.size, a.gpu_base)?;
+            if got.gpu_base != a.gpu_base || got.size != a.size {
+                return Err(format!(
+                    "arena {}/{} came back at {:#x}+{:#x}, not {:#x}+{:#x}",
+                    a.ctx, a.arena, got.gpu_base, got.size, a.gpu_base, a.size
+                ));
+            }
+            if a.contents.len() as u64 != a.size {
+                return Err(format!("arena {}/{}: contents short", a.ctx, a.arena));
+            }
+            // SAFETY: the embedder maps `size` bytes at `host_addr` for as long as the arena
+            // lives, and nothing runs on it before its ring restarts.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    a.contents.as_ptr(),
+                    got.host_addr as *mut u8,
+                    a.contents.len(),
+                )
+            };
+            if a.ctx == 0 {
+                orphans.insert(a.arena, got);
+                continue;
+            }
+            if let Some(off) = a.window {
+                if got.host_addr % ARENA_ALIGN != 0 || !self.map(got.host_addr, off, got.size) {
+                    return Err(format!("arena {}/{}: window mapping", a.ctx, a.arena));
+                }
+                self.reserve(off, got.size);
+            }
+            let c = self
+                .contexts
+                .get_mut(&a.ctx)
+                .ok_or_else(|| format!("arena {}/{}: no such context", a.ctx, a.arena))?;
+            c.arenas.insert(
+                a.arena,
+                ContextArena {
+                    arena: got,
+                    window: a.window,
+                    import: None,
+                },
+            );
+        }
+        let mut exports = Vec::new();
+        for &(resource, ctx, arena, mapped) in &s.exports {
+            let got = self.cfg.ext.export_arena(ctx, arena, resource)?;
+            let expected = if ctx == 0 {
+                orphans.get(&arena).copied()
+            } else {
+                self.contexts
+                    .get(&ctx)
+                    .and_then(|c| c.arenas.get(&arena))
+                    .map(|a| a.arena)
+            };
+            if expected.is_none_or(|e| e.gpu_base != got.gpu_base) {
+                return Err(format!("export {resource}: not the arena it was"));
+            }
+            self.exports.insert(
+                resource,
+                Export {
+                    arena: got,
+                    mapped,
+                    origin: (ctx, arena),
+                },
+            );
+            exports.push((resource, got));
+        }
+        for &(ctx, arena, resource) in &s.imports {
+            let got = self.cfg.ext.import_arena(ctx, arena, resource)?;
+            let c = self
+                .contexts
+                .get_mut(&ctx)
+                .ok_or_else(|| format!("import {resource}: no context {ctx}"))?;
+            c.arenas.insert(
+                arena,
+                ContextArena {
+                    arena: got,
+                    window: None,
+                    import: Some(resource),
+                },
+            );
+        }
+        Ok(exports)
+    }
+
+    /// Restarts every ring where the snapshot left it, once the surfaces the contexts use are
+    /// bound again, and lets the embedder drop what held the arenas' places.
+    pub fn restore_rings(&mut self, s: &ExtSnapshot) -> Result<(), String> {
+        let r = s.contexts.iter().try_for_each(|c| match &c.ring {
+            Some((arena, off, size, export)) => self
+                .cfg
+                .ext
+                .restore_ring(c.ctx, *arena, *off, *size, export),
+            None => Ok(()),
+        });
+        self.cfg.ext.restore_done();
+        r
+    }
+}
+
+const SNAPSHOT_MAGIC: u32 = 0x4c45_5831; // "LEX1"
+
+struct Out(Vec<u8>);
+
+impl Out {
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn opt(&mut self, v: Option<u64>) {
+        self.u64(v.unwrap_or(u64::MAX));
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u64(b.len() as u64);
+        self.0.extend_from_slice(b);
+    }
+}
+
+struct In<'a>(&'a [u8]);
+
+impl In<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        (self.0.len() >= n).then(|| {
+            let (a, b) = self.0.split_at(n);
+            self.0 = b;
+            a
+        })
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn opt(&mut self) -> Option<Option<u64>> {
+        let v = self.u64()?;
+        Some((v != u64::MAX).then_some(v))
+    }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let n = usize::try_from(self.u64()?).ok()?;
+        Some(self.take(n)?.to_vec())
+    }
+    /// A count of items, refused if the rest cannot hold that many of at least `min` bytes.
+    fn count(&mut self, min: usize) -> Option<usize> {
+        let n = self.u32()? as usize;
+        (n.checked_mul(min)? <= self.0.len()).then_some(n)
+    }
+}
+
+impl ExtSnapshot {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut o = Out(Vec::new());
+        o.u32(SNAPSHOT_MAGIC);
+        o.u32(self.contexts.len() as u32);
+        for c in &self.contexts {
+            o.u32(c.ctx);
+            o.u32(c.doorbell);
+            match &c.ring {
+                Some((arena, off, size, export)) => {
+                    o.u32(1);
+                    o.u32(*arena);
+                    o.u64(*off);
+                    o.u32(*size);
+                    o.bytes(export);
+                }
+                None => o.u32(0),
+            }
+        }
+        o.u32(self.arenas.len() as u32);
+        for a in &self.arenas {
+            o.u32(a.ctx);
+            o.u32(a.arena);
+            o.u64(a.size);
+            o.u64(a.gpu_base);
+            o.opt(a.window);
+            o.bytes(&a.contents);
+        }
+        o.u32(self.exports.len() as u32);
+        for &(resource, ctx, arena, mapped) in &self.exports {
+            o.u32(resource);
+            o.u32(ctx);
+            o.u32(arena);
+            o.opt(mapped);
+        }
+        o.u32(self.imports.len() as u32);
+        for &(ctx, arena, resource) in &self.imports {
+            o.u32(ctx);
+            o.u32(arena);
+            o.u32(resource);
+        }
+        o.u32(self.made.len() as u32);
+        for (resource, ctx, shape, rows) in &self.made {
+            o.u32(*resource);
+            o.u32(*ctx);
+            o.0.extend_from_slice(shape.as_slice());
+            o.bytes(rows);
+        }
+        o.u32(self.held.len() as u32);
+        for &(ctx, resource) in &self.held {
+            o.u32(ctx);
+            o.u32(resource);
+        }
+        o.0
+    }
+
+    /// `None` for anything malformed.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        let mut i = In(data);
+        if i.u32()? != SNAPSHOT_MAGIC {
+            return None;
+        }
+        let mut s = Self::default();
+        for _ in 0..i.count(12)? {
+            let ctx = i.u32()?;
+            let doorbell = i.u32()?;
+            let ring = match i.u32()? {
+                0 => None,
+                1 => Some((i.u32()?, i.u64()?, i.u32()?, i.bytes()?)),
+                _ => return None,
+            };
+            s.contexts.push(ContextSnapshot {
+                ctx,
+                doorbell,
+                ring,
+            });
+        }
+        for _ in 0..i.count(40)? {
+            s.arenas.push(ArenaSnapshot {
+                ctx: i.u32()?,
+                arena: i.u32()?,
+                size: i.u64()?,
+                gpu_base: i.u64()?,
+                window: i.opt()?,
+                contents: i.bytes()?,
+            });
+        }
+        for _ in 0..i.count(20)? {
+            s.exports.push((i.u32()?, i.u32()?, i.u32()?, i.opt()?));
+        }
+        for _ in 0..i.count(12)? {
+            s.imports.push((i.u32()?, i.u32()?, i.u32()?));
+        }
+        let shape_len = std::mem::size_of::<SurfaceShape>();
+        for _ in 0..i.count(8 + shape_len + 8)? {
+            let resource = i.u32()?;
+            let ctx = i.u32()?;
+            let shape = SurfaceShape::from_slice(i.take(shape_len)?).copied()?;
+            s.made.push((resource, ctx, shape, i.bytes()?));
+        }
+        for _ in 0..i.count(8)? {
+            s.held.push((i.u32()?, i.u32()?));
+        }
+        i.0.is_empty().then_some(s)
+    }
+}
+
+/// An arena's bytes, as its mapping in this process holds them.
+fn read(a: &ExtArena) -> Vec<u8> {
+    // SAFETY: the embedder keeps `size` bytes mapped at `host_addr` for as long as the arena
+    // lives; the guest is quiesced and the arena's context drained.
+    unsafe { std::slice::from_raw_parts(a.host_addr as *const u8, a.size as usize) }.to_vec()
 }
 
 #[cfg(test)]
@@ -699,6 +1178,17 @@ mod tests {
         log: Mutex<Vec<String>>,
         /// Fences the "GPU" has not completed: (ctx, seqno, signal).
         fences: Mutex<Vec<(u32, u64, Signal)>>,
+        /// Arenas by (ctx, arena), and exports by resource, in real memory.
+        arenas: Mutex<HashMap<(u32, u32), ExtArena>>,
+        exports: Mutex<HashMap<u32, ExtArena>>,
+        next_base: Mutex<u64>,
+    }
+
+    /// `size` bytes of zeroed, page-aligned memory that lives as long as the test.
+    fn pages(size: u64) -> u64 {
+        let layout = std::alloc::Layout::from_size_align(size as usize, ARENA_ALIGN as usize);
+        // SAFETY: a non-zero size and a power-of-two alignment.
+        unsafe { std::alloc::alloc_zeroed(layout.unwrap()) as u64 }
     }
 
     impl Fake {
@@ -733,14 +1223,21 @@ mod tests {
         fn destroy_context(&self, ctx: u32) {
             self.log.lock().unwrap().push(format!("-ctx {ctx}"));
         }
-        fn create_arena(&self, _ctx: u32, _arena: u32, size: u64) -> Result<ExtArena, String> {
-            Ok(ExtArena {
-                host_addr: 0x1_0000_0000,
-                size: size.next_multiple_of(ARENA_ALIGN),
-                gpu_base: 0x5000,
-            })
+        fn create_arena(&self, ctx: u32, arena: u32, size: u64) -> Result<ExtArena, String> {
+            let size = size.next_multiple_of(ARENA_ALIGN);
+            let mut next = self.next_base.lock().unwrap();
+            let gpu_base = 0x15_0000_0000 + *next;
+            *next += size + 0x8000;
+            let a = ExtArena {
+                host_addr: pages(size),
+                size,
+                gpu_base,
+            };
+            self.arenas.lock().unwrap().insert((ctx, arena), a);
+            Ok(a)
         }
         fn destroy_arena(&self, ctx: u32, arena: u32) {
+            self.arenas.lock().unwrap().remove(&(ctx, arena));
             self.log
                 .lock()
                 .unwrap()
@@ -755,25 +1252,71 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("export {ctx}/{arena} as {export}"));
-            Ok(ExtArena {
-                host_addr: 0x1_0000_0000,
-                size: 1 << 20,
-                gpu_base: 0x5000,
-            })
+            let a = *self
+                .arenas
+                .lock()
+                .unwrap()
+                .get(&(ctx, arena))
+                .ok_or("no such arena")?;
+            self.exports.lock().unwrap().insert(export, a);
+            Ok(a)
         }
         fn import_arena(&self, ctx: u32, arena: u32, export: u32) -> Result<ExtArena, String> {
             self.log
                 .lock()
                 .unwrap()
                 .push(format!("import {export} as {ctx}/{arena}"));
-            Ok(ExtArena {
-                host_addr: 0x1_0000_0000,
-                size: 1 << 20,
-                gpu_base: 0x5000,
-            })
+            let a = *self
+                .exports
+                .lock()
+                .unwrap()
+                .get(&export)
+                .ok_or("no such export")?;
+            self.arenas.lock().unwrap().insert((ctx, arena), a);
+            Ok(a)
         }
         fn release_export(&self, export: u32) {
+            self.exports.lock().unwrap().remove(&export);
             self.log.lock().unwrap().push(format!("-export {export}"));
+        }
+        fn export_context(&self, ctx: u32) -> Result<Vec<u8>, String> {
+            Ok(format!("journal of {ctx}").into_bytes())
+        }
+        fn restore_arena(
+            &self,
+            ctx: u32,
+            arena: u32,
+            size: u64,
+            gpu_base: u64,
+        ) -> Result<ExtArena, String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("restore arena {ctx}/{arena} at {gpu_base:#x}"));
+            let a = ExtArena {
+                host_addr: pages(size),
+                size,
+                gpu_base,
+            };
+            self.arenas.lock().unwrap().insert((ctx, arena), a);
+            Ok(a)
+        }
+        fn restore_ring(
+            &self,
+            ctx: u32,
+            arena: u32,
+            offset: u64,
+            data_size: u32,
+            export: &[u8],
+        ) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!(
+                "ring {ctx} at {arena}+{offset} ({data_size}): {}",
+                String::from_utf8_lossy(export)
+            ));
+            Ok(())
+        }
+        fn restore_done(&self) {
+            self.log.lock().unwrap().push("restore done".into());
         }
         fn fence(&self, ctx: u32, seqno: u64, signal: Signal) {
             self.fences.lock().unwrap().push((ctx, seqno, signal));
@@ -824,6 +1367,121 @@ mod tests {
                 tx,
             ),
         )
+    }
+
+    fn fill(a: &ExtArena, byte: u8) {
+        // SAFETY: the fake's arenas are real memory of `size` bytes.
+        unsafe { std::ptr::write_bytes(a.host_addr as *mut u8, byte, a.size as usize) };
+    }
+
+    /// Everything the extension holds, carried into a fresh device: two contexts with doorbells,
+    /// window arenas around a hole, a ring, an export imported elsewhere, an export whose arena
+    /// only it still holds, and a surface made by one context and held by another.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_snapshot_restores_into_a_fresh_device_as_it_was() {
+        let (f, mut s) = state();
+        let window = |arena_id, size| virtio_gpu_limina_arena_create {
+            arena_id,
+            flags: 0,
+            size,
+        };
+        let blob = |arena_id| virtio_gpu_limina_arena_create {
+            arena_id,
+            flags: ARENA_FLAG_BLOB,
+            size: 1 << 16,
+        };
+        s.create_context(1).unwrap();
+        s.create_context(2).unwrap();
+        s.destroy_context(1).unwrap();
+        s.create_context(3).unwrap();
+        s.create_arena(3, window(1, 1 << 16)).unwrap();
+        s.create_arena(3, window(2, 1 << 15)).unwrap();
+        s.create_arena(3, window(3, 1 << 16)).unwrap();
+        s.destroy_arena(3, 2).unwrap();
+        s.attach_ring(
+            3,
+            virtio_gpu_limina_ring_attach {
+                arena_id: 1,
+                data_size: 1 << 14,
+                offset: 0,
+            },
+        )
+        .unwrap();
+        s.create_arena(3, blob(4)).unwrap();
+        s.export_arena(3, 4, 40, 1 << 16).unwrap();
+        s.set_mapped(40, Some(0x20_0000));
+        s.import_arena(
+            2,
+            virtio_gpu_limina_arena_import {
+                arena_id: 9,
+                resource_id: 40,
+            },
+        )
+        .unwrap();
+        s.create_arena(2, blob(5)).unwrap();
+        s.export_arena(2, 5, 41, 1 << 16).unwrap();
+        for (&(ctx, arena), a) in f.arenas.lock().unwrap().iter() {
+            fill(a, (ctx * 16 + arena) as u8);
+        }
+        s.destroy_arena(2, 5).unwrap();
+        let shape = SurfaceShape {
+            width: 64,
+            height: 32,
+            drm_fourcc: 0x34325258,
+            stride: 256,
+        };
+        s.bind_made_surface(3, 50, 7, shape).unwrap();
+        s.bind_surface(2, 50, 8).unwrap();
+
+        let snap = s.snapshot();
+        assert!(
+            snap.arenas
+                .windows(2)
+                .all(|w| w[0].gpu_base < w[1].gpu_base)
+        );
+        assert!(
+            snap.arenas
+                .iter()
+                .any(|a| (a.ctx, a.arena) == (0, 41) && a.contents.iter().all(|&b| b == 2 * 16 + 5)),
+            "the orphaned export is carried with its bytes"
+        );
+        assert_eq!(snap.made, vec![(50, 3, shape, Vec::new())]);
+        assert_eq!(snap.held, vec![(2, 50), (3, 50)]);
+
+        let (g, mut r) = state();
+        let exports = r.restore(&snap).unwrap();
+        assert_eq!(
+            exports.iter().map(|e| e.0).collect::<Vec<_>>(),
+            vec![40, 41]
+        );
+        r.bind_made_surface(3, 50, 17, shape).unwrap();
+        r.bind_surface(2, 50, 18).unwrap();
+        r.restore_rings(&snap).unwrap();
+        let log = g.log.lock().unwrap().clone();
+        let restored: Vec<&String> = log
+            .iter()
+            .filter(|l| l.starts_with("restore arena"))
+            .collect();
+        assert_eq!(restored.len(), snap.arenas.len(), "{log:?}");
+        assert!(
+            log.contains(&"ring 3 at 1+0 (16384): journal of 3".to_string()),
+            "{log:?}"
+        );
+        assert_eq!(log.last().map(String::as_str), Some("restore done"));
+        let bytes = snap.to_bytes();
+        assert_eq!(ExtSnapshot::from_bytes(&bytes).as_ref(), Some(&snap));
+        for n in [0, 3, bytes.len() / 2, bytes.len() - 1] {
+            assert_eq!(ExtSnapshot::from_bytes(&bytes[..n]), None, "{n}");
+        }
+
+        let again = r.snapshot();
+        assert_eq!(again.contexts, snap.contexts, "doorbells and rings");
+        assert_eq!(again.arenas, snap.arenas, "addresses, windows and contents");
+        assert_eq!(again.exports, snap.exports);
+        assert_eq!(again.imports, snap.imports);
+        assert_eq!(again.made, snap.made);
+        assert_eq!(again.held, snap.held);
     }
 
     #[test]

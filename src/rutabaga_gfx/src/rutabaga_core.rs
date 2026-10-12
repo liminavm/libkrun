@@ -246,6 +246,19 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// limina: the inverse of [`Self::read_iosurface`], at the surface's own layout: `src` holds
+    /// `height` rows `stride` bytes apart. A CPU write with no ordering against any renderer.
+    #[cfg(target_os = "macos")]
+    fn write_iosurface(
+        &self,
+        _resource_id: u32,
+        _src: &[u8],
+        _stride: u32,
+        _height: u32,
+    ) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// limina: a send right to the IOSurface `resource_id` is presented from, with its shape, for
     /// the embedder's own renderer to import. Only virgl implements it.
     #[cfg(target_os = "macos")]
@@ -1231,6 +1244,23 @@ impl Rutabaga {
             .ok_or(RutabagaError::InvalidComponent)?;
 
         component.read_iosurface(resource_id, dst, dst_stride, height)
+    }
+
+    /// limina: writes `height` rows, `stride` bytes apart, into the surface `resource_id` is
+    /// presented from. Nothing may be drawing into it or reading it meanwhile.
+    #[cfg(target_os = "macos")]
+    pub fn write_iosurface(
+        &self,
+        resource_id: u32,
+        src: &[u8],
+        stride: u32,
+        height: u32,
+    ) -> RutabagaResult<()> {
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+        component.write_iosurface(resource_id, src, stride, height)
     }
 
     /// limina vrend zero-copy scanout: complete a vrend scanout's renders, waiting here. Call
