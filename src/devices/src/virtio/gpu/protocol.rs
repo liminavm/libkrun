@@ -596,6 +596,7 @@ pub enum GpuCommand {
     LiminaArenaCreate(ext::virtio_gpu_limina_arena_create),
     LiminaArenaDestroy(ext::virtio_gpu_limina_arena_destroy),
     LiminaRingAttach(ext::virtio_gpu_limina_ring_attach),
+    LiminaArenaImport(ext::virtio_gpu_limina_arena_import),
 }
 
 /// An error indicating something went wrong decoding a `GpuCommand`. These correspond to
@@ -651,6 +652,7 @@ impl fmt::Debug for GpuCommand {
             LiminaArenaCreate(_info) => f.debug_struct("LiminaArenaCreate").finish(),
             LiminaArenaDestroy(_info) => f.debug_struct("LiminaArenaDestroy").finish(),
             LiminaRingAttach(_info) => f.debug_struct("LiminaRingAttach").finish(),
+            LiminaArenaImport(_info) => f.debug_struct("LiminaArenaImport").finish(),
         }
     }
 }
@@ -694,6 +696,7 @@ impl GpuCommand {
             ext::VIRTIO_GPU_CMD_LIMINA_ARENA_CREATE => LiminaArenaCreate(cmd.read_obj()?),
             ext::VIRTIO_GPU_CMD_LIMINA_ARENA_DESTROY => LiminaArenaDestroy(cmd.read_obj()?),
             ext::VIRTIO_GPU_CMD_LIMINA_RING_ATTACH => LiminaRingAttach(cmd.read_obj()?),
+            ext::VIRTIO_GPU_CMD_LIMINA_ARENA_IMPORT => LiminaArenaImport(cmd.read_obj()?),
             _ => return Err(GpuCommandDecodeError::InvalidType(hdr.type_)),
         };
 
