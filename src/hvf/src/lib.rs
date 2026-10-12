@@ -1084,6 +1084,7 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
+            warn!("hv_vcpu_get_sys_reg({reg:#06x}) failed: {ret:#x}");
             Err(Error::VcpuReadSystemRegister)
         } else {
             Ok(val)
@@ -1121,6 +1122,7 @@ impl HvfVcpu<'_> {
         let mut val: hv_simd_fp_uchar16_t = 0;
         let ret = unsafe { hv_vcpu_get_simd_fp_reg(self.vcpuid, reg, &mut val) };
         if ret != HV_SUCCESS {
+            warn!("hv_vcpu_get_simd_fp_reg({reg}) failed: {ret:#x}");
             Err(Error::VcpuSnapshot)
         } else {
             Ok(val)
@@ -1140,6 +1142,7 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut val) };
         if ret != HV_SUCCESS {
+            warn!("hv_vcpu_get_vtimer_offset failed: {ret:#x}");
             Err(Error::VcpuSnapshot)
         } else {
             Ok(val)
@@ -1159,6 +1162,7 @@ impl HvfVcpu<'_> {
         let mut masked = false;
         let ret = unsafe { hv_vcpu_get_vtimer_mask(self.vcpuid, &mut masked) };
         if ret != HV_SUCCESS {
+            warn!("hv_vcpu_get_vtimer_mask failed: {ret:#x}");
             Err(Error::VcpuSnapshot)
         } else {
             Ok(masked)
@@ -1169,6 +1173,7 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_gic_get_icc_reg(self.vcpuid, reg, &mut val) };
         if ret != HV_SUCCESS {
+            warn!("hv_gic_get_icc_reg({reg:#06x}) failed: {ret:#x}");
             Err(Error::VcpuSnapshot)
         } else {
             Ok(val)
@@ -1188,6 +1193,7 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_gic_get_ich_reg(self.vcpuid, reg, &mut val) };
         if ret != HV_SUCCESS {
+            warn!("hv_gic_get_ich_reg({reg:#06x}) failed: {ret:#x}");
             Err(Error::VcpuSnapshot)
         } else {
             Ok(val)
@@ -1213,6 +1219,7 @@ impl HvfVcpu<'_> {
         let mut pending = false;
         let ret = unsafe { hv_vcpu_get_pending_interrupt(self.vcpuid, ty, &mut pending) };
         if ret != HV_SUCCESS {
+            warn!("hv_vcpu_get_pending_interrupt({ty}) failed: {ret:#x}");
             Err(Error::VcpuSnapshot)
         } else {
             Ok(pending)
