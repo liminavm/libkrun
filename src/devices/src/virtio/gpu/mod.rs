@@ -1,4 +1,5 @@
 mod device;
+pub mod ext;
 mod journal;
 mod protocol;
 mod trace;
