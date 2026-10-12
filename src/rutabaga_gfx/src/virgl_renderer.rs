@@ -1024,6 +1024,7 @@ impl RutabagaComponent for VirglRenderer {
         surface: SurfaceDesc,
     ) -> RutabagaResult<(RutabagaResource, u32)> {
         let handle = res(resource_id)?;
+        use virglrenderer::renderer::SurfaceShape;
         use virglrenderer::surface::PixelFormat;
         let fourcc = |code: &[u8; 4]| u32::from_le_bytes(*code);
         // The two 32-bit layouts IOSurface stores; alpha or not, the bytes are the same.
@@ -1037,10 +1038,12 @@ impl RutabagaComponent for VirglRenderer {
             .with("resource_create_surface", |r| {
                 r.resource_create_surface(
                     handle,
-                    surface.width,
-                    surface.height,
-                    format,
-                    surface.stride,
+                    SurfaceShape {
+                        width: surface.width,
+                        height: surface.height,
+                        format,
+                        bytes_per_row: surface.stride,
+                    },
                 )
             })?
             .map_err(|e| refused("create_surface", e))?;
