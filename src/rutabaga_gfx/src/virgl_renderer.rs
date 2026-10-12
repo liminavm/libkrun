@@ -456,6 +456,8 @@ impl RutabagaComponent for VirglRenderer {
         let drm_fourcc = u32::from_le_bytes(match shape.format {
             PixelFormat::Bgra => *b"AR24",
             PixelFormat::Rgba => *b"AB24",
+            PixelFormat::R8 => *b"R8  ",
+            PixelFormat::Rg8 => *b"GR88",
         });
         let desc = SurfaceDesc {
             width: shape.width,
