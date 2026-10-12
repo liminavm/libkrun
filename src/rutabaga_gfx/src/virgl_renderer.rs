@@ -356,6 +356,28 @@ impl VirglRenderer {
 
 impl RutabagaComponent for VirglRenderer {
     #[cfg(target_os = "macos")]
+    fn surface_port(&self, resource_id: u32) -> RutabagaResult<(u32, SurfaceDesc)> {
+        use virglrenderer::surface::PixelFormat;
+        let handle = res(resource_id)?;
+        let (port, shape) = self
+            .r
+            .lock()
+            .unwrap()
+            .resource_surface_port(handle)
+            .map_err(|_| RutabagaError::Unsupported)?;
+        let drm_fourcc = u32::from_le_bytes(match shape.format {
+            PixelFormat::Bgra => *b"AR24",
+            PixelFormat::Rgba => *b"AB24",
+        });
+        let desc = SurfaceDesc {
+            width: shape.width,
+            height: shape.height,
+            drm_fourcc,
+            stride: shape.bytes_per_row,
+        };
+        Ok((port.into_raw(), desc))
+    }
+
     fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
         let handle = res(resource_id)?;
         self.r

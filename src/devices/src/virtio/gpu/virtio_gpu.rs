@@ -4105,6 +4105,22 @@ impl VirtioGpu {
     /// A resource whose storage is an IOSurface minted for the extension's renderer (see
     /// `Rutabaga::resource_create_surface`); answers the send right for it.
     #[cfg(target_os = "macos")]
+    /// A send right to the surface `resource_id` is presented from, with its shape.
+    #[cfg(target_os = "macos")]
+    pub fn resource_surface_port(
+        &self,
+        resource_id: u32,
+    ) -> std::result::Result<(u32, SurfaceDesc), GpuResponse> {
+        self.rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .resource_surface_port(resource_id)
+            .map_err(|e| {
+                debug!("virtio-gpu: resource {resource_id} has no surface to import: {e}");
+                ErrInvalidResourceId
+            })
+    }
+
     pub fn resource_create_surface(
         &mut self,
         ctx_id: u32,
