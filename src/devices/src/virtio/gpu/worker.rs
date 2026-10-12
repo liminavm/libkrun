@@ -23,6 +23,10 @@ use super::ext::{
     ExtError, ExtState, GpuExtConfig, virtio_gpu_limina_resp_surface,
     virtio_gpu_limina_surface_create, virtio_gpu_limina_surface_import,
 };
+#[cfg(target_os = "macos")]
+use super::ext::{ExtSnapshot, SurfaceShape};
+#[cfg(target_os = "macos")]
+use super::journal::GpuSnapshotPayload;
 use super::protocol::{
     GpuCommand, GpuResponse, VIRTIO_GPU_BLOB_MEM_HOST3D, VirtioGpuResult, virtio_gpu_ctrl_hdr,
     virtio_gpu_mem_entry,
@@ -227,8 +231,9 @@ impl Worker {
                 // limina M9.3: a snapshot request can arrive while inactive (unlikely — the
                 // production suspend path snapshots with the device DRIVER_OK — but harmless).
                 Ok(WorkerCmd::Snapshot { reply }) => {
+                    let ext = self.snapshot_ext(&virtio_gpu);
                     Self::drain_fences(&virtio_gpu);
-                    let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
+                    let _ = reply.send(virtio_gpu.snapshot_gpu_payload(ext));
                     continue;
                 }
             };
@@ -436,10 +441,37 @@ impl Worker {
     /// limina M9.3: replay a GPU snapshot section into the (fresh) renderer. macOS-only
     /// mechanism today — the venus/KK stack this exists for; elsewhere report failure so
     /// the caller falls back to fresh-renderer behavior.
-    fn gpu_restore(&self, virtio_gpu: &mut VirtioGpu, data: &[u8], mem: &GuestMemoryMmap) -> bool {
+    fn gpu_restore(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        data: &[u8],
+        mem: &GuestMemoryMmap,
+    ) -> bool {
         #[cfg(target_os = "macos")]
         {
-            virtio_gpu.restore_gpu_payload(data, &self.shm_region, mem)
+            let Some(mut payload) = GpuSnapshotPayload::from_bytes(data) else {
+                error!("gpu restore: unparseable GPU snapshot section");
+                return false;
+            };
+            let ext = match std::mem::take(&mut payload.ext) {
+                bytes if bytes.is_empty() => None,
+                bytes => match ExtSnapshot::from_bytes(&bytes) {
+                    Some(s) => Some(s),
+                    None => {
+                        error!("gpu restore: unparseable extension section");
+                        return false;
+                    }
+                },
+            };
+            if let Some(s) = &ext
+                && !self.restore_ext_resources(virtio_gpu, s)
+            {
+                return false;
+            }
+            if !virtio_gpu.restore_gpu_payload(payload, &self.shm_region, mem) {
+                return false;
+            }
+            ext.is_none_or(|s| self.restore_ext_rings(virtio_gpu, &s))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -593,8 +625,9 @@ impl Worker {
                         // the caller, so the queues are idle). Drain in-flight fences first —
                         // see drain_fences.
                         Ok(WorkerCmd::Snapshot { reply }) => {
+                            let ext = self.snapshot_ext(virtio_gpu);
                             Self::drain_fences(virtio_gpu);
-                            let _ = reply.send(virtio_gpu.snapshot_gpu_payload());
+                            let _ = reply.send(virtio_gpu.snapshot_gpu_payload(ext));
                         }
                         // An Activate while already active shouldn't happen (the lifecycle is
                         // activate→reset→activate); ignore it. Empty = spurious wake.
@@ -814,7 +847,16 @@ impl Worker {
             stride: req.stride,
         };
         let port = virtio_gpu.resource_create_surface(ctx, req.resource_id, surface)?;
-        if ext.bind_surface(ctx, req.resource_id, port).is_err() {
+        let shape = SurfaceShape {
+            width: req.width,
+            height: req.height,
+            drm_fourcc: req.drm_fourcc,
+            stride: req.stride,
+        };
+        if ext
+            .bind_made_surface(ctx, req.resource_id, port, shape)
+            .is_err()
+        {
             let _ = virtio_gpu.unref_resource(req.resource_id);
             return Err(GpuResponse::ErrUnspec);
         }
@@ -872,6 +914,113 @@ impl Worker {
         _req: virtio_gpu_limina_surface_create,
     ) -> VirtioGpuResult {
         Err(GpuResponse::ErrUnspec)
+    }
+
+    /// limina: the extension's section of a snapshot, empty without one. Every context is exported
+    /// first, which waits for its committed work (or loses the context), so the fence drain that
+    /// follows finds its fences answered.
+    fn snapshot_ext(&self, virtio_gpu: &VirtioGpu) -> Vec<u8> {
+        let Some(ext) = self.ext.as_ref() else {
+            return Vec::new();
+        };
+        #[allow(unused_mut)]
+        let mut s = ext.snapshot();
+        #[cfg(target_os = "macos")]
+        for (resource, _, shape, rows) in &mut s.made {
+            match virtio_gpu.read_surface(*resource, shape.stride, shape.height) {
+                Some(r) => *rows = r,
+                // The client draws it again; until then the window is blank.
+                None => warn!("gpu snapshot: surface {resource}: rows not read"),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = virtio_gpu;
+        s.to_bytes()
+    }
+
+    /// limina restore, before the other renderers' replay: the extension's contexts, arenas,
+    /// exports and imports, then the surfaces contexts made, which that replay names.
+    #[cfg(target_os = "macos")]
+    fn restore_ext_resources(&mut self, virtio_gpu: &mut VirtioGpu, s: &ExtSnapshot) -> bool {
+        let Some(ext) = self.ext.as_mut() else {
+            error!("gpu restore: the snapshot has an extension section and this device none");
+            return false;
+        };
+        let exports = match ext.restore(s) {
+            Ok(e) => e,
+            Err(e) => {
+                error!("gpu restore: extension: {e}");
+                return false;
+            }
+        };
+        for (resource, a) in exports {
+            let mapped = s.exports.iter().find(|e| e.0 == resource).and_then(|e| e.3);
+            if let Some(offset) = mapped
+                && virtio_gpu
+                    .map_ext_blob(a.host_addr, a.size, &self.shm_region, offset)
+                    .is_err()
+            {
+                error!("gpu restore: extension blob {resource} not mapped at {offset:#x}");
+                return false;
+            }
+        }
+        for (resource, ctx, shape, rows) in &s.made {
+            let desc = SurfaceDesc {
+                width: shape.width,
+                height: shape.height,
+                drm_fourcc: shape.drm_fourcc,
+                stride: shape.stride,
+            };
+            let port = match virtio_gpu.resource_create_surface(*ctx, *resource, desc) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("gpu restore: surface {resource} of context {ctx}: {e:?}");
+                    return false;
+                }
+            };
+            if !rows.is_empty()
+                && !virtio_gpu.write_surface(*resource, rows, shape.stride, shape.height)
+            {
+                warn!("gpu restore: surface {resource}: rows not written; blank until redrawn");
+            }
+            if ext
+                .bind_made_surface(*ctx, *resource, port, *shape)
+                .is_err()
+            {
+                error!("gpu restore: surface {resource} not given to context {ctx}");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// limina restore, after the other renderers' replay: surfaces contexts imported, which may
+    /// be resources that replay made, then every ring where it stopped.
+    #[cfg(target_os = "macos")]
+    fn restore_ext_rings(&mut self, virtio_gpu: &mut VirtioGpu, s: &ExtSnapshot) -> bool {
+        let Some(ext) = self.ext.as_mut() else {
+            return false;
+        };
+        for &(ctx, resource) in &s.held {
+            if s.made.iter().any(|m| (m.0, m.1) == (resource, ctx)) {
+                continue;
+            }
+            let bound = virtio_gpu
+                .resource_surface_port(resource)
+                .ok()
+                .is_some_and(|(port, _)| ext.bind_surface(ctx, resource, port).is_ok());
+            if !bound {
+                error!("gpu restore: surface {resource} not given back to context {ctx}");
+                return false;
+            }
+        }
+        match ext.restore_rings(s) {
+            Ok(()) => true,
+            Err(e) => {
+                error!("gpu restore: extension rings: {e}");
+                false
+            }
+        }
     }
 
     /// The guest driver went away: its extension contexts and arenas go with it.
