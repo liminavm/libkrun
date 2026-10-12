@@ -139,7 +139,9 @@ const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
 // something unrelated forces a full recomposite. These are the one copy of those
 // pixels that certainly exists — the host is displaying them — and they need no
 // guest cooperation to capture or to put back.
-const PAYLOAD_VERSION: u32 = 8;
+// v9: + ext — the native-context extension's section (its books, its arenas' bytes and each
+// context's export), opaque here: the extension writes and reads it.
+const PAYLOAD_VERSION: u32 = 9;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -231,6 +233,8 @@ pub struct GpuSnapshotPayload {
     /// after the restore's scanout flips so the first frame the user sees is the
     /// desktop they left rather than whatever the fresh renderer starts with.
     pub scanout_frames: Vec<ScanoutFrame>,
+    /// v9: the native-context extension's section, empty without one.
+    pub ext: Vec<u8>,
 }
 
 /// One scanout's presented pixels, tightly packed BGRA/RGBA at `width * 4` stride —
@@ -478,6 +482,10 @@ impl GpuSnapshotPayload {
             buf.extend_from_slice(&f.pixels);
         }
 
+        // v9 extension section.
+        put_u64(&mut buf, self.ext.len() as u64);
+        buf.extend_from_slice(&self.ext);
+
         buf
     }
 
@@ -683,6 +691,10 @@ impl GpuSnapshotPayload {
                 pixels,
             });
         }
+
+        // v9 extension section.
+        let len = c.u64()? as usize;
+        payload.ext = c.take(len)?.to_vec();
 
         Some(payload)
     }
@@ -926,6 +938,7 @@ mod tests {
                 height: 2,
                 pixels: (0..24u8).collect(),
             }],
+            ext: vec![0x5a; 40],
             displays: vec![
                 DisplayInfo {
                     width: 2560,
@@ -1032,6 +1045,7 @@ mod tests {
         // v8: the presented pixels are the only copy of a Vulkan compositor's screen, so a
         // silent truncation here is a blank desktop on restore, not a smaller payload.
         assert_eq!(got.scanout_frames, payload.scanout_frames);
+        assert_eq!(got.ext, payload.ext);
 
         assert_eq!(got.displays.len(), 2);
         let d0 = &got.displays[0];
