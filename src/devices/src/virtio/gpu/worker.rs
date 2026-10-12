@@ -10,6 +10,8 @@ use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+#[cfg(target_os = "macos")]
+use rutabaga_gfx::SurfaceDesc;
 use rutabaga_gfx::{ResourceCreate3D, ResourceCreateBlob, RutabagaFence, Transfer3D};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -17,7 +19,7 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
-use super::ext::{ExtError, ExtState, GpuExtConfig};
+use super::ext::{ExtError, ExtState, GpuExtConfig, virtio_gpu_limina_surface_create};
 use super::protocol::{
     GpuCommand, GpuResponse, VIRTIO_GPU_BLOB_MEM_HOST3D, VirtioGpuResult, virtio_gpu_ctrl_hdr,
     virtio_gpu_mem_entry,
@@ -764,6 +766,46 @@ impl Worker {
         self.ext.as_ref().is_some_and(|e| e.is_export(resource))
     }
 
+    /// Resource `req.resource_id` becomes a surface the device mints and gives to extension
+    /// context `ctx`: the context renders into it, and every other context reaches it as an
+    /// ordinary resource (vrend adopts it, venus imports it).
+    #[cfg(target_os = "macos")]
+    fn create_ext_surface(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        ctx: u32,
+        req: virtio_gpu_limina_surface_create,
+    ) -> VirtioGpuResult {
+        let Some(ext) = self.ext.as_mut() else {
+            return Err(GpuResponse::ErrUnspec);
+        };
+        if !ext.has_context(ctx) {
+            return Err(GpuResponse::ErrInvalidContextId);
+        }
+        let surface = SurfaceDesc {
+            width: req.width,
+            height: req.height,
+            drm_fourcc: req.drm_fourcc,
+            stride: req.stride,
+        };
+        let port = virtio_gpu.resource_create_surface(ctx, req.resource_id, surface)?;
+        if ext.bind_surface(ctx, req.resource_id, port).is_err() {
+            let _ = virtio_gpu.unref_resource(req.resource_id);
+            return Err(GpuResponse::ErrUnspec);
+        }
+        Ok(GpuResponse::OkNoData)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn create_ext_surface(
+        &mut self,
+        _virtio_gpu: &mut VirtioGpu,
+        _ctx: u32,
+        _req: virtio_gpu_limina_surface_create,
+    ) -> VirtioGpuResult {
+        Err(GpuResponse::ErrUnspec)
+    }
+
     /// The guest driver went away: its extension contexts and arenas go with it.
     fn reset_ext(&mut self) {
         if let Some(ext) = self.ext.as_mut() {
@@ -832,6 +874,9 @@ impl Worker {
             | GpuCommand::LiminaRingAttach(_)
             | GpuCommand::LiminaArenaImport(_)
             | GpuCommand::LiminaFence(_) => self.process_ext_command(hdr, cmd),
+            GpuCommand::LiminaSurfaceCreate(req) => {
+                self.create_ext_surface(virtio_gpu, hdr.ctx_id, req)
+            }
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
@@ -863,6 +908,9 @@ impl Worker {
                 Ok(GpuResponse::OkNoData)
             }
             GpuCommand::ResourceUnref(info) => {
+                if let Some(ext) = self.ext.as_mut() {
+                    ext.release_surface(info.resource_id);
+                }
                 let r = virtio_gpu.unref_resource(info.resource_id);
                 if r.is_ok() {
                     let pinned = virtio_gpu.journal_mut().resource_unref(info.resource_id);

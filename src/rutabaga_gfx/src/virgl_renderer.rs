@@ -881,6 +881,55 @@ impl RutabagaComponent for VirglRenderer {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    fn create_surface(
+        &self,
+        resource_id: u32,
+        surface: SurfaceDesc,
+    ) -> RutabagaResult<(RutabagaResource, u32)> {
+        let handle = res(resource_id)?;
+        use virglrenderer::surface::PixelFormat;
+        let fourcc = |code: &[u8; 4]| u32::from_le_bytes(*code);
+        // The two 32-bit layouts IOSurface stores; alpha or not, the bytes are the same.
+        let format = match surface.drm_fourcc {
+            f if f == fourcc(b"AR24") || f == fourcc(b"XR24") => PixelFormat::Bgra,
+            f if f == fourcc(b"AB24") || f == fourcc(b"XB24") => PixelFormat::Rgba,
+            _ => return Err(RutabagaError::Unsupported),
+        };
+        let port = self
+            .r
+            .lock()
+            .unwrap()
+            .resource_create_surface(
+                handle,
+                surface.width,
+                surface.height,
+                format,
+                surface.stride,
+            )
+            .map_err(|e| refused("create_surface", e))?;
+        let size = u64::from(surface.stride) * u64::from(surface.height);
+        Ok((
+            RutabagaResource {
+                resource_id,
+                handle: None,
+                blob: true,
+                blob_mem: RUTABAGA_BLOB_MEM_HOST3D,
+                blob_flags: RUTABAGA_BLOB_FLAG_USE_SHAREABLE,
+                map_info: None,
+                map_ptr: None,
+                info_2d: None,
+                info_3d: None,
+                vulkan_info: None,
+                backing_iovecs: None,
+                component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
+                size,
+                mapping: None,
+            },
+            port.into_raw(),
+        ))
+    }
+
     fn resource_map(
         &self,
         _resource_id: u32,
