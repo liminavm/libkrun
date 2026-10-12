@@ -17,12 +17,17 @@
 //!   until its last holder lets go: the arena id in its own context, the blob resource, and every
 //!   import.
 //!
+//! - **Fences**: `FENCE` is sent with `VIRTIO_GPU_FLAG_FENCE`; its response is held until the
+//!   context's ring has completed the seqno it names, so a guest `dma_fence` follows GPU work the
+//!   control queue never carried. Every fence is answered: when its context goes away, it is
+//!   answered then.
+//!
 //! The device owns the mechanism (window placement, mappings, slots, lifetimes); what an arena or
 //! a doorbell means is the embedder's, through [`GpuExtension`]. A guest that does not negotiate the
 //! feature sees a plain virtio-gpu.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{Sender, unbounded};
@@ -54,6 +59,7 @@ pub const VIRTIO_GPU_CMD_LIMINA_ARENA_CREATE: u32 = 0x4c02;
 pub const VIRTIO_GPU_CMD_LIMINA_ARENA_DESTROY: u32 = 0x4c03;
 pub const VIRTIO_GPU_CMD_LIMINA_RING_ATTACH: u32 = 0x4c04;
 pub const VIRTIO_GPU_CMD_LIMINA_ARENA_IMPORT: u32 = 0x4c05;
+pub const VIRTIO_GPU_CMD_LIMINA_FENCE: u32 = 0x4c06;
 
 pub const VIRTIO_GPU_RESP_OK_LIMINA_CTX: u32 = 0x1180;
 pub const VIRTIO_GPU_RESP_OK_LIMINA_ARENA: u32 = 0x1181;
@@ -109,6 +115,15 @@ pub struct virtio_gpu_limina_arena_import {
 // SAFETY: plain integers, no padding.
 unsafe impl ByteValued for virtio_gpu_limina_arena_import {}
 
+/// `FENCE`: answered once `hdr.ctx_id`'s ring has completed `seqno`.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct virtio_gpu_limina_fence {
+    pub seqno: u64,
+}
+// SAFETY: a plain integer.
+unsafe impl ByteValued for virtio_gpu_limina_fence {}
+
 /// What a successful `CTX_CREATE` answers, after the header.
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
@@ -160,6 +175,29 @@ pub trait GpuExtension: Send + Sync {
     /// Makes arena `arena` of `ctx` the memory of `export`.
     fn import_arena(&self, ctx: u32, arena: u32, export: u32) -> Result<ExtArena, String>;
     fn release_export(&self, export: u32);
+    /// Calls `signal` once `ctx`'s ring has completed `seqno` or the context is lost, from any
+    /// thread; at once if it already has.
+    fn fence(&self, ctx: u32, seqno: u64, signal: Signal);
+}
+
+/// What answers a fence; see [`GpuExtension::fence`].
+pub type Signal = Box<dyn FnOnce() + Send>;
+
+/// A fence's answer, shared by the embedder and the device: whichever comes first sends it.
+#[derive(Clone)]
+struct PendingFence(Arc<Mutex<Option<Signal>>>);
+
+impl PendingFence {
+    fn fire(&self) {
+        let signal = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(signal) = signal {
+            signal();
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    }
 }
 
 /// Where the device put the extension's windows in guest-physical space.
@@ -201,6 +239,8 @@ impl BusDevice for DoorbellDevice {
 
 struct Context {
     doorbell: u32,
+    /// Fences not answered yet, answered when the context goes away.
+    fences: Vec<PendingFence>,
     /// arena id → its (window offset, size), or `None` for one shared through a blob resource.
     arenas: HashMap<u32, Option<(u64, u64)>>,
 }
@@ -263,6 +303,7 @@ impl ExtState {
             ctx,
             Context {
                 doorbell,
+                fences: Vec::new(),
                 arenas: HashMap::new(),
             },
         );
@@ -282,6 +323,25 @@ impl ExtState {
             self.cfg.ext.destroy_arena(ctx, arena);
         }
         self.cfg.ext.destroy_context(ctx);
+        for f in c.fences {
+            f.fire();
+        }
+        Ok(())
+    }
+
+    /// Answers `signal` once `ctx` has completed `seqno`, or when the context goes away; at once
+    /// if there is no such context, so no fence is left unanswered.
+    pub fn fence(&mut self, ctx: u32, seqno: u64, signal: Signal) -> Result<(), ExtError> {
+        let pending = PendingFence(Arc::new(Mutex::new(Some(signal))));
+        let Some(c) = self.contexts.get_mut(&ctx) else {
+            pending.fire();
+            return Err(ExtError::InvalidContext);
+        };
+        c.fences.retain(|f| !f.fired());
+        c.fences.push(pending.clone());
+        self.cfg
+            .ext
+            .fence(ctx, seqno, Box::new(move || pending.fire()));
         Ok(())
     }
 
@@ -538,11 +598,33 @@ impl ExtState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[derive(Default)]
     struct Fake {
         log: Mutex<Vec<String>>,
+        /// Fences the "GPU" has not completed: (ctx, seqno, signal).
+        fences: Mutex<Vec<(u32, u64, Signal)>>,
+    }
+
+    impl Fake {
+        /// Completes every fence of `ctx` up to `seqno`.
+        fn complete(&self, ctx: u32, seqno: u64) {
+            let mut fences = self.fences.lock().unwrap();
+            let (done, rest) = std::mem::take(&mut *fences)
+                .into_iter()
+                .partition(|f| f.0 == ctx && f.1 <= seqno);
+            *fences = rest;
+            drop(fences);
+            for (_, _, signal) in done {
+                signal();
+            }
+        }
+    }
+
+    fn logging_signal(f: &Arc<Fake>, what: &str) -> Signal {
+        let f = f.clone();
+        let what = what.to_string();
+        Box::new(move || f.log.lock().unwrap().push(what))
     }
 
     impl GpuExtension for Fake {
@@ -597,6 +679,9 @@ mod tests {
         }
         fn release_export(&self, export: u32) {
             self.log.lock().unwrap().push(format!("-export {export}"));
+        }
+        fn fence(&self, ctx: u32, seqno: u64, signal: Signal) {
+            self.fences.lock().unwrap().push((ctx, seqno, signal));
         }
     }
 
@@ -806,5 +891,52 @@ mod tests {
             Some(ExtError::InvalidParameter),
             "no such arena"
         );
+    }
+
+    #[test]
+    fn a_fence_is_answered_when_its_seqno_completes_and_only_once() {
+        let (f, mut s) = state();
+        s.create_context(1).unwrap();
+        s.fence(1, 5, logging_signal(&f, "fence 5")).unwrap();
+        f.complete(1, 4);
+        assert!(!f.log.lock().unwrap().contains(&"fence 5".to_string()));
+        f.complete(1, 5);
+        s.destroy_context(1).unwrap();
+        let log = f.log.lock().unwrap();
+        assert_eq!(log.iter().filter(|l| *l == "fence 5").count(), 1);
+    }
+
+    #[test]
+    fn destroying_a_context_answers_its_pending_fences() {
+        let (f, mut s) = state();
+        s.create_context(1).unwrap();
+        s.fence(1, 9, logging_signal(&f, "fence 9")).unwrap();
+        s.destroy_context(1).unwrap();
+        let log = f.log.lock().unwrap().clone();
+        let answered = log.iter().position(|l| l == "fence 9");
+        assert!(answered.is_some(), "the fence was answered: {log:?}");
+        drop(f.fences.lock().unwrap().drain(..));
+    }
+
+    #[test]
+    fn a_fence_without_a_context_is_answered_at_once() {
+        let (f, mut s) = state();
+        assert_eq!(
+            s.fence(7, 1, logging_signal(&f, "fence")).err(),
+            Some(ExtError::InvalidContext)
+        );
+        assert!(f.log.lock().unwrap().contains(&"fence".to_string()));
+    }
+
+    #[test]
+    fn a_reset_answers_every_fence() {
+        let (f, mut s) = state();
+        s.create_context(1).unwrap();
+        s.create_context(2).unwrap();
+        s.fence(1, 1, logging_signal(&f, "a")).unwrap();
+        s.fence(2, 1, logging_signal(&f, "b")).unwrap();
+        s.reset();
+        let log = f.log.lock().unwrap();
+        assert!(log.contains(&"a".to_string()) && log.contains(&"b".to_string()));
     }
 }
