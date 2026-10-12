@@ -748,6 +748,10 @@ pub fn build_microvm(
     let gpu_shm_size = requirements.iter().filter_map(|r| r.gpu_shm).next();
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
+    #[cfg(feature = "gpu")]
+    let gpu_ext_sizes = requirements.iter().filter_map(|r| r.gpu_ext).next();
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ext_sizes: Option<(usize, usize)> = None;
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
 
     #[cfg(feature = "tdx")]
@@ -784,6 +788,7 @@ pub fn build_microvm(
         vm_resources.efi_vars.as_deref(),
         &fs_shm_sizes,
         gpu_shm_size,
+        gpu_ext_sizes,
         use_vhost_user,
         &payload,
         #[cfg(feature = "tee")]
@@ -2216,6 +2221,7 @@ pub fn create_guest_memory(
     efi_vars: Option<&std::path::Path>,
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
+    gpu_ext_sizes: Option<(usize, usize)>,
     use_vhost_user: bool,
     payload: &Payload,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
@@ -2306,6 +2312,14 @@ pub fn create_guest_memory(
     }
     #[cfg(not(feature = "gpu"))]
     let _ = gpu_shm_size;
+    #[cfg(feature = "gpu")]
+    if let Some((doorbells, arenas)) = gpu_ext_sizes {
+        shm_manager
+            .create_gpu_ext_regions(doorbells, arenas)
+            .map_err(StartMicrovmError::ShmCreate)?;
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_ext_sizes;
 
     let _ = use_vhost_user;
 
@@ -2416,6 +2430,12 @@ pub fn create_guest_memory(
     };
 
     arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
+    // The GPU extension's windows are not guest memory, but the IPA space must reach them.
+    #[cfg(feature = "gpu")]
+    if let Some((_, arenas)) = shm_manager.gpu_ext_regions() {
+        let end = arenas.guest_addr.raw_value() + arenas.size as u64 - 1;
+        arch_mem_info.guest_last_addr = arch_mem_info.guest_last_addr.max(end);
+    }
 
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
 }
@@ -3059,6 +3079,7 @@ pub mod tests {
             None,
             None,
             &[],
+            None,
             None,
             false,
             &Payload::Empty,
