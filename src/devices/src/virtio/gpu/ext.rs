@@ -1100,7 +1100,10 @@ impl ExtSnapshot {
         for (resource, ctx, shape, rows) in &self.made {
             o.u32(*resource);
             o.u32(*ctx);
-            o.0.extend_from_slice(shape.as_slice());
+            o.u32(shape.width);
+            o.u32(shape.height);
+            o.u32(shape.drm_fourcc);
+            o.u32(shape.stride);
             o.bytes(rows);
         }
         o.u32(self.held.len() as u32);
@@ -1148,11 +1151,15 @@ impl ExtSnapshot {
         for _ in 0..i.count(12)? {
             s.imports.push((i.u32()?, i.u32()?, i.u32()?));
         }
-        let shape_len = std::mem::size_of::<SurfaceShape>();
-        for _ in 0..i.count(8 + shape_len + 8)? {
+        for _ in 0..i.count(8 + 16 + 8)? {
             let resource = i.u32()?;
             let ctx = i.u32()?;
-            let shape = SurfaceShape::from_slice(i.take(shape_len)?).copied()?;
+            let shape = SurfaceShape {
+                width: i.u32()?,
+                height: i.u32()?,
+                drm_fourcc: i.u32()?,
+                stride: i.u32()?,
+            };
             s.made.push((resource, ctx, shape, i.bytes()?));
         }
         for _ in 0..i.count(8)? {
@@ -1280,7 +1287,8 @@ mod tests {
             self.log.lock().unwrap().push(format!("-export {export}"));
         }
         fn export_context(&self, ctx: u32) -> Result<Vec<u8>, String> {
-            Ok(format!("journal of {ctx}").into_bytes())
+            // An odd length, as real exports have: what follows it in a snapshot is unaligned.
+            Ok(format!("journal of {ctx}!").into_bytes())
         }
         fn restore_arena(
             &self,
@@ -1465,7 +1473,7 @@ mod tests {
             .collect();
         assert_eq!(restored.len(), snap.arenas.len(), "{log:?}");
         assert!(
-            log.contains(&"ring 3 at 1+0 (16384): journal of 3".to_string()),
+            log.contains(&"ring 3 at 1+0 (16384): journal of 3!".to_string()),
             "{log:?}"
         );
         assert_eq!(log.last().map(String::as_str), Some("restore done"));
