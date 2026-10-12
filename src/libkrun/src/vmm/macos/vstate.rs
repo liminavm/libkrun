@@ -397,7 +397,8 @@ impl Vcpu {
     /// but UNMAPPED in a fresh `--restore` worker until the guest re-establishes its blobs. venus'
     /// ring + every mappable `VkDeviceMemory` are HOST3D blobs in this window and are SKIPPED by
     /// `dump_ram`, so this exit is the unambiguous signature of "GPU/venus state is gone on restore."
-    /// Logged loudly once per vCPU (the access would otherwise flood).
+    /// Only an exit no device claims counts: the virtio-gpu extension's doorbells live up there and
+    /// trap by design. Logged loudly once per vCPU (the access would otherwise flood).
     fn flag_shm_window_fault(&mut self, vcpuid: u64, addr: u64, write: bool) {
         if self.shm_start != 0 && addr >= self.shm_start && !self.shm_fault_logged {
             self.shm_fault_logged = true;
@@ -497,17 +498,22 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    self.flag_shm_window_fault(vcpuid, addr, false);
-                    if let Some(ref mmio_bus) = self.mmio_bus {
+                    let handled = self.mmio_bus.as_ref().is_some_and(|mmio_bus| {
                         debug!("vCPU {vcpuid} MMIO read 0x{addr:x}");
-                        mmio_bus.read(vcpuid, addr, data);
+                        mmio_bus.read(vcpuid, addr, data)
+                    });
+                    if !handled {
+                        self.flag_shm_window_fault(vcpuid, addr, false);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    self.flag_shm_window_fault(vcpuid, addr, true);
-                    if let Some(ref mmio_bus) = self.mmio_bus {
-                        mmio_bus.write(vcpuid, addr, data);
+                    let handled = self
+                        .mmio_bus
+                        .as_ref()
+                        .is_some_and(|mmio_bus| mmio_bus.write(vcpuid, addr, data));
+                    if !handled {
+                        self.flag_shm_window_fault(vcpuid, addr, true);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
