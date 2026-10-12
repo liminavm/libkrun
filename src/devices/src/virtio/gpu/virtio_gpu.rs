@@ -24,6 +24,8 @@ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
+#[cfg(target_os = "macos")]
+use rutabaga_gfx::SurfaceDesc;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
@@ -4127,6 +4129,32 @@ impl VirtioGpu {
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
         Ok(self.result_from_query(resource_id))
+    }
+
+    /// A resource whose storage is an IOSurface minted for the extension's renderer (see
+    /// `Rutabaga::resource_create_surface`); answers the send right for it.
+    #[cfg(target_os = "macos")]
+    pub fn resource_create_surface(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        surface: SurfaceDesc,
+    ) -> std::result::Result<u32, GpuResponse> {
+        let port = self
+            .rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .resource_create_surface(resource_id, surface)
+            .map_err(|e| {
+                warn!("virtio-gpu: surface resource {resource_id}: {e}");
+                ErrInvalidParameter
+            })?;
+        let size = u64::from(surface.stride) * u64::from(surface.height);
+        let mut resource =
+            VirtioGpuResource::new(resource_id, surface.width, surface.height, None, size);
+        resource.ctx_id = ctx_id;
+        self.resources.insert(resource_id, resource);
+        Ok(port)
     }
 
     /// Uses the hypervisor to map the rutabaga blob resource.
