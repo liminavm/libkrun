@@ -742,6 +742,25 @@ impl RutabagaComponent for VirglRenderer {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn write_iosurface(
+        &self,
+        resource_id: u32,
+        src: &[u8],
+        stride: u32,
+        height: u32,
+    ) -> RutabagaResult<()> {
+        let handle = res(resource_id)?;
+        self.r
+            .lock()
+            .unwrap()
+            .resource_write_surface(handle, src, stride as usize, height)
+            .map_err(|e| {
+                error!("virglrs: write_iosurface: resource {resource_id}: {e}");
+                RutabagaError::ComponentError(-libc::EINVAL)
+            })
+    }
+
     /// limina vrend zero-copy scanout: complete what was rendered into the surface before it is
     /// presented. An error is the VMM's cue to read the pixels back instead.
     #[cfg(target_os = "macos")]

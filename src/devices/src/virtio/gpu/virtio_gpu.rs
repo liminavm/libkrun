@@ -1425,14 +1425,15 @@ impl VirtioGpu {
     }
 
     /// bytes (host allocations, invisible to the guest-RAM dump). Worker thread.
-    pub fn snapshot_gpu_payload(&mut self) -> Option<Vec<u8>> {
+    /// `ext` is the native-context extension's section, carried as it is.
+    pub fn snapshot_gpu_payload(&mut self, ext: Vec<u8>) -> Option<Vec<u8>> {
         // Hardware decodes run on threads of their own, so a quiesced guest is not a quiet
         // renderer: a decode may still be writing a target. Everything below reads resource
         // contents, so every decode is brought to rest first.
         if let Some(rutabaga) = self.rutabaga.as_ref() {
             rutabaga.limina_settle_video();
         }
-        if self.rutabaga.is_none() || self.journal.entries().is_empty() {
+        if self.rutabaga.is_none() || (self.journal.entries().is_empty() && ext.is_empty()) {
             return None;
         }
 
@@ -1446,6 +1447,7 @@ impl VirtioGpu {
             classic_contents: Vec::new(),
             displays: self.displays.to_vec(),
             scanout_frames: self.capture_scanout_frames(),
+            ext,
         };
 
         let mut ctxs: Vec<(u32, u32)> = Vec::new();
@@ -1572,17 +1574,13 @@ impl VirtioGpu {
     #[cfg(target_os = "macos")]
     pub fn restore_gpu_payload(
         &mut self,
-        data: &[u8],
+        payload: super::journal::GpuSnapshotPayload,
         shm_region: &VirtioShmRegion,
         mem: &GuestMemoryMmap,
     ) -> bool {
         use super::journal::GpuSnapshotPayload;
         use std::collections::HashMap;
 
-        let Some(payload) = GpuSnapshotPayload::from_bytes(data) else {
-            error!("gpu restore: unparseable GPU snapshot section");
-            return false;
-        };
         let GpuSnapshotPayload {
             mut ops,
             vkr_journals,
@@ -1593,6 +1591,7 @@ impl VirtioGpu {
             classic_contents,
             displays,
             scanout_frames,
+            ext: _,
         } = payload;
 
         // The restored device was built with the default display configuration, but the guest
@@ -4129,6 +4128,27 @@ impl VirtioGpu {
                 debug!("virtio-gpu: resource {resource_id} has no surface to import: {e}");
                 ErrInvalidResourceId
             })
+    }
+
+    /// The rows of the surface `resource_id` is presented from, at its own layout.
+    #[cfg(target_os = "macos")]
+    pub fn read_surface(&self, resource_id: u32, stride: u32, height: u32) -> Option<Vec<u8>> {
+        let mut rows = vec![0; stride as usize * height as usize];
+        let r = self.rutabaga.as_ref()?;
+        r.read_iosurface(resource_id, &mut rows, stride, height)
+            .map_err(|e| warn!("virtio-gpu: read surface {resource_id}: {e}"))
+            .ok()?;
+        Some(rows)
+    }
+
+    /// Puts back rows [`Self::read_surface`] read. Nothing may be using the surface meanwhile.
+    #[cfg(target_os = "macos")]
+    pub fn write_surface(&self, resource_id: u32, rows: &[u8], stride: u32, height: u32) -> bool {
+        self.rutabaga.as_ref().is_some_and(|r| {
+            r.write_iosurface(resource_id, rows, stride, height)
+                .map_err(|e| warn!("virtio-gpu: write surface {resource_id}: {e}"))
+                .is_ok()
+        })
     }
 
     pub fn resource_create_surface(
