@@ -770,6 +770,78 @@ static SNAPSHOT_SYS_REGS: &[hv_sys_reg_t] = &[
     hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
 ];
 
+/// The EL2 system registers a nested vCPU adds to [`SNAPSHOT_SYS_REGS`], saved after it in the
+/// same vector. With EL2 enabled they hold the guest hypervisor's own state. `CNTVOFF_EL2` is the
+/// guest hypervisor's offset for its guests, a value separate from HVF's vtimer offset (the host's
+/// offset for this guest), so both are kept. `CNTHP_TVAL_EL2` is left out for the reason
+/// `CNTP_TVAL_EL0` is. Every entry round-trips into a fresh nested VM
+/// (`spikes/nested-virt-probe/el2-regs.c`).
+#[rustfmt::skip]
+static SNAPSHOT_EL2_SYS_REGS: &[hv_sys_reg_t] = &[
+    hv_sys_reg_t_HV_SYS_REG_CNTHCTL_EL2, hv_sys_reg_t_HV_SYS_REG_CNTHP_CTL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTHP_CVAL_EL2, hv_sys_reg_t_HV_SYS_REG_CNTVOFF_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CPTR_EL2, hv_sys_reg_t_HV_SYS_REG_ELR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL2, hv_sys_reg_t_HV_SYS_REG_FAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_HCR_EL2, hv_sys_reg_t_HV_SYS_REG_HPFAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL2, hv_sys_reg_t_HV_SYS_REG_MDCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL2, hv_sys_reg_t_HV_SYS_REG_SPSR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL2, hv_sys_reg_t_HV_SYS_REG_TCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL2, hv_sys_reg_t_HV_SYS_REG_TTBR0_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL2, hv_sys_reg_t_HV_SYS_REG_VBAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VMPIDR_EL2, hv_sys_reg_t_HV_SYS_REG_VPIDR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VTCR_EL2, hv_sys_reg_t_HV_SYS_REG_VTTBR_EL2,
+];
+
+/// The GIC virtualization-control registers a nested vCPU adds after [`SNAPSHOT_ICC_REGS`] (and
+/// after `ICC_SRE_EL2`): the guest hypervisor's view of the interrupts it injects into its own
+/// guests. The read-only status registers (`ICH_VTR/MISR/EISR/ELRSR_EL2`) are derived and refuse a
+/// write; the `ICV_*` registers a nested guest reads are views of these. Followed by the list
+/// registers ([`ICH_LIST_REGS`]).
+#[rustfmt::skip]
+static SNAPSHOT_ICH_REGS: &[hv_gic_ich_reg_t] = &[
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_HCR_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_VMCR_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP1R0_EL2,
+];
+
+/// Every list register the API names. A host implements fewer (`ICH_VTR_EL2.ListRegs + 1`, 8 on
+/// an M4 Pro) and refuses the rest, so a snapshot records the ones past that as zero, which keeps
+/// its length the same on every host.
+#[rustfmt::skip]
+static ICH_LIST_REGS: &[hv_gic_ich_reg_t] = &[
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR0_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR1_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR2_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR3_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR4_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR5_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR6_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR7_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR8_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR9_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR10_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR11_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR12_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR13_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR14_EL2, hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR15_EL2,
+];
+
+/// How many system and GIC CPU-interface registers a [`VcpuState`] holds for a vCPU with or
+/// without EL2: (`sysregs`, `icc`).
+fn snapshot_reg_counts(nested: bool) -> (usize, usize) {
+    if nested {
+        (
+            SNAPSHOT_SYS_REGS.len() + SNAPSHOT_EL2_SYS_REGS.len(),
+            SNAPSHOT_ICC_REGS.len() + 1 + SNAPSHOT_ICH_REGS.len() + ICH_LIST_REGS.len(),
+        )
+    } else {
+        (SNAPSHOT_SYS_REGS.len(), SNAPSHOT_ICC_REGS.len())
+    }
+}
+
+impl VcpuState {
+    /// Whether this state was saved from a vCPU with EL2 enabled, or `None` if its register
+    /// counts match neither shape (a file from another build).
+    pub fn nested(&self) -> Option<bool> {
+        let shape = (self.sysregs.len(), self.icc.len());
+        [false, true]
+            .into_iter()
+            .find(|&nested| snapshot_reg_counts(nested) == shape)
+    }
+}
+
 pub struct HvfVcpu<'a> {
     vcpuid: hv_vcpu_t,
     vcpu_exit: &'a hv_vcpu_exit_t,
@@ -1112,6 +1184,31 @@ impl HvfVcpu<'_> {
         }
     }
 
+    fn read_ich_reg(&self, reg: hv_gic_ich_reg_t) -> Result<u64, Error> {
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_gic_get_ich_reg(self.vcpuid, reg, &mut val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(val)
+        }
+    }
+
+    fn write_ich_reg(&self, reg: hv_gic_ich_reg_t, val: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_gic_set_ich_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSnapshot)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// How many of [`ICH_LIST_REGS`] this host implements (`ICH_VTR_EL2.ListRegs + 1`).
+    fn ich_list_regs(&self) -> Result<usize, Error> {
+        let vtr = self.read_ich_reg(hv_gic_ich_reg_t_HV_GIC_ICH_REG_VTR_EL2)?;
+        Ok(((vtr & 0x1f) as usize + 1).min(ICH_LIST_REGS.len()))
+    }
+
     fn read_pending_interrupt(&self, ty: hv_interrupt_type_t) -> Result<bool, Error> {
         let mut pending = false;
         let ret = unsafe { hv_vcpu_get_pending_interrupt(self.vcpuid, ty, &mut pending) };
@@ -1170,6 +1267,23 @@ impl HvfVcpu<'_> {
         for &reg in SNAPSHOT_ICC_REGS {
             icc.push(self.read_icc_reg(reg)?);
         }
+        if self.nested_enabled {
+            for &reg in SNAPSHOT_EL2_SYS_REGS {
+                sysregs.push(self.read_sys_reg(reg)?);
+            }
+            icc.push(self.read_icc_reg(hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL2)?);
+            for &reg in SNAPSHOT_ICH_REGS {
+                icc.push(self.read_ich_reg(reg)?);
+            }
+            let implemented = self.ich_list_regs()?;
+            for (i, &reg) in ICH_LIST_REGS.iter().enumerate() {
+                icc.push(if i < implemented {
+                    self.read_ich_reg(reg)?
+                } else {
+                    0
+                });
+            }
+        }
 
         Ok(VcpuState {
             x,
@@ -1182,8 +1296,12 @@ impl HvfVcpu<'_> {
             icc,
             vtimer_offset: self.read_vtimer_offset()?,
             vtimer_masked: self.read_vtimer_mask()?,
-            pending_irq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
-            pending_fiq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
+            // With EL2 the in-kernel GIC owns the vCPU's interrupt lines and HVF answers
+            // HV_UNSUPPORTED for them; what is pending is in the GIC state the caller saves.
+            pending_irq: !self.nested_enabled
+                && self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
+            pending_fiq: !self.nested_enabled
+                && self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
             // The register file alone cannot say this: a parked vCPU looks exactly like one that
             // is about to return from a PSCI call. The park sites set it (see `set_power`).
             power: self.power,
@@ -1196,19 +1314,47 @@ impl HvfVcpu<'_> {
     /// order otherwise follows the round-trip spike (sysregs, then GP/PC/PSTATE/SIMD, then the
     /// vtimer offset and pending lines).
     pub fn restore_state(&mut self, state: &VcpuState) -> Result<(), Error> {
-        if state.sysregs.len() != SNAPSHOT_SYS_REGS.len()
-            || state.icc.len() != SNAPSHOT_ICC_REGS.len()
-        {
+        if state.nested() != Some(self.nested_enabled) {
             return Err(Error::VcpuSnapshot);
         }
         // Order follows the round-trip spike: GIC CPU-interface (ICC) regs first (the VM-wide GIC
         // blob is already restored by the caller), then the EL1/EL0 sysregs, then GP/PC/PSTATE/SIMD,
         // then the vtimer offset + mask and the pending lines. ICC before sysregs matters: a stale
-        // sysreg view must not sit atop a half-restored CPU interface.
-        for (&reg, &val) in SNAPSHOT_ICC_REGS.iter().zip(state.icc.iter()) {
+        // sysreg view must not sit atop a half-restored CPU interface. A nested vCPU's interface
+        // starts from ICC_SRE_EL2 and the ICH registers, the EL2 configuration the EL1 interface
+        // sits under, and its EL2 sysregs follow the EL1 ones.
+        let (el1_icc, el2_icc) = state.icc.split_at(SNAPSHOT_ICC_REGS.len());
+        if self.nested_enabled {
+            let (sre_el2, ich) = el2_icc.split_at(1);
+            self.write_icc_reg(hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL2, sre_el2[0])?;
+            let (ich, list) = ich.split_at(SNAPSHOT_ICH_REGS.len());
+            for (&reg, &val) in SNAPSHOT_ICH_REGS.iter().zip(ich) {
+                self.write_ich_reg(reg, val)?;
+            }
+            let implemented = self.ich_list_regs()?;
+            for (i, (&reg, &val)) in ICH_LIST_REGS.iter().zip(list).enumerate() {
+                if i < implemented {
+                    self.write_ich_reg(reg, val)?;
+                } else if val != 0 {
+                    // Saved on a host with more list registers, holding an interrupt this one
+                    // has nowhere to put.
+                    return Err(Error::VcpuSnapshot);
+                }
+            }
+        }
+        for (&reg, &val) in SNAPSHOT_ICC_REGS.iter().zip(el1_icc) {
             self.write_icc_reg(reg, val)?;
         }
-        for (&reg, &val) in SNAPSHOT_SYS_REGS.iter().zip(state.sysregs.iter()) {
+        let el2_sysregs = SNAPSHOT_EL2_SYS_REGS.iter().take(if self.nested_enabled {
+            SNAPSHOT_EL2_SYS_REGS.len()
+        } else {
+            0
+        });
+        for (&reg, &val) in SNAPSHOT_SYS_REGS
+            .iter()
+            .chain(el2_sysregs)
+            .zip(state.sysregs.iter())
+        {
             self.write_sys_reg(reg, val)?;
         }
         for (i, &val) in state.x.iter().enumerate() {
@@ -1226,8 +1372,10 @@ impl HvfVcpu<'_> {
         // guest snapshotted mid-timer waits forever on an IRQ that never re-fires.
         vcpu_set_vtimer_mask(self.vcpuid, state.vtimer_masked)?;
         self.vtimer_masked = state.vtimer_masked;
-        vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
-        vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
+        if !self.nested_enabled {
+            vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
+            vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
+        }
         Ok(())
     }
 
@@ -1677,7 +1825,10 @@ impl HvfVcpu<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IpaGranule, map_granule, round_up};
+    use super::{
+        ICH_LIST_REGS, IpaGranule, SNAPSHOT_EL2_SYS_REGS, SNAPSHOT_ICH_REGS, VcpuPower, VcpuState,
+        map_granule, round_up, snapshot_reg_counts,
+    };
 
     // The blob-map alignment guard: hv_vm_map/hv_vm_unmap take sizes at granule
     // granularity only, so the wrappers must round sub-granule sizes up (and by exactly
@@ -1713,5 +1864,43 @@ mod tests {
         // The same size under the host page granule reaches 12 KiB past the blob, into
         // guest addresses a 4 KiB guest is entitled to hand its next blob.
         assert_eq!(round_up(0x21000, IpaGranule::SixteenK.bytes()), 0x24000);
+    }
+
+    fn state(sysregs: usize, icc: usize) -> VcpuState {
+        VcpuState {
+            x: [0; 31],
+            pc: 0,
+            cpsr: 0,
+            fpcr: 0,
+            fpsr: 0,
+            q: [0; 32],
+            sysregs: vec![0; sysregs],
+            icc: vec![0; icc],
+            vtimer_offset: 0,
+            vtimer_masked: false,
+            pending_irq: false,
+            pending_fiq: false,
+            power: VcpuPower::Running,
+        }
+    }
+
+    // A restore reads the EL2 halves only from a state that has them, and refuses one saved with
+    // and restored without EL2 (or the reverse) by the shape alone, so the two layouts must
+    // never coincide, and an older EL1-only file must keep reading as not nested.
+    #[test]
+    fn a_saved_state_says_whether_it_had_el2() {
+        let (sys, icc) = snapshot_reg_counts(false);
+        assert_eq!(state(sys, icc).nested(), Some(false));
+        let (sys2, icc2) = snapshot_reg_counts(true);
+        assert_eq!(state(sys2, icc2).nested(), Some(true));
+        assert_eq!(
+            (sys2 - sys, icc2 - icc),
+            (
+                SNAPSHOT_EL2_SYS_REGS.len(),
+                1 + SNAPSHOT_ICH_REGS.len() + ICH_LIST_REGS.len()
+            )
+        );
+        assert_eq!(state(sys2, icc).nested(), None);
+        assert_eq!(state(sys, icc2).nested(), None);
     }
 }

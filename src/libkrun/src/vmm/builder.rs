@@ -1496,6 +1496,29 @@ pub fn build_microvm(
                 crate::vmm::Error::RestoreRefused(why),
             ));
         }
+        // A guest suspended at EL2 left its hypervisor's state in registers a VM without EL2 does
+        // not have, and a guest that never had EL2 cannot be handed one mid-run.
+        if let Some(saved) = snap.head.vcpus.first().map(|v| v.nested()) {
+            let here = vm_resources.nested_enabled;
+            if saved != Some(here) {
+                let why = match saved {
+                    Some(true) => {
+                        "restore refused: this VM was suspended with nested virtualization on, \
+                         and it is off now"
+                    }
+                    Some(false) => {
+                        "restore refused: this VM was suspended with nested virtualization off, \
+                         and it is on now"
+                    }
+                    None => "restore refused: the snapshot's vCPU registers match no known layout",
+                }
+                .to_string();
+                error!("{why}");
+                return Err(StartMicrovmError::Internal(
+                    crate::vmm::Error::RestoreRefused(why),
+                ));
+            }
+        }
         // Every device is attached by now, and a guest driver bound to a slot that now holds a
         // different device spins on it (a vsock driver rings an input device and floods the log
         // with HdrDescTooSmall). Refused before the RAM is applied, so a refusal costs nothing.
