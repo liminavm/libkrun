@@ -252,6 +252,17 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// limina: mint an IOSurface for the embedder's own renderer and make it a resource every
+    /// context can reach (see [`Rutabaga::resource_create_surface`]). Only virgl implements it.
+    #[cfg(target_os = "macos")]
+    fn create_surface(
+        &self,
+        _resource_id: u32,
+        _surface: SurfaceDesc,
+    ) -> RutabagaResult<(RutabagaResource, u32)> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// limina vrend zero-copy scanout: complete what was rendered into the resource's display
     /// IOSurface before it is presented, and wait for it here. Only virgl implements it.
     fn sync_iosurface(&self, _resource_id: u32) -> RutabagaResult<()> {
@@ -1150,6 +1161,28 @@ impl Rutabaga {
     /// surface dies -- so a stamped id could name a stranger's surface. virglrenderer zeroes its
     /// own cached copy when it frees a surface, so this answers 0 exactly then, and every caller
     /// already treats 0 as "not IOSurface-backed".
+    /// limina: a resource whose storage is an IOSurface minted for a renderer of the embedder's
+    /// own, which renders into it out of this process (limina's Metal transport). Any context
+    /// reaches it as a share of the surface: vrend adopts it as a texture's storage, venus
+    /// imports it. Returns a send right for the surface, the caller's to move to that renderer.
+    #[cfg(target_os = "macos")]
+    pub fn resource_create_surface(
+        &mut self,
+        resource_id: u32,
+        surface: SurfaceDesc,
+    ) -> RutabagaResult<u32> {
+        if self.resources.contains_key(&resource_id) {
+            return Err(RutabagaError::InvalidResourceId);
+        }
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+        let (resource, port) = component.create_surface(resource_id, surface)?;
+        self.resources.insert(resource_id, resource);
+        Ok(port)
+    }
+
     #[cfg(target_os = "macos")]
     pub fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
         let component = self
