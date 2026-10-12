@@ -60,6 +60,7 @@ pub const VIRTIO_GPU_CMD_LIMINA_ARENA_DESTROY: u32 = 0x4c03;
 pub const VIRTIO_GPU_CMD_LIMINA_RING_ATTACH: u32 = 0x4c04;
 pub const VIRTIO_GPU_CMD_LIMINA_ARENA_IMPORT: u32 = 0x4c05;
 pub const VIRTIO_GPU_CMD_LIMINA_FENCE: u32 = 0x4c06;
+pub const VIRTIO_GPU_CMD_LIMINA_SURFACE_CREATE: u32 = 0x4c07;
 
 pub const VIRTIO_GPU_RESP_OK_LIMINA_CTX: u32 = 0x1180;
 pub const VIRTIO_GPU_RESP_OK_LIMINA_ARENA: u32 = 0x1181;
@@ -124,6 +125,22 @@ pub struct virtio_gpu_limina_fence {
 // SAFETY: a plain integer.
 unsafe impl ByteValued for virtio_gpu_limina_fence {}
 
+/// `SURFACE_CREATE`: resource `resource_id` becomes a surface the device mints, `width` x
+/// `height` of DRM format `drm_fourcc` with rows `stride` bytes apart, that `hdr.ctx_id` renders
+/// into and every other context reaches as an ordinary resource.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct virtio_gpu_limina_surface_create {
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub drm_fourcc: u32,
+    pub stride: u32,
+    pub padding: u32,
+}
+// SAFETY: plain integers, no padding.
+unsafe impl ByteValued for virtio_gpu_limina_surface_create {}
+
 /// What a successful `CTX_CREATE` answers, after the header.
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
@@ -178,6 +195,10 @@ pub trait GpuExtension: Send + Sync {
     /// Calls `signal` once `ctx`'s ring has completed `seqno` or the context is lost, from any
     /// thread; at once if it already has.
     fn fence(&self, ctx: u32, seqno: u64, signal: Signal);
+    /// Gives `ctx` the surface `port` (a send right, moved) names, as `surface`.
+    fn bind_surface(&self, ctx: u32, surface: u32, port: u32) -> Result<(), String>;
+    /// `ctx` gives up `surface`; what it already made over it keeps it.
+    fn release_surface(&self, ctx: u32, surface: u32);
 }
 
 /// What answers a fence; see [`GpuExtension::fence`].
@@ -270,6 +291,8 @@ pub struct ExtState {
     /// Blob resources that are exported arenas, with where the blob is mapped in the
     /// host-visible region.
     exports: HashMap<u32, Export>,
+    /// Resources that are surfaces given to a context, with that context.
+    surfaces: HashMap<u32, u32>,
 }
 
 impl ExtState {
@@ -284,6 +307,7 @@ impl ExtState {
             contexts: HashMap::new(),
             used: Vec::new(),
             exports: HashMap::new(),
+            surfaces: HashMap::new(),
         }
     }
 
@@ -323,6 +347,8 @@ impl ExtState {
             self.cfg.ext.destroy_arena(ctx, arena);
         }
         self.cfg.ext.destroy_context(ctx);
+        // The embedder's context took its surfaces with it; the resources live on.
+        self.surfaces.retain(|_, c| *c != ctx);
         for f in c.fences {
             f.fire();
         }
@@ -412,6 +438,32 @@ impl ExtState {
     pub fn release_export(&mut self, resource: u32) {
         if self.exports.remove(&resource).is_some() {
             self.cfg.ext.release_export(resource);
+        }
+    }
+
+    /// Resource `resource`, a surface the device minted, is given to `ctx` through `port`.
+    pub fn bind_surface(&mut self, ctx: u32, resource: u32, port: u32) -> Result<(), ExtError> {
+        if !self.contexts.contains_key(&ctx) {
+            return Err(ExtError::InvalidContext);
+        }
+        if self.surfaces.contains_key(&resource) {
+            return Err(ExtError::InvalidParameter);
+        }
+        self.cfg
+            .ext
+            .bind_surface(ctx, resource, port)
+            .map_err(|e| {
+                warn!("limina ext: ctx {ctx} surface {resource}: {e}");
+                ExtError::Unspec
+            })?;
+        self.surfaces.insert(resource, ctx);
+        Ok(())
+    }
+
+    /// The resource is gone; a surface given to a context is taken back from it.
+    pub fn release_surface(&mut self, resource: u32) {
+        if let Some(ctx) = self.surfaces.remove(&resource) {
+            self.cfg.ext.release_surface(ctx, resource);
         }
     }
 
@@ -683,6 +735,19 @@ mod tests {
         fn fence(&self, ctx: u32, seqno: u64, signal: Signal) {
             self.fences.lock().unwrap().push((ctx, seqno, signal));
         }
+        fn bind_surface(&self, ctx: u32, surface: u32, port: u32) -> Result<(), String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("surface {surface} port {port} to {ctx}"));
+            Ok(())
+        }
+        fn release_surface(&self, ctx: u32, surface: u32) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("-surface {surface} of {ctx}"));
+        }
     }
 
     fn state() -> (Arc<Fake>, ExtState) {
@@ -862,6 +927,45 @@ mod tests {
             .err(),
             Some(ExtError::InvalidParameter),
             "a released resource imports nothing"
+        );
+    }
+
+    #[test]
+    fn a_surface_is_given_back_once_and_goes_with_its_context() {
+        let (f, mut s) = state();
+        let log = |f: &Arc<Fake>, line: &str| f.log.lock().unwrap().contains(&line.to_string());
+        assert_eq!(
+            s.bind_surface(1, 50, 7).err(),
+            Some(ExtError::InvalidContext),
+            "no context to give it to"
+        );
+        s.create_context(1).unwrap();
+        s.bind_surface(1, 50, 7).unwrap();
+        assert!(log(&f, "surface 50 port 7 to 1"));
+        assert_eq!(
+            s.bind_surface(1, 50, 8).err(),
+            Some(ExtError::InvalidParameter),
+            "one resource, one surface"
+        );
+        s.release_surface(50);
+        s.release_surface(50);
+        assert_eq!(
+            f.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| *l == "-surface 50 of 1")
+                .count(),
+            1,
+            "given back once"
+        );
+
+        s.bind_surface(1, 51, 9).unwrap();
+        s.destroy_context(1).unwrap();
+        s.release_surface(51);
+        assert!(
+            !log(&f, "-surface 51 of 1"),
+            "the context took its surfaces with it"
         );
     }
 
