@@ -945,6 +945,12 @@ impl Worker {
             s.made.len(),
             bytes.len() >> 20
         );
+        debug!(
+            "gpu snapshot: extension resources: made {:?}, held {:?}, exports {:?}",
+            s.made.iter().map(|m| (m.0, m.1)).collect::<Vec<_>>(),
+            s.held,
+            s.exports.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>()
+        );
         bytes
     }
 
@@ -975,6 +981,7 @@ impl Worker {
             }
         }
         for (resource, ctx, shape, rows) in &s.made {
+            debug!("gpu restore: re-creating surface {resource} of context {ctx}");
             let desc = SurfaceDesc {
                 width: shape.width,
                 height: shape.height,
