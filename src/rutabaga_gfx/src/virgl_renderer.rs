@@ -200,6 +200,17 @@ fn res(resource_id: u32) -> RutabagaResult<ResourceHandle> {
     ResourceHandle::new(resource_id).ok_or(RutabagaError::InvalidResourceId)
 }
 
+/// A surface's shape as rutabaga carries it, its format by the one DRM code virglrs names it by.
+#[cfg(target_os = "macos")]
+fn surface_desc(shape: virglrenderer::renderer::SurfaceShape) -> SurfaceDesc {
+    SurfaceDesc {
+        width: shape.width,
+        height: shape.height,
+        drm_fourcc: shape.format.drm_fourcc().get(),
+        stride: shape.bytes_per_row,
+    }
+}
+
 /// The guest pages behind a resource, as the renderer describes them.
 ///
 /// A copy of the descriptions, never of the pages: `GuestIov` is a base and a length, and the
@@ -447,25 +458,22 @@ impl VirglRenderer {
 impl RutabagaComponent for VirglRenderer {
     #[cfg(target_os = "macos")]
     fn surface_port(&self, resource_id: u32) -> RutabagaResult<(u32, SurfaceDesc)> {
-        use virglrenderer::surface::PixelFormat;
         let handle = res(resource_id)?;
         let (port, shape) = self
             .r
             .with("resource_surface_port", |r| r.resource_surface_port(handle))?
             .map_err(|_| RutabagaError::Unsupported)?;
-        let drm_fourcc = u32::from_le_bytes(match shape.format {
-            PixelFormat::Bgra => *b"AR24",
-            PixelFormat::Rgba => *b"AB24",
-            PixelFormat::R8 => *b"R8  ",
-            PixelFormat::Rg8 => *b"GR88",
-        });
-        let desc = SurfaceDesc {
-            width: shape.width,
-            height: shape.height,
-            drm_fourcc,
-            stride: shape.bytes_per_row,
-        };
-        Ok((port.into_raw(), desc))
+        Ok((port.into_raw(), surface_desc(shape)))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn embedder_surfaces(&self) -> Vec<(u32, SurfaceDesc)> {
+        self.r
+            .with("embedder_surfaces", |r| r.embedder_surfaces())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(handle, shape)| (handle.get(), surface_desc(shape)))
+            .collect()
     }
 
     fn iosurface_id(&self, resource_id: u32) -> RutabagaResult<u32> {
@@ -1043,13 +1051,11 @@ impl RutabagaComponent for VirglRenderer {
         let handle = res(resource_id)?;
         use virglrenderer::renderer::SurfaceShape;
         use virglrenderer::surface::PixelFormat;
-        let fourcc = |code: &[u8; 4]| u32::from_le_bytes(*code);
-        // The two 32-bit layouts IOSurface stores; alpha or not, the bytes are the same.
-        let format = match surface.drm_fourcc {
-            f if f == fourcc(b"AR24") || f == fourcc(b"XR24") => PixelFormat::Bgra,
-            f if f == fourcc(b"AB24") || f == fourcc(b"XB24") => PixelFormat::Rgba,
-            _ => return Err(RutabagaError::Unsupported),
-        };
+        use virglrenderer::vrend::formats::DrmFourcc;
+        // The guest makes only the two 32-bit layouts; the planes come from decode.
+        let format = PixelFormat::from_drm(DrmFourcc::new(surface.drm_fourcc.to_le_bytes()))
+            .filter(|f| matches!(f, PixelFormat::Bgra | PixelFormat::Rgba))
+            .ok_or(RutabagaError::Unsupported)?;
         let port = self
             .r
             .with("resource_create_surface", |r| {

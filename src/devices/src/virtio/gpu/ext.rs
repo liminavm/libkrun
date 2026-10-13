@@ -384,7 +384,10 @@ pub struct ExtSnapshot {
     pub exports: Vec<(u32, u32, u32, Option<u64>)>,
     /// (ctx, arena, resource).
     pub imports: Vec<(u32, u32, u32)>,
-    /// Surfaces contexts made: (resource, ctx, shape, rows).
+    /// Surfaces minted for the embedder that still exist: (resource, ctx, shape, rows), `ctx`
+    /// being the context the resource was made for. That context may be gone; a surface is given
+    /// back only to the contexts in `held`. Filled by the device, which owns the resources: the
+    /// extension knows a surface only through who holds it.
     pub made: Vec<(u32, u32, SurfaceShape, Vec<u8>)>,
     /// Every context holding a surface: (ctx, resource).
     pub held: Vec<(u32, u32)>,
@@ -413,8 +416,6 @@ pub struct ExtState {
     /// Surfaces given to contexts, as (context, resource), with the shape each was given as:
     /// one resource is held by the context that made it and by every one that imported it.
     surfaces: HashMap<(u32, u32), SurfaceShape>,
-    /// Surfaces contexts made, by resource: the context and the shape.
-    made: HashMap<u32, (u32, SurfaceShape)>,
 }
 
 impl ExtState {
@@ -430,7 +431,6 @@ impl ExtState {
             used: Vec::new(),
             exports: HashMap::new(),
             surfaces: HashMap::new(),
-            made: HashMap::new(),
         }
     }
 
@@ -591,19 +591,6 @@ impl ExtState {
         }
     }
 
-    /// Resource `resource`, a surface `ctx` made with `shape`, is given to it through `port`.
-    pub fn bind_made_surface(
-        &mut self,
-        ctx: u32,
-        resource: u32,
-        port: u32,
-        shape: SurfaceShape,
-    ) -> Result<(), ExtError> {
-        self.bind_surface(ctx, resource, port, shape)?;
-        self.made.insert(resource, (ctx, shape));
-        Ok(())
-    }
-
     /// Resource `resource`, a surface of shape `shape`, is given to `ctx` through `port`.
     pub fn bind_surface(
         &mut self,
@@ -643,7 +630,6 @@ impl ExtState {
 
     /// The resource is gone; every context holding it gives it back.
     pub fn release_surface(&mut self, resource: u32) {
-        self.made.remove(&resource);
         let holders: Vec<u32> = self
             .surfaces
             .keys()
@@ -922,12 +908,6 @@ impl ExtState {
         s.arenas.sort_by_key(|a| a.gpu_base);
         s.exports.sort_unstable();
         s.imports.sort_unstable();
-        s.made = self
-            .made
-            .iter()
-            .map(|(&r, &(ctx, shape))| (r, ctx, shape, Vec::new()))
-            .collect();
-        s.made.sort_by_key(|m| m.0);
         s.held = self.surfaces.keys().copied().collect();
         s.held.sort_unstable();
         s
@@ -1500,10 +1480,12 @@ mod tests {
             drm_fourcc: 0x34325258,
             stride: 256,
         };
-        s.bind_made_surface(3, 50, 7, shape).unwrap();
+        s.bind_surface(3, 50, 7, shape).unwrap();
         s.bind_surface(2, 50, 8, SurfaceShape::default()).unwrap();
 
-        let snap = s.snapshot();
+        let mut snap = s.snapshot();
+        assert!(snap.made.is_empty(), "the device fills in the surfaces");
+        snap.made = vec![(50, 3, shape, vec![1, 2, 3])];
         assert!(
             snap.arenas
                 .windows(2)
@@ -1515,7 +1497,6 @@ mod tests {
                 .any(|a| (a.ctx, a.arena) == (0, 41) && a.contents.iter().all(|&b| b == 2 * 16 + 5)),
             "the orphaned export is carried with its bytes"
         );
-        assert_eq!(snap.made, vec![(50, 3, shape, Vec::new())]);
         assert_eq!(snap.held, vec![(2, 50), (3, 50)]);
 
         let (g, mut r) = state();
@@ -1524,7 +1505,7 @@ mod tests {
             exports.iter().map(|e| e.0).collect::<Vec<_>>(),
             vec![40, 41]
         );
-        r.bind_made_surface(3, 50, 17, shape).unwrap();
+        r.bind_surface(3, 50, 17, shape).unwrap();
         r.bind_surface(2, 50, 18, SurfaceShape::default()).unwrap();
         r.restore_rings(&snap).unwrap();
         let log = g.log.lock().unwrap().clone();
@@ -1549,8 +1530,29 @@ mod tests {
         assert_eq!(again.arenas, snap.arenas, "addresses, windows and contents");
         assert_eq!(again.exports, snap.exports);
         assert_eq!(again.imports, snap.imports);
-        assert_eq!(again.made, snap.made);
         assert_eq!(again.held, snap.held);
+    }
+
+    /// A surface outlives the context that made it while another holds it, and a restore binds
+    /// every context a snapshot names, so a snapshot must name only contexts it carries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_surface_whose_maker_is_gone_is_snapshot_without_it() {
+        let (_f, mut s) = state();
+        s.create_context(3).unwrap();
+        s.create_context(5).unwrap();
+        s.bind_surface(3, 50, 7, SurfaceShape::default()).unwrap();
+        s.bind_surface(5, 50, 8, SurfaceShape::default()).unwrap();
+        s.destroy_context(3).unwrap();
+        let snap = s.snapshot();
+        let live: Vec<u32> = snap.contexts.iter().map(|c| c.ctx).collect();
+        assert_eq!(snap.held, vec![(5, 50)]);
+        for (resource, ctx, ..) in &snap.made {
+            assert!(
+                live.contains(ctx),
+                "surface {resource} is restored for context {ctx}, which is gone"
+            );
+        }
     }
 
     #[test]
