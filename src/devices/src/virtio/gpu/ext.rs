@@ -62,10 +62,12 @@ pub const VIRTIO_GPU_CMD_LIMINA_ARENA_IMPORT: u32 = 0x4c05;
 pub const VIRTIO_GPU_CMD_LIMINA_FENCE: u32 = 0x4c06;
 pub const VIRTIO_GPU_CMD_LIMINA_SURFACE_CREATE: u32 = 0x4c07;
 pub const VIRTIO_GPU_CMD_LIMINA_SURFACE_IMPORT: u32 = 0x4c08;
+pub const VIRTIO_GPU_CMD_LIMINA_INFO: u32 = 0x4c09;
 
 pub const VIRTIO_GPU_RESP_OK_LIMINA_CTX: u32 = 0x1180;
 pub const VIRTIO_GPU_RESP_OK_LIMINA_ARENA: u32 = 0x1181;
 pub const VIRTIO_GPU_RESP_OK_LIMINA_SURFACE: u32 = 0x1182;
+pub const VIRTIO_GPU_RESP_OK_LIMINA_INFO: u32 = 0x1183;
 
 /// `CTX_CREATE`: the context is `hdr.ctx_id`, in the extension's own namespace.
 #[derive(Copy, Clone, Debug, Default)]
@@ -166,6 +168,18 @@ pub struct virtio_gpu_limina_resp_surface {
 // SAFETY: plain integers, no padding.
 unsafe impl ByteValued for virtio_gpu_limina_resp_surface {}
 
+/// What `INFO` answers, after the header: enough for a guest driver to decline a host it cannot
+/// speak to without creating a context.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct virtio_gpu_limina_resp_info {
+    /// The version of the protocol the embedder's renderer speaks on a context's ring.
+    pub wire_version: u32,
+    pub flags: u32,
+}
+// SAFETY: plain integers, no padding.
+unsafe impl ByteValued for virtio_gpu_limina_resp_info {}
+
 /// What a successful `CTX_CREATE` answers, after the header.
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
@@ -202,6 +216,8 @@ pub struct ExtArena {
 
 /// The embedder's half of the extension: the renderer behind contexts, arenas and doorbells.
 pub trait GpuExtension: Send + Sync {
+    /// The version of the protocol contexts speak on their rings, which the device only relays.
+    fn wire_version(&self) -> u32;
     fn create_context(&self, ctx: u32, doorbell: u32) -> Result<(), String>;
     fn destroy_context(&self, ctx: u32);
     fn create_arena(&self, ctx: u32, arena: u32, size: u64) -> Result<ExtArena, String>;
@@ -415,6 +431,13 @@ impl ExtState {
             exports: HashMap::new(),
             surfaces: HashSet::new(),
             made: HashMap::new(),
+        }
+    }
+
+    pub fn info(&self) -> virtio_gpu_limina_resp_info {
+        virtio_gpu_limina_resp_info {
+            wire_version: self.cfg.ext.wire_version(),
+            flags: 0,
         }
     }
 
@@ -1220,6 +1243,9 @@ mod tests {
     }
 
     impl GpuExtension for Fake {
+        fn wire_version(&self) -> u32 {
+            7
+        }
         fn create_context(&self, ctx: u32, doorbell: u32) -> Result<(), String> {
             self.log
                 .lock()
@@ -1490,6 +1516,18 @@ mod tests {
         assert_eq!(again.imports, snap.imports);
         assert_eq!(again.made, snap.made);
         assert_eq!(again.held, snap.held);
+    }
+
+    #[test]
+    fn info_carries_the_embedders_wire_version() {
+        let (_, state) = state();
+        assert_eq!(
+            state.info(),
+            virtio_gpu_limina_resp_info {
+                wire_version: 7,
+                flags: 0
+            }
+        );
     }
 
     #[test]
