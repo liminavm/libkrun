@@ -1160,18 +1160,31 @@ impl Worker {
             }
             GpuCommand::ResourceUnref(info) if self.is_ext_blob(info.resource_id) => {
                 let ext = self.ext.as_mut().expect("is_ext_blob checked it");
-                if let Some((a, Some(offset))) = ext.export(info.resource_id) {
-                    let _ = virtio_gpu.unmap_ext_blob(a.size, &self.shm_region, offset);
+                if let Some((a, Some(offset))) = ext.export(info.resource_id)
+                    && virtio_gpu
+                        .unmap_ext_blob(a.size, &self.shm_region, offset)
+                        .is_err()
+                {
+                    // Released, the export's arena would be freed under a mapping the guest
+                    // still has.
+                    error!(
+                        "limina ext: blob {} could not be unmapped; its arena is kept so the \
+                         guest never reaches freed memory",
+                        info.resource_id
+                    );
+                    return Ok(GpuResponse::OkNoData);
                 }
                 ext.release_export(info.resource_id);
                 Ok(GpuResponse::OkNoData)
             }
             GpuCommand::ResourceUnref(info) => {
-                if let Some(ext) = self.ext.as_mut() {
-                    ext.release_surface(info.resource_id);
-                }
                 let r = virtio_gpu.unref_resource(info.resource_id);
                 if r.is_ok() {
+                    // Only now: a refused unref leaves the resource standing, still held, and a
+                    // snapshot must keep carrying its holders.
+                    if let Some(ext) = self.ext.as_mut() {
+                        ext.release_surface(info.resource_id);
+                    }
                     let pinned = virtio_gpu.journal_mut().resource_unref(info.resource_id);
                     // The GLOBAL unref releases the vkr journal pin the blob create
                     // took on its backing memory (per-ctx detach must not).
