@@ -20,8 +20,8 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::ext::{
-    ExtError, ExtState, GpuExtConfig, virtio_gpu_limina_resp_surface,
-    virtio_gpu_limina_surface_create, virtio_gpu_limina_surface_import,
+    ExtError, ExtState, GpuExtConfig, virtio_gpu_limina_surface_create,
+    virtio_gpu_limina_surface_import,
 };
 #[cfg(target_os = "macos")]
 use super::ext::{ExtSnapshot, SurfaceShape};
@@ -78,6 +78,17 @@ pub enum WorkerCmd {
 enum InnerExit {
     Deactivate,
     Shutdown,
+}
+
+/// The shape a surface is answered with, from what the renderer that made it says.
+#[cfg(target_os = "macos")]
+fn shape_of(d: SurfaceDesc) -> SurfaceShape {
+    SurfaceShape {
+        width: d.width,
+        height: d.height,
+        drm_fourcc: d.drm_fourcc,
+        stride: d.stride,
+    }
 }
 
 pub struct Worker {
@@ -878,22 +889,19 @@ impl Worker {
         if !ext.has_context(ctx) {
             return Err(GpuResponse::ErrInvalidContextId);
         }
-        // Asked before a send right is made: one made and then refused would have no one to
-        // give it back to.
-        if ext.holds_surface(ctx, req.resource_id) {
-            return Err(GpuResponse::ErrInvalidParameter);
+        // A context made only on this transport is never told its handles closed (the kernel
+        // attaches and detaches resources for contexts of its own only), so a guest importing a
+        // buffer again after letting go of it finds it still held: that hold stands until the
+        // resource goes, and answers again. Asked before a send right is made: one made and then
+        // not given would have no one to give it back to.
+        if let Some(shape) = ext.held_surface(ctx, req.resource_id) {
+            return Ok(GpuResponse::OkLiminaSurface(shape));
         }
         let (port, desc) = virtio_gpu.resource_surface_port(req.resource_id)?;
-        ext.bind_surface(ctx, req.resource_id, port)
+        let shape = shape_of(desc);
+        ext.bind_surface(ctx, req.resource_id, port, shape)
             .map_err(|_| GpuResponse::ErrUnspec)?;
-        Ok(GpuResponse::OkLiminaSurface(
-            virtio_gpu_limina_resp_surface {
-                width: desc.width,
-                height: desc.height,
-                drm_fourcc: desc.drm_fourcc,
-                stride: desc.stride,
-            },
-        ))
+        Ok(GpuResponse::OkLiminaSurface(shape))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1022,10 +1030,14 @@ impl Worker {
             if s.made.iter().any(|m| (m.0, m.1) == (resource, ctx)) {
                 continue;
             }
-            let bound = virtio_gpu
-                .resource_surface_port(resource)
-                .ok()
-                .is_some_and(|(port, _)| ext.bind_surface(ctx, resource, port).is_ok());
+            let bound =
+                virtio_gpu
+                    .resource_surface_port(resource)
+                    .ok()
+                    .is_some_and(|(port, desc)| {
+                        ext.bind_surface(ctx, resource, port, shape_of(desc))
+                            .is_ok()
+                    });
             if !bound {
                 error!("gpu restore: surface {resource} not given back to context {ctx}");
                 return false;
