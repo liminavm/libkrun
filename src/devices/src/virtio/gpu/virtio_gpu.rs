@@ -278,6 +278,10 @@ struct VirtioGpuResource {
     /// the resource, so the id read there could already belong to someone else.
     #[cfg(target_os = "macos")]
     published_iosurface_id: Option<u32>,
+    /// A surface the extension's renderer draws into: the renderer here can neither fence its
+    /// presents nor copy it, and the guest waits for its rendering before it flushes.
+    #[cfg(target_os = "macos")]
+    extension_surface: bool,
 }
 
 impl VirtioGpuResource {
@@ -302,6 +306,8 @@ impl VirtioGpuResource {
             ctx_id: 0,
             #[cfg(target_os = "macos")]
             published_iosurface_id: None,
+            #[cfg(target_os = "macos")]
+            extension_surface: false,
         }
     }
 }
@@ -3070,6 +3076,10 @@ impl VirtioGpu {
         if !Self::fence_present_enabled() {
             return false;
         }
+        let extension_surface = self
+            .resources
+            .get(&resource_id)
+            .is_some_and(|r| r.extension_surface);
         let (Some(pf), Some(rutabaga)) = (self.present_fence.as_mut(), self.rutabaga.as_mut())
         else {
             return false;
@@ -3090,6 +3100,20 @@ impl VirtioGpu {
         );
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
         pf.flush_parked_cookies.push((cookie, scanout_id));
+
+        // Nothing to wait for: the guest waited for the frame's rendering before it flushed. The
+        // frame still goes through the parked path, so a fenced flush holds the guest off the
+        // buffer until it has left glass.
+        if extension_surface {
+            pf.retired
+                .lock()
+                .unwrap()
+                .push((cookie, std::time::Instant::now()));
+            if let Err(e) = pf.event.write(1) {
+                error!("present eventfd write failed: {e}");
+            }
+            return true;
+        }
 
         if copy {
             match rutabaga.present_copy(resource_id, scanout_id, cookie) {
@@ -4199,6 +4223,10 @@ impl VirtioGpu {
         let mut resource =
             VirtioGpuResource::new(resource_id, surface.width, surface.height, None, size);
         resource.ctx_id = ctx_id;
+        #[cfg(target_os = "macos")]
+        {
+            resource.extension_surface = true;
+        }
         self.resources.insert(resource_id, resource);
         Ok(port)
     }
