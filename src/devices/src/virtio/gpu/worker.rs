@@ -1065,6 +1065,7 @@ impl Worker {
         };
         let ctx = hdr.ctx_id;
         let r = match cmd {
+            GpuCommand::LiminaInfo => Ok(GpuResponse::OkLiminaInfo(ext.info())),
             GpuCommand::LiminaCtxCreate(_) => ext.create_context(ctx).map(GpuResponse::OkLiminaCtx),
             GpuCommand::LiminaCtxDestroy => ext.destroy_context(ctx).map(|_| GpuResponse::OkNoData),
             GpuCommand::LiminaArenaCreate(req) => {
@@ -1109,7 +1110,8 @@ impl Worker {
         virtio_gpu.force_ctx_0();
 
         match cmd {
-            GpuCommand::LiminaCtxCreate(_)
+            GpuCommand::LiminaInfo
+            | GpuCommand::LiminaCtxCreate(_)
             | GpuCommand::LiminaCtxDestroy
             | GpuCommand::LiminaArenaCreate(_)
             | GpuCommand::LiminaArenaDestroy(_)
