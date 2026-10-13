@@ -26,7 +26,7 @@
 //! a doorbell means is the embedder's, through [`GpuExtension`]. A guest that does not negotiate the
 //! feature sees a plain virtio-gpu.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
@@ -410,9 +410,9 @@ pub struct ExtState {
     /// Blob resources that are exported arenas, with where the blob is mapped in the
     /// host-visible region.
     exports: HashMap<u32, Export>,
-    /// Surfaces given to contexts, as (context, resource): one resource is held by the context
-    /// that made it and by every one that imported it.
-    surfaces: HashSet<(u32, u32)>,
+    /// Surfaces given to contexts, as (context, resource), with the shape each was given as:
+    /// one resource is held by the context that made it and by every one that imported it.
+    surfaces: HashMap<(u32, u32), SurfaceShape>,
     /// Surfaces contexts made, by resource: the context and the shape.
     made: HashMap<u32, (u32, SurfaceShape)>,
 }
@@ -429,7 +429,7 @@ impl ExtState {
             contexts: HashMap::new(),
             used: Vec::new(),
             exports: HashMap::new(),
-            surfaces: HashSet::new(),
+            surfaces: HashMap::new(),
             made: HashMap::new(),
         }
     }
@@ -479,7 +479,7 @@ impl ExtState {
         }
         self.cfg.ext.destroy_context(ctx);
         // The embedder's context took its surfaces with it; the resources live on.
-        self.surfaces.retain(|&(c, _)| c != ctx);
+        self.surfaces.retain(|&(c, _), _| c != ctx);
         for f in c.fences {
             f.fire();
         }
@@ -585,17 +585,23 @@ impl ExtState {
         port: u32,
         shape: SurfaceShape,
     ) -> Result<(), ExtError> {
-        self.bind_surface(ctx, resource, port)?;
+        self.bind_surface(ctx, resource, port, shape)?;
         self.made.insert(resource, (ctx, shape));
         Ok(())
     }
 
-    /// Resource `resource`, a surface, is given to `ctx` through `port`.
-    pub fn bind_surface(&mut self, ctx: u32, resource: u32, port: u32) -> Result<(), ExtError> {
+    /// Resource `resource`, a surface of shape `shape`, is given to `ctx` through `port`.
+    pub fn bind_surface(
+        &mut self,
+        ctx: u32,
+        resource: u32,
+        port: u32,
+        shape: SurfaceShape,
+    ) -> Result<(), ExtError> {
         if !self.contexts.contains_key(&ctx) {
             return Err(ExtError::InvalidContext);
         }
-        if self.surfaces.contains(&(ctx, resource)) {
+        if self.surfaces.contains_key(&(ctx, resource)) {
             return Err(ExtError::InvalidParameter);
         }
         self.cfg
@@ -605,17 +611,18 @@ impl ExtState {
                 warn!("limina ext: ctx {ctx} surface {resource}: {e}");
                 ExtError::Unspec
             })?;
-        self.surfaces.insert((ctx, resource));
+        self.surfaces.insert((ctx, resource), shape);
         Ok(())
     }
 
-    pub fn holds_surface(&self, ctx: u32, resource: u32) -> bool {
-        self.surfaces.contains(&(ctx, resource))
+    /// The shape `ctx` holds `resource` as, if it holds it.
+    pub fn held_surface(&self, ctx: u32, resource: u32) -> Option<SurfaceShape> {
+        self.surfaces.get(&(ctx, resource)).copied()
     }
 
     /// `ctx` let go of the resource; the others holding it keep it.
     pub fn detach_surface(&mut self, ctx: u32, resource: u32) {
-        if self.surfaces.remove(&(ctx, resource)) {
+        if self.surfaces.remove(&(ctx, resource)).is_some() {
             self.cfg.ext.release_surface(ctx, resource);
         }
     }
@@ -625,7 +632,7 @@ impl ExtState {
         self.made.remove(&resource);
         let holders: Vec<u32> = self
             .surfaces
-            .iter()
+            .keys()
             .filter(|&&(_, r)| r == resource)
             .map(|&(c, _)| c)
             .collect();
@@ -900,7 +907,7 @@ impl ExtState {
             .map(|(&r, &(ctx, shape))| (r, ctx, shape, Vec::new()))
             .collect();
         s.made.sort_by_key(|m| m.0);
-        s.held = self.surfaces.iter().copied().collect();
+        s.held = self.surfaces.keys().copied().collect();
         s.held.sort_unstable();
         s
     }
@@ -1466,7 +1473,7 @@ mod tests {
             stride: 256,
         };
         s.bind_made_surface(3, 50, 7, shape).unwrap();
-        s.bind_surface(2, 50, 8).unwrap();
+        s.bind_surface(2, 50, 8, SurfaceShape::default()).unwrap();
 
         let snap = s.snapshot();
         assert!(
@@ -1490,7 +1497,7 @@ mod tests {
             vec![40, 41]
         );
         r.bind_made_surface(3, 50, 17, shape).unwrap();
-        r.bind_surface(2, 50, 18).unwrap();
+        r.bind_surface(2, 50, 18, SurfaceShape::default()).unwrap();
         r.restore_rings(&snap).unwrap();
         let log = g.log.lock().unwrap().clone();
         let restored: Vec<&String> = log
@@ -1682,15 +1689,15 @@ mod tests {
         let (f, mut s) = state();
         let log = |f: &Arc<Fake>, line: &str| f.log.lock().unwrap().contains(&line.to_string());
         assert_eq!(
-            s.bind_surface(1, 50, 7).err(),
+            s.bind_surface(1, 50, 7, SurfaceShape::default()).err(),
             Some(ExtError::InvalidContext),
             "no context to give it to"
         );
         s.create_context(1).unwrap();
-        s.bind_surface(1, 50, 7).unwrap();
+        s.bind_surface(1, 50, 7, SurfaceShape::default()).unwrap();
         assert!(log(&f, "surface 50 port 7 to 1"));
         assert_eq!(
-            s.bind_surface(1, 50, 8).err(),
+            s.bind_surface(1, 50, 8, SurfaceShape::default()).err(),
             Some(ExtError::InvalidParameter),
             "a context holds a surface once"
         );
@@ -1707,13 +1714,31 @@ mod tests {
             "given back once"
         );
 
-        s.bind_surface(1, 51, 9).unwrap();
+        s.bind_surface(1, 51, 9, SurfaceShape::default()).unwrap();
         s.destroy_context(1).unwrap();
         s.release_surface(51);
         assert!(
             !log(&f, "-surface 51 of 1"),
             "the context took its surfaces with it"
         );
+    }
+
+    #[test]
+    fn a_held_surface_answers_its_shape_until_it_goes() {
+        let (_f, mut s) = state();
+        let shape = SurfaceShape {
+            width: 718,
+            height: 1166,
+            drm_fourcc: 0x3432_5241,
+            stride: 2880,
+        };
+        s.create_context(1).unwrap();
+        assert_eq!(s.held_surface(1, 70), None);
+        s.bind_surface(1, 70, 7, shape).unwrap();
+        assert_eq!(s.held_surface(1, 70), Some(shape), "as it was given");
+        assert_eq!(s.held_surface(2, 70), None, "to that context only");
+        s.release_surface(70);
+        assert_eq!(s.held_surface(1, 70), None, "until the resource goes");
     }
 
     #[test]
@@ -1724,9 +1749,9 @@ mod tests {
         s.create_context(1).unwrap();
         s.create_context(2).unwrap();
         s.create_context(3).unwrap();
-        s.bind_surface(1, 60, 7).unwrap();
-        s.bind_surface(2, 60, 8).unwrap();
-        s.bind_surface(3, 60, 9).unwrap();
+        s.bind_surface(1, 60, 7, SurfaceShape::default()).unwrap();
+        s.bind_surface(2, 60, 8, SurfaceShape::default()).unwrap();
+        s.bind_surface(3, 60, 9, SurfaceShape::default()).unwrap();
 
         s.detach_surface(2, 60);
         s.detach_surface(2, 60);
