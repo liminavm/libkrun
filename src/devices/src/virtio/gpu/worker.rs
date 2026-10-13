@@ -80,6 +80,18 @@ enum InnerExit {
     Shutdown,
 }
 
+/// Gives up a send right nothing will take.
+#[cfg(target_os = "macos")]
+fn release_port(port: u32) {
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> i32;
+    }
+    // SAFETY: `port` is a send right this task owns and no one else will use; the task port is
+    // set before any code runs and never changes.
+    unsafe { mach_port_deallocate(mach_task_self_, port) };
+}
+
 /// The shape a surface is answered with, from what the renderer that made it says.
 #[cfg(target_os = "macos")]
 fn shape_of(d: SurfaceDesc) -> SurfaceShape {
@@ -864,10 +876,7 @@ impl Worker {
             drm_fourcc: req.drm_fourcc,
             stride: req.stride,
         };
-        if ext
-            .bind_made_surface(ctx, req.resource_id, port, shape)
-            .is_err()
-        {
+        if ext.bind_surface(ctx, req.resource_id, port, shape).is_err() {
             let _ = virtio_gpu.unref_resource(req.resource_id);
             return Err(GpuResponse::ErrUnspec);
         }
@@ -934,12 +943,15 @@ impl Worker {
         #[allow(unused_mut)]
         let mut s = ext.snapshot();
         #[cfg(target_os = "macos")]
-        for (resource, _, shape, rows) in &mut s.made {
-            match virtio_gpu.read_surface(*resource, shape.stride, shape.height) {
-                Some(r) => *rows = r,
-                // The client draws it again; until then the window is blank.
-                None => warn!("gpu snapshot: surface {resource}: rows not read"),
-            }
+        for (resource, ctx, desc) in virtio_gpu.embedder_surfaces() {
+            let rows = virtio_gpu
+                .read_surface(resource, desc.stride, desc.height)
+                .unwrap_or_else(|| {
+                    // The client draws it again; until then the window is blank.
+                    warn!("gpu snapshot: surface {resource}: rows not read");
+                    Vec::new()
+                });
+            s.made.push((resource, ctx, shape_of(desc), rows));
         }
         #[cfg(not(target_os = "macos"))]
         let _ = virtio_gpu;
@@ -1008,12 +1020,16 @@ impl Worker {
             {
                 warn!("gpu restore: surface {resource}: rows not written; blank until redrawn");
             }
-            if ext
-                .bind_made_surface(*ctx, *resource, port, *shape)
-                .is_err()
-            {
-                error!("gpu restore: surface {resource} not given to context {ctx}");
-                return false;
+            // The right goes to one holder now; the others take theirs after the replay, with the
+            // surfaces they imported. A surface no context holds any more keeps only its resource.
+            let holder = s.held.iter().find(|h| h.1 == *resource).map(|h| h.0);
+            match holder {
+                Some(holder) if ext.bind_surface(holder, *resource, port, *shape).is_err() => {
+                    error!("gpu restore: surface {resource} not given to context {holder}");
+                    return false;
+                }
+                Some(_) => {}
+                None => release_port(port),
             }
         }
         true
@@ -1027,7 +1043,7 @@ impl Worker {
             return false;
         };
         for &(ctx, resource) in &s.held {
-            if s.made.iter().any(|m| (m.0, m.1) == (resource, ctx)) {
+            if ext.held_surface(ctx, resource).is_some() {
                 continue;
             }
             let bound =
