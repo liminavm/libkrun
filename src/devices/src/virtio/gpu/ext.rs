@@ -470,14 +470,28 @@ impl ExtState {
 
     pub fn destroy_context(&mut self, ctx: u32) -> Result<(), ExtError> {
         let c = self.contexts.remove(&ctx).ok_or(ExtError::InvalidContext)?;
-        for (arena, a) in c.arenas {
+        let mut reachable = false;
+        for a in c.arenas.values() {
             if let Some(off) = a.window {
-                self.unmap(off, a.arena.size);
-                self.release(off);
+                if self.unmap(off, a.arena.size) {
+                    self.release(off);
+                } else {
+                    reachable = true;
+                }
             }
-            self.cfg.ext.destroy_arena(ctx, arena);
         }
-        self.cfg.ext.destroy_context(ctx);
+        if reachable {
+            // The context's memory goes with the context in the embedder, so the context stays.
+            error!(
+                "limina ext: an arena of context {ctx} could not be unmapped; the context is \
+                 kept so the guest never reaches freed memory"
+            );
+        } else {
+            for arena in c.arenas.keys() {
+                self.cfg.ext.destroy_arena(ctx, *arena);
+            }
+            self.cfg.ext.destroy_context(ctx);
+        }
         // The embedder's context took its surfaces with it; the resources live on.
         self.surfaces.retain(|&(c, _), _| c != ctx);
         for f in c.fences {
@@ -715,19 +729,18 @@ impl ExtState {
     }
 
     #[cfg(target_os = "macos")]
-    fn unmap(&self, off: u64, size: u64) {
+    /// Takes `size` bytes at `off` out of guest-physical space. False when the hypervisor did
+    /// not, and the guest may still reach the pages: they must not be freed then.
+    fn unmap(&self, off: u64, size: u64) -> bool {
         let (tx, rx) = unbounded();
-        if self
-            .map_sender
+        self.map_sender
             .send(WorkerMessage::GpuRemoveMapping(
                 tx,
                 self.cfg.arenas_guest_addr + off,
                 size,
             ))
             .is_ok()
-        {
-            let _ = rx.recv();
-        }
+            && rx.recv().unwrap_or(false)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -736,7 +749,9 @@ impl ExtState {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn unmap(&self, _off: u64, _size: u64) {}
+    fn unmap(&self, _off: u64, _size: u64) -> bool {
+        true
+    }
 
     pub fn create_arena(
         &mut self,
@@ -807,7 +822,13 @@ impl ExtState {
             c.ring = None;
         }
         if let Some(off) = a.window {
-            self.unmap(off, a.arena.size);
+            if !self.unmap(off, a.arena.size) {
+                error!(
+                    "limina ext: arena {ctx}/{arena} could not be unmapped; it is kept so the \
+                     guest never reaches freed memory"
+                );
+                return Ok(());
+            }
             self.release(off);
         }
         self.cfg.ext.destroy_arena(ctx, arena);
@@ -1378,6 +1399,11 @@ mod tests {
     }
 
     fn state() -> (Arc<Fake>, ExtState) {
+        state_unmapping(true)
+    }
+
+    /// A state whose hypervisor answers every unmap with `unmaps`.
+    fn state_unmapping(unmaps: bool) -> (Arc<Fake>, ExtState) {
         let fake = Arc::new(Fake::default());
         let cfg = GpuExtConfig {
             ext: fake.clone(),
@@ -1392,9 +1418,11 @@ mod tests {
         std::thread::spawn(move || {
             while let Ok(m) = rx.recv() {
                 match m {
-                    WorkerMessage::GpuAddMapping(r, ..)
-                    | WorkerMessage::GpuRemoveMapping(r, ..) => {
+                    WorkerMessage::GpuAddMapping(r, ..) => {
                         let _ = r.send(true);
+                    }
+                    WorkerMessage::GpuRemoveMapping(r, ..) => {
+                        let _ = r.send(unmaps);
                     }
                     _ => {}
                 }
@@ -1570,6 +1598,36 @@ mod tests {
             s.create_arena(1, req(4, 1 << 20)).err(),
             Some(ExtError::OutOfMemory),
             "the window is full"
+        );
+    }
+
+    /// An arena the guest may still reach is never freed: when the hypervisor fails to take it out
+    /// of guest-physical space, the arena, or the whole context, is kept, and so is its place.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_arena_the_hypervisor_would_not_unmap_is_kept() {
+        let (f, mut s) = state_unmapping(false);
+        let req = |arena_id| virtio_gpu_limina_arena_create {
+            arena_id,
+            flags: 0,
+            size: 1 << 19,
+        };
+        s.create_context(1).unwrap();
+        let a = s.create_arena(1, req(1)).unwrap();
+        s.destroy_arena(1, 1).unwrap();
+        s.create_context(2).unwrap();
+        s.create_arena(2, req(1)).unwrap();
+        s.destroy_context(2).unwrap();
+        let log = f.log.lock().unwrap().clone();
+        assert!(!log.contains(&"-arena 1/1".to_string()), "{log:?}");
+        assert!(!log.contains(&"-arena 2/1".to_string()), "{log:?}");
+        assert!(!log.contains(&"-ctx 2".to_string()), "{log:?}");
+        assert!(f.arenas.lock().unwrap().contains_key(&(1, 1)));
+        assert_eq!(
+            s.create_arena(1, req(3)).err(),
+            Some(ExtError::OutOfMemory),
+            "the kept arenas still hold their places (at {:#x})",
+            a.shm_offset
         );
     }
 
