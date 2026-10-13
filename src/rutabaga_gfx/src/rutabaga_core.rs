@@ -273,6 +273,13 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// limina: every resource minted by [`Self::create_surface`] that still exists, with its
+    /// shape read from the surface. Only virgl implements it.
+    #[cfg(target_os = "macos")]
+    fn embedder_surfaces(&self) -> Vec<(u32, SurfaceDesc)> {
+        Vec::new()
+    }
+
     /// limina: mint an IOSurface for the embedder's own renderer and make it a resource every
     /// context can reach (see [`Rutabaga::resource_create_surface`]). Only virgl implements it.
     #[cfg(target_os = "macos")]
@@ -1215,6 +1222,16 @@ impl Rutabaga {
             .get(&self.default_component)
             .ok_or(RutabagaError::InvalidComponent)?;
         component.surface_port(resource_id)
+    }
+
+    /// The surfaces [`Self::resource_create_surface`] minted that still exist, by resource, with
+    /// their shapes: what a snapshot carries to make them again.
+    #[cfg(target_os = "macos")]
+    pub fn embedder_surfaces(&self) -> Vec<(u32, SurfaceDesc)> {
+        self.components
+            .get(&self.default_component)
+            .map(|c| c.embedder_surfaces())
+            .unwrap_or_default()
     }
 
     #[cfg(target_os = "macos")]
