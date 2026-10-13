@@ -4183,6 +4183,22 @@ impl VirtioGpu {
             })
     }
 
+    /// Every surface [`Self::resource_create_surface`] made that still exists: (resource, the
+    /// context it was made for, shape).
+    #[cfg(target_os = "macos")]
+    pub fn embedder_surfaces(&self) -> Vec<(u32, u32, SurfaceDesc)> {
+        let Some(r) = self.rutabaga.as_ref() else {
+            return Vec::new();
+        };
+        r.embedder_surfaces()
+            .into_iter()
+            .map(|(resource, desc)| {
+                let ctx = self.resources.get(&resource).map_or(0, |r| r.ctx_id);
+                (resource, ctx, desc)
+            })
+            .collect()
+    }
+
     /// The rows of the surface `resource_id` is presented from, at its own layout.
     #[cfg(target_os = "macos")]
     pub fn read_surface(&self, resource_id: u32, stride: u32, height: u32) -> Option<Vec<u8>> {
