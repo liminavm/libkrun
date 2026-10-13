@@ -600,6 +600,7 @@ pub enum GpuCommand {
     LiminaFence(ext::virtio_gpu_limina_fence),
     LiminaSurfaceCreate(ext::virtio_gpu_limina_surface_create),
     LiminaSurfaceImport(ext::virtio_gpu_limina_surface_import),
+    LiminaInfo,
 }
 
 /// An error indicating something went wrong decoding a `GpuCommand`. These correspond to
@@ -659,6 +660,7 @@ impl fmt::Debug for GpuCommand {
             LiminaFence(_info) => f.debug_struct("LiminaFence").finish(),
             LiminaSurfaceCreate(_info) => f.debug_struct("LiminaSurfaceCreate").finish(),
             LiminaSurfaceImport(_info) => f.debug_struct("LiminaSurfaceImport").finish(),
+            LiminaInfo => f.debug_struct("LiminaInfo").finish(),
         }
     }
 }
@@ -706,6 +708,7 @@ impl GpuCommand {
             ext::VIRTIO_GPU_CMD_LIMINA_FENCE => LiminaFence(cmd.read_obj()?),
             ext::VIRTIO_GPU_CMD_LIMINA_SURFACE_CREATE => LiminaSurfaceCreate(cmd.read_obj()?),
             ext::VIRTIO_GPU_CMD_LIMINA_SURFACE_IMPORT => LiminaSurfaceImport(cmd.read_obj()?),
+            ext::VIRTIO_GPU_CMD_LIMINA_INFO => LiminaInfo,
             _ => return Err(GpuCommandDecodeError::InvalidType(hdr.type_)),
         };
 
@@ -748,6 +751,7 @@ pub enum GpuResponse {
     OkLiminaCtx(ext::virtio_gpu_limina_resp_ctx),
     OkLiminaArena(ext::virtio_gpu_limina_resp_arena),
     OkLiminaSurface(ext::virtio_gpu_limina_resp_surface),
+    OkLiminaInfo(ext::virtio_gpu_limina_resp_info),
     ErrUnspec,
     ErrRutabaga(RutabagaError),
     ErrScanout {
@@ -965,6 +969,11 @@ impl GpuResponse {
                 resp.write_obj(body)?;
                 size_of_val(&hdr) + size_of_val(&body)
             }
+            GpuResponse::OkLiminaInfo(body) => {
+                resp.write_obj(hdr)?;
+                resp.write_obj(body)?;
+                size_of_val(&hdr) + size_of_val(&body)
+            }
             _ => {
                 resp.write_obj(hdr)?;
                 size_of_val(&hdr)
@@ -987,6 +996,7 @@ impl GpuResponse {
             GpuResponse::OkLiminaCtx(_) => ext::VIRTIO_GPU_RESP_OK_LIMINA_CTX,
             GpuResponse::OkLiminaArena(_) => ext::VIRTIO_GPU_RESP_OK_LIMINA_ARENA,
             GpuResponse::OkLiminaSurface(_) => ext::VIRTIO_GPU_RESP_OK_LIMINA_SURFACE,
+            GpuResponse::OkLiminaInfo(_) => ext::VIRTIO_GPU_RESP_OK_LIMINA_INFO,
             GpuResponse::ErrUnspec => VIRTIO_GPU_RESP_ERR_UNSPEC,
             GpuResponse::ErrRutabaga(_) => VIRTIO_GPU_RESP_ERR_UNSPEC,
             GpuResponse::ErrScanout { num_scanouts: _ } => VIRTIO_GPU_RESP_ERR_UNSPEC,
