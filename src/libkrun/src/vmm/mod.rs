@@ -200,6 +200,14 @@ pub struct Vmm {
     pub(crate) paused: bool,
     #[cfg(target_os = "macos")]
     pub(crate) paused_at: u64,
+    /// limina: the vtimer offset every vCPU carries — the guest's counter is
+    /// `mach_absolute_time()` minus it. Moved by a live pause that hides its interval and set by a
+    /// restore; whoever states host times in guest counter time needs it.
+    #[cfg(target_os = "macos")]
+    vtimer_offset: u64,
+    /// limina: the GPU extension's timing page, when it has one.
+    #[cfg(feature = "gpu")]
+    gpu_timing: Option<Arc<devices::virtio::gpu::timing::TimingPage>>,
     /// limina: a handle for pushing runtime display resizes into the live virtio-gpu device,
     /// captured when the GPU device is attached. `None` if no display/GPU is configured.
     #[cfg(feature = "gpu")]
@@ -245,6 +253,32 @@ impl Vmm {
     #[cfg(feature = "gpu")]
     pub fn set_gpu_resize_handle(&mut self, handle: devices::virtio::DisplayResizeHandle) {
         self.gpu_resize_handle = Some(handle);
+    }
+
+    /// limina: the GPU extension's timing page, where the embedder states the host display's
+    /// vsync grid for the guest (see [`devices::virtio::gpu::timing`]).
+    #[cfg(feature = "gpu")]
+    pub fn gpu_timing(&self) -> Option<Arc<devices::virtio::gpu::timing::TimingPage>> {
+        self.gpu_timing.clone()
+    }
+
+    /// limina: record the timing page at attach time, in the current counter time.
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu_timing(&mut self, timing: Arc<devices::virtio::gpu::timing::TimingPage>) {
+        #[cfg(target_os = "macos")]
+        timing.set_vtimer_offset(self.vtimer_offset);
+        self.gpu_timing = Some(timing);
+    }
+
+    /// limina: the vCPUs' vtimer offset moved (or was restored); keep what is stated in guest
+    /// counter time in step.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn note_vtimer_offset(&mut self, offset: u64) {
+        self.vtimer_offset = offset;
+        #[cfg(feature = "gpu")]
+        if let Some(timing) = &self.gpu_timing {
+            timing.set_vtimer_offset(offset);
+        }
     }
 
     /// limina M9.3: record the GPU device at attach time, for snapshot/replay.
@@ -448,6 +482,7 @@ impl Vmm {
             }
         }
         self.paused = false;
+        self.note_vtimer_offset(self.vtimer_offset.wrapping_add(paused_ticks));
         Ok(())
     }
 
