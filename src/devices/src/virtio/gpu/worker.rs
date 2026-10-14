@@ -291,6 +291,9 @@ impl Worker {
             let control_queue = Arc::new(Mutex::new(control_q.queue));
             let cursor_queue = Arc::new(Mutex::new(cursor_q.queue));
             self.cursor_kicked = false;
+            if let Some(ext) = self.ext.as_mut() {
+                ext.map_timing();
+            }
             *self.active.lock().unwrap() = Some(GpuActivation {
                 mem: mem.clone(),
                 control_queue: control_queue.clone(),

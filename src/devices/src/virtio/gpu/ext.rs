@@ -25,6 +25,9 @@
 //! The device owns the mechanism (window placement, mappings, slots, lifetimes); what an arena or
 //! a doorbell means is the embedder's, through [`GpuExtension`]. A guest that does not negotiate the
 //! feature sees a plain virtio-gpu.
+//!
+//! - **Timing** (shm id [`super::timing::SHM_ID_TIMING`]): when the embedder provides one, the host display's
+//!   vsync grid in the guest's counter time ([`super::timing`]), at the arena window's first slot.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,6 +38,7 @@ use crossbeam_channel::{Sender, unbounded};
 use utils::worker_message::WorkerMessage;
 use vm_memory::ByteValued;
 
+use super::timing::{TIMING_SIZE, TimingPage};
 use crate::bus::BusDevice;
 
 /// Feature bit: the device implements this extension.
@@ -294,11 +298,22 @@ pub struct GpuExtConfig {
     pub arenas_size: u64,
     pub doorbells_guest_addr: u64,
     pub doorbells_size: u64,
+    /// The timing page, which takes the arena window's first slot (shm id [`super::timing::SHM_ID_TIMING`]).
+    pub timing: Option<Arc<TimingPage>>,
 }
 
 impl GpuExtConfig {
     pub fn doorbell_slots(&self) -> u32 {
         (self.doorbells_size / DOORBELL_STRIDE).min(u32::MAX as u64) as u32
+    }
+
+    /// Where arenas may start in the window: past the timing page, when there is one.
+    fn arenas_start(&self) -> u64 {
+        if self.timing.is_some() {
+            TIMING_SIZE
+        } else {
+            0
+        }
     }
 }
 
@@ -416,6 +431,8 @@ pub struct ExtState {
     /// Surfaces given to contexts, as (context, resource), with the shape each was given as:
     /// one resource is held by the context that made it and by every one that imported it.
     surfaces: HashMap<(u32, u32), SurfaceShape>,
+    /// Whether the timing page is mapped into the guest yet.
+    timing_mapped: bool,
 }
 
 impl ExtState {
@@ -431,6 +448,21 @@ impl ExtState {
             used: Vec::new(),
             exports: HashMap::new(),
             surfaces: HashMap::new(),
+            timing_mapped: false,
+        }
+    }
+
+    /// Map the timing page at the window's first slot, once: it outlives every activation.
+    pub fn map_timing(&mut self) {
+        let Some(timing) = self.cfg.timing.clone() else {
+            return;
+        };
+        if self.timing_mapped {
+            return;
+        }
+        self.timing_mapped = self.map(timing.host_addr(), 0, TIMING_SIZE);
+        if !self.timing_mapped {
+            warn!("limina ext: the timing page could not be mapped; the guest keeps its own timer");
         }
     }
 
@@ -681,7 +713,7 @@ impl ExtState {
     }
 
     fn place(&self, size: u64) -> Option<u64> {
-        let mut at = 0u64;
+        let mut at = self.cfg.arenas_start();
         for &(off, len) in &self.used {
             if off >= at && off - at >= size {
                 return Some(at);
@@ -1391,6 +1423,7 @@ mod tests {
             arenas_size: 1 << 20,
             doorbells_guest_addr: 0x3f_0000_0000,
             doorbells_size: 4 * DOORBELL_STRIDE,
+            timing: None,
         };
         #[cfg(target_os = "macos")]
         let (tx, rx) = unbounded();
@@ -1576,6 +1609,44 @@ mod tests {
         s.destroy_context(1).unwrap();
         assert_eq!(s.create_context(3).unwrap().doorbell, a);
         assert_eq!(s.create_context(3).err(), Some(ExtError::InvalidContext));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_timing_page_takes_the_first_slot_and_arenas_start_after_it() {
+        let (_f, mut s) = state();
+        s.cfg.timing = Some(Arc::new(TimingPage::new().unwrap()));
+        s.map_timing();
+        assert!(s.timing_mapped);
+        s.create_context(1).unwrap();
+        let a = s
+            .create_arena(
+                1,
+                virtio_gpu_limina_arena_create {
+                    arena_id: 1,
+                    flags: 0,
+                    size: 16_384,
+                },
+            )
+            .unwrap();
+        assert_eq!(a.shm_offset, TIMING_SIZE);
+        s.destroy_arena(1, 1).unwrap();
+        s.reset();
+        s.create_context(2).unwrap();
+        let b = s
+            .create_arena(
+                2,
+                virtio_gpu_limina_arena_create {
+                    arena_id: 1,
+                    flags: 0,
+                    size: 16_384,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            b.shm_offset, TIMING_SIZE,
+            "a reset does not free the timing slot"
+        );
     }
 
     #[cfg(target_os = "macos")]
