@@ -514,6 +514,9 @@ impl Vmm {
         } else {
             0
         };
+        // Before the vCPUs run: until then a timing page still in the old counter time would put
+        // the guest's next vblank `paused_ticks` in its future.
+        self.note_vtimer_offset(self.vtimer_offset.wrapping_add(paused_ticks));
         for h in &self.vcpus_handles {
             h.send_event(VcpuEvent::Resume(paused_ticks))
                 .map_err(|e| format!("vcpu resume event: {e:?}"))?;
@@ -530,7 +533,6 @@ impl Vmm {
             }
         }
         self.paused = false;
-        self.note_vtimer_offset(self.vtimer_offset.wrapping_add(paused_ticks));
         Ok(())
     }
 
