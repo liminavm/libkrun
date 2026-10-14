@@ -21,6 +21,7 @@ use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
 use super::ext::{GpuExtConfig, SHM_ID_ARENAS, SHM_ID_DOORBELLS, VIRTIO_GPU_F_LIMINA_EXT};
 use super::protocol::VIRTIO_GPU_EVENT_DISPLAY;
+use super::timing::{SHM_ID_TIMING, TIMING_SIZE};
 use super::virtio_gpu::GpuActivation;
 use super::worker::{Worker, WorkerCmd};
 use crate::display::{DisplayInfo, EdidParams};
@@ -638,6 +639,11 @@ impl VirtioDevice for Gpu {
                 host_addr: 0,
                 guest_addr: e.doorbells_guest_addr,
                 size: e.doorbells_size as usize,
+            }),
+            SHM_ID_TIMING => ext.filter(|e| e.timing.is_some()).map(|e| VirtioShmRegion {
+                host_addr: 0,
+                guest_addr: e.arenas_guest_addr,
+                size: TIMING_SIZE as usize,
             }),
             0 | 1 => self.shm_region.clone(),
             _ => None,

@@ -2,6 +2,7 @@ mod device;
 pub mod ext;
 mod journal;
 mod protocol;
+pub mod timing;
 mod trace;
 mod virtio_gpu;
 mod worker;
