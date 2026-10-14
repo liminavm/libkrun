@@ -12,6 +12,12 @@ use super::edid::EdidInfo;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdidParams {
     pub refresh_rate: u32,
+    /// limina: the preferred mode's exact refresh rate, in millihertz (59950 for a 59.95 Hz
+    /// panel). When set it alone sets that mode's pixel clock, to the encoding's full 10 kHz
+    /// precision, so a guest whose vblank timer runs off the mode ticks at the host display's
+    /// rate rather than beating against it; `refresh_rate` still names the mode everywhere a
+    /// whole number of Hz is wanted. `None` keeps the historical clock, byte for byte.
+    pub refresh_millihertz: Option<u32>,
     pub physical_size: PhysicalSize,
     /// The *stable identity* half of the EDID: the fields a guest compositor uses to recognize
     /// this monitor across mode changes and reboots (and to key its remembered per-monitor
@@ -49,6 +55,7 @@ impl Default for EdidParams {
     fn default() -> Self {
         EdidParams {
             refresh_rate: 60,
+            refresh_millihertz: None,
             physical_size: PhysicalSize::Dpi(DEFAULT_DPI),
             identity: None,
             range: None,
