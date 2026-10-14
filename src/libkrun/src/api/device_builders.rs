@@ -40,6 +40,8 @@ use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualE
 pub use devices::virtio::fs::{CachePolicy, PermissionSemantics};
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::ext::{DOORBELL_STRIDE, DoorbellDevice, GpuExtConfig, GpuExtension};
+#[cfg(feature = "gpu")]
+use devices::virtio::gpu::timing::TimingPage;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 #[cfg(feature = "input")]
 use krun_input;
@@ -2286,12 +2288,23 @@ impl<'a> AttachDevice<'a> for GpuDevice {
         {
             let bell = Arc::new(Mutex::new(DoorbellDevice::new(ext.clone())));
             ctx.insert_mmio_device(bell, db_addr, db_len)?;
+            let timing = match TimingPage::new() {
+                Ok(t) => Some(Arc::new(t)),
+                Err(e) => {
+                    log::warn!("gpu: no timing page ({e}); the guest keeps its own vblank timer");
+                    None
+                }
+            };
+            if let Some(t) = &timing {
+                ctx.vmm.set_gpu_timing(t.clone());
+            }
             inner.lock().unwrap().set_extension(GpuExtConfig {
                 ext,
                 arenas_guest_addr: ar_addr,
                 arenas_size: ar_len,
                 doorbells_guest_addr: db_addr,
                 doorbells_size: db_len,
+                timing,
             });
         }
 

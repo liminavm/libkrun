@@ -1517,6 +1517,10 @@ pub fn build_microvm(
         paused_at: 0,
         #[cfg(target_os = "macos")]
         ram_in_blocks: payload_config.ram_in_blocks,
+        #[cfg(target_os = "macos")]
+        vtimer_offset: 0,
+        #[cfg(feature = "gpu")]
+        gpu_timing: None,
         #[cfg(feature = "gpu")]
         gpu_resize_handle: None,
         #[cfg(feature = "gpu")]
@@ -1757,6 +1761,9 @@ pub fn build_microvm(
         }
         let gate = Arc::new(crate::vmm::vstate::RestoreGate::default());
         let vcpu_states = std::mem::take(&mut snap.head.vcpus);
+        if let Some(first) = vcpu_states.first() {
+            vmm.note_vtimer_offset(first.vtimer_offset);
+        }
         let vcpus = vcpus
             .into_iter()
             .zip(vcpu_states)
