@@ -95,6 +95,10 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         gpu_device: None,
         #[cfg(target_os = "macos")]
         released_ram: Arc::new(hvf::ReleasedRam::new(Vec::new())),
+        #[cfg(target_os = "macos")]
+        vtimer_offset: 0,
+        #[cfg(feature = "gpu")]
+        gpu_timing: None,
     };
 
     match control {
