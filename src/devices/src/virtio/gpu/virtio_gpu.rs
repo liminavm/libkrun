@@ -511,14 +511,34 @@ impl PresentOrder {
 /// until the frames are on glass, so it cannot draw into a buffer the display still shows. A
 /// flush whose parked frames get no fence -- a stock guest kernel's -- leaves the guest free to
 /// reuse them at once, and a display sampling the surface zero-copy then shows frames out of
-/// order. The display is told only when a scanout's answer changes.
+/// order. A scanout can also be held two ways, by a copy on glass or by a fence, and a guest that
+/// starts fencing moves from one to the other without its answer changing. Each change of either
+/// is logged; the display, which only needs the answer, is told when that changes.
 #[derive(Default)]
-struct ScanoutHolds(HashMap<u32, bool>);
+struct ScanoutHolds(HashMap<u32, Hold>);
+
+/// How a scanout's presented buffers are kept from the guest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hold {
+    /// Not at all.
+    Free,
+    /// Glass shows copies the guest cannot reach.
+    Copies,
+    /// The guest's flushes are fenced until their frames leave glass.
+    Fenced,
+}
+
+impl Hold {
+    fn held(self) -> bool {
+        self != Hold::Free
+    }
+}
 
 impl ScanoutHolds {
-    /// Record `held` for `scanout_id`; true when that is news.
-    fn note(&mut self, scanout_id: u32, held: bool) -> bool {
-        self.0.insert(scanout_id, held) != Some(held)
+    /// Record `hold` for `scanout_id`; returns the one it replaces, unless it is the same.
+    fn note(&mut self, scanout_id: u32, hold: Hold) -> Option<Option<Hold>> {
+        let was = self.0.insert(scanout_id, hold);
+        (was != Some(hold)).then_some(was)
     }
 }
 
@@ -3101,6 +3121,11 @@ impl VirtioGpu {
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
         pf.flush_parked_cookies.push((cookie, scanout_id));
 
+        // What goes up is the guest's own surface unless this present is a copy.
+        if extension_surface || !copy {
+            self.scanout_copies.copying.insert(scanout_id, false);
+        }
+        let pf = self.present_fence.as_mut().unwrap();
         // Nothing to wait for: the guest waited for the frame's rendering before it flushed. The
         // frame still goes through the parked path, so a fenced flush holds the guest off the
         // buffer until it has left glass.
@@ -3198,20 +3223,28 @@ impl VirtioGpu {
     /// Tell the display whether the guest is held off `scanout_id`'s presented buffers, when
     /// that changes.
     fn note_scanout_held(&mut self, scanout_id: u32, held: bool) {
-        if !self.held_scanouts.note(scanout_id, held) {
+        let hold = if !held {
+            Hold::Free
+        } else if self.scanout_copies.copying(scanout_id) {
+            Hold::Copies
+        } else {
+            Hold::Fenced
+        };
+        let Some(was) = self.held_scanouts.note(scanout_id, hold) else {
             return;
-        }
+        };
         info!(
             "virtio-gpu: scanout {scanout_id} {}",
-            if !held {
-                "flushes carry no fence; nothing holds the guest off buffers on glass"
-            } else if self.scanout_copies.copying(scanout_id) {
-                "flushes carry no fence; glass shows copies the guest cannot reach"
-            } else {
-                "flushes are fenced; the guest is held off buffers on glass"
+            match hold {
+                Hold::Free =>
+                    "flushes carry no fence; nothing holds the guest off buffers on glass",
+                Hold::Copies => "flushes carry no fence; glass shows copies the guest cannot reach",
+                Hold::Fenced => "flushes are fenced; the guest is held off buffers on glass",
             }
         );
-        let _ = self.display_backend.scanout_held(scanout_id, held);
+        if was.map(Hold::held) != Some(held) {
+            let _ = self.display_backend.scanout_held(scanout_id, held);
+        }
     }
 
     /// Tell [`PresentOrder`] when a present is about to skip past frames still parked for its
@@ -4685,15 +4718,26 @@ mod test {
     // have to wake it on their own, or a drain that runs for seconds starves that one.
     #[test]
     fn a_scanout_hold_is_reported_only_when_it_changes() {
+        use super::Hold::{Copies, Fenced, Free};
         let mut holds = super::ScanoutHolds::default();
-        assert!(holds.note(0, false), "the first answer is news");
-        assert!(!holds.note(0, false), "the same answer again is not");
-        assert!(holds.note(1, false), "another scanout keeps its own answer");
-        assert!(
-            holds.note(0, true),
-            "a fenced flush holding the guest again is news"
+        assert_eq!(holds.note(0, Free), Some(None), "the first answer is news");
+        assert_eq!(holds.note(0, Free), None, "the same answer again is not");
+        assert_eq!(
+            holds.note(1, Free),
+            Some(None),
+            "another scanout keeps its own answer"
         );
-        assert!(!holds.note(0, true));
+        assert_eq!(
+            holds.note(0, Copies),
+            Some(Some(Free)),
+            "a copy on glass holding the guest is news"
+        );
+        assert_eq!(
+            holds.note(0, Fenced),
+            Some(Some(Copies)),
+            "a guest that starts fencing is held another way, which is news too"
+        );
+        assert_eq!(holds.note(0, Fenced), None);
     }
 
     #[test]
