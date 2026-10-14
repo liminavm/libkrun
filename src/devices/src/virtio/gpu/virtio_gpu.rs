@@ -552,6 +552,17 @@ impl Hold {
     fn held(self) -> bool {
         self != Hold::Free
     }
+
+    /// How a scanout is held, from whether it is (`held`), whether its flushes carry a fence and
+    /// whether glass shows copies. A fence says it first: a fenced guest is held whatever goes up,
+    /// and a transport scanout is copied and fenced both.
+    fn of(held: bool, fenced: bool, copying: bool) -> Hold {
+        match (held, fenced, copying) {
+            (false, _, _) => Hold::Free,
+            (true, true, _) | (true, false, false) => Hold::Fenced,
+            (true, false, true) => Hold::Copies,
+        }
+    }
 }
 
 impl ScanoutHolds {
@@ -3268,13 +3279,11 @@ impl VirtioGpu {
     /// Tell the display whether the guest is held off `scanout_id`'s presented buffers, when
     /// that changes.
     fn note_scanout_held(&mut self, scanout_id: u32, held: bool) {
-        let hold = if !held {
-            Hold::Free
-        } else if self.scanout_copies.copying(scanout_id) {
-            Hold::Copies
-        } else {
-            Hold::Fenced
-        };
+        let hold = Hold::of(
+            held,
+            self.scanout_copies.fenced.get(&scanout_id) == Some(&true),
+            self.scanout_copies.copying(scanout_id),
+        );
         let Some(was) = self.held_scanouts.note(scanout_id, hold) else {
             return;
         };
@@ -3284,7 +3293,9 @@ impl VirtioGpu {
                 Hold::Free =>
                     "flushes carry no fence; nothing holds the guest off buffers on glass",
                 Hold::Copies => "flushes carry no fence; glass shows copies the guest cannot reach",
-                Hold::Fenced => "flushes are fenced; the guest is held off buffers on glass",
+                Hold::Fenced =>
+                    "flushes are fenced; the guest is held until the host is done with \
+                                 each buffer",
             }
         );
         if was.map(Hold::held) != Some(held) {
@@ -4831,6 +4842,21 @@ mod test {
             "the guest's own buffer waits for the display"
         );
         assert_eq!(pf.awaiting_shown, [(9, 2)]);
+    }
+
+    /// A transport scanout is fenced and copied both, and is held by its fence: reporting it as
+    /// unfenced copies read as a guest that had stopped fencing.
+    #[test]
+    fn a_fenced_scanout_is_held_by_its_fence_whatever_goes_up() {
+        use super::Hold::{self, Copies, Fenced, Free};
+        assert_eq!(Hold::of(true, true, true), Fenced, "fenced, copied");
+        assert_eq!(
+            Hold::of(true, true, false),
+            Fenced,
+            "fenced, the guest's own buffer"
+        );
+        assert_eq!(Hold::of(true, false, true), Copies, "unfenced, copied");
+        assert_eq!(Hold::of(false, false, false), Free);
     }
 
     #[test]
