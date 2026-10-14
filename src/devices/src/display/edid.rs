@@ -537,9 +537,12 @@ fn populate_detailed_timing(
         }
     };
     if rounded > u32::from(u16::MAX) {
-        warn!(
+        // Expected for large high-refresh modes, and not a loss: the DisplayID block carries the
+        // honest timing, and that is what the guest runs.
+        info!(
             "edid: {width}x{height}@{refresh_rate} needs a {} MHz pixel clock, above the \
-             655.35 MHz an EDID detailed timing can express; clamping the advertised refresh",
+             655.35 MHz a detailed timing can express; the detailed timing understates the \
+             refresh, the DisplayID block carries it",
             rounded / 100
         );
     }
