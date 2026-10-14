@@ -209,7 +209,19 @@ impl EdidInfo {
     fn pixel_clock_khz(&self, width: u32, height: u32, refresh_hz: u32) -> u32 {
         let htotal = width + u32::from(self.horizontal_blanking);
         let vtotal = height + u32::from(self.vertical_blanking);
+        if let Some(mhz) = self.exact_millihertz(width, height, refresh_hz) {
+            let khz =
+                (u64::from(mhz) * u64::from(htotal) * u64::from(vtotal) + 500_000) / 1_000_000;
+            return khz.min(u64::from(u32::MAX)) as u32;
+        }
         refresh_hz.saturating_mul(htotal).saturating_mul(vtotal) / 1000
+    }
+
+    /// The exact rate to time this mode at, when it is the preferred mode and one was given.
+    fn exact_millihertz(&self, width: u32, height: u32, refresh_hz: u32) -> Option<u32> {
+        self.params
+            .refresh_millihertz
+            .filter(|_| (width, height, refresh_hz) == (self.width, self.height, self.refresh_rate))
     }
 }
 
@@ -511,14 +523,24 @@ fn populate_detailed_timing(
     // in a DisplayID type VII block (`overflowing_timings`), whose pixel clock is 24-bit and in
     // kHz. A *CTA-861* extension would not help: its detailed timings are the same 18-byte
     // descriptor with the same 16-bit field. See `docs/design/stable-edid-hotplug.md`.
-    let raw_clock = (refresh_rate * htotal * vtotal) / 10000;
-    // Round to nearest 10khz.
-    let rounded = ((raw_clock + 5) / 10) * 10;
+    let rounded = match info.exact_millihertz(width, height, refresh_rate) {
+        // To the field's own 10 kHz step: what the guest's vblank timer runs off.
+        Some(mhz) => {
+            let clock =
+                (u64::from(mhz) * u64::from(htotal) * u64::from(vtotal) + 5_000_000) / 10_000_000;
+            clock.min(u64::from(u32::MAX)) as u32
+        }
+        // Historical: in 100 kHz steps, which put a 60 Hz 2560x1440 mode at 59.995 Hz.
+        None => {
+            let raw_clock = (refresh_rate * htotal * vtotal) / 10000;
+            ((raw_clock + 5) / 10) * 10
+        }
+    };
     if rounded > u32::from(u16::MAX) {
         warn!(
             "edid: {width}x{height}@{refresh_rate} needs a {} MHz pixel clock, above the \
              655.35 MHz an EDID detailed timing can express; clamping the advertised refresh",
-            raw_clock / 100
+            rounded / 100
         );
     }
     let clock = rounded.min(u32::from(u16::MAX)) as u16;
@@ -1064,6 +1086,63 @@ mod tests {
     /// A mode whose pixel clock overflows the 16-bit field must be *clamped*, never wrapped:
     /// wrapping silently advertised 3024x1964 @ 120 Hz as a 30 Hz mode. The size — which is
     /// what actually drives the scanout — must still be exact.
+    #[test]
+    fn an_exact_rate_sets_the_preferred_clock_to_the_field_precision() {
+        let params = EdidParams {
+            identity: Some(identity()),
+            refresh_rate: 60,
+            refresh_millihertz: Some(59_950),
+            alt_mode: Some(DetailedMode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            }),
+            ..EdidParams::default()
+        };
+        let edid = build(2560, 1440, &params);
+        let clock = |block: &[u8]| u32::from(u16::from_le_bytes([block[0], block[1]]));
+        let total = |block: &[u8]| {
+            let (w, h, _) = decode_detailed(block);
+            let hb = block[3] as u32 | ((block[4] & 0x0F) as u32) << 8;
+            let vb = block[6] as u32 | ((block[7] & 0x0F) as u32) << 8;
+            u64::from((w + hb) * (h + vb))
+        };
+        let preferred = descriptor(&edid, 0);
+        // The rate the guest's timer will run at, from the encoded clock.
+        let millihertz = u64::from(clock(preferred)) * 10_000_000 / total(preferred);
+        assert!(
+            millihertz.abs_diff(59_950) <= 2,
+            "the preferred mode runs at {millihertz} mHz, not 59950"
+        );
+        // Still a 60 Hz mode by name.
+        assert_eq!(decode_detailed(preferred).2, 60);
+        // Only the preferred mode is retimed.
+        let alt = descriptor(&edid, 2);
+        assert_eq!(decode_detailed(alt), (1920, 1080, 60));
+        let historical = build(
+            2560,
+            1440,
+            &EdidParams {
+                refresh_millihertz: None,
+                ..params
+            },
+        );
+        assert_eq!(clock(alt), clock(descriptor(&historical, 2)));
+    }
+
+    #[test]
+    fn without_an_exact_rate_the_clock_is_unchanged() {
+        let base = EdidParams {
+            identity: Some(identity()),
+            ..EdidParams::default()
+        };
+        assert_eq!(base.refresh_millihertz, None);
+        let edid = build(2560, 1440, &base);
+        // 60 * 3120 * 1490 / 10000, rounded to 100 kHz: the historical 278.9 MHz.
+        let block = descriptor(&edid, 0);
+        assert_eq!(u16::from_le_bytes([block[0], block[1]]), 27890);
+    }
+
     #[test]
     fn an_overflowing_pixel_clock_saturates_instead_of_wrapping() {
         let params = EdidParams {
