@@ -1149,11 +1149,16 @@ impl HvfVcpu<'_> {
         }
     }
 
+    /// Restore the offset a snapshot saved. Recorded as well as written: the next pause advances
+    /// from the record (`advance_vtimer_offset`) and the WFE path judges deadlines by it, so a
+    /// record left at 0 would rebuild the offset without the restored part and jump the guest's
+    /// counter forward by it.
     fn write_vtimer_offset(&self, val: u64) -> Result<(), Error> {
         let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, val) };
         if ret != HV_SUCCESS {
             Err(Error::VcpuSnapshot)
         } else {
+            self.vtimer_offset.set(val);
             Ok(())
         }
     }
