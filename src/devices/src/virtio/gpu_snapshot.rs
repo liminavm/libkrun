@@ -141,7 +141,8 @@ const PAYLOAD_MAGIC: u32 = 0x5550_474c; // 'LGPU' LE
 // guest cooperation to capture or to put back.
 // v9: + ext — the native-context extension's section (its books, its arenas' bytes and each
 // context's export), opaque here: the extension writes and reads it.
-const PAYLOAD_VERSION: u32 = 9;
+// v10: + each generated EDID's exact refresh rate (`refresh_millihertz`).
+const PAYLOAD_VERSION: u32 = 10;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -721,6 +722,7 @@ fn put_display(buf: &mut Vec<u8>, d: &DisplayInfo) {
 
 fn put_edid_params(buf: &mut Vec<u8>, p: &EdidParams) {
     put_u32(buf, p.refresh_rate);
+    put_opt(buf, &p.refresh_millihertz, |buf, mhz| put_u32(buf, *mhz));
     match p.physical_size {
         PhysicalSize::Dpi(dpi) => {
             buf.push(0);
@@ -790,6 +792,7 @@ fn get_display(c: &mut Cursor) -> Option<DisplayInfo> {
 
 fn get_edid_params(c: &mut Cursor) -> Option<EdidParams> {
     let refresh_rate = c.u32()?;
+    let refresh_millihertz = c.opt(|c| c.u32())?;
     let physical_size = match c.u8()? {
         0 => PhysicalSize::Dpi(c.u32()?),
         1 => PhysicalSize::DimensionsMillimeters(c.u16()?, c.u16()?),
@@ -840,6 +843,7 @@ fn get_edid_params(c: &mut Cursor) -> Option<EdidParams> {
     })?;
     Some(EdidParams {
         refresh_rate,
+        refresh_millihertz,
         physical_size,
         identity,
         range,
@@ -946,6 +950,7 @@ mod tests {
                     position: (100, 200),
                     edid: DisplayInfoEdid::Generated(EdidParams {
                         refresh_rate: 120,
+                        refresh_millihertz: Some(119_880),
                         physical_size: PhysicalSize::DimensionsMillimeters(600, 340),
                         identity: Some(EdidIdentity {
                             manufacturer: *b"LMN",
