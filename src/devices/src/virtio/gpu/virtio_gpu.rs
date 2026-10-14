@@ -389,6 +389,23 @@ impl PresentFenceState {
             && self.retired.lock().unwrap().is_empty()
     }
 
+    /// `p`, parked as `cookie`, is about to be presented: the holds waiting on it stop waiting for
+    /// the present, and for its confirmation too when there is nothing more to confirm -- no acks,
+    /// or a copy, whose fence retired once the guest's buffer had been read. The rest wait for
+    /// the display to say it is shown.
+    fn presenting(&mut self, cookie: u64, p: &ParkedFlush) {
+        let confirmed = !self.ack_active || p.copied;
+        for hold in self.guest_holds.iter_mut() {
+            hold.unpresented.remove(&cookie);
+            if confirmed {
+                hold.unconfirmed.remove(&cookie);
+            }
+        }
+        if self.ack_active && !p.copied {
+            self.awaiting_shown.push_back((p.iosurface_id, cookie));
+        }
+    }
+
     /// Whether the fence handler or the ack reader has left the worker something to present or
     /// answer. Asked between commands of a long control-queue drain, so it reads the three
     /// hand-off lists and nothing else -- no eventfd, which a drain must never block on.
@@ -440,6 +457,9 @@ struct ParkedFlush {
     parked_at: std::time::Instant,
     /// Where this flush stands in [`PresentOrder`].
     seq: u64,
+    /// Whether what goes up is a copy, out of the guest's reach once it retires: then the guest's
+    /// buffer is free when the copy is done, not when the display has let go of it.
+    copied: bool,
 }
 
 /// Which flush each scanout last put on glass, so a present that would show an older frame over a
@@ -3045,6 +3065,20 @@ impl VirtioGpu {
     /// source of exactly the hard-to-attribute kind the present-miss work chases. The
     /// flush path pays one relaxed load; the poller (windowed runs only) costs 2
     /// wakes/s. Replaces the pre-default-on force-ON marker of the 0017 era.
+    /// Whether transport surfaces are presented as copies (`try_park_present`). On unless
+    /// `LIMINA_TRANSPORT_COPY=0`, which presents the guest's own surface and holds a fenced flush
+    /// until the display has let go of it.
+    fn transport_copy_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("LIMINA_TRANSPORT_COPY").map_or(true, |v| v != "0");
+            if !on {
+                info!("virtio-gpu: LIMINA_TRANSPORT_COPY=0: transport surfaces go up uncopied");
+            }
+            on
+        })
+    }
+
     fn fence_present_enabled() -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
         static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3116,28 +3150,20 @@ impl VirtioGpu {
                 rect: *rect,
                 parked_at: std::time::Instant::now(),
                 seq,
+                copied: false,
             },
         );
         // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
         pf.flush_parked_cookies.push((cookie, scanout_id));
 
+        // A transport surface is copied too, fenced or not: its renderer finished the frame before
+        // the flush, so the copy is one blit, and a fenced flush then holds the guest for that blit
+        // rather than until the display lets go of its buffer -- which comes a refresh after
+        // latch, and held every flip a refresh late (`spikes/transport-copy`).
+        let copy = copy || (extension_surface && Self::transport_copy_enabled());
         // What goes up is the guest's own surface unless this present is a copy.
-        if extension_surface || !copy {
+        if !copy {
             self.scanout_copies.copying.insert(scanout_id, false);
-        }
-        let pf = self.present_fence.as_mut().unwrap();
-        // Nothing to wait for: the guest waited for the frame's rendering before it flushed. The
-        // frame still goes through the parked path, so a fenced flush holds the guest off the
-        // buffer until it has left glass.
-        if extension_surface {
-            pf.retired
-                .lock()
-                .unwrap()
-                .push((cookie, std::time::Instant::now()));
-            if let Err(e) = pf.event.write(1) {
-                error!("present eventfd write failed: {e}");
-            }
-            return true;
         }
 
         if copy {
@@ -3146,11 +3172,16 @@ impl VirtioGpu {
                     let pf = self.present_fence.as_mut().unwrap();
                     if let Some(p) = pf.parked.get_mut(&cookie) {
                         p.iosurface_id = copied;
+                        p.copied = true;
                     }
                     if self.scanout_copies.copying.insert(scanout_id, true) != Some(true) {
                         info!(
-                            "virtio-gpu: scanout {scanout_id} presents copies taken on the \
-                             guest's own queue, out of its reach"
+                            "virtio-gpu: scanout {scanout_id} presents copies {}, out of its reach",
+                            if extension_surface {
+                                "the host blits as each flush arrives"
+                            } else {
+                                "taken on the guest's own queue"
+                            }
                         );
                     }
                     return true;
@@ -3192,6 +3223,20 @@ impl VirtioGpu {
                     }
                 }
             }
+        }
+        // Nothing to wait for: the guest waited for the frame's rendering before it flushed. The
+        // frame still goes through the parked path, so a fenced flush holds the guest off the
+        // buffer until it has left glass.
+        if extension_surface {
+            let pf = self.present_fence.as_mut().unwrap();
+            pf.retired
+                .lock()
+                .unwrap()
+                .push((cookie, std::time::Instant::now()));
+            if let Err(e) = pf.event.write(1) {
+                error!("present eventfd write failed: {e}");
+            }
+            return true;
         }
         let Some(rutabaga) = self.rutabaga.as_mut() else {
             return false;
@@ -3323,15 +3368,7 @@ impl VirtioGpu {
                 // anything sleeps). With acks: confirmation comes from the supervisor's
                 // "shown"; without: presenting IS the confirmation (the open-loop latch
                 // delay supplies the margin).
-                for hold in pf.guest_holds.iter_mut() {
-                    hold.unpresented.remove(cookie);
-                    if !pf.ack_active {
-                        hold.unconfirmed.remove(cookie);
-                    }
-                }
-                if pf.ack_active {
-                    pf.awaiting_shown.push_back((p.iosurface_id, *cookie));
-                }
+                pf.presenting(*cookie, &p);
             }
         }
         // Ack path: a shown(X) confirms every awaited frame up to and including the
@@ -4702,6 +4739,7 @@ mod test {
                 },
                 parked_at: std::time::Instant::now(),
                 seq: 1,
+                copied: false,
             },
         );
         assert!(!pf.quiescent());
@@ -4738,6 +4776,61 @@ mod test {
             "a guest that starts fencing is held another way, which is news too"
         );
         assert_eq!(holds.note(0, Fenced), None);
+    }
+
+    /// A held flush whose frame goes up as a copy is free once the copy retires: the guest's
+    /// buffer was read by then, and what the display shows is out of its reach. One whose frame
+    /// goes up as the guest's own buffer still waits for the display to say it is shown.
+    #[test]
+    fn a_copied_frame_frees_its_hold_without_waiting_for_the_display() {
+        let mut pf = bare_present_fence_state();
+        let parked = |copied| super::ParkedFlush {
+            scanout_id: 0,
+            iosurface_id: 9,
+            resource_id: 1,
+            rect: super::Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            parked_at: std::time::Instant::now(),
+            seq: 1,
+            copied,
+        };
+        let hold = |cookie| super::GuestFlushHold {
+            fence: rutabaga_gfx::RutabagaFence {
+                flags: 0,
+                fence_id: cookie,
+                ctx_id: 0,
+                ring_idx: 0,
+            },
+            unpresented: [cookie].into(),
+            unconfirmed: [cookie].into(),
+            fallback_at: None,
+            created_at: std::time::Instant::now(),
+        };
+        pf.guest_holds = vec![hold(1), hold(2)];
+
+        pf.presenting(1, &parked(true));
+        assert!(pf.guest_holds[0].unpresented.is_empty());
+        assert!(
+            pf.guest_holds[0].unconfirmed.is_empty(),
+            "a copy is confirmed by retiring"
+        );
+        assert!(
+            pf.awaiting_shown.is_empty(),
+            "nothing to wait for the display on"
+        );
+
+        pf.presenting(2, &parked(false));
+        assert!(pf.guest_holds[1].unpresented.is_empty());
+        assert_eq!(
+            pf.guest_holds[1].unconfirmed,
+            [2].into(),
+            "the guest's own buffer waits for the display"
+        );
+        assert_eq!(pf.awaiting_shown, [(9, 2)]);
     }
 
     #[test]
