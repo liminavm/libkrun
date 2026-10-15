@@ -555,6 +555,10 @@ impl Vmm {
                 .map_err(Error::VcpuEvent)?;
             receivers.push(rx);
         }
+        // Every vCPU parks once it has answered, whether its save worked or not, so the VM is
+        // paused from here on even if the collection below fails: the abort path's resume must
+        // still reach them.
+        self.paused = true;
         self.vcpu_list.kick_all();
         let mut states = Vec::with_capacity(receivers.len());
         for (i, rx) in receivers.into_iter().enumerate() {
@@ -567,7 +571,6 @@ impl Vmm {
                 }
             }
         }
-        self.paused = true;
         Ok(states)
     }
 
