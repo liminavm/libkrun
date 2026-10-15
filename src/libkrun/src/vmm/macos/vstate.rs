@@ -1081,7 +1081,18 @@ impl Vcpu {
     /// back. Runs where a `Snapshot` is serviced, a clean boundary between `hv_vcpu_run` calls, so
     /// the captured register file is consistent.
     fn save_and_reply(&mut self, hvf_vcpu: &mut HvfVcpu, reply: Sender<Box<VcpuState>>) {
-        match hvf_vcpu.save_state() {
+        // Test aid (LIMINA_TEST_FAIL_VCPU_SAVE=<vcpu id>): fail this vCPU's save, as a host that
+        // refuses one of the reads would.
+        let injected = std::env::var("LIMINA_TEST_FAIL_VCPU_SAVE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            == Some(hvf_vcpu.id());
+        let saved = if injected {
+            Err(hvf::Error::VcpuSnapshot)
+        } else {
+            hvf_vcpu.save_state()
+        };
+        match saved {
             Ok(state) => {
                 // If the collector is gone the whole snapshot is being aborted; just park.
                 let _ = reply.send(Box::new(state));
