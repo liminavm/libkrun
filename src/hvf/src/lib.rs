@@ -1223,11 +1223,16 @@ impl HvfVcpu<'_> {
     fn read_pending_interrupt(&self, ty: hv_interrupt_type_t) -> Result<bool, Error> {
         let mut pending = false;
         let ret = unsafe { hv_vcpu_get_pending_interrupt(self.vcpuid, ty, &mut pending) };
-        if ret != HV_SUCCESS {
-            warn!("hv_vcpu_get_pending_interrupt({ty}) failed: {ret:#x}");
-            Err(Error::VcpuSnapshot)
-        } else {
-            Ok(pending)
+        match ret {
+            HV_SUCCESS => Ok(pending),
+            // The vCPU has no such line: its interrupts come through the in-kernel GIC, whose
+            // state the caller saves. HVF says so with EL2, and on macOS 27 for every VM with
+            // that GIC (spikes/hvf-pending-irq-macos27).
+            HV_UNSUPPORTED => Ok(false),
+            _ => {
+                warn!("hv_vcpu_get_pending_interrupt({ty}) failed: {ret:#x}");
+                Err(Error::VcpuSnapshot)
+            }
         }
     }
 
@@ -1308,12 +1313,8 @@ impl HvfVcpu<'_> {
             icc,
             vtimer_offset: self.read_vtimer_offset()?,
             vtimer_masked: self.read_vtimer_mask()?,
-            // With EL2 the in-kernel GIC owns the vCPU's interrupt lines and HVF answers
-            // HV_UNSUPPORTED for them; what is pending is in the GIC state the caller saves.
-            pending_irq: !self.nested_enabled
-                && self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
-            pending_fiq: !self.nested_enabled
-                && self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
+            pending_irq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?,
+            pending_fiq: self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?,
             // The register file alone cannot say this: a parked vCPU looks exactly like one that
             // is about to return from a PSCI call. The park sites set it (see `set_power`).
             power: self.power,
@@ -1384,9 +1385,13 @@ impl HvfVcpu<'_> {
         // guest snapshotted mid-timer waits forever on an IRQ that never re-fires.
         vcpu_set_vtimer_mask(self.vcpuid, state.vtimer_masked)?;
         self.vtimer_masked = state.vtimer_masked;
-        if !self.nested_enabled {
-            vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
-            vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
+        // Only a raised line is written: a fresh vCPU's lines are clear, and a vCPU without them
+        // (see `read_pending_interrupt`) refuses even a write of false.
+        if state.pending_irq {
+            vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
+        }
+        if state.pending_fiq {
+            vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, true)?;
         }
         Ok(())
     }
