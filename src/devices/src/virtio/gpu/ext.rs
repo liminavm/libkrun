@@ -29,7 +29,7 @@
 //! - **Timing** (shm id [`super::timing::SHM_ID_TIMING`]): when the embedder provides one, the host display's
 //!   vsync grid in the guest's counter time ([`super::timing`]), at the arena window's first slot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
@@ -433,6 +433,9 @@ pub struct ExtState {
     surfaces: HashMap<(u32, u32), SurfaceShape>,
     /// Whether the timing page is mapped into the guest yet.
     timing_mapped: bool,
+    /// Contexts a restore brings back lost, between [`Self::restore`] and
+    /// [`Self::restore_rings`].
+    restore_lost: HashSet<u32>,
 }
 
 impl ExtState {
@@ -449,6 +452,7 @@ impl ExtState {
             exports: HashMap::new(),
             surfaces: HashMap::new(),
             timing_mapped: false,
+            restore_lost: HashSet::new(),
         }
     }
 
@@ -963,18 +967,55 @@ impl ExtState {
                 },
             );
         }
-        let mut orphans = HashMap::new();
+        // An arena that cannot have its address comes back elsewhere, so the guest's memory stays
+        // whole, and every context holding its old address restarts lost. Those are made once
+        // every arena that can be placed is, so that none of them takes a recorded address.
+        self.restore_lost.clear();
+        let mut placed = Vec::with_capacity(s.arenas.len());
+        let mut refused = Vec::new();
         for a in &s.arenas {
-            let got = self
+            match self
                 .cfg
                 .ext
-                .restore_arena(a.ctx, a.arena, a.size, a.gpu_base)?;
-            if got.gpu_base != a.gpu_base || got.size != a.size {
-                return Err(format!(
-                    "arena {}/{} came back at {:#x}+{:#x}, not {:#x}+{:#x}",
-                    a.ctx, a.arena, got.gpu_base, got.size, a.gpu_base, a.size
-                ));
+                .restore_arena(a.ctx, a.arena, a.size, a.gpu_base)
+            {
+                Ok(got) if got.gpu_base == a.gpu_base && got.size >= a.size => {
+                    placed.push((a, got))
+                }
+                Ok(got) => {
+                    error!(
+                        "gpu restore: extension: arena {}/{} came back at {:#x}+{:#x}, not \
+                         {:#x}+{:#x}",
+                        a.ctx, a.arena, got.gpu_base, got.size, a.gpu_base, a.size
+                    );
+                    placed.push((a, got));
+                    refused.push((a, true));
+                }
+                Err(e) => {
+                    error!(
+                        "gpu restore: extension: arena {}/{} not placed at {:#x}: {e}",
+                        a.ctx, a.arena, a.gpu_base
+                    );
+                    refused.push((a, false));
+                }
             }
+        }
+        let mut moved = HashSet::new();
+        for (a, standing) in refused {
+            if !standing {
+                let got = self.cfg.ext.create_arena(a.ctx, a.arena, a.size)?;
+                if got.size < a.size {
+                    return Err(format!("arena {}/{}: came back short", a.ctx, a.arena));
+                }
+                placed.push((a, got));
+            }
+            moved.insert((a.ctx, a.arena));
+            if a.ctx != 0 {
+                self.lose_in_restore(a.ctx, "an arena of its is not at its address");
+            }
+        }
+        let mut orphans = HashMap::new();
+        for (a, got) in placed {
             if a.contents.len() as u64 != a.size {
                 return Err(format!("arena {}/{}: contents short", a.ctx, a.arena));
             }
@@ -1035,6 +1076,12 @@ impl ExtState {
             exports.push((resource, got));
         }
         for &(ctx, arena, resource) in &s.imports {
+            if s.exports
+                .iter()
+                .any(|e| e.0 == resource && moved.contains(&(e.1, e.2)))
+            {
+                self.lose_in_restore(ctx, "an arena it imported is not at its address");
+            }
             let got = self.cfg.ext.import_arena(ctx, arena, resource)?;
             let c = self
                 .contexts
@@ -1055,15 +1102,26 @@ impl ExtState {
     /// Restarts every ring where the snapshot left it, once the surfaces the contexts use are
     /// bound again, and lets the embedder drop what held the arenas' places.
     pub fn restore_rings(&mut self, s: &ExtSnapshot) -> Result<(), String> {
+        let lost = std::mem::take(&mut self.restore_lost);
         let r = s.contexts.iter().try_for_each(|c| match &c.ring {
-            Some((arena, off, size, export)) => self
-                .cfg
-                .ext
-                .restore_ring(c.ctx, *arena, *off, *size, export),
+            // An empty export restarts the context lost, where its consumer stopped.
+            Some((arena, off, size, export)) => self.cfg.ext.restore_ring(
+                c.ctx,
+                *arena,
+                *off,
+                *size,
+                if lost.contains(&c.ctx) { &[] } else { export },
+            ),
             None => Ok(()),
         });
         self.cfg.ext.restore_done();
         r
+    }
+
+    fn lose_in_restore(&mut self, ctx: u32, why: &str) {
+        if self.restore_lost.insert(ctx) {
+            error!("gpu restore: extension: context {ctx} restored lost: {why}");
+        }
     }
 }
 
@@ -1252,6 +1310,8 @@ mod tests {
         arenas: Mutex<HashMap<(u32, u32), ExtArena>>,
         exports: Mutex<HashMap<u32, ExtArena>>,
         next_base: Mutex<u64>,
+        /// Addresses a restore cannot have.
+        taken: Mutex<Vec<u64>>,
     }
 
     /// `size` bytes of zeroed, page-aligned memory that lives as long as the test.
@@ -1367,6 +1427,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("restore arena {ctx}/{arena} at {gpu_base:#x}"));
+            if self.taken.lock().unwrap().contains(&gpu_base) {
+                return Err(format!("{gpu_base:#x} is taken"));
+            }
             let a = ExtArena {
                 host_addr: pages(size),
                 size,
@@ -1564,6 +1627,130 @@ mod tests {
         assert_eq!(again.exports, snap.exports);
         assert_eq!(again.imports, snap.imports);
         assert_eq!(again.held, snap.held);
+    }
+
+    /// Two contexts, each with a ring in a window arena; context 3 exports a shared arena that
+    /// context 2 imports. Answers the snapshot and its arenas' recorded addresses by (ctx, arena).
+    #[cfg(target_os = "macos")]
+    fn two_contexts_sharing_an_arena() -> (ExtSnapshot, HashMap<(u32, u32), u64>) {
+        let (f, mut s) = state();
+        for (ctx, ring) in [(2, 6), (3, 1)] {
+            s.create_context(ctx).unwrap();
+            s.create_arena(
+                ctx,
+                virtio_gpu_limina_arena_create {
+                    arena_id: ring,
+                    flags: 0,
+                    size: 1 << 16,
+                },
+            )
+            .unwrap();
+            s.attach_ring(
+                ctx,
+                virtio_gpu_limina_ring_attach {
+                    arena_id: ring,
+                    data_size: 1 << 14,
+                    offset: 0,
+                },
+            )
+            .unwrap();
+        }
+        s.create_arena(
+            3,
+            virtio_gpu_limina_arena_create {
+                arena_id: 4,
+                flags: ARENA_FLAG_BLOB,
+                size: 1 << 16,
+            },
+        )
+        .unwrap();
+        s.export_arena(3, 4, 40, 1 << 16).unwrap();
+        s.import_arena(
+            2,
+            virtio_gpu_limina_arena_import {
+                arena_id: 9,
+                resource_id: 40,
+            },
+        )
+        .unwrap();
+        for (&(ctx, arena), a) in f.arenas.lock().unwrap().iter() {
+            fill(a, (ctx * 16 + arena) as u8);
+        }
+        let bases = f
+            .arenas
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&k, a)| (k, a.gpu_base))
+            .collect();
+        (s.snapshot(), bases)
+    }
+
+    /// Restores `snap` into a fresh device whose GPU host cannot place `taken`, and answers the
+    /// rings it restarted.
+    #[cfg(target_os = "macos")]
+    fn restore_without(snap: &ExtSnapshot, taken: u64) -> (ExtState, Vec<String>) {
+        let (g, mut r) = state();
+        g.taken.lock().unwrap().push(taken);
+        r.restore(snap)
+            .expect("a refused arena loses its context, not the restore");
+        r.restore_rings(snap).unwrap();
+        let rings = g
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("ring "))
+            .cloned()
+            .collect();
+        (r, rings)
+    }
+
+    /// An arena the GPU host cannot put back at its address loses only its context: the arena
+    /// comes back elsewhere with its contents and its window, that context restarts lost, and the
+    /// other carries on where it was.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_arena_not_placed_loses_only_its_context() {
+        let (snap, bases) = two_contexts_sharing_an_arena();
+        let (r, rings) = restore_without(&snap, bases[&(3, 1)]);
+        assert_eq!(
+            rings,
+            vec![
+                "ring 2 at 6+0 (16384): journal of 2!".to_string(),
+                "ring 3 at 1+0 (16384): ".to_string(),
+            ]
+        );
+        let again = r.snapshot();
+        let moved = again
+            .arenas
+            .iter()
+            .find(|a| (a.ctx, a.arena) == (3, 1))
+            .expect("the arena is back");
+        assert_ne!(moved.gpu_base, bases[&(3, 1)]);
+        let was = snap
+            .arenas
+            .iter()
+            .find(|a| (a.ctx, a.arena) == (3, 1))
+            .unwrap();
+        assert_eq!(moved.window, was.window);
+        assert_eq!(moved.contents, was.contents);
+    }
+
+    /// A context that imported an arena which came back elsewhere holds its old address, so it
+    /// restarts lost along with the arena's own context.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_importer_of_an_arena_not_placed_is_lost_too() {
+        let (snap, bases) = two_contexts_sharing_an_arena();
+        let (_r, rings) = restore_without(&snap, bases[&(3, 4)]);
+        assert_eq!(
+            rings,
+            vec![
+                "ring 2 at 6+0 (16384): ".to_string(),
+                "ring 3 at 1+0 (16384): ".to_string(),
+            ]
+        );
     }
 
     /// A surface outlives the context that made it while another holds it, and a restore binds
