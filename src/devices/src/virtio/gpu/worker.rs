@@ -1757,6 +1757,7 @@ impl Worker {
                                 let _ = ext.fence(
                                     ctx_id,
                                     req.seqno,
+                                    req.completed_at,
                                     Box::new(move || handler.call(fence)),
                                 );
                             } else {
