@@ -124,13 +124,16 @@ pub struct virtio_gpu_limina_arena_import {
 // SAFETY: plain integers, no padding.
 unsafe impl ByteValued for virtio_gpu_limina_arena_import {}
 
-/// `FENCE`: answered once `hdr.ctx_id`'s ring has completed `seqno`.
+/// `FENCE`: answered once the `u64` at `completed_at` in `hdr.ctx_id`'s ring arena reaches
+/// `seqno`; `completed_at` 0 is the ring's own completed value.
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
 pub struct virtio_gpu_limina_fence {
     pub seqno: u64,
+    pub completed_at: u32,
+    pub padding: u32,
 }
-// SAFETY: a plain integer.
+// SAFETY: plain integers, no padding.
 unsafe impl ByteValued for virtio_gpu_limina_fence {}
 
 /// `SURFACE_CREATE`: resource `resource_id` becomes a surface the device mints, `width` x
@@ -237,9 +240,10 @@ pub trait GpuExtension: Send + Sync {
     /// Makes arena `arena` of `ctx` the memory of `export`.
     fn import_arena(&self, ctx: u32, arena: u32, export: u32) -> Result<ExtArena, String>;
     fn release_export(&self, export: u32);
-    /// Calls `signal` once `ctx`'s ring has completed `seqno` or the context is lost, from any
-    /// thread; at once if it already has.
-    fn fence(&self, ctx: u32, seqno: u64, signal: Signal);
+    /// Calls `signal` once the `u64` at `completed_at` in `ctx`'s ring arena (`0`, the ring's own
+    /// completed value) reaches `seqno` or the context is lost, from any thread; at once if it
+    /// already has.
+    fn fence(&self, ctx: u32, seqno: u64, completed_at: u32, signal: Signal);
     /// Gives `ctx` the surface `port` (a send right, moved) names, as `surface`.
     fn bind_surface(&self, ctx: u32, surface: u32, port: u32) -> Result<(), String>;
     /// `ctx` gives up `surface`; what it already made over it keeps it.
@@ -536,9 +540,15 @@ impl ExtState {
         Ok(())
     }
 
-    /// Answers `signal` once `ctx` has completed `seqno`, or when the context goes away; at once
-    /// if there is no such context, so no fence is left unanswered.
-    pub fn fence(&mut self, ctx: u32, seqno: u64, signal: Signal) -> Result<(), ExtError> {
+    /// Answers `signal` once `ctx` has completed `seqno` at `completed_at`, or when the context
+    /// goes away; at once if there is no such context, so no fence is left unanswered.
+    pub fn fence(
+        &mut self,
+        ctx: u32,
+        seqno: u64,
+        completed_at: u32,
+        signal: Signal,
+    ) -> Result<(), ExtError> {
         let pending = PendingFence(Arc::new(Mutex::new(Some(signal))));
         let Some(c) = self.contexts.get_mut(&ctx) else {
             pending.fire();
@@ -548,7 +558,7 @@ impl ExtState {
         c.fences.push(pending.clone());
         self.cfg
             .ext
-            .fence(ctx, seqno, Box::new(move || pending.fire()));
+            .fence(ctx, seqno, completed_at, Box::new(move || pending.fire()));
         Ok(())
     }
 
@@ -1455,7 +1465,7 @@ mod tests {
         fn restore_done(&self) {
             self.log.lock().unwrap().push("restore done".into());
         }
-        fn fence(&self, ctx: u32, seqno: u64, signal: Signal) {
+        fn fence(&self, ctx: u32, seqno: u64, _completed_at: u32, signal: Signal) {
             self.fences.lock().unwrap().push((ctx, seqno, signal));
         }
         fn bind_surface(&self, ctx: u32, surface: u32, port: u32) -> Result<(), String> {
@@ -2118,7 +2128,7 @@ mod tests {
     fn a_fence_is_answered_when_its_seqno_completes_and_only_once() {
         let (f, mut s) = state();
         s.create_context(1).unwrap();
-        s.fence(1, 5, logging_signal(&f, "fence 5")).unwrap();
+        s.fence(1, 5, 0, logging_signal(&f, "fence 5")).unwrap();
         f.complete(1, 4);
         assert!(!f.log.lock().unwrap().contains(&"fence 5".to_string()));
         f.complete(1, 5);
@@ -2131,7 +2141,7 @@ mod tests {
     fn destroying_a_context_answers_its_pending_fences() {
         let (f, mut s) = state();
         s.create_context(1).unwrap();
-        s.fence(1, 9, logging_signal(&f, "fence 9")).unwrap();
+        s.fence(1, 9, 0, logging_signal(&f, "fence 9")).unwrap();
         s.destroy_context(1).unwrap();
         let log = f.log.lock().unwrap().clone();
         let answered = log.iter().position(|l| l == "fence 9");
@@ -2143,7 +2153,7 @@ mod tests {
     fn a_fence_without_a_context_is_answered_at_once() {
         let (f, mut s) = state();
         assert_eq!(
-            s.fence(7, 1, logging_signal(&f, "fence")).err(),
+            s.fence(7, 1, 0, logging_signal(&f, "fence")).err(),
             Some(ExtError::InvalidContext)
         );
         assert!(f.log.lock().unwrap().contains(&"fence".to_string()));
@@ -2154,8 +2164,8 @@ mod tests {
         let (f, mut s) = state();
         s.create_context(1).unwrap();
         s.create_context(2).unwrap();
-        s.fence(1, 1, logging_signal(&f, "a")).unwrap();
-        s.fence(2, 1, logging_signal(&f, "b")).unwrap();
+        s.fence(1, 1, 0, logging_signal(&f, "a")).unwrap();
+        s.fence(2, 1, 0, logging_signal(&f, "b")).unwrap();
         s.reset();
         let log = f.log.lock().unwrap();
         assert!(log.contains(&"a".to_string()) && log.contains(&"b".to_string()));
