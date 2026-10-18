@@ -317,6 +317,23 @@ impl MmioTransport {
         self.state.device_status & (set | clr) == set
     }
 
+    /// A queue notification activates a device that asks for it
+    /// (`VirtioDevice::activates_before_driver_ok`) once the driver has accepted the features and
+    /// made every queue ready; DRIVER_OK then finds it active.
+    fn activates_on_this_notify(&self) -> bool {
+        self.state.device_status
+            == (device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK)
+            && self
+                .state
+                .queues
+                .as_ref()
+                .is_some_and(|qs| qs.iter().all(|q| q.ready))
+            && {
+                let device = self.locked_device();
+                device.activates_before_driver_ok() && !device.is_activated()
+            }
+    }
+
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&mut self, f: F) -> bool {
         self.state.with_queue_mut(self.state.queue_select, f)
     }
@@ -660,6 +677,9 @@ impl BusDevice for MmioTransport {
                         }
                     }),
                     0x50 => {
+                        if self.activates_on_this_notify() {
+                            self.activate();
+                        }
                         // A device may service the notification right here, on this vCPU; see
                         // `VirtioDevice::notify_inline`. Only once the driver is running: before
                         // that there are no queues to service.
@@ -684,7 +704,8 @@ impl BusDevice for MmioTransport {
                         if let Some(evt) = self.state.queue_evts().first() {
                             super::wake_probe::irq_acked_transport(evt.as_raw_fd());
                         }
-                        if self.check_device_status(device_status::DRIVER_OK, 0)
+                        if (self.check_device_status(device_status::DRIVER_OK, 0)
+                            || self.locked_device().is_activated())
                             && let Err(e) = self.interrupt.on_ack(v)
                         {
                             warn!("Failed to clear irq line on ack: {e:?}");
@@ -752,6 +773,7 @@ pub(crate) mod tests {
         inline_notified: Vec<u32>,
         /// Whether a guest reset deactivates it, as a real device's `reset` does.
         resettable: bool,
+        early: bool,
     }
 
     impl DummyDevice {
@@ -764,6 +786,7 @@ pub(crate) mod tests {
                 inline_queue: None,
                 inline_notified: Vec::new(),
                 resettable: false,
+                early: false,
             }
         }
 
@@ -831,6 +854,10 @@ pub(crate) mod tests {
         fn notify_inline(&mut self, queue: u32) -> bool {
             self.inline_notified.push(queue);
             self.inline_queue == Some(queue)
+        }
+
+        fn activates_before_driver_ok(&self) -> bool {
+            self.early
         }
     }
 
@@ -1403,6 +1430,49 @@ pub(crate) mod tests {
         assert_eq!(d.queue_evts()[0].read().unwrap(), 1);
 
         assert_eq!(dummy.lock().unwrap().inline_notified, vec![1, 0]);
+    }
+
+    #[test]
+    fn a_notify_before_driver_ok_activates_a_device_that_asks_for_it() {
+        for early in [false, true] {
+            let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+            let mut dummy = DummyDevice::new();
+            dummy.early = early;
+            let dummy = Arc::new(Mutex::new(dummy));
+            let mut d = MmioTransport::new(m, DummyIrqChip::new().into(), dummy.clone()).unwrap();
+            let mut buf = [0; 4];
+            let features_ok =
+                device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK;
+            set_device_status(&mut d, device_status::ACKNOWLEDGE);
+            set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+            set_device_status(&mut d, features_ok);
+            for q in 0..2 {
+                d.state.queue_select = q;
+                write_le_u32(&mut buf[..], 16);
+                d.write(0, 0x38, &buf[..]);
+                // A notification while a queue is still not ready activates nothing.
+                if q == 0 {
+                    write_le_u32(&mut buf[..], 0);
+                    d.write(0, 0x50, &buf[..]);
+                    assert!(!dummy.lock().unwrap().is_activated());
+                }
+                write_le_u32(&mut buf[..], 1);
+                d.write(0, 0x44, &buf[..]);
+            }
+
+            write_le_u32(&mut buf[..], 0);
+            d.write(0, 0x50, &buf[..]);
+            assert_eq!(dummy.lock().unwrap().is_activated(), early);
+            // The kick still reaches the queue, for the now-running device to find.
+            assert!(d.queue_evts()[0].read().is_ok());
+
+            set_device_status(&mut d, features_ok | device_status::DRIVER_OK);
+            assert_eq!(
+                d.state.device_status,
+                features_ok | device_status::DRIVER_OK
+            );
+            assert!(dummy.lock().unwrap().is_activated());
+        }
     }
 
     #[test]
