@@ -112,6 +112,9 @@ pub enum Error {
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     /// Cannot generate or write FDT
     SetupFDT(devices::fdt::Error),
+    /// limina: cannot generate or write the aarch64 ACPI tables.
+    #[cfg(target_arch = "aarch64")]
+    SetupAcpi(devices::acpi::Error),
     /// Vcpu error.
     Vcpu(vstate::Error),
     /// Cannot send event to vCPU.
@@ -151,6 +154,8 @@ impl Display for Error {
             RegisterMMIODevice(e) => write!(f, "Cannot add a device to the MMIO Bus. {e}"),
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             SetupFDT(e) => write!(f, "Error generating or writing FDT: {e:?}"),
+            #[cfg(target_arch = "aarch64")]
+            SetupAcpi(e) => write!(f, "Error generating or writing the ACPI tables: {e:?}"),
             Vcpu(e) => write!(f, "Vcpu error: {e}"),
             VcpuEvent(e) => write!(f, "Cannot send event to vCPU. {e:?}"),
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
@@ -920,6 +925,16 @@ impl Vmm {
                 self.mmio_device_manager.vcpu_capacities(),
             )
             .map_err(Error::SetupFDT)?;
+            if _acpi_enabled {
+                let vcpu_mpidr: Vec<u64> = vcpus.iter().map(|cpu| cpu.get_mpidr()).collect();
+                devices::acpi::create_acpi_tables(
+                    &self.guest_memory,
+                    &vcpu_mpidr,
+                    self.mmio_device_manager.get_device_info(),
+                    _intc,
+                )
+                .map_err(Error::SetupAcpi)?;
+            }
         }
 
         #[cfg(target_arch = "aarch64")]
