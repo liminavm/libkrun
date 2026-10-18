@@ -13,7 +13,8 @@ use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::gic::GICDevice;
 use arch::aarch64::layout::{
-    EFI_VARS_SIZE, EFI_VARS_START, GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT,
+    ACPI_SIZE, ACPI_START, EFI_VARS_SIZE, EFI_VARS_START, GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC,
+    GTIMER_VIRT,
 };
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
@@ -119,6 +120,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     create_cpu_nodes(&mut fdt, &vcpu_mpidr, vcpu_capacities)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_efi_vars_node(&mut fdt, guest_mem)?;
+    create_acpi_tables_node(&mut fdt, guest_mem)?;
     create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
@@ -273,6 +275,19 @@ fn create_efi_vars_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Res
         "reg",
         &generate_prop64(&[EFI_VARS_START, EFI_VARS_SIZE as u64]),
     )?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
+/// limina: when guest memory holds an ACPI window, tell the firmware where its tables are. A
+/// firmware that installs them hands the OS ACPI and withholds this tree.
+fn create_acpi_tables_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Result<()> {
+    if guest_mem.find_region(GuestAddress(ACPI_START)).is_none() {
+        return Ok(());
+    }
+    let node = fdt.begin_node(&format!("acpi-tables@{ACPI_START:x}"))?;
+    fdt.property_string("compatible", "libkrun,acpi-tables")?;
+    fdt.property("reg", &generate_prop64(&[ACPI_START, ACPI_SIZE as u64]))?;
     fdt.end_node(node)?;
     Ok(())
 }
