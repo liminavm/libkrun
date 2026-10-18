@@ -171,6 +171,8 @@ pub enum StartMicrovmError {
     TpmState(io::Error),
     /// limina: the UEFI variable store's file could not be opened, made or used.
     EfiVars(io::Error),
+    /// limina: the machine cannot be described with ACPI.
+    Acpi(String),
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// The kernel doesn't fit into the microVM memory.
@@ -352,6 +354,7 @@ impl Display for StartMicrovmError {
             #[cfg(feature = "tpm")]
             TpmState(ref err) => write!(f, "Cannot load the TPM's state: {err}"),
             EfiVars(ref err) => write!(f, "Cannot map the UEFI variable store: {err}"),
+            Acpi(ref err) => write!(f, "Cannot describe the machine with ACPI: {err}"),
             InvalidKernelBundle(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -786,6 +789,7 @@ pub fn build_microvm(
         vm_resources.initrd_bundle.as_ref(),
         vm_resources.firmware_config.as_ref(),
         vm_resources.efi_vars.as_deref(),
+        vm_resources.acpi_enabled,
         &fs_shm_sizes,
         gpu_shm_size,
         gpu_ext_sizes,
@@ -2200,6 +2204,22 @@ fn efi_vars_region(
     ))
 }
 
+/// limina: the guest region the ACPI tables are written to. Only a firmware hands ACPI to an
+/// arm64 OS (through its configuration table), so a direct kernel boot keeps the device tree.
+#[cfg(target_arch = "aarch64")]
+fn acpi_region(
+    firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    use arch::aarch64::layout::{ACPI_SIZE, ACPI_START};
+
+    if !firmware {
+        return Err(StartMicrovmError::Acpi(
+            "an arm64 guest only finds ACPI tables through a firmware".into(),
+        ));
+    }
+    Ok((GuestAddress(ACPI_START), ACPI_SIZE, None))
+}
+
 #[cfg(not(target_arch = "aarch64"))]
 fn efi_vars_region(
     path: &std::path::Path,
@@ -2226,6 +2246,7 @@ pub fn create_guest_memory(
     >,
     firmware_config: Option<&crate::vmm::vmm_config::firmware::FirmwareConfig>,
     efi_vars: Option<&std::path::Path>,
+    acpi: bool,
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
     gpu_ext_sizes: Option<(usize, usize)>,
@@ -2392,10 +2413,14 @@ pub fn create_guest_memory(
             .collect();
         if let Some(path) = efi_vars {
             regions.push(efi_vars_region(path, firmware_config.is_some())?);
-            // Guest memory takes its regions in address order, and the store sits between the
-            // firmware and RAM.
-            regions.sort_by_key(|&(addr, _, _)| addr);
         }
+        #[cfg(target_arch = "aarch64")]
+        if acpi {
+            regions.push(acpi_region(firmware_config.is_some())?);
+        }
+        // Guest memory takes its regions in address order, and the variable store and the ACPI
+        // window sit between the firmware and RAM.
+        regions.sort_by_key(|&(addr, _, _)| addr);
         GuestMemoryMmap::from_ranges_with_files(&regions)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
@@ -3002,6 +3027,7 @@ pub mod tests {
                 path: firmware.clone(),
             }),
             Some(&vars),
+            false,
             &[],
             None,
             false,
@@ -3085,6 +3111,7 @@ pub mod tests {
             None,
             None,
             None,
+            false,
             &[],
             None,
             None,
