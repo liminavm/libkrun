@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use acpi_tables::aml::{
-    Device, Interrupt, Memory32Fixed, Method, Name, Notify, Path, ResourceTemplate, Scope,
+    Device, Interrupt, Memory32Fixed, Method, Name, Notify, Package, Path, ResourceTemplate, Scope,
+    Uuid,
 };
 use acpi_tables::fadt::{FADTBuilder, Flags};
 use acpi_tables::madt::{
@@ -310,17 +311,21 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
     let gpio_events = GpioEvents::new();
     let mut virtio_uid = 0u32;
     for (device_type, info) in devices {
+        let battery;
         let mut extra: Vec<&dyn Aml> = Vec::new();
         let mut irq = Some(info.irq());
         let (name, hid, uid, coherent) = match device_type {
-            DeviceType::Virtio(_) => {
+            DeviceType::Virtio(virtio_type) => {
                 virtio_uid += 1;
-                (
-                    format!("VR{:02X}", virtio_uid - 1),
-                    "LNRO0005",
-                    virtio_uid - 1,
-                    false,
-                )
+                let name = format!("VR{:02X}", virtio_uid - 1);
+                #[cfg(not(feature = "tee"))]
+                if virtio_type == crate::virtio::TYPE_I2C {
+                    battery = SbsBattery::on(&name);
+                    extra.push(&battery);
+                }
+                #[cfg(feature = "tee")]
+                let _ = virtio_type;
+                (name, "LNRO0005", virtio_uid - 1, false)
             }
             DeviceType::Serial => ("COM0".to_string(), "ARMH0011", 0, false),
             DeviceType::Xhci => ("USB0".to_string(), "PNP0D10", 0, true),
@@ -412,6 +417,74 @@ impl GpioEvents {
         let mut children: Vec<&dyn Aml> = vec![&self.aei];
         children.extend(self.methods.iter().map(|m| m as &dyn Aml));
         children
+    }
+}
+
+/// The SBS smart battery on the virtio-i2c adapter, which the device tree declares as the
+/// adapter's `sbs,sbs-battery` child. virtio-i2c gives its adapter the transport's ACPI node, so
+/// Linux enumerates I2C clients whose I2cSerialBus resource names that node; PRP0001 and the
+/// `compatible` property let the stock sbs-battery driver match it by its device-tree table.
+#[cfg(not(feature = "tee"))]
+struct SbsBattery {
+    hid: Name,
+    crs: Name,
+    dsd: Name,
+}
+
+#[cfg(not(feature = "tee"))]
+impl SbsBattery {
+    /// `_DSD`'s device-properties UUID.
+    const DEVICE_PROPERTIES: &'static str = "daffd814-6eba-4d8c-8a91-bc9bbf4aa301";
+
+    fn on(adapter: &str) -> Self {
+        let bus = I2cSerialBus {
+            address: crate::virtio::i2c::SBS_BATTERY_ADDR,
+            adapter: format!("\\_SB_.{adapter}"),
+        };
+        let compatible = Package::new(vec![&"compatible", &"sbs,sbs-battery"]);
+        let properties = Package::new(vec![&compatible]);
+        let uuid = Uuid::new(Self::DEVICE_PROPERTIES);
+        SbsBattery {
+            hid: Name::new(Path::new("_HID"), &"PRP0001"),
+            crs: Name::new(Path::new("_CRS"), &ResourceTemplate::new(vec![&bus])),
+            dsd: Name::new(Path::new("_DSD"), &Package::new(vec![&uuid, &properties])),
+        }
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl Aml for SbsBattery {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        Device::new(Path::new("BAT0"), vec![&self.hid, &self.crs, &self.dsd]).to_aml_bytes(sink);
+    }
+}
+
+/// An I2cSerialBusV2 connection descriptor (ACPI 6.5, 6.4.3.8.2.1): a 7-bit, controller-initiated
+/// client at `address` on the adapter whose ACPI path is `adapter`, at standard-mode speed.
+#[cfg(not(feature = "tee"))]
+struct I2cSerialBus {
+    address: u16,
+    adapter: String,
+}
+
+#[cfg(not(feature = "tee"))]
+impl Aml for I2cSerialBus {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        const TYPE_DATA_LEN: u16 = 6;
+        let source_len = self.adapter.len() as u16 + 1;
+        sink.byte(0x8E);
+        sink.word(15 + source_len);
+        sink.byte(2); // revision
+        sink.byte(0); // resource source index
+        sink.byte(1); // I2C
+        sink.byte(0x02); // consumer, controller-initiated
+        sink.word(0); // 7-bit addressing
+        sink.byte(1); // type-specific revision
+        sink.word(TYPE_DATA_LEN);
+        sink.dword(100_000);
+        sink.word(self.address);
+        sink.vec(self.adapter.as_bytes());
+        sink.byte(0);
     }
 }
 
@@ -634,6 +707,41 @@ mod tests {
                 "{needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_i2c_adapter_carries_the_sbs_battery() {
+        let mut devices = HashMap::new();
+        devices.insert(
+            (DeviceType::Virtio(crate::virtio::TYPE_I2C), "i2c".into()),
+            Info {
+                addr: 0x0a01_4000,
+                irq: 48,
+            },
+        );
+        let dsdt = build_dsdt(1, &devices).unwrap();
+        assert!(checksum_ok(&dsdt));
+        for needle in [
+            &b"BAT0"[..],
+            b"PRP0001",
+            b"sbs,sbs-battery",
+            b"\\_SB_.VR00\0",
+        ] {
+            assert!(
+                dsdt.windows(needle.len()).any(|w| w == needle),
+                "{needle:?}"
+            );
+        }
+        let mut bus = Vec::new();
+        I2cSerialBus {
+            address: 0x0b,
+            adapter: "\\_SB_.VR00".into(),
+        }
+        .to_aml_bytes(&mut bus);
+        assert_eq!(bus.len(), 18 + 11);
+        assert_eq!(u16::from_le_bytes([bus[1], bus[2]]) as usize, bus.len() - 3);
+        assert_eq!(u16::from_le_bytes([bus[10], bus[11]]), 6);
+        assert_eq!(u16::from_le_bytes([bus[16], bus[17]]), 0x0b);
     }
 
     #[test]
