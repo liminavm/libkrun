@@ -186,6 +186,14 @@ pub trait VirtioDevice: AsAny + Send {
         false
     }
 
+    /// limina: activate on the first queue notification once the driver has accepted the
+    /// features and made every queue ready, instead of waiting for DRIVER_OK. For a device whose
+    /// stock Linux driver submits requests from its own probe, before the virtio core sets
+    /// DRIVER_OK, and waits for them without a timeout. The default waits for DRIVER_OK.
+    fn activates_before_driver_ok(&self) -> bool {
+        false
+    }
+
     /// Optionally deactivates this device. The device should drop its queues.
     /// After reset, the transport will recreate queues from queue_config().
     fn reset(&mut self) -> bool {
