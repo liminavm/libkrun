@@ -55,6 +55,11 @@ const GPIO_WAKE_LINE: u16 = 6;
 const NOTIFY_BUTTON_PRESSED: u8 = 0x80;
 const NOTIFY_BUTTON_WAKE: u8 = 0x02;
 
+/// The TPM2 table: revision 4, a client platform, and the TIS (memory-mapped) start method.
+const TPM2_REVISION: u8 = 4;
+const TPM2_PLATFORM_CLIENT: u16 = 0;
+const TPM2_START_METHOD_TIS: u32 = 6;
+
 /// GTDT timer flags.
 const GTDT_TIMER_ALWAYS_ON: u32 = 1 << 2;
 const GTDT_REVISION: u8 = 3;
@@ -110,8 +115,8 @@ struct Gic {
     maint_ppi: u32,
 }
 
-/// Lays the tables out from `base`: RSDP, XSDT, FADT, MADT, GTDT, PPTT, DSDT, each 8-byte
-/// aligned.
+/// Lays the tables out from `base`: RSDP, XSDT, FADT, MADT, GTDT, PPTT, the TPM2 table when
+/// there is a TPM, then the DSDT, each 8-byte aligned.
 fn build_tables<T: DeviceInfoForFDT + Clone + Debug>(
     base: u64,
     vcpu_mpidr: &[u64],
@@ -121,35 +126,40 @@ fn build_tables<T: DeviceInfoForFDT + Clone + Debug>(
     if gic.compatible != "arm,gic-v3" {
         return Err(Error::UnsupportedGic(gic.compatible.clone()));
     }
-    let madt = build_madt(vcpu_mpidr, &gic.properties, gic.maint_ppi);
-    let gtdt = build_gtdt();
-    let pptt = build_pptt(vcpu_mpidr.len());
+    let mut tables = vec![
+        build_madt(vcpu_mpidr, &gic.properties, gic.maint_ppi),
+        build_gtdt(),
+        build_pptt(vcpu_mpidr.len()),
+    ];
+    if device_info.keys().any(|(t, _)| *t == DeviceType::Tpm) {
+        tables.push(build_tpm2());
+    }
     let dsdt = build_dsdt(vcpu_mpidr.len(), device_info)?;
 
     let rsdp_len = aml_bytes(&Rsdp::new(OEM_ID, 0)).len();
-    let xsdt_len = build_xsdt(&[0, 0, 0, 0]).len();
+    let xsdt_len = build_xsdt(&vec![0; tables.len() + 1]).len();
     let fadt_len = build_fadt(0).len();
 
     let xsdt_addr = base + align8(rsdp_len);
     let fadt_addr = xsdt_addr + align8(xsdt_len);
-    let madt_addr = fadt_addr + align8(fadt_len);
-    let gtdt_addr = madt_addr + align8(madt.len());
-    let pptt_addr = gtdt_addr + align8(gtdt.len());
-    let dsdt_addr = pptt_addr + align8(pptt.len());
+    let mut entries = vec![fadt_addr];
+    let mut next = fadt_addr + align8(fadt_len);
+    for table in &tables {
+        entries.push(next);
+        next += align8(table.len());
+    }
+    let dsdt_addr = next;
+
+    let mut layout = vec![
+        (base, aml_bytes(&Rsdp::new(OEM_ID, xsdt_addr))),
+        (xsdt_addr, build_xsdt(&entries)),
+        (fadt_addr, build_fadt(dsdt_addr)),
+    ];
+    layout.extend(entries[1..].iter().copied().zip(tables));
+    layout.push((dsdt_addr, dsdt));
 
     let mut blob = Vec::new();
-    for (addr, table) in [
-        (base, aml_bytes(&Rsdp::new(OEM_ID, xsdt_addr))),
-        (
-            xsdt_addr,
-            build_xsdt(&[fadt_addr, madt_addr, gtdt_addr, pptt_addr]),
-        ),
-        (fadt_addr, build_fadt(dsdt_addr)),
-        (madt_addr, madt),
-        (gtdt_addr, gtdt),
-        (pptt_addr, pptt),
-        (dsdt_addr, dsdt),
-    ] {
+    for (addr, table) in layout {
         blob.resize((addr - base) as usize, 0);
         blob.extend_from_slice(&table);
     }
@@ -239,6 +249,25 @@ fn build_gtdt() -> Vec<u8> {
     gtdt.as_slice().to_vec()
 }
 
+/// The TPM's TIS registers are memory-mapped (start method 6) and it has no CRB control area.
+/// Linux's `tpm_tis` refuses an `MSFT0101` device without this table.
+fn build_tpm2() -> Vec<u8> {
+    let mut tpm2 = Sdt::new(
+        *b"TPM2",
+        36,
+        TPM2_REVISION,
+        OEM_ID,
+        *b"LIMNTPM2",
+        OEM_REVISION,
+    );
+    tpm2.append(TPM2_PLATFORM_CLIENT);
+    tpm2.append(0u16);
+    tpm2.append(0u64);
+    tpm2.append(TPM2_START_METHOD_TIS);
+    tpm2.update_checksum();
+    tpm2.as_slice().to_vec()
+}
+
 /// One package holding every vCPU. Without a PPTT, arm64 Linux cannot work out the CPU
 /// topology under ACPI and its cacheinfo and topology sysfs setup fail.
 fn build_pptt(vcpus: usize) -> Vec<u8> {
@@ -282,6 +311,7 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
     let mut virtio_uid = 0u32;
     for (device_type, info) in devices {
         let mut extra: Vec<&dyn Aml> = Vec::new();
+        let mut irq = Some(info.irq());
         let (name, hid, uid, coherent) = match device_type {
             DeviceType::Virtio(_) => {
                 virtio_uid += 1;
@@ -302,11 +332,16 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
                 extra = gpio_events.children();
                 ("GPO0".to_string(), "ARMH0061", 0, false)
             }
-            // Not described yet: the virtual cpufreq controller and the TPM. The PL031 has no
-            // ACPI binding; the OS reaches the clock through the firmware's GetTime.
+            // No interrupt: tpm_tis polls, as it does for the device-tree node.
+            DeviceType::Tpm => {
+                irq = None;
+                ("TPM0".to_string(), "MSFT0101", 0, false)
+            }
+            // Not described yet: the virtual cpufreq controller. The PL031 has no ACPI binding;
+            // the OS reaches the clock through the firmware's GetTime.
             _ => continue,
         };
-        body.extend(mmio_device(&name, hid, uid, info, coherent, &extra)?);
+        body.extend(mmio_device(&name, hid, uid, info, irq, coherent, &extra)?);
     }
 
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, *b"LIMNDSDT", OEM_REVISION);
@@ -314,20 +349,25 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(dsdt.as_slice().to_vec())
 }
 
-/// One MMIO window and one edge-triggered SPI: HVF's in-kernel GIC only pulses SPIs, which is
-/// why the device tree declares them edge-triggered too.
+/// One MMIO window and, if the device has one, an edge-triggered SPI: HVF's in-kernel GIC only
+/// pulses SPIs, which is why the device tree declares them edge-triggered too.
 fn mmio_device<T: DeviceInfoForFDT>(
     name: &str,
     hid: &'static str,
     uid: u32,
     info: &T,
+    irq: Option<u32>,
     coherent: bool,
     extra: &[&dyn Aml],
 ) -> Result<Vec<u8>> {
     let base = u32::try_from(info.addr()).map_err(|_| Error::DeviceAbove4G(info.addr()))?;
     let mem = Memory32Fixed::new(true, base, info.length() as u32);
-    let irq = Interrupt::new(true, true, false, false, info.irq());
-    let resources = ResourceTemplate::new(vec![&mem, &irq]);
+    let irq = irq.map(|irq| Interrupt::new(true, true, false, false, irq));
+    let mut descriptors: Vec<&dyn Aml> = vec![&mem];
+    if let Some(irq) = &irq {
+        descriptors.push(irq);
+    }
+    let resources = ResourceTemplate::new(descriptors);
     let hid = Name::new(Path::new("_HID"), &hid);
     let uid = Name::new(Path::new("_UID"), &uid);
     let crs = Name::new(Path::new("_CRS"), &resources);
@@ -641,5 +681,52 @@ mod tests {
             }
         }
         assert_eq!(signatures, [b"FACP", b"APIC", b"GTDT", b"PPTT"]);
+    }
+
+    #[test]
+    fn a_tpm_adds_its_table_and_a_device_without_an_interrupt() {
+        let gic = Gic {
+            compatible: "arm,gic-v3".into(),
+            properties: vec![0x1000, 0x1_0000, 0x2000, 0x4_0000],
+            maint_ppi: 9,
+        };
+        let mut devices = HashMap::new();
+        devices.insert(
+            (DeviceType::Tpm, "tpm".into()),
+            Info {
+                addr: 0x0a00_6000,
+                irq: 0,
+            },
+        );
+        let base = 0x0408_0000;
+        let blob = build_tables(base, &[0], &devices, &gic).unwrap();
+        let xsdt = table_at(&blob, (u64_at(&blob, 24) - base) as usize);
+        let mut tpm2 = None;
+        let mut dsdt = None;
+        for entry in xsdt[36..].chunks(8) {
+            let table = table_at(
+                &blob,
+                (u64::from_le_bytes(entry.try_into().unwrap()) - base) as usize,
+            );
+            assert!(checksum_ok(table));
+            match &table[..4] {
+                b"TPM2" => tpm2 = Some(table),
+                b"FACP" => dsdt = Some(table_at(&blob, (u64_at(table, 140) - base) as usize)),
+                _ => {}
+            }
+        }
+        let tpm2 = tpm2.expect("no TPM2 table");
+        assert_eq!(tpm2.len(), 52);
+        assert_eq!(tpm2[8], 4);
+        assert_eq!(u32::from_le_bytes(tpm2[48..52].try_into().unwrap()), 6);
+
+        let dsdt = dsdt.unwrap();
+        let at = dsdt.windows(8).position(|w| w == b"MSFT0101").unwrap();
+        // The device's _CRS holds the memory window and no Extended Interrupt descriptor.
+        let crs = dsdt[at..].windows(4).position(|w| w == b"_CRS").unwrap() + at;
+        assert_eq!(dsdt[crs + 4], 0x11);
+        // TPM0 is the last device, so the rest of the table is its _CRS.
+        assert!(dsdt[crs..].contains(&0x86));
+        assert!(!dsdt[crs..].contains(&0x89));
     }
 }
