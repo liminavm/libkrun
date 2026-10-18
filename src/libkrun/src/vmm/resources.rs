@@ -128,8 +128,10 @@ pub struct VmResources {
     /// Whether to ask for transparent huge pages for guest memory (Linux).
     #[cfg(target_os = "linux")]
     pub transparent_huge_pages: bool,
-    /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
-    /// discovered via the kernel command line and SMP uses the MP table.
+    /// Whether to expose ACPI tables. x86_64: when disabled, virtio-mmio devices are discovered
+    /// via the kernel command line and SMP uses the MP table. aarch64 (limina, firmware boots
+    /// only): the VMM also writes ACPI tables for the firmware to hand the OS in place of the
+    /// device tree.
     pub acpi_enabled: bool,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
