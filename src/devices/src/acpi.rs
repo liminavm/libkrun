@@ -10,8 +10,9 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-use acpi_tables::Aml;
-use acpi_tables::aml::{Device, Interrupt, Memory32Fixed, Name, Path, ResourceTemplate, Scope};
+use acpi_tables::aml::{
+    Device, Interrupt, Memory32Fixed, Method, Name, Notify, Path, ResourceTemplate, Scope,
+};
 use acpi_tables::fadt::{FADTBuilder, Flags};
 use acpi_tables::madt::{
     EnabledStatus, GicVersion, Gicc, Gicd, Gicr, LocalInterruptController, MADT, Trigger,
@@ -20,6 +21,7 @@ use acpi_tables::pptt::{PPTT, ProcessorNode};
 use acpi_tables::rsdp::Rsdp;
 use acpi_tables::sdt::Sdt;
 use acpi_tables::xsdt::XSDT;
+use acpi_tables::{Aml, AmlSink};
 use arch::aarch64::layout::{
     ACPI_SIZE, ACPI_START, GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT,
 };
@@ -41,6 +43,17 @@ const PPI_BASE: u32 = 16;
 const ARM_BOOT_ARCH_PSCI_COMPLIANT: u16 = 1 << 0;
 #[cfg(target_os = "linux")]
 const ARM_BOOT_ARCH_PSCI_USE_HVC: u16 = 1 << 1;
+
+/// The PL061 lines the device tree's `gpio-keys` node names, which the VMM pulses from its
+/// power, sleep and wake eventfds. Under ACPI they are GPIO-signalled events instead: the
+/// controller's `_AEI` lists them and its `_Exx` methods notify the power and sleep buttons.
+/// The restart line (5) has no ACPI button to map to.
+const GPIO_POWER_LINE: u16 = 3;
+const GPIO_SLEEP_LINE: u16 = 4;
+const GPIO_WAKE_LINE: u16 = 6;
+/// Button notification values: the button was pressed, or it woke the system.
+const NOTIFY_BUTTON_PRESSED: u8 = 0x80;
+const NOTIFY_BUTTON_WAKE: u8 = 0x02;
 
 /// GTDT timer flags.
 const GTDT_TIMER_ALWAYS_ON: u32 = 1 << 2;
@@ -261,8 +274,14 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
         let uid = Name::new(Path::new("_UID"), &(index as u32));
         Device::new(Path::new(&format!("C{index:03X}")), vec![&hid, &uid]).to_aml_bytes(&mut body);
     }
+    let pwrb_hid = Name::new(Path::new("_HID"), &"PNP0C0C");
+    let slpb_hid = Name::new(Path::new("_HID"), &"PNP0C0E");
+    let button_uid = Name::new(Path::new("_UID"), &0u32);
+
+    let gpio_events = GpioEvents::new();
     let mut virtio_uid = 0u32;
     for (device_type, info) in devices {
+        let mut extra: Vec<&dyn Aml> = Vec::new();
         let (name, hid, uid, coherent) = match device_type {
             DeviceType::Virtio(_) => {
                 virtio_uid += 1;
@@ -275,12 +294,19 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
             }
             DeviceType::Serial => ("COM0".to_string(), "ARMH0011", 0, false),
             DeviceType::Xhci => ("USB0".to_string(), "PNP0D10", 0, true),
-            // Not described yet: the PL061 power and sleep keys, the PL031 (no ACPI binding;
-            // the OS reaches it through the firmware's GetTime), the virtual cpufreq controller
-            // and the TPM.
+            DeviceType::Gpio => {
+                Device::new(Path::new("PWRB"), vec![&pwrb_hid, &button_uid])
+                    .to_aml_bytes(&mut body);
+                Device::new(Path::new("SLPB"), vec![&slpb_hid, &button_uid])
+                    .to_aml_bytes(&mut body);
+                extra = gpio_events.children();
+                ("GPO0".to_string(), "ARMH0061", 0, false)
+            }
+            // Not described yet: the virtual cpufreq controller and the TPM. The PL031 has no
+            // ACPI binding; the OS reaches the clock through the firmware's GetTime.
             _ => continue,
         };
-        body.extend(mmio_device(&name, hid, uid, info, coherent)?);
+        body.extend(mmio_device(&name, hid, uid, info, coherent, &extra)?);
     }
 
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, *b"LIMNDSDT", OEM_REVISION);
@@ -296,6 +322,7 @@ fn mmio_device<T: DeviceInfoForFDT>(
     uid: u32,
     info: &T,
     coherent: bool,
+    extra: &[&dyn Aml],
 ) -> Result<Vec<u8>> {
     let base = u32::try_from(info.addr()).map_err(|_| Error::DeviceAbove4G(info.addr()))?;
     let mem = Memory32Fixed::new(true, base, info.length() as u32);
@@ -309,9 +336,115 @@ fn mmio_device<T: DeviceInfoForFDT>(
     if coherent {
         children.push(&cca);
     }
+    children.extend_from_slice(extra);
     let mut bytes = Vec::new();
     Device::new(Path::new(name), children).to_aml_bytes(&mut bytes);
     Ok(bytes)
+}
+
+/// The PL061's `_AEI` and its event methods: the power and sleep lines press the buttons, and
+/// the wake line, marked wake-capable so Linux arms its interrupt for wake during s2idle, tells
+/// the sleep button it woke the system (a wake, not a press).
+struct GpioEvents {
+    aei: Name,
+    methods: [EventMethod; 3],
+}
+
+impl GpioEvents {
+    fn new() -> Self {
+        let pins = [
+            GpioInt::edge(GPIO_POWER_LINE, false),
+            GpioInt::edge(GPIO_SLEEP_LINE, false),
+            GpioInt::edge(GPIO_WAKE_LINE, true),
+        ];
+        let resources: Vec<&dyn Aml> = pins.iter().map(|pin| pin as &dyn Aml).collect();
+        GpioEvents {
+            aei: Name::new(Path::new("_AEI"), &ResourceTemplate::new(resources)),
+            methods: [
+                EventMethod::new(GPIO_POWER_LINE, "\\_SB_.PWRB", NOTIFY_BUTTON_PRESSED),
+                EventMethod::new(GPIO_SLEEP_LINE, "\\_SB_.SLPB", NOTIFY_BUTTON_PRESSED),
+                EventMethod::new(GPIO_WAKE_LINE, "\\_SB_.SLPB", NOTIFY_BUTTON_WAKE),
+            ],
+        }
+    }
+
+    fn children(&self) -> Vec<&dyn Aml> {
+        let mut children: Vec<&dyn Aml> = vec![&self.aei];
+        children.extend(self.methods.iter().map(|m| m as &dyn Aml));
+        children
+    }
+}
+
+/// `Method (_Exx) { Notify (<button>, <value>) }`, the handler ACPI runs for GPIO event line xx.
+struct EventMethod {
+    line: u16,
+    button: Path,
+    value: u8,
+}
+
+impl EventMethod {
+    fn new(line: u16, button: &str, value: u8) -> Self {
+        EventMethod {
+            line,
+            button: Path::new(button),
+            value,
+        }
+    }
+}
+
+impl Aml for EventMethod {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        let notify = Notify::new(&self.button, &self.value);
+        Method::new(
+            Path::new(&format!("_E{:02X}", self.line)),
+            0,
+            false,
+            vec![&notify],
+        )
+        .to_aml_bytes(sink);
+    }
+}
+
+/// A GpioInt connection descriptor (ACPI 6.5, 6.4.3.8.1) for one edge-triggered, active-high
+/// pin on `\_SB_.GPO0`.
+struct GpioInt {
+    pin: u16,
+    wake: bool,
+}
+
+impl GpioInt {
+    const SOURCE: &'static [u8] = b"\\_SB_.GPO0\0";
+    const HEADER_LEN: u16 = 23;
+
+    fn edge(pin: u16, wake: bool) -> Self {
+        GpioInt { pin, wake }
+    }
+}
+
+impl Aml for GpioInt {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        let pin_table = Self::HEADER_LEN;
+        let source = pin_table + 2;
+        let vendor = source + Self::SOURCE.len() as u16;
+        // Edge-triggered, active high; exclusive, or exclusive and wake.
+        let flags: u16 = 1 | if self.wake { 2 << 3 } else { 0 };
+        sink.byte(0x8C);
+        sink.word(vendor - 3);
+        sink.byte(1); // revision
+        sink.byte(0); // an interrupt connection
+        sink.word(1); // consumer
+        sink.word(flags);
+        sink.byte(0); // default pull
+        sink.word(0); // drive strength
+        sink.word(0); // debounce
+        sink.word(pin_table);
+        sink.byte(0); // resource source index
+        sink.word(source);
+        sink.word(vendor);
+        sink.word(0); // no vendor data
+        sink.word(self.pin);
+        sink.vec(Self::SOURCE);
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +566,51 @@ mod tests {
         // The RTC has no ACPI binding and is left out.
         let irq36 = [0x89, 6, 0, 0x03, 1, 36, 0, 0, 0];
         assert!(!dsdt.windows(irq36.len()).any(|w| w == irq36));
+    }
+
+    #[test]
+    fn gpio_events_press_the_buttons_and_wake() {
+        let mut devices = HashMap::new();
+        devices.insert(
+            (DeviceType::Gpio, "gpio".into()),
+            Info {
+                addr: 0x0a00_5000,
+                irq: 37,
+            },
+        );
+        let dsdt = build_dsdt(1, &devices).unwrap();
+        assert!(checksum_ok(&dsdt));
+        for needle in [
+            &b"ARMH0061"[..],
+            b"PNP0C0C",
+            b"PNP0C0E",
+            b"_AEI",
+            b"_E03",
+            b"_E04",
+            b"_E06",
+        ] {
+            assert!(
+                dsdt.windows(needle.len()).any(|w| w == needle),
+                "{needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpio_int_descriptor_layout() {
+        let mut bytes = Vec::new();
+        GpioInt::edge(6, true).to_aml_bytes(&mut bytes);
+        assert_eq!(bytes.len(), 36);
+        assert_eq!(bytes[0], 0x8C);
+        assert_eq!(u16::from_le_bytes([bytes[1], bytes[2]]), 33);
+        // Edge-triggered, exclusive and wake.
+        assert_eq!(u16::from_le_bytes([bytes[7], bytes[8]]), 0x11);
+        // The pin, then the controller's path.
+        assert_eq!(u16::from_le_bytes([bytes[23], bytes[24]]), 6);
+        assert_eq!(&bytes[25..], b"\\_SB_.GPO0\0");
+        let mut plain = Vec::new();
+        GpioInt::edge(3, false).to_aml_bytes(&mut plain);
+        assert_eq!(u16::from_le_bytes([plain[7], plain[8]]), 0x01);
     }
 
     #[test]
