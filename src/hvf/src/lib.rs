@@ -637,6 +637,33 @@ struct MmioRead {
     addr: u64,
     len: usize,
     srt: u32,
+    /// The syndrome's SSE bit: a sign-extending load (`ldrsb`, `ldrsh`, `ldrsw`).
+    sign_extend: bool,
+    /// The syndrome's SF bit: the destination is a 64-bit register.
+    sixty_four: bool,
+}
+
+/// The value a trapped MMIO load leaves in its destination register (Arm ARM, ISS encoding for
+/// a data abort: SAS, SSE, SF): the device's `len` bytes, sign-extended to 32 or 64 bits when
+/// the load was a sign-extending one. A 32-bit destination's upper half reads as zero.
+fn mmio_load_value(buf: &[u8], len: usize, sign_extend: bool, sixty_four: bool) -> Option<u64> {
+    let raw = match len {
+        1 => u8::from_le_bytes(buf.get(0..1)?.try_into().ok()?) as u64,
+        2 => u16::from_le_bytes(buf.get(0..2)?.try_into().ok()?) as u64,
+        4 => u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) as u64,
+        8 => u64::from_le_bytes(buf.get(0..8)?.try_into().ok()?),
+        _ => return None,
+    };
+    if !sign_extend || len == 8 {
+        return Some(raw);
+    }
+    let shift = 64 - 8 * len as u32;
+    let extended = (((raw << shift) as i64) >> shift) as u64;
+    Some(if sixty_four {
+        extended
+    } else {
+        extended & 0xffff_ffff
+    })
 }
 
 /// A vCPU's PSCI power state at snapshot time.
@@ -1245,13 +1272,13 @@ impl HvfVcpu<'_> {
         if let Some(mmio_read) = self.pending_mmio_read.take()
             && mmio_read.srt < 31
         {
-            let val = match mmio_read.len {
-                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                _ => return Err(Error::Unhandled),
-            };
+            let val = mmio_load_value(
+                &self.mmio_buf,
+                mmio_read.len,
+                mmio_read.sign_extend,
+                mmio_read.sixty_four,
+            )
+            .ok_or(Error::Unhandled)?;
             self.write_reg(mmio_read.srt, val)?;
         }
         if self.pending_advance_pc {
@@ -1599,18 +1626,17 @@ impl HvfVcpu<'_> {
         if let Some(mmio_read) = self.pending_mmio_read.take()
             && mmio_read.srt < 31
         {
-            let val = match mmio_read.len {
-                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                _ => {
-                    error!(
-                        "unsupported MMIO read size: pa=0x{:x} len={}; stopping the VM",
-                        mmio_read.addr, mmio_read.len
-                    );
-                    return Err(Error::Unhandled);
-                }
+            let Some(val) = mmio_load_value(
+                &self.mmio_buf,
+                mmio_read.len,
+                mmio_read.sign_extend,
+                mmio_read.sixty_four,
+            ) else {
+                error!(
+                    "unsupported MMIO read size: pa=0x{:x} len={}; stopping the VM",
+                    mmio_read.addr, mmio_read.len
+                );
+                return Err(Error::Unhandled);
             };
 
             self.write_reg(mmio_read.srt, val)?;
@@ -1711,7 +1737,13 @@ impl HvfVcpu<'_> {
 
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
                 } else {
-                    self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
+                    self.pending_mmio_read = Some(MmioRead {
+                        addr: pa,
+                        srt,
+                        len,
+                        sign_extend: (syndrome >> 21) & 1 != 0,
+                        sixty_four: (syndrome >> 15) & 1 != 0,
+                    });
                     Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
                 }
             }
@@ -1850,6 +1882,46 @@ mod tests {
     // The blob-map alignment guard: hv_vm_map/hv_vm_unmap take sizes at granule
     // granularity only, so the wrappers must round sub-granule sizes up (and by exactly
     // the same amount on both map and unmap). See round_up_to_map_granule.
+    // The destination of a trapped load, per the ISS: ldrb/ldrh/ldr zero-extend; ldrsb and
+    // ldrsh sign-extend to the W or X register SF names, ldrsw to X.
+    #[test]
+    fn a_trapped_load_extends_as_its_instruction_does() {
+        let b = [0x81u8, 0x80, 0x00, 0x80, 0, 0, 0, 0];
+        // ldrb w / ldrsb w / ldrsb x
+        assert_eq!(super::mmio_load_value(&b, 1, false, false), Some(0x81));
+        assert_eq!(
+            super::mmio_load_value(&b, 1, true, false),
+            Some(0xffff_ff81)
+        );
+        assert_eq!(
+            super::mmio_load_value(&b, 1, true, true),
+            Some(0xffff_ffff_ffff_ff81)
+        );
+        // ldrh w / ldrsh w
+        assert_eq!(super::mmio_load_value(&b, 2, false, false), Some(0x8081));
+        assert_eq!(
+            super::mmio_load_value(&b, 2, true, false),
+            Some(0xffff_8081)
+        );
+        // ldr w / ldrsw x
+        assert_eq!(
+            super::mmio_load_value(&b, 4, false, false),
+            Some(0x8000_8081)
+        );
+        assert_eq!(
+            super::mmio_load_value(&b, 4, true, true),
+            Some(0xffff_ffff_8000_8081)
+        );
+        // A positive value is unchanged by sign extension.
+        assert_eq!(super::mmio_load_value(&[0x7f], 1, true, true), Some(0x7f));
+        // ldr x
+        assert_eq!(
+            super::mmio_load_value(&b, 8, false, true),
+            Some(0x8000_8081)
+        );
+        assert_eq!(super::mmio_load_value(&b, 3, false, false), None);
+    }
+
     #[test]
     fn sizes_round_up_to_the_map_granule() {
         let page = map_granule();
