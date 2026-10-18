@@ -105,3 +105,11 @@ pub const EFI_VARS_START: u64 = 0x0400_0000;
 /// limina: the variable store's size, the firmware's `PcdVariableStoreSize`. A multiple of the
 /// 16 KiB host page, which every guest mapping is.
 pub const EFI_VARS_SIZE: usize = 0x4_0000;
+
+/// limina: where the VMM writes the guest's ACPI tables, RSDP first, when it describes the
+/// machine with ACPI: past the variable store, below the GIC. The firmware finds it through the
+/// `libkrun,acpi-tables` device-tree node and installs the tables from it.
+pub const ACPI_START: u64 = 0x0408_0000;
+
+/// limina: the ACPI window's size, a multiple of the 16 KiB host page.
+pub const ACPI_SIZE: usize = 0x4_0000;
