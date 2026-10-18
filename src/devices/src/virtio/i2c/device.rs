@@ -398,6 +398,14 @@ impl VirtioDevice for I2c {
         "i2c"
     }
 
+    /// virtio-i2c registers its adapter, and so probes the adapter's clients, from its own probe.
+    /// When a client's driver is already loaded, which it is for an ACPI-described client (the
+    /// client's ACPI node exists from boot and udev loads its driver), the client's first
+    /// transfer comes before DRIVER_OK and the driver waits for it indefinitely.
+    fn activates_before_driver_ok(&self) -> bool {
+        true
+    }
+
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
     }
