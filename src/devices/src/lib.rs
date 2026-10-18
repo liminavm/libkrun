@@ -13,6 +13,8 @@ extern crate log;
 use std::fmt;
 use std::io;
 
+#[cfg(target_arch = "aarch64")]
+pub mod acpi;
 mod bus;
 pub mod display;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
