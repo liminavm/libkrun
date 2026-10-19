@@ -1,26 +1,40 @@
+use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::Sender as CmdSender;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
+use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, DumpGate, QueueConfig, VirtioDevice,
     VirtioShmRegion, fs::ExportTable,
 };
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
-use super::virtio_gpu::virgl_flags_to_capsets;
-use super::worker::Worker;
-use crate::display::DisplayInfo;
+use super::ext::{GpuExtConfig, SHM_ID_ARENAS, SHM_ID_DOORBELLS, VIRTIO_GPU_F_LIMINA_EXT};
+use super::protocol::VIRTIO_GPU_EVENT_DISPLAY;
+use super::timing::{SHM_ID_TIMING, TIMING_SIZE};
+use super::virtio_gpu::GpuActivation;
+use super::worker::{Worker, WorkerCmd};
+use crate::display::{DisplayInfo, EdidParams};
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
-// Supported features.
+// Supported features. EVENT_IDX lets the guest suppress its doorbell writes while the
+// worker is still draining (avail_event) and lets the device skip used-buffer interrupts
+// the guest isn't waiting for (used_event) — under a 60fps venus stream both directions
+// fire thousands of times per second otherwise.
 pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
+    | (1u64 << VIRTIO_RING_F_EVENT_IDX)
     | (1u64 << uapi::VIRTIO_GPU_F_VIRGL)
     | (1u64 << uapi::VIRTIO_GPU_F_EDID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
@@ -28,9 +42,119 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT)
     | (1u64 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT);
 
+// limina software-2D-only mode: advertise a plain 2D virtio-gpu — no VIRGL/BLOB/CONTEXT_INIT
+// (all renderer-backed) and no capsets — so the guest never probes for or issues 3D
+// commands and falls back to the 2D scanout path (efifb/simpledrm/fbcon). See `Gpu::new`.
+pub(crate) const AVAIL_FEATURES_SOFTWARE_2D: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
+    | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+    | (1u64 << uapi::VIRTIO_GPU_F_EDID)
+    | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID);
+
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
     [QueueConfig::new(QUEUE_SIZE); defs::NUM_QUEUES];
+
+/// limina: one runtime change to a scanout. Every field is optional so callers can push a
+/// resize, a new EDID, or a connect/disconnect independently — or all three at once, which is
+/// what moving the window to another host display does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DisplayUpdate {
+    /// The scanout to change.
+    pub display_id: u32,
+    /// New preferred mode, in pixels.
+    pub size: Option<(u32, u32)>,
+    /// New position in the guest's desktop (`DisplayInfo::position` — the arrangement
+    /// relay's suggested-offset source).
+    pub position: Option<(u32, u32)>,
+    /// New EDID parameters — identity, mode list and refresh range. Only meaningful for a
+    /// display whose EDID is generated (a caller-provided raw blob is left alone).
+    pub edid: Option<EdidParams>,
+    /// New connection state. `false` makes the guest's connector report *disconnected*
+    /// (`virtio_gpu_conn_detect` keys on exactly this), which is a genuine unplug.
+    pub connected: Option<bool>,
+}
+
+impl DisplayUpdate {
+    /// Can `next` be folded into this pending update instead of being queued behind it?
+    ///
+    /// Only for same-display updates that don't change connection state: each connectivity
+    /// change has to reach the guest as its own event, or a disconnect immediately followed by
+    /// a reconnect would collapse into "nothing happened" and the guest would never see the
+    /// unplug.
+    fn can_merge(&self, next: &DisplayUpdate) -> bool {
+        self.display_id == next.display_id && self.connected.is_none() && next.connected.is_none()
+    }
+
+    fn merge(&mut self, next: DisplayUpdate) {
+        if next.size.is_some() {
+            self.size = next.size;
+        }
+        if next.position.is_some() {
+            self.position = next.position;
+        }
+        if next.edid.is_some() {
+            self.edid = next.edid;
+        }
+    }
+}
+
+/// limina: a cloneable, thread-safe handle that lets the host push a runtime display change
+/// into the live GPU device after boot, from any thread (the supervisor's window-resize gesture
+/// and display-migration tracker funnel here via limina-vmm). Mechanism only — *policy* (when,
+/// to what size, with which identity) lives in limina. Obtained from
+/// [`Gpu::display_resize_handle`] before boot and held by limina-vmm.
+///
+/// A request is queued and kicks the GPU worker's eventfd; the worker applies it to
+/// `displays[id]`, sets the config-space display-event bit, and raises a virtio-gpu
+/// config-change interrupt so the guest re-reads `GET_DISPLAY_INFO` + `GET_EDID` and
+/// re-probes the connector. See `docs/design/runtime-display-resize.md` and
+/// `docs/design/stable-edid-hotplug.md`.
+#[derive(Clone)]
+pub struct DisplayResizeHandle {
+    /// Wakes the GPU worker's epoll loop; shared (same eventfd object) with the worker.
+    resize_evt: Arc<EventFd>,
+    /// Queued updates; the worker takes **one** per wake so that each reaches the guest as its
+    /// own config-change event. Consecutive updates that only change mode/EDID for the same
+    /// display are merged on push, so a burst of resizes still costs one modeset.
+    pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
+    /// Number of scanouts, for validating `display_id` host-side.
+    num_displays: usize,
+}
+
+impl DisplayResizeHandle {
+    /// Request the guest reflow scanout `display_id` to `width`×`height`.
+    pub fn request(&self, display_id: u32, width: u32, height: u32) -> bool {
+        self.update(DisplayUpdate {
+            display_id,
+            size: Some((width, height)),
+            ..Default::default()
+        })
+    }
+
+    /// Queue an arbitrary display change and kick the GPU worker. Returns `false` (logged) if
+    /// `display_id` is out of range or the worker can't be woken.
+    pub fn update(&self, update: DisplayUpdate) -> bool {
+        if update.display_id as usize >= self.num_displays {
+            error!(
+                "display update: invalid display id {} (have {})",
+                update.display_id, self.num_displays
+            );
+            return false;
+        }
+        {
+            let mut pending = self.pending.lock().unwrap();
+            match pending.back_mut() {
+                Some(last) if last.can_merge(&update) => last.merge(update),
+                _ => pending.push_back(update),
+            }
+        }
+        if let Err(e) = self.resize_evt.write(1) {
+            error!("display update: failed to kick gpu worker: {e}");
+            return false;
+        }
+        true
+    }
+}
 
 pub struct Gpu {
     pub(crate) avail_features: u64,
@@ -38,35 +162,95 @@ pub struct Gpu {
     pub(crate) device_state: DeviceState,
     shm_region: Option<VirtioShmRegion>,
     virgl_flags: u32,
+    /// limina: serve only software-2D scanout; don't init virglrenderer/rutabaga (see module).
+    software_2d: bool,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
+    /// limina: signs the pipeline-cache data the renderer hands the guest; see
+    /// [`Self::set_pipeline_cache_key`].
+    pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     blob_alignment: u32,
+    /// The long-lived gpu worker thread. Spawned once (on first `activate()`) and kept across
+    /// resets — it owns the process-global, thread-bound renderer for the whole VMM lifetime.
+    /// Joined on `Drop`. See [`WorkerCmd`].
+    worker_thread: Option<JoinHandle<()>>,
+    /// Sends activate/deactivate/shutdown commands to the worker; `None` until first activate.
+    worker_tx: Option<CmdSender<WorkerCmd>>,
+    /// Wakes the worker's inner epoll loop when a command is queued (reset / Drop).
+    worker_stopfd: EventFd,
+    /// limina runtime display resize (see [`DisplayResizeHandle`]). The config-space
+    /// `events_read` field, shared with the worker (which sets the display-event bit) and read
+    /// by the guest via [`Self::read_config`]; cleared by the guest's `events_clear` write.
+    events_read: Arc<AtomicU32>,
+    /// Wakes the worker to apply a pending resize; cloned into the worker and the handle.
+    resize_evt: Arc<EventFd>,
+    /// Queued display updates; pushed by the handle, taken one per wake by the worker.
+    resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
+    /// limina M9.3: a staged GPU snapshot payload, set by the restore path and replayed by
+    /// the worker on the next activation (after the guest thaw's device reset).
+    pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+    /// limina M9.3: `false` while a staged replay is pending, flipped back by the worker
+    /// once the replay finished. `activate` blocks the guest's DRIVER_OK on it so guest
+    /// userspace (still frozen during dpm_resume) can't touch blob shmem before the replay
+    /// re-established the mappings — mesa's post-thaw writes would land in limbo and the
+    /// first live `vkExecuteCommandStreamsMESA` would decode stale bytes (garbage) and
+    /// FATAL the ring.
+    restore_done: Arc<(Mutex<bool>, Condvar)>,
+    /// limina (host-sleep s2idle): set by the transport just before `activate` when this
+    /// activation's queues were re-armed from the stash (a bus-fallback s2idle thaw, not a
+    /// real driver re-init). Forwarded to the worker so it can classify a parked session —
+    /// adopt it on a thaw, run the deferred `reset_session` on a re-init.
+    thaw_activation: bool,
+    /// Held closed by a snapshot while it copies guest RAM. The worker passes through it on
+    /// every wake, and the fence handler (called from the renderer's own threads as well) for
+    /// every fence it retires into the used ring.
+    dump_gate: Arc<DumpGate>,
+    /// limina: the native-context extension's windows and embedder, if configured.
+    ext: Option<GpuExtConfig>,
 }
 
 impl Gpu {
     pub fn new(
         virgl_flags: u32,
+        software_2d: bool,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
         Ok(Gpu {
-            avail_features: AVAIL_FEATURES,
+            avail_features: if software_2d {
+                AVAIL_FEATURES_SOFTWARE_2D
+            } else {
+                AVAIL_FEATURES
+            },
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
             virgl_flags,
+            software_2d,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table: None,
+            pipeline_cache_key: None,
             displays,
             display_backend,
             // Blobs are mapped into the guest in host pages, which can be
             // larger than the guest's (16 KiB on Apple silicon).
             blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
+            worker_thread: None,
+            worker_tx: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?,
+            events_read: Arc::new(AtomicU32::new(0)),
+            resize_evt: Arc::new(EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?),
+            resize_pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending_restore: Arc::new(Mutex::new(None)),
+            restore_done: Arc::new((Mutex::new(true), Condvar::new())),
+            thaw_activation: false,
+            dump_gate: Arc::default(),
+            ext: None,
         })
     }
 
@@ -74,13 +258,40 @@ impl Gpu {
         defs::GPU_DEV_ID
     }
 
+    /// limina: a handle for pushing runtime display resizes into this live device. Grab it
+    /// before boot and hold it host-side (limina-vmm); see [`DisplayResizeHandle`].
+    pub fn display_resize_handle(&self) -> DisplayResizeHandle {
+        DisplayResizeHandle {
+            resize_evt: self.resize_evt.clone(),
+            pending: self.resize_pending.clone(),
+            num_displays: self.displays.len(),
+        }
+    }
+
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         debug!("virtio_gpu: set_shm_region");
         self.shm_region = Some(shm_region);
     }
 
+    /// limina: offer the native-context extension (see [`super::ext`]). A software-2D device has
+    /// no renderer to extend, so it ignores this.
+    pub fn set_extension(&mut self, cfg: GpuExtConfig) {
+        if self.software_2d {
+            return;
+        }
+        self.avail_features |= 1u64 << VIRTIO_GPU_F_LIMINA_EXT;
+        self.ext = Some(cfg);
+    }
+
     pub fn set_export_table(&mut self, export_table: ExportTable) {
         self.export_table = Some(export_table);
+    }
+
+    /// limina: the key the renderer signs the guest's pipeline-cache data with. The same key on
+    /// every launch keeps a VM's saved caches warm across boots; without one the renderer makes
+    /// a key per process. Read when the worker starts, so set it before the first activation.
+    pub fn set_pipeline_cache_key(&mut self, key: rutabaga_gfx::PipelineCacheKey) {
+        self.pipeline_cache_key = Some(key);
     }
 
     /*
@@ -139,6 +350,67 @@ impl Gpu {
     */
 }
 
+impl Gpu {
+    /// Spawn the long-lived worker thread (which owns the process-global renderer) if it
+    /// isn't running yet, and return the command channel. Called on first activation, and
+    /// early by the restore path so a GPU snapshot replay can run before the guest does.
+    fn ensure_worker(&mut self) -> &CmdSender<WorkerCmd> {
+        if self.worker_tx.is_none() {
+            let shm_region = match self.shm_region.as_ref() {
+                Some(s) => s.clone(),
+                None => panic!("virtio_gpu: missing SHM region"),
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let active: Arc<Mutex<Option<GpuActivation>>> = Arc::new(Mutex::new(None));
+            let worker = Worker::new(
+                shm_region,
+                self.virgl_flags,
+                self.software_2d,
+                self.worker_stopfd.try_clone().unwrap(),
+                rx,
+                active,
+                #[cfg(target_os = "macos")]
+                self.map_sender.clone(),
+                self.export_table.take(),
+                self.pipeline_cache_key.take(),
+                self.displays.clone(),
+                self.display_backend,
+                self.events_read.clone(),
+                self.resize_evt.clone(),
+                self.resize_pending.clone(),
+                self.pending_restore.clone(),
+                self.restore_done.clone(),
+                self.dump_gate.clone(),
+                self.ext.clone(),
+            );
+            self.worker_thread = Some(worker.run());
+            self.worker_tx = Some(tx);
+        }
+        self.worker_tx.as_ref().unwrap()
+    }
+
+    /// limina M9.3: ask the worker to serialize the GPU re-creation state (the rutabaga
+    /// journal, the venus wire journals and the mapped-blob contents). Call with the vCPUs
+    /// quiesced. `None` means nothing to save (software-2D, stock guest, or an empty journal).
+    pub fn snapshot_gpu(&self) -> Option<Vec<u8>> {
+        let tx = self.worker_tx.as_ref()?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        tx.send(WorkerCmd::Snapshot { reply: reply_tx }).ok()?;
+        let _ = self.worker_stopfd.write(1);
+        reply_rx.recv().ok().flatten()
+    }
+
+    /// limina M9.3: stage a GPU snapshot payload for replay. The worker replays it at the
+    /// next activation — which on the restore path is the guest thaw's DRIVER_OK, right
+    /// after the thaw reset (which would wipe an earlier replay) and before any queue
+    /// command. Replaying earlier also deadlocks: the blob-mapping messages it emits are
+    /// serviced by a VMM thread that only starts after `build_microvm` returns.
+    pub fn restore_gpu(&mut self, data: Vec<u8>) {
+        *self.pending_restore.lock().unwrap() = Some(data);
+        *self.restore_done.0.lock().unwrap() = false;
+    }
+}
+
 impl VirtioDevice for Gpu {
     fn avail_features(&self) -> u64 {
         self.avail_features
@@ -164,12 +436,42 @@ impl VirtioDevice for Gpu {
         &QUEUE_CONFIG
     }
 
+    fn dump_gate(&self) -> Option<Arc<DumpGate>> {
+        Some(self.dump_gate.clone())
+    }
+
+    fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
+        let mut config = [0u8; std::mem::size_of::<virtio_gpu_config>()];
+        self.read_config(0, &mut config);
+        let config = virtio_gpu_config::from_slice(&config)
+            .copied()
+            .unwrap_or_default();
+        vec![
+            ("scanouts", config.num_scanouts as u64),
+            ("capsets", config.num_capsets as u64),
+            ("blob alignment", config.blob_alignment as u64),
+        ]
+    }
+
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config = virtio_gpu_config {
-            events_read: 0,
+            // limina: the guest reads this after a config-change interrupt; a set
+            // VIRTIO_GPU_EVENT_DISPLAY bit tells it to re-fetch GET_DISPLAY_INFO (runtime resize).
+            events_read: self.events_read.load(Ordering::SeqCst),
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            num_capsets: virgl_flags_to_capsets(self.virgl_flags).count_ones(),
+            // No renderer in software-2D-only mode → no capsets to advertise. Otherwise
+            // advertise exactly the capsets our renderer backs for these flags (venus-only
+            // under NO_VIRGL), so the guest doesn't enumerate and probe capsets we can't
+            // serve. This is the pop-count of the same mask create_rutabaga() passes to the
+            // builder — derived from virgl_flags, so it's stable before the renderer exists
+            // (the guest reads this config field during device probe, pre-activate).
+            num_capsets: if self.software_2d {
+                0
+            } else {
+                super::virtio_gpu::VirtioGpu::capset_mask_from_virgl_flags(self.virgl_flags)
+                    .count_ones()
+            },
             blob_alignment: self.blob_alignment,
         };
 
@@ -187,6 +489,20 @@ impl VirtioDevice for Gpu {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        // limina: the driver acks display events by writing the bits-to-clear into the
+        // `events_clear` field (offset 4 in virtio_gpu_config); clear them from `events_read`.
+        const EVENTS_CLEAR_OFFSET: u64 = 4;
+        if offset == EVENTS_CLEAR_OFFSET && data.len() == 4 {
+            let clear = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            self.events_read.fetch_and(!clear, Ordering::SeqCst);
+            // The ack releases the display-update queue: the worker holds further updates
+            // while an unconsumed event is in flight (see the resize handler), so the ack
+            // must wake it back up to deliver whatever queued in the meantime.
+            if clear & VIRTIO_GPU_EVENT_DISPLAY != 0 {
+                let _ = self.resize_evt.write(1);
+            }
+            return;
+        }
         warn!(
             "gpu: guest driver attempted to write device config (offset={:x}, len={:x})",
             offset,
@@ -200,7 +516,7 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
+        let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
                 defs::NUM_QUEUES
@@ -208,27 +524,73 @@ impl VirtioDevice for Gpu {
             ActivateError::BadActivate
         })?;
 
-        let shm_region = match self.shm_region.as_ref() {
-            Some(s) => s.clone(),
-            None => panic!("virtio_gpu: missing SHM region"),
-        };
+        // Spawn the worker ONCE, on the first activation (or earlier, if a GPU snapshot
+        // replay needed it — see `ensure_worker`). It owns the process-global, thread-bound
+        // renderer for the whole VMM lifetime; later activations (driver rebind, EFI→kernel
+        // hand-off, reboot) reuse the same thread+renderer and just rebind transport.
+        // This is the renderer-singleton fix: `virgl_renderer_init` can't be re-run, so we
+        // must never drop+recreate the renderer on reset.
+        let thaw = self.thaw_activation;
+        // A fresh driver init can never consume an event raised before it existed (an update
+        // pushed while the guest was still in firmware), and an unacked event HOLDS the
+        // display-update queue — so a stale one would wedge it forever. Drop it and release
+        // the queue. Not on a thaw: there the guest driver survives with the event possibly
+        // still legitimately in flight.
+        if !thaw && self.events_read.swap(0, Ordering::SeqCst) != 0 {
+            let _ = self.resize_evt.write(1);
+        }
+        let tx = self.ensure_worker();
 
-        // cursor queue not used by worker
-        let worker = Worker::new(
-            control_q,
-            mem.clone(),
-            interrupt.clone(),
-            shm_region,
-            self.virgl_flags,
-            #[cfg(target_os = "macos")]
-            self.map_sender.clone(),
-            self.export_table.take(),
-            self.displays.clone(),
-            self.display_backend,
-        );
-        worker.run();
+        // Bind this activation's transport. The worker is in its outer recv() (first activate)
+        // or just deactivated, so a plain send wakes it — no stop_fd kick needed here.
+        if tx
+            .send(WorkerCmd::Activate {
+                mem: mem.clone(),
+                control_q,
+                cursor_q,
+                interrupt: interrupt.clone(),
+                thaw,
+            })
+            .is_err()
+        {
+            error!("virtio_gpu: worker thread is gone; cannot activate");
+            return Err(ActivateError::BadActivate);
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
+
+        // limina M9.3: if a snapshot replay is staged, hold the guest here (this is the
+        // vCPU thread servicing the thaw's DRIVER_OK write, while guest userspace is still
+        // frozen) until the worker finishes replaying. Otherwise the resumed guest races
+        // the replay: mesa writes command-stream bytes through blob mappings the replay
+        // hasn't re-established yet, the bytes are lost, and the first live ring submission
+        // decodes garbage → ring FATAL → compositor abort. The VMM worker thread that
+        // services the replay's GpuAddMapping messages doesn't need this thread or the
+        // device lock, so waiting here is deadlock-free.
+        let (done_lock, done_cv) = &*self.restore_done;
+        let mut done = done_lock.lock().unwrap();
+        if !*done {
+            info!("virtio_gpu: holding DRIVER_OK for the staged snapshot replay");
+            let start = std::time::Instant::now();
+            while !*done {
+                let (guard, timeout) = done_cv
+                    .wait_timeout(done, std::time::Duration::from_secs(120))
+                    .unwrap();
+                done = guard;
+                if timeout.timed_out() && !*done {
+                    error!(
+                        "virtio_gpu: staged snapshot replay did not finish within 120s; \
+                         releasing DRIVER_OK (the session will likely be lost)"
+                    );
+                    break;
+                }
+            }
+            info!(
+                "virtio_gpu: released DRIVER_OK after {:?} (replay {})",
+                start.elapsed(),
+                if *done { "complete" } else { "TIMED OUT" }
+            );
+        }
 
         Ok(())
     }
@@ -237,22 +599,196 @@ impl VirtioDevice for Gpu {
         self.device_state.is_activated()
     }
 
+    fn set_thaw_activation(&mut self, thaw: bool) {
+        self.thaw_activation = thaw;
+    }
+
+    fn reset(&mut self) -> bool {
+        // Tell the worker to stop servicing the (about-to-be-freed) queues and drop this
+        // session's bookkeeping, WITHOUT tearing down the renderer — so the guest's re-init
+        // (firmware→kernel hand-off, driver rebind, reboot) gets a fresh device backed by the
+        // same long-lived renderer instead of a failed second `virgl_renderer_init`. The
+        // stop_fd kick wakes the worker's inner epoll loop to pick up the queued command.
+        if let Some(tx) = &self.worker_tx {
+            let _ = tx.send(WorkerCmd::Deactivate);
+            let _ = self.worker_stopfd.write(1);
+        }
+        self.device_state = DeviceState::Inactive;
+        true
+    }
+
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         debug!("virtio_gpu: GET_shm_region");
         self.shm_region.as_ref()
+    }
+
+    fn shm_region_by_id(&self, id: u32) -> Option<VirtioShmRegion> {
+        let ext = self.ext.as_ref();
+        match id {
+            SHM_ID_ARENAS => ext.map(|e| VirtioShmRegion {
+                host_addr: 0,
+                guest_addr: e.arenas_guest_addr,
+                size: e.arenas_size as usize,
+            }),
+            SHM_ID_DOORBELLS => ext.map(|e| VirtioShmRegion {
+                host_addr: 0,
+                guest_addr: e.doorbells_guest_addr,
+                size: e.doorbells_size as usize,
+            }),
+            SHM_ID_TIMING => ext.filter(|e| e.timing.is_some()).map(|e| VirtioShmRegion {
+                host_addr: 0,
+                guest_addr: e.arenas_guest_addr,
+                size: TIMING_SIZE as usize,
+            }),
+            0 | 1 => self.shm_region.clone(),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        // Reap the long-lived worker thread (it isn't joined on reset anymore). Closing the
+        // command channel would also end it, but the explicit Shutdown + stop_fd kick wakes it
+        // promptly whether it's parked in recv() or its inner epoll loop.
+        if let Some(tx) = self.worker_tx.take() {
+            let _ = tx.send(WorkerCmd::Shutdown);
+            let _ = self.worker_stopfd.write(1);
+        }
+        if let Some(worker) = self.worker_thread.take()
+            && let Err(e) = worker.join()
+        {
+            error!("error waiting for gpu worker thread: {e:?}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::{InterruptTransport, Queue};
+    use krun_display::{
+        DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBackendNew, IntoDisplayBackend,
+        Rect, ResourceFormat,
+    };
+    use std::sync::Arc;
+    use vm_memory::GuestAddress;
+
+    /// Minimal no-op display backend so the reset test can spin a real worker thread
+    /// without a window/capture sink. Its frame methods are never reached (no queue
+    /// activity); only `new` is invoked, via `VirtioGpu::new`'s `create_instance`.
+    struct StubBackend {
+        buf: Vec<u8>,
+    }
+    impl DisplayBackendNew<()> for StubBackend {
+        fn new(_userdata: Option<&()>) -> Self {
+            StubBackend { buf: vec![0u8; 4] }
+        }
+    }
+    impl DisplayBackendBasicFramebuffer for StubBackend {
+        fn configure_scanout(
+            &mut self,
+            _scanout_id: u32,
+            _display_width: u32,
+            _display_height: u32,
+            _width: u32,
+            _height: u32,
+            _format: ResourceFormat,
+        ) -> Result<(), DisplayBackendError> {
+            Ok(())
+        }
+        fn disable_scanout(&mut self, _scanout_id: u32) -> Result<(), DisplayBackendError> {
+            Ok(())
+        }
+        fn alloc_frame(
+            &mut self,
+            _scanout_id: u32,
+        ) -> Result<(u32, &mut [u8]), DisplayBackendError> {
+            Ok((0, &mut self.buf))
+        }
+        fn present_frame(
+            &mut self,
+            _scanout_id: u32,
+            _frame_id: u32,
+            _rect: Option<&Rect>,
+        ) -> Result<(), DisplayBackendError> {
+            Ok(())
+        }
+    }
+
+    fn dummy_device_queue() -> DeviceQueue {
+        DeviceQueue::new(
+            Queue::new(QUEUE_SIZE),
+            Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+        )
+    }
+
+    fn test_gpu() -> Gpu {
+        let backend = StubBackend::into_display_backend(None);
+        Gpu::new(
+            0,
+            true, // software_2d -> no rutabaga, no renderer init
+            Vec::<DisplayInfo>::new().into_boxed_slice(),
+            backend,
+            #[cfg(target_os = "macos")]
+            crossbeam_channel::unbounded().0,
+        )
+        .unwrap()
+    }
+
+    /// The renderer-singleton fix: `virgl_renderer_init` can't be re-run, so the worker (which
+    /// owns the renderer) must be spawned ONCE and **persist** across resets — `activate()`/
+    /// `reset()` just bind/unbind the transport. This asserts that lifecycle: the worker thread
+    /// is created on first activate, survives a reset (not joined), and re-activates without a
+    /// second spawn; `Drop` then joins it cleanly (a deadlock there would hang this test).
+    /// (Runs with `software_2d=true` → no real renderer, so it exercises the thread/transport
+    /// lifecycle, not the renderer reuse itself — that's `venus_reset.rs`.)
+    #[test]
+    fn test_worker_persists_across_reset() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let intc =
+            InterruptTransport::new(DummyIrqChip::new().into(), "gpu-test".to_string()).unwrap();
+
+        let mut gpu = test_gpu();
+        gpu.set_shm_region(VirtioShmRegion {
+            host_addr: 0,
+            guest_addr: 0,
+            size: 0,
+        });
+
+        // First activate -> the single worker thread is spawned.
+        gpu.activate(
+            mem.clone(),
+            intc.clone(),
+            vec![dummy_device_queue(), dummy_device_queue()],
+        )
+        .unwrap();
+        assert!(gpu.is_activated());
+        assert!(gpu.worker_thread.is_some());
+        assert!(gpu.worker_tx.is_some());
+
+        // Reset -> device inactive, but the worker thread PERSISTS (renderer must outlive it).
+        assert!(gpu.reset());
+        assert!(!gpu.is_activated());
+        assert!(gpu.worker_thread.is_some(), "worker must survive reset");
+
+        // Re-activate -> reuses the same worker (no second spawn, no panic).
+        gpu.activate(mem, intc, vec![dummy_device_queue(), dummy_device_queue()])
+            .unwrap();
+        assert!(gpu.is_activated());
+
+        // Drop joins the worker (Shutdown + stop_fd kick); a broken teardown would hang here.
+        drop(gpu);
+    }
+
     use crate::display::NoopDisplayBackend;
-    use krun_display::IntoDisplayBackend;
 
     #[test]
     fn blob_alignment_offered() {
         let gpu = Gpu::new(
             0,
+            false,
             Box::new([]),
             NoopDisplayBackend::into_display_backend(None),
             #[cfg(target_os = "macos")]
@@ -267,5 +803,93 @@ mod tests {
         gpu.read_config(16, &mut data);
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         assert_eq!(u32::from_le_bytes(data), page_size);
+    }
+
+    fn test_handle(num_displays: usize) -> DisplayResizeHandle {
+        DisplayResizeHandle {
+            resize_evt: Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            num_displays,
+        }
+    }
+
+    fn queued(handle: &DisplayResizeHandle) -> Vec<DisplayUpdate> {
+        handle.pending.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// A burst of resizes must collapse into one update — otherwise a window drag would cost
+    /// the guest a modeset per intermediate size.
+    #[test]
+    fn consecutive_mode_updates_merge() {
+        let handle = test_handle(1);
+        assert!(handle.request(0, 1280, 800));
+        assert!(handle.request(0, 1600, 900));
+        assert!(handle.request(0, 1920, 1080));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].size, Some((1920, 1080)));
+    }
+
+    /// A resize followed by an EDID push merges into a single update carrying both — that is
+    /// exactly what moving the window to another host display produces.
+    #[test]
+    fn a_resize_and_an_edid_push_merge_into_one_update() {
+        let handle = test_handle(1);
+        assert!(handle.request(0, 1512, 982));
+        assert!(handle.update(DisplayUpdate {
+            display_id: 0,
+            edid: Some(EdidParams::default()),
+            ..Default::default()
+        }));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].size, Some((1512, 982)));
+        assert!(queue[0].edid.is_some());
+    }
+
+    /// Connectivity changes must NOT merge: a disconnect immediately followed by a reconnect
+    /// has to reach the guest as two events, or it observes only the final state and never
+    /// notices the display went away.
+    #[test]
+    fn connectivity_changes_are_never_merged_away() {
+        let handle = test_handle(1);
+        assert!(handle.update(DisplayUpdate {
+            display_id: 0,
+            connected: Some(false),
+            ..Default::default()
+        }));
+        assert!(handle.update(DisplayUpdate {
+            display_id: 0,
+            connected: Some(true),
+            size: Some((1920, 1080)),
+            ..Default::default()
+        }));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].connected, Some(false));
+        assert_eq!(queue[1].connected, Some(true));
+    }
+
+    /// Updates for different scanouts stay separate even when adjacent.
+    #[test]
+    fn updates_for_different_displays_do_not_merge() {
+        let handle = test_handle(2);
+        assert!(handle.request(0, 1280, 800));
+        assert!(handle.request(1, 1920, 1080));
+
+        let queue = queued(&handle);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].display_id, 0);
+        assert_eq!(queue[1].display_id, 1);
+    }
+
+    #[test]
+    fn an_out_of_range_display_id_is_rejected_without_queueing() {
+        let handle = test_handle(1);
+        assert!(!handle.request(3, 1280, 800));
+        assert!(queued(&handle).is_empty());
     }
 }

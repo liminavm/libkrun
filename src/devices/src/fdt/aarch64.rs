@@ -12,10 +12,15 @@ use std::{io, result};
 use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::gic::GICDevice;
-use arch::aarch64::layout::{GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT};
+use arch::aarch64::layout::{
+    ACPI_SIZE, ACPI_START, EFI_VARS_SIZE, EFI_VARS_START, GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC,
+    GTIMER_VIRT,
+};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
+};
 
 // This is a value for uniquely identifying the FDT node declaring the interrupt controller.
 const GIC_PHANDLE: u32 = 1;
@@ -23,12 +28,27 @@ const GIC_PHANDLE: u32 = 1;
 const CLOCK_PHANDLE: u32 = 2;
 // This is a value for uniquely identifying the FDT node containing the gpio controller.
 const GPIO_PHANDLE: u32 = 4;
+/// Phandles for the CPU nodes, referenced from `/cpus/cpu-map`. Well clear of the handful of
+/// small ids above so adding one there cannot collide with a vCPU.
+const CPU_PHANDLE_BASE: u32 = 0x100;
 // Read the documentation specified when appending the root node to the FDT.
 const ADDRESS_CELLS: u32 = 0x2;
 const SIZE_CELLS: u32 = 0x2;
 
 // System restart
 const KEY_RESTART: u32 = 0x198;
+// Linux input code for the power key. systemd-logind maps KEY_POWER to HandlePowerKey
+// (default: poweroff), so pulsing this line asks a stock guest to power off gracefully —
+// the host-driven shutdown path (the shutdown eventfd).
+const KEY_POWER: u32 = 116;
+// Linux input code for the "sleep"/suspend key. systemd-logind maps KEY_SLEEP to its
+// HandleSuspendKey action (default: suspend), so pulsing this line makes a stock guest
+// enter suspend-to-idle with no guest agent (M9 freeze trigger, stock tier).
+const KEY_SLEEP: u32 = 142;
+// Linux input code for the wake key. Its gpio-keys node carries `wakeup-source`, so the guest
+// arms this line's irq for wake (`enable_irq_wake`) during s2idle — pulsing it is what brings the
+// guest OUT of suspend-to-idle (M9 restore: injected after reloading a quiesced snapshot).
+const KEY_WAKEUP: u32 = 143;
 
 // As per kvm tool and
 // https://www.kernel.org/doc/Documentation/devicetree/bindings/interrupt-controller/arm%2Cgic.txt
@@ -69,6 +89,7 @@ impl From<FdtError> for Error {
 }
 
 /// Creates the flattened device tree for this aarch64 microVM.
+#[allow(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     guest_mem: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,
@@ -77,6 +98,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     gic_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    vcpu_capacities: &[u32],
 ) -> Result<Vec<u8>> {
     // Alocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -95,8 +117,10 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // This is not mandatory but we use it to point the root node to the node
     // containing description of the interrupt controller for this VM.
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
-    create_cpu_nodes(&mut fdt, &vcpu_mpidr)?;
+    create_cpu_nodes(&mut fdt, &vcpu_mpidr, vcpu_capacities)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
+    create_efi_vars_node(&mut fdt, guest_mem)?;
+    create_acpi_tables_node(&mut fdt, guest_mem)?;
     create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
@@ -145,7 +169,16 @@ fn generate_prop64(cells: &[u64]) -> Vec<u8> {
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
+/// `vcpu_capacities` is either empty (a uniform machine: emit nothing) or holds one
+/// `capacity-dmips-mhz` per vCPU. It is all-or-nothing on purpose —
+/// `topology_parse_cpu_capacity()` treats a single CPU node missing the property as
+/// "partial information" and throws away every capacity it has already parsed, falling the
+/// whole machine back to a flat 1024.
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    vcpu_mpidr: &[u64],
+    vcpu_capacities: &[u32],
+) -> Result<()> {
     // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/arm/cpus.yaml.
     let cpu_node = fdt.begin_node("cpus")?;
     // As per documentation, on ARM v8 64-bit systems value should be set to 2.
@@ -165,9 +198,47 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
         // Set the field to first 24 bits of the MPIDR - Multiprocessor Affinity Register.
         // See http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0488c/BABHBJCI.html.
         fdt.property_u64("reg", mpidr & 0x7FFFFF)?;
+        if let Some(&capacity) = vcpu_capacities.get(index) {
+            fdt.property_u32("capacity-dmips-mhz", capacity)?;
+            fdt.property_u32("phandle", CPU_PHANDLE_BASE + index as u32)?;
+        }
         fdt.end_node(cpu_name_node)?;
     }
+    if !vcpu_capacities.is_empty() {
+        create_cpu_map_node(fdt, vcpu_capacities)?;
+    }
     fdt.end_node(cpu_node)?;
+    Ok(())
+}
+
+/// `/cpus/cpu-map`, one cluster per run of equal-capacity CPUs.
+///
+/// This node is what makes the capacities *reach* the kernel: `parse_dt_topology()` returns
+/// early when `/cpus/cpu-map` is absent, and `topology_parse_cpu_capacity()` is only ever
+/// called from underneath it. `capacity-dmips-mhz` on the CPU nodes alone is read by nobody —
+/// the properties are present, the guest reports a flat 1024, and nothing says why.
+///
+/// Emitted only for an asymmetric machine, so a default VM's device tree keeps exactly the
+/// shape it has always had.
+fn create_cpu_map_node(fdt: &mut FdtWriter, vcpu_capacities: &[u32]) -> Result<()> {
+    let map = fdt.begin_node("cpu-map")?;
+    let mut cluster = 0;
+    let mut index = 0;
+    while index < vcpu_capacities.len() {
+        let capacity = vcpu_capacities[index];
+        let cluster_node = fdt.begin_node(&format!("cluster{cluster}"))?;
+        let mut core = 0;
+        while index < vcpu_capacities.len() && vcpu_capacities[index] == capacity {
+            let core_node = fdt.begin_node(&format!("core{core}"))?;
+            fdt.property_u32("cpu", CPU_PHANDLE_BASE + index as u32)?;
+            fdt.end_node(core_node)?;
+            core += 1;
+            index += 1;
+        }
+        fdt.end_node(cluster_node)?;
+        cluster += 1;
+    }
+    fdt.end_node(map)?;
     Ok(())
 }
 
@@ -185,6 +256,39 @@ fn create_memory_node(
     fdt.property_string("device_type", "memory")?;
     fdt.property("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;
+    Ok(())
+}
+
+/// limina: when guest memory holds a file-backed UEFI variable store, tell the firmware where.
+/// It is not RAM for the OS to use: the firmware reserves it as runtime memory, and an OS booted
+/// through it takes its memory map from UEFI, not from this tree.
+fn create_efi_vars_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Result<()> {
+    if guest_mem
+        .find_region(GuestAddress(EFI_VARS_START))
+        .is_none()
+    {
+        return Ok(());
+    }
+    let node = fdt.begin_node(&format!("efi-vars@{EFI_VARS_START:x}"))?;
+    fdt.property_string("compatible", "libkrun,efi-variable-store")?;
+    fdt.property(
+        "reg",
+        &generate_prop64(&[EFI_VARS_START, EFI_VARS_SIZE as u64]),
+    )?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
+/// limina: when guest memory holds an ACPI window, tell the firmware where its tables are. A
+/// firmware that installs them hands the OS ACPI and withholds this tree.
+fn create_acpi_tables_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Result<()> {
+    if guest_mem.find_region(GuestAddress(ACPI_START)).is_none() {
+        return Ok(());
+    }
+    let node = fdt.begin_node(&format!("acpi-tables@{ACPI_START:x}"))?;
+    fdt.property_string("compatible", "libkrun,acpi-tables")?;
+    fdt.property("reg", &generate_prop64(&[ACPI_START, ACPI_SIZE as u64]))?;
+    fdt.end_node(node)?;
     Ok(())
 }
 
@@ -307,6 +411,7 @@ fn create_psci_node(fdt: &mut FdtWriter) -> Result<()> {
 fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
+    virtio_type: u32,
 ) -> Result<()> {
     let device_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
     #[cfg(target_os = "linux")]
@@ -323,6 +428,27 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property("reg", &device_reg_prop)?;
     fdt.property("interrupts", &irq)?;
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+
+    // The virtio-i2c adapter carries its bus topology in the DT (the virtio core
+    // adopts the transport's sole child node whose compatible is
+    // "virtio,device<ID hex>"; the i2c core then instantiates that node's own
+    // children as slaves — Documentation/devicetree/bindings/i2c/i2c-virtio.yaml).
+    // Declare the emulated SBS smart battery so a stock guest's sbs-battery
+    // driver binds it with no guest-side configuration.
+    #[cfg(not(feature = "tee"))]
+    if virtio_type == crate::virtio::TYPE_I2C {
+        let i2c_node = fdt.begin_node("i2c")?;
+        fdt.property_string("compatible", "virtio,device22")?;
+        fdt.property_u32("#address-cells", 0x1)?;
+        fdt.property_u32("#size-cells", 0x0)?;
+        let battery_node =
+            fdt.begin_node(&format!("battery@{:x}", crate::virtio::SBS_BATTERY_ADDR))?;
+        fdt.property_string("compatible", "sbs,sbs-battery")?;
+        fdt.property_u32("reg", u32::from(crate::virtio::SBS_BATTERY_ADDR))?;
+        fdt.end_node(battery_node)?;
+        fdt.end_node(i2c_node)?;
+    }
+
     fdt.end_node(virtio_node)?;
 
     Ok(())
@@ -343,7 +469,7 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     ]);
 
     let node = fdt.begin_node(&format!("uart@{:x}", dev_info.addr()))?;
-    fdt.property_string("compatible", "arm,pl011")?;
+    fdt.property("compatible", b"arm,pl011\0arm,primecell\0")?;
     fdt.property_string("status", "okay")?;
     fdt.property("reg", &serial_reg_prop)?;
     fdt.property_u32("clocks", CLOCK_PHANDLE)?;
@@ -362,8 +488,15 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
     let rtc_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
     #[cfg(target_os = "linux")]
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_LEVEL_HI]);
+    // macOS/HVF: the in-kernel GIC's `set_irq` only asserts a one-shot pulse (no de-assert path),
+    // so declare the alarm SPI edge-triggered (like the GPIO device) — the guest gets one edge per
+    // fired alarm and clears it via RTCICR, with no risk of a held-high level re-firing.
     #[cfg(target_os = "macos")]
-    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq() - 32, IRQ_TYPE_LEVEL_HI]);
+    let irq = generate_prop32(&[
+        GIC_FDT_IRQ_TYPE_SPI,
+        dev_info.irq() - 32,
+        IRQ_TYPE_EDGE_RISING,
+    ]);
     let rtc_node = fdt.begin_node(&format!("rtc@{:x}", dev_info.addr()))?;
     fdt.property("compatible", compatible)?;
     fdt.property("reg", &rtc_reg_prop)?;
@@ -371,6 +504,38 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property_u32("clocks", CLOCK_PHANDLE)?;
     fdt.property_string("clock-names", "apb_pclk")?;
     fdt.end_node(rtc_node)?;
+
+    Ok(())
+}
+
+fn create_xhci_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let xhci_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
+    // The Linux `xhci-plat` driver binds DT `compatible = "generic-xhci"` with one
+    // `reg`, one `interrupts`, and optional `dma-coherent` (its guest-facing binding).
+    #[cfg(target_os = "linux")]
+    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_EDGE_RISING]);
+    // macOS/HVF: the in-kernel GIC's `set_irq` (hv_gic_set_spi) takes the SPI index and
+    // only asserts a one-shot pulse, so declare the interrupt edge-triggered (like the
+    // RTC/GPIO devices) and write the SPI index (irq - 32), not the absolute INTID.
+    #[cfg(target_os = "macos")]
+    let irq = generate_prop32(&[
+        GIC_FDT_IRQ_TYPE_SPI,
+        dev_info.irq() - 32,
+        IRQ_TYPE_EDGE_RISING,
+    ]);
+
+    let xhci_node = fdt.begin_node(&format!("usb@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "generic-xhci")?;
+    fdt.property("reg", &xhci_reg_prop)?;
+    fdt.property("interrupts", &irq)?;
+    fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+    // Guest RAM is coherent with the emulated controller's DMA (there is no real
+    // device cache to maintain), so advertise dma-coherent to skip cache ops.
+    fdt.property_null("dma-coherent")?;
+    fdt.end_node(xhci_node)?;
 
     Ok(())
 }
@@ -405,14 +570,74 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property_string("compatible", "gpio-keys")?;
     fdt.property_u32("#size-cells", 0)?;
     fdt.property_u32("#address-cells", 1)?;
+    // Poweroff button (KEY_POWER on GPIO line 3) — the host pulses it to ask the guest to
+    // power off gracefully (the shutdown eventfd → logind HandlePowerKey → poweroff).
     let gpio_keys_poweroff_node = fdt.begin_node("button@1")?;
     fdt.property_string("label", "GPIO Key Poweroff")?;
-    fdt.property_u32("linux,code", KEY_RESTART)?;
+    fdt.property_u32("linux,code", KEY_POWER)?;
     let gpios = [GPIO_PHANDLE, 3, 0];
     fdt.property_array_u32("gpios", &gpios)?;
     fdt.end_node(gpio_keys_poweroff_node)?;
+    // Suspend button (KEY_SLEEP on GPIO line 4) — the host pulses it to ask a cooperative
+    // guest to suspend-to-idle with no agent (M9 freeze trigger, stock tier).
+    let gpio_keys_suspend_node = fdt.begin_node("button@2")?;
+    fdt.property_string("label", "GPIO Key Suspend")?;
+    fdt.property_u32("linux,code", KEY_SLEEP)?;
+    let suspend_gpios = [GPIO_PHANDLE, 4, 0];
+    fdt.property_array_u32("gpios", &suspend_gpios)?;
+    fdt.end_node(gpio_keys_suspend_node)?;
+    // Restart button (KEY_RESTART on GPIO line 5) — the host pulses it to ask the guest to
+    // reboot gracefully (the restart eventfd → logind HandleRebootKey → reboot → relaunch).
+    let gpio_keys_restart_node = fdt.begin_node("button@3")?;
+    fdt.property_string("label", "GPIO Key Restart")?;
+    fdt.property_u32("linux,code", KEY_RESTART)?;
+    let restart_gpios = [GPIO_PHANDLE, 5, 0];
+    fdt.property_array_u32("gpios", &restart_gpios)?;
+    fdt.end_node(gpio_keys_restart_node)?;
+    // Wake button (KEY_WAKEUP on GPIO line 6) — a `wakeup-source` so the guest arms its irq for
+    // wake during s2idle; pulsing it is the only line that brings the guest out of suspend-to-idle
+    // (M9 restore: the worker injects it after reloading a quiesced snapshot).
+    let gpio_keys_wake_node = fdt.begin_node("button@4")?;
+    fdt.property_string("label", "GPIO Key Wakeup")?;
+    fdt.property_u32("linux,code", KEY_WAKEUP)?;
+    fdt.property_null("wakeup-source")?;
+    let wake_gpios = [GPIO_PHANDLE, 6, 0];
+    fdt.property_array_u32("gpios", &wake_gpios)?;
+    fdt.end_node(gpio_keys_wake_node)?;
     fdt.end_node(gpio_keys_node)?;
 
+    Ok(())
+}
+
+/// The virtual cpufreq controller (`Documentation/devicetree/bindings/cpufreq/
+/// qemu,virtual-cpufreq.yaml`): compatible + reg, and deliberately nothing else. The binding
+/// declares `additionalProperties: false` and takes no interrupt, so anything extra here — an
+/// `interrupts` property copied from a neighbouring device, say — makes the guest reject the node
+/// rather than bind it.
+fn create_cpufreq_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
+    let node = fdt.begin_node(&format!("cpufreq@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "qemu,virtual-cpufreq")?;
+    fdt.property("reg", &reg_prop)?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
+/// The TPM (`Documentation/devicetree/bindings/tpm/tcg,tpm-tis-mmio.yaml`'s binding, as QEMU's
+/// `virt` machine emits it): compatible + reg. No `interrupts`: the device has none, and Linux's
+/// `tpm_tis` polls when the node names no interrupt.
+fn create_tpm_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
+    let node = fdt.begin_node(&format!("tpm@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "tcg,tpm-tis-mmio")?;
+    fdt.property("reg", &reg_prop)?;
+    fdt.end_node(node)?;
     Ok(())
 }
 
@@ -421,23 +646,26 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &HashMap<(DeviceType, String), T>,
 ) -> Result<()> {
     // Create one temp Vec to store all virtio devices
-    let mut ordered_virtio_device: Vec<&T> = Vec::new();
+    let mut ordered_virtio_device: Vec<(&T, u32)> = Vec::new();
 
     for ((device_type, _device_id), info) in dev_info {
         match device_type {
             DeviceType::Gpio => create_gpio_node(fdt, info)?,
             DeviceType::RTC => create_rtc_node(fdt, info)?,
             DeviceType::Serial => create_serial_node(fdt, info)?,
-            DeviceType::Virtio(_) => {
-                ordered_virtio_device.push(info);
+            DeviceType::Xhci => create_xhci_node(fdt, info)?,
+            DeviceType::CpuFreq => create_cpufreq_node(fdt, info)?,
+            DeviceType::Tpm => create_tpm_node(fdt, info)?,
+            DeviceType::Virtio(virtio_type) => {
+                ordered_virtio_device.push((info, *virtio_type));
             }
         }
     }
 
     // Sort out virtio devices by address from low to high and insert them into fdt table.
-    ordered_virtio_device.sort_by_key(|a| a.addr());
-    for ordered_device_info in ordered_virtio_device.drain(..) {
-        create_virtio_node(fdt, ordered_device_info)?;
+    ordered_virtio_device.sort_by_key(|(a, _)| a.addr());
+    for (ordered_device_info, virtio_type) in ordered_virtio_device.drain(..) {
+        create_virtio_node(fdt, ordered_device_info, virtio_type)?;
     }
 
     Ok(())

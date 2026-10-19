@@ -14,6 +14,10 @@ amd-sev = ["blk", "tee"]
 tdx = ["blk", "tee"]
 net = []
 blk = []
+snd = []
+usb = []
+# The janus TPM 2.0 engine as a backend for the TIS device (limina).
+tpm = ["dep:janus", "dep:getrandom"]
 gpu = ["rutabaga_gfx", "thiserror", "zerocopy", "krun_display"]
 input = ["zerocopy", "krun_input"]
 virgl_resource_map2 = []
@@ -42,7 +46,9 @@ krun_input = { package = "krun-input", version = "0.1.0", path = "../input", fea
 arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
-rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
+rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-2.0.0-dev", path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
+janus = { path = "../../../janus", optional = true }
+getrandom = { version = "0.4.3", optional = true }
 imago = { version = "0.2.4", default-features = false, features = ["sync", "vm-memory"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -54,7 +60,7 @@ hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
 lru = ">=0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
+rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-2.0.0-dev", path = "../rutabaga_gfx", features = ["x"], optional = true }
 caps = "0.5.5"
 kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25"
@@ -62,6 +68,9 @@ vmm-sys-util = "0.15"
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+acpi_tables = "0.2.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
@@ -77,3 +86,12 @@ windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
 ] }
+
+# loom's models (`loom_model` modules) build only under `--cfg loom`.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+# `cfg(kani)` gates the proofs `cargo kani` runs, `cfg(fuzzing)` the hooks the fuzz targets in
+# `fuzz/` use, and `cfg(loom)` the loom models (limina's docs/design/in-crate-checkers.md).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(fuzzing)", "cfg(loom)"] }

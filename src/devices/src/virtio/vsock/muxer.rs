@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 #[cfg(windows)]
 use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
+use super::super::queue::DescriptorChain;
 use super::TsiFlags;
 use super::VsockError;
 use super::defs;
@@ -23,6 +25,7 @@ use super::tsi_stream::TsiStreamProxy;
 use super::unix_proxy::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
@@ -90,7 +93,7 @@ pub fn push_packet(
     mem: &GuestMemoryMmap,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
-    if let Some(head) = queue.pop(mem) {
+    if let Some(head) = pop_rx(&mut queue, mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
             if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
@@ -101,6 +104,38 @@ pub fn push_packet(
         error!("couldn't push pkt to queue, adding it to rxq");
         drop(queue);
         rxq_mutex.lock().unwrap().push(rx);
+    }
+}
+
+/// Pop the next RX buffer. With EVENT_IDX the guest announces a refill only when its avail index
+/// passes the `avail_event` the device publishes, so a ring found empty publishes the device's
+/// position before giving up, and takes a buffer that raced the publish.
+pub(crate) fn pop_rx<'a>(
+    queue: &mut VirtQueue,
+    mem: &'a GuestMemoryMmap,
+) -> Option<DescriptorChain<'a>> {
+    queue
+        .pop(mem)
+        .or_else(|| match queue.enable_notification(mem) {
+            Ok(true) => queue.pop(mem),
+            _ => None,
+        })
+}
+
+/// Interrupt the guest for the RX buffers used since the last check, unless EVENT_IDX says it is
+/// not waiting for them yet.
+pub(crate) fn signal_rx(
+    queue: &Mutex<VirtQueue>,
+    mem: &GuestMemoryMmap,
+    interrupt: &InterruptTransport,
+) {
+    if queue
+        .lock()
+        .unwrap()
+        .needs_notification(mem)
+        .unwrap_or(true)
+    {
+        interrupt.signal_used_queue();
     }
 }
 
@@ -116,6 +151,14 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    timesync: bool,
+    // Per-activation thread stop signals, so a device reset (suspend/resume) tears the current
+    // activation's threads down before the device is re-activated with a fresh queue — otherwise a
+    // stale timesync/muxer thread keeps writing into the recreated guest RX ring. Fire-and-forget:
+    // signalled in `deactivate`, each thread self-exits (see timesync/muxer_thread/reaper).
+    timesync_stop: Option<Arc<AtomicBool>>,
+    muxer_stop: Option<EventFd>,
 }
 
 impl VsockMuxer {
@@ -124,6 +167,7 @@ impl VsockMuxer {
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
+        timesync: bool,
     ) -> Self {
         VsockMuxer {
             cid,
@@ -137,6 +181,9 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            timesync,
+            timesync_stop: None,
+            muxer_stop: None,
         }
     }
 
@@ -151,13 +198,25 @@ impl VsockMuxer {
         self.interrupt = Some(interrupt.clone());
 
         #[cfg(target_os = "macos")]
-        {
-            let timesync =
-                TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
+        if self.timesync {
+            let stop = Arc::new(AtomicBool::new(false));
+            let timesync = TimesyncThread::new(
+                self.cid,
+                mem.clone(),
+                queue.clone(),
+                interrupt.clone(),
+                stop.clone(),
+            );
             timesync.run();
+            self.timesync_stop = Some(stop);
         }
 
         let (sender, receiver) = unbounded();
+
+        // Stop eventfd for the muxer thread: `deactivate` writes it to wake the thread out of its
+        // blocking epoll and exit. We keep the write end here; the thread registers the read fd.
+        let muxer_stop = EventFd::new(EFD_NONBLOCK).unwrap();
+        let stop_fd = muxer_stop.as_raw_fd();
 
         let thread = MuxerThread::new(
             self.cid,
@@ -169,12 +228,49 @@ impl VsockMuxer {
             interrupt.clone(),
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
+            stop_fd,
         );
         thread.run();
+        self.muxer_stop = Some(muxer_stop);
 
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
         reaper.run();
+    }
+
+    /// Tear down the current activation's worker threads on a device reset (suspend/resume), before
+    /// the device is re-activated with a fresh queue. Without this, a stale timesync/muxer thread
+    /// from the previous activation keeps writing used-ring entries into the guest RX ring that the
+    /// resumed driver has recreated (freed + reallocated) → silent guest-memory corruption, plus a
+    /// leaked thread trio per suspend cycle.
+    ///
+    /// Fire-and-forget by design: this runs on the vCPU MMIO thread inside `set_device_status(0)`
+    /// while the guest is suspending, so it must not block on `join`. Each thread checks its stop
+    /// signal before any queue access and self-exits; because reset (status 0) precedes re-activate
+    /// (DRIVER_OK), the old threads are gone — or harmlessly winding down without touching the
+    /// queue — before the next activation spawns new ones.
+    pub(crate) fn deactivate(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(stop) = self.timesync_stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+        // Wake the muxer thread but keep the eventfd ALIVE: the thread reads the fd asynchronously,
+        // so dropping it here could close the fd (and cancel the kqueue event) before the thread
+        // sees it. The next `activate` replaces `muxer_stop`, dropping this one only once the old
+        // thread has long since woken and exited.
+        if let Some(stop_evt) = &self.muxer_stop {
+            let _ = stop_evt.write(1);
+        }
+        // Dropping the muxer's sender + the exiting muxer thread's sender disconnects the reaper,
+        // which then stops instead of busy-looping.
+        self.reaper_sender = None;
+        // Drop stale host-side proxy state (open connections/listeners) so their fds don't leak
+        // across the cycle and a re-activate starts from a clean slate; likewise the pending RX.
+        self.proxy_map.write().unwrap().clear();
+        *self.rxq.lock().unwrap() = MuxerRxQ::new();
+        self.queue = None;
+        self.mem = None;
+        self.interrupt = None;
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
@@ -211,7 +307,7 @@ impl VsockMuxer {
         };
 
         let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
+        if let Some(head) = pop_rx(&mut queue, mem) {
             if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
                 rx_to_pkt(self.cid, rx, &mut pkt);
                 if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
@@ -275,9 +371,10 @@ impl VsockMuxer {
         }
 
         if update.signal_queue
-            && let Some(interrupt) = &self.interrupt
+            && let (Some(interrupt), Some(queue), Some(mem)) =
+                (&self.interrupt, &self.queue, &self.mem)
         {
-            interrupt.signal_used_queue();
+            signal_rx(queue, mem, interrupt);
         }
     }
 
@@ -551,13 +648,12 @@ impl VsockMuxer {
             defs::TSI_PROXY_RELEASE if self.tsi_flags.tsi_enabled() => {
                 self.process_proxy_release(pkt)
             }
-            _ => {
-                if pkt.op() == uapi::VSOCK_OP_RW {
-                    self.process_dgram_rw(pkt);
-                } else {
-                    error!("unexpected dgram pkt: {}", pkt.op());
-                }
-            }
+            _ => match pkt.op() {
+                uapi::VSOCK_OP_RW => self.process_dgram_rw(pkt),
+                // A guest with nothing bound to a datagram's port answers it with a reset.
+                uapi::VSOCK_OP_RST => debug!("dgram reset from guest port {}", pkt.src_port()),
+                op => error!("unexpected dgram pkt: {op}"),
+            },
         }
 
         Ok(())
@@ -588,7 +684,7 @@ impl VsockMuxer {
             }
             let rxq = self.rxq.clone();
 
-            let mut unix = UnixProxy::new(
+            let mut unix = match UnixProxy::new(
                 id,
                 self.cid,
                 pkt.dst_port(),
@@ -597,8 +693,18 @@ impl VsockMuxer {
                 queue.clone(),
                 rxq,
                 path.to_path_buf(),
-            )
-            .unwrap();
+            ) {
+                Ok(unix) => unix,
+                Err(e) => {
+                    warn!("refusing connection to port {}: {e:?}", pkt.dst_port());
+                    let rx = MuxerRx::Reset {
+                        local_port: pkt.dst_port(),
+                        peer_port: pkt.src_port(),
+                    };
+                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    return;
+                }
+            };
             let tsi = TsiConnectReq {
                 peer_port: 0,
                 addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
@@ -749,5 +855,115 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use vm_memory::GuestAddress;
+
+    fn activated_muxer(timesync: bool) -> VsockMuxer {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "vsock-test".to_string()).unwrap();
+        let queue = Arc::new(Mutex::new(VirtQueue::new(16)));
+        let mut muxer = VsockMuxer::new(3, None, None, TsiFlags::empty(), timesync);
+        muxer.activate(mem, queue, interrupt);
+        muxer
+    }
+
+    #[test]
+    fn timesync_disabled_spawns_no_timesync_thread() {
+        let mut muxer = activated_muxer(false);
+        assert!(muxer.timesync_stop.is_none());
+        muxer.deactivate();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timesync_enabled_spawns_the_timesync_thread() {
+        let mut muxer = activated_muxer(true);
+        assert!(muxer.timesync_stop.is_some());
+        muxer.deactivate();
+    }
+
+    const EMFILE_CHILD: &str = "KRUN_VSOCK_EMFILE_CHILD";
+    const IPC_PORT: u32 = 1025;
+    const GUEST_PORT: u32 = 50000;
+
+    /// Exhausting descriptors would starve every other test in this process, so the scenario
+    /// runs in a child: this same test binary, re-run on just this test.
+    #[test]
+    fn a_connection_whose_proxy_socket_cannot_be_created_is_reset() {
+        if std::env::var_os(EMFILE_CHILD).is_some() {
+            connect_with_no_descriptors_left();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "virtio::vsock::muxer::tests::a_connection_whose_proxy_socket_cannot_be_created_is_reset",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child: {status}");
+    }
+
+    fn connect_with_no_descriptors_left() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::queue::tests::VirtQueue as GuestQueue;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let tx = GuestQueue::new(GuestAddress(0), &mem, 16);
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        tx.dtable[0].set(0x2000, VSOCK_PKT_HDR_SIZE as u32, 0, 0);
+        tx.avail.ring[0].set(0);
+        tx.avail.idx.set(1);
+        let mut txq = tx.create_queue();
+        let head = txq.pop(&mem).unwrap();
+        let mut pkt = VsockPacket::from_tx_virtq_head(&head).unwrap();
+        pkt.set_op(uapi::VSOCK_OP_REQUEST)
+            .set_src_port(GUEST_PORT)
+            .set_dst_port(IPC_PORT)
+            .set_dst_cid(uapi::VSOCK_HOST_CID);
+
+        let ipc = HashMap::from([(
+            IPC_PORT,
+            (PathBuf::from("/nonexistent/krun-vsock-test.sock"), false),
+        )]);
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "vsock-test".to_string()).unwrap();
+        let mut muxer = VsockMuxer::new(3, None, Some(ipc), TsiFlags::empty(), false);
+        muxer.activate(
+            mem.clone(),
+            Arc::new(Mutex::new(rx.create_queue())),
+            interrupt,
+        );
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        while unsafe { libc::dup(2) } >= 0 {}
+
+        muxer.process_op_request(&pkt);
+
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset {
+                local_port: IPC_PORT,
+                peer_port: GUEST_PORT,
+            })
+        ));
     }
 }

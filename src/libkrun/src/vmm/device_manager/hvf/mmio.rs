@@ -5,13 +5,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use devices::legacy::VcpuList;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-use devices::DeviceType;
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
+use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
 use polly::event_manager::EventManager;
 #[cfg(target_arch = "aarch64")]
@@ -65,6 +66,14 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// Currently hardcoded to 4K.
 const MMIO_LEN: u64 = 0x1000;
 
+/// The xHCI controller needs a larger MMIO window than the default per-device
+/// `MMIO_LEN`: its register file spans capability + operational + runtime +
+/// doorbell + extended-capability regions. 64 KiB (matches the FDT `reg` size and
+/// `devices::usb::XhciDevice::XHCI_MMIO_LEN`). The bump allocator stays otherwise
+/// unchanged — registering the controller just reserves this many bytes.
+#[cfg(feature = "usb")]
+const XHCI_MMIO_LEN: u64 = 0x1_0000;
+
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
@@ -72,9 +81,30 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// Handle to the live PL061 GPIO device (M9 snapshot save/restore of its register file, and
+    /// wake injection). `None` until `register_mmio_gpio` runs (macOS/aarch64 only).
+    pub gpio: Option<Arc<Mutex<devices::legacy::Gpio>>>,
+    /// Handle to the live xHCI USB controller, for snapshot save/restore of its host-side state
+    /// (M14 suspend/resume — without it a restored guest's USB stack dies). `None` until
+    /// `register_mmio_xhci` runs, i.e. unless USB is enabled.
+    #[cfg(feature = "usb")]
+    pub xhci: Option<Arc<Mutex<devices::usb::XhciDevice>>>,
+    /// limina: handle to the live TPM, for snapshot save/restore of everything it holds: a
+    /// restored guest resumes with the TPM it suspended with, running. `None` unless
+    /// `register_mmio_tpm` ran.
+    pub tpm: Option<Arc<Mutex<dyn devices::tpm::TpmDevice>>>,
+    /// limina: one `capacity-dmips-mhz` per vCPU, for the FDT's CPU nodes. Empty unless the
+    /// virtual cpufreq device was registered with an asymmetric topology.
+    vcpu_capacities: Vec<u32>,
 }
 
 impl MMIODeviceManager {
+    /// One `capacity-dmips-mhz` per vCPU, or empty for a uniform machine. See
+    /// `create_cpu_nodes`: it is all-or-nothing.
+    pub fn vcpu_capacities(&self) -> &[u32] {
+        &self.vcpu_capacities
+    }
+
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
         if cfg!(target_arch = "aarch64") {
@@ -87,6 +117,11 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            gpio: None,
+            tpm: None,
+            vcpu_capacities: Vec::new(),
+            #[cfg(feature = "usb")]
+            xhci: None,
         }
     }
 
@@ -169,17 +204,33 @@ impl MMIODeviceManager {
 
     #[cfg(target_arch = "aarch64")]
     /// Register a MMIO RTC device.
-    pub fn register_mmio_rtc(&mut self, _vm: &Vm, _intc: IrqChip) -> Result<()> {
+    pub fn register_mmio_rtc(
+        &mut self,
+        _vm: &Vm,
+        intc: IrqChip,
+        event_manager: &mut EventManager,
+    ) -> Result<()> {
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
-        // Attaching the RTC device.
+        // Attaching the RTC device. Wire its alarm interrupt to the GIC and subscribe to its timer
+        // eventfd (mirroring the GPIO device) so a programmed match actually raises an SPI — the
+        // mechanism a guest needs to wake from suspend-to-idle via `rtcwake`.
         let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
-        let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
+        let rtc = Arc::new(Mutex::new(devices::legacy::RTC::new(
+            rtc_evt.try_clone().map_err(Error::EventFd)?,
+        )));
+
+        event_manager.add_subscriber(rtc.clone()).unwrap();
+        {
+            let mut rtc = rtc.lock().unwrap();
+            rtc.set_intc(intc);
+            rtc.set_irq_line(self.irq);
+        }
 
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .insert(rtc, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
 
         let ret = self.mmio_base;
@@ -200,18 +251,27 @@ impl MMIODeviceManager {
 
     #[cfg(target_arch = "aarch64")]
     /// Register a GPIO
+    #[allow(clippy::too_many_arguments)]
     pub fn register_mmio_gpio(
         &mut self,
         _vm: &Vm,
         intc: IrqChip,
         event_manager: &mut EventManager,
         shutdown_efd: EventFd,
+        suspend_efd: EventFd,
+        restart_efd: EventFd,
+        wake_efd: EventFd,
+        vcpu_list: Arc<VcpuList>,
     ) -> Result<()> {
         // Attaching the GPIO device.
         let gpio_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let gpio = Arc::new(Mutex::new(devices::legacy::Gpio::new(
             shutdown_efd,
+            suspend_efd,
+            restart_efd,
+            wake_efd,
             gpio_evt.try_clone().map_err(Error::EventFd)?,
+            vcpu_list,
         )));
 
         event_manager.add_subscriber(gpio.clone()).unwrap();
@@ -225,6 +285,10 @@ impl MMIODeviceManager {
             gpio.set_intc(intc);
             gpio.set_irq_line(self.irq);
         }
+
+        // Keep a typed handle for M9 snapshot save/restore of the register file + wake injection,
+        // before the Arc is coerced to `dyn BusDevice` and moved into the bus.
+        self.gpio = Some(gpio.clone());
 
         self.bus
             .insert(gpio, self.mmio_base, MMIO_LEN)
@@ -246,7 +310,140 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    #[cfg(all(target_arch = "aarch64", feature = "usb"))]
+    /// Register the emulated xHCI USB controller (platform `generic-xhci`) and
+    /// spawn its ring worker.
+    ///
+    /// Unlike the other platform devices this claims a 64 KiB MMIO window
+    /// ([`XHCI_MMIO_LEN`]) rather than the default `MMIO_LEN`. The interrupt is wired
+    /// exactly like the RTC (hold the `IrqChip` handle + SPI line so the worker can
+    /// pulse the interrupter). `mem` is the guest memory the worker DMAs the rings
+    /// through; `usb_devices` are the cold-plugged gadgets (one per root port).
+    pub fn register_mmio_xhci(
+        &mut self,
+        _vm: &Vm,
+        intc: IrqChip,
+        _event_manager: &mut EventManager,
+        mem: &vm_memory::GuestMemoryMmap,
+        usb_devices: Vec<Arc<dyn devices::usb::UsbDeviceModel>>,
+    ) -> Result<()> {
+        if self.irq > self.last_irq {
+            return Err(Error::IrqsExhausted);
+        }
+
+        let xhci_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        // The worker is woken by register writes (`kick`) and torn down via `stop`.
+        let kick = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        let stop = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+        let xhci = Arc::new(Mutex::new(devices::usb::XhciDevice::new(
+            xhci_evt.try_clone().map_err(Error::EventFd)?,
+        )));
+        {
+            let mut xhci = xhci.lock().unwrap();
+            xhci.set_intc(intc);
+            xhci.set_irq_line(self.irq);
+            xhci.attach_devices(usb_devices, kick.try_clone().map_err(Error::EventFd)?);
+        }
+
+        // The worker holds a Weak handle (no reference cycle: VMM teardown drops the
+        // bus's strong ref and ends the thread). Downgrade before the bus takes it.
+        let weak = Arc::downgrade(&xhci);
+        devices::usb::spawn_worker(weak, mem.clone(), kick, stop);
+
+        // Keep our own strong handle: the snapshot save/restore path needs to reach the
+        // controller, and the bus does not hand its devices back out.
+        self.xhci = Some(xhci.clone());
+
+        self.bus
+            .insert(xhci, self.mmio_base, XHCI_MMIO_LEN)
+            .map_err(Error::BusError)?;
+
+        let ret = self.mmio_base;
+        self.id_to_dev_info.insert(
+            (DeviceType::Xhci, "xhci".to_string()),
+            MMIODeviceInfo {
+                addr: ret,
+                len: XHCI_MMIO_LEN,
+                irq: self.irq,
+            },
+        );
+
+        self.mmio_base += XHCI_MMIO_LEN;
+        self.irq += 1;
+
+        Ok(())
+    }
+
     #[cfg(target_arch = "aarch64")]
+    /// Register the virtual cpufreq device (`qemu,virtual-cpufreq`).
+    ///
+    /// Claims one 4 KiB window per vCPU rather than the flat `MMIO_LEN`, because the guest
+    /// driver indexes the region by logical CPU number. Takes **no interrupt**: the whole
+    /// interface is polled registers, and the guest is never notified of anything.
+    ///
+    /// Registered last, after every interrupt-carrying device, so that turning it on cannot
+    /// shift another device's IRQ line.
+    pub fn register_mmio_cpufreq(
+        &mut self,
+        per_cpu: Vec<devices::legacy::VcpuPerfDomain>,
+    ) -> Result<()> {
+        let len = devices::legacy::VirtCpuFreq::mmio_len(per_cpu.len());
+        // Kept for the FDT, which emits them on the CPU nodes. Capacities and perf domains are
+        // described together (see VcpuPerfDomain::capacity) so they cannot drift apart.
+        self.vcpu_capacities = per_cpu.iter().map(|p| p.capacity).collect();
+        let dev = Arc::new(Mutex::new(devices::legacy::VirtCpuFreq::new(per_cpu)));
+
+        self.bus
+            .insert(dev, self.mmio_base, len)
+            .map_err(Error::BusError)?;
+
+        let ret = self.mmio_base;
+        self.id_to_dev_info.insert(
+            (DeviceType::CpuFreq, "cpufreq".to_string()),
+            MMIODeviceInfo {
+                addr: ret,
+                len,
+                // No interrupt line. `create_fdt` must not emit an `interrupts` property for
+                // this node — the binding has none, and a stray one makes the guest's OF core
+                // fail the probe.
+                irq: 0,
+            },
+        );
+
+        self.mmio_base += len;
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    /// Register a TPM 2.0 behind the TIS MMIO interface (`tcg,tpm-tis-mmio`): five 4 KiB
+    /// locality windows, page-aligned so locality `n` sits at `base + n * 0x1000` as the guest
+    /// driver computes it. Takes **no interrupt** — the guest polls — and so, like cpufreq, is
+    /// registered after every interrupt-carrying device.
+    pub fn register_mmio_tpm<B: devices::tpm::TpmBackend + 'static>(
+        &mut self,
+        tpm: devices::tpm::TpmTis<B>,
+    ) -> Result<()> {
+        let len = devices::tpm::MMIO_LEN;
+        let base = self.mmio_base.next_multiple_of(devices::tpm::LOCALITY_SIZE);
+        let tpm = Arc::new(Mutex::new(tpm));
+        self.bus
+            .insert(tpm.clone(), base, len)
+            .map_err(Error::BusError)?;
+        self.tpm = Some(tpm);
+        self.id_to_dev_info.insert(
+            (DeviceType::Tpm, "tpm".to_string()),
+            MMIODeviceInfo {
+                addr: base,
+                len,
+                // No interrupt line: `create_tpm_node` emits none.
+                irq: 0,
+            },
+        );
+        self.mmio_base = base + len;
+        Ok(())
+    }
+
     /// Register a MMIO GIC device.
     pub fn register_mmio_gic(&mut self, _vm: &Vm, intc: IrqChip) -> Result<()> {
         let (mmio_addr, mmio_size) = {
@@ -269,6 +466,253 @@ impl MMIODeviceManager {
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
+    }
+
+    /// Gets the specified device.
+    pub fn get_device(
+        &self,
+        device_type: DeviceType,
+        device_id: &str,
+    ) -> Option<&Mutex<dyn BusDevice>> {
+        if let Some(dev_info) = self
+            .id_to_dev_info
+            .get(&(device_type, device_id.to_string()))
+            && let Some((_, device)) = self.bus.get_device(dev_info.addr)
+        {
+            return Some(device);
+        }
+        None
+    }
+
+    /// limina M9.2: snapshot every virtio-mmio device as `(virtio type id, id, device_status)`.
+    /// The quiesce oracle / INIT-invariant assert reads this at suspend time. A device quiesced by
+    /// its driver's s2idle `.suspend` callback has been reset to `INIT` (0); virtio-gpu is the known
+    /// exception (no PM ops → stays `DRIVER_OK`). Only virtio-mmio transports are inspected (the
+    /// legacy PL0xx devices carry no virtio status).
+    pub fn virtio_statuses(&self) -> Vec<(u32, String, u32)> {
+        self.virtio_status_changes()
+            .into_iter()
+            .map(|(type_id, id, status, _)| (type_id, id, status))
+            .collect()
+    }
+
+    /// limina: [`Self::virtio_statuses`] plus each device's `status_changed_at` — the power-watch
+    /// generation of its last status change, which orders changes across devices.
+    pub fn virtio_status_changes(&self) -> Vec<(u32, String, u32, u64)> {
+        use devices::virtio::MmioTransport;
+        let mut out = Vec::new();
+        for (dtype, id) in self.id_to_dev_info.keys() {
+            if let DeviceType::Virtio(type_id) = *dtype
+                && let Some(dev) = self.get_device(*dtype, id)
+            {
+                let guard = dev.lock().unwrap();
+                // Deref to `&dyn BusDevice` so `as_any` dispatches via the supertrait vtable
+                // (not the blanket `impl<T: Any> AsAny for T` on the non-'static MutexGuard).
+                let dev_ref: &dyn BusDevice = &*guard;
+                if let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() {
+                    out.push((
+                        type_id,
+                        id.clone(),
+                        mmio.device_status(),
+                        mmio.status_changed_at(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Where every virtio-mmio device sits, in address order — what a snapshot records so a
+    /// restore can refuse a machine whose devices moved.
+    pub fn device_slots(&self) -> Vec<crate::vmm::snapshot::DeviceSlot> {
+        let mut slots: Vec<_> = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((dtype, _), info)| match *dtype {
+                DeviceType::Virtio(type_id) => Some(crate::vmm::snapshot::DeviceSlot {
+                    type_id,
+                    mmio_base: info.addr,
+                    irq: info.irq,
+                }),
+                _ => None,
+            })
+            .collect();
+        slots.sort_by_key(|s| s.mmio_base);
+        slots
+    }
+
+    /// What every virtio-mmio device offers the guest, in address order -- what a snapshot records
+    /// so a restore can refuse a device that changed under a driver bound to it.
+    pub fn device_fingerprints(&self) -> Vec<crate::vmm::snapshot::DeviceFingerprint> {
+        use devices::virtio::MmioTransport;
+        let mut prints: Vec<_> = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((dtype, id), info)| {
+                let DeviceType::Virtio(type_id) = *dtype else {
+                    return None;
+                };
+                let dev = self.get_device(*dtype, id)?;
+                let mut guard = dev.lock().unwrap();
+                let dev_ref: &mut dyn devices::BusDevice = &mut *guard;
+                let mmio = dev_ref.as_mut_any().downcast_mut::<MmioTransport>()?;
+                let device = mmio.locked_device();
+                Some(crate::vmm::snapshot::DeviceFingerprint {
+                    type_id,
+                    mmio_base: info.addr,
+                    features: device.avail_features(),
+                    queues: device.queue_config().len() as u32,
+                    topology: device
+                        .snapshot_topology()
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value))
+                        .collect(),
+                })
+            })
+            .collect();
+        prints.sort_by_key(|f| f.mmio_base);
+        prints
+    }
+
+    /// limina: the dump gate of every virtio-mmio device that has one (see
+    /// `VirtioDevice::dump_gate`), with the device's type and id.
+    pub fn dump_gates(&self) -> Vec<(u32, String, Arc<devices::virtio::DumpGate>)> {
+        use devices::virtio::MmioTransport;
+        let mut out = Vec::new();
+        for (dtype, id) in self.id_to_dev_info.keys() {
+            let DeviceType::Virtio(type_id) = *dtype else {
+                continue;
+            };
+            let Some(dev) = self.get_device(*dtype, id) else {
+                continue;
+            };
+            let mut guard = dev.lock().unwrap();
+            let dev_ref: &mut dyn BusDevice = &mut *guard;
+            if let Some(mmio) = dev_ref.as_mut_any().downcast_mut::<MmioTransport>()
+                && let Some(gate) = mmio.locked_device().dump_gate()
+            {
+                out.push((type_id, id.clone(), gate));
+            }
+        }
+        out
+    }
+
+    /// limina M9.3: capture the transport state of every virtio-mmio device the guest left
+    /// `device_status != 0` at quiesce (today exactly virtio-gpu — it has no s2idle PM ops so it never
+    /// resets/re-negotiates, unlike every other device which the guest reset to INIT). Those are the
+    /// only devices that need transport restore; a reset device re-drives its own `DRIVER_OK` on resume
+    /// and the fresh worker activates it then. Identity (type_id/mmio base/irq) is carried so restore
+    /// can fail closed on a layout mismatch.
+    pub fn capture_transport_states(&self) -> Vec<crate::vmm::snapshot::DeviceTransportState> {
+        use crate::vmm::snapshot::{DeviceTransportState, QueueRegs};
+        use devices::virtio::MmioTransport;
+        let mut out = Vec::new();
+        for ((dtype, id), dev_info) in self.id_to_dev_info.iter() {
+            let DeviceType::Virtio(type_id) = *dtype else {
+                continue;
+            };
+            let Some(dev) = self.get_device(*dtype, id) else {
+                continue;
+            };
+            let guard = dev.lock().unwrap();
+            let dev_ref: &dyn BusDevice = &*guard;
+            let Some(mmio) = dev_ref.as_any().downcast_ref::<MmioTransport>() else {
+                continue;
+            };
+            if mmio.device_status() == 0 {
+                continue; // reset device — re-negotiated by the guest on resume, nothing to carry
+            }
+            let ts = mmio.transport_state();
+            out.push(DeviceTransportState {
+                type_id,
+                mmio_base: dev_info.addr,
+                irq: dev_info.irq,
+                device_status: ts.device_status,
+                acked_features: ts.acked_features,
+                config_generation: ts.config_generation,
+                isr: ts.isr,
+                queues: ts
+                    .queues
+                    .into_iter()
+                    .map(|q| QueueRegs {
+                        size: q.size,
+                        ready: q.ready,
+                        desc: q.desc,
+                        avail: q.avail,
+                        used: q.used,
+                    })
+                    .collect(),
+            });
+        }
+        out
+    }
+
+    /// limina M9.3: validate + log the captured device transports on restore. We do NOT replay the
+    /// negotiation: the guest re-negotiates every virtio device ITSELF on s2idle thaw
+    /// (`virtio_device_restore` resets + re-drives DRIVER_OK for each; the fresh worker's `activate()`
+    /// fires from the guest's own writes). A device is captured only because it was DRIVER_OK at
+    /// snapshot time — for the virtio-gpu that's just because it has no driver PM ops, so it's the sole
+    /// device left non-INIT; it is still re-negotiated on thaw like the rest (RED-first + R4 verified,
+    /// 2026-07-18). So this pass only (a) fails closed on layout drift — a captured device missing at
+    /// its snapshot base/irq means the restore worker's device topology diverged, which would silently
+    /// corrupt guest driver state — and (b) logs the captured transport for diagnostics.
+    ///
+    /// A newer limina offering different device features than the snapshot's is refused earlier,
+    /// against the snapshot's device fingerprints (`snapshot::fingerprint_mismatch`, v10 files).
+    pub fn validate_transport_states(
+        &self,
+        states: &[crate::vmm::snapshot::DeviceTransportState],
+    ) -> std::result::Result<(), String> {
+        use devices::virtio::MmioTransport;
+        for st in states {
+            // Locate the device by identity: same virtio type at the same mmio base + irq.
+            let matched = self.id_to_dev_info.iter().find(|((dtype, _), info)| {
+                matches!(*dtype, DeviceType::Virtio(t) if t == st.type_id)
+                    && info.addr == st.mmio_base
+                    && info.irq == st.irq
+            });
+            let Some(((dtype, id), _)) = matched else {
+                return Err(format!(
+                    "restore: no virtio device type={} @0x{:x} irq={} (layout drift)",
+                    st.type_id, st.mmio_base, st.irq
+                ));
+            };
+            info!(
+                "restore: captured virtio type={} @0x{:x} status=0x{:x} acked_features=0x{:x} {} queue(s) \
+                 (validated; queue regs seeded for the no-PM-ops thaw re-arm)",
+                st.type_id,
+                st.mmio_base,
+                st.device_status,
+                st.acked_features,
+                st.queues.len()
+            );
+            // Seed the fresh transport's previous-activation queue register file from the capture.
+            // The guest re-negotiates every device itself on s2idle thaw; a driver WITH PM ops
+            // re-programs its queues and never looks at this. A driver WITHOUT PM ops (virtio-gpu,
+            // verified absent through v7.1.2) resumes via the bus fallback — reset → features →
+            // DRIVER_OK, no queue writes — and the transport re-arms from this seed at activation
+            // (see MmioTransport::rearm_queues_from_stash). Without it, the guest drives DRIVER_OK
+            // onto dead queues and every GPU command waits forever (the M9.3 restore wedge).
+            if let Some(dev) = self.get_device(*dtype, id) {
+                let mut guard = dev.lock().unwrap();
+                let dev_ref: &mut dyn devices::BusDevice = &mut *guard;
+                if let Some(mmio) = dev_ref.as_mut_any().downcast_mut::<MmioTransport>() {
+                    mmio.seed_queue_regs(
+                        st.queues
+                            .iter()
+                            .map(|q| devices::virtio::QueueRegs {
+                                size: q.size,
+                                ready: q.ready,
+                                desc: q.desc,
+                                avail: q.avail,
+                                used: q.used,
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -328,6 +772,8 @@ mod tests {
     struct DummyDevice {
         dummy: u32,
         queue_config: Vec<QueueConfig>,
+        /// A port count to report as topology, as a console does.
+        ports: Option<u64>,
     }
 
     impl DummyDevice {
@@ -335,6 +781,7 @@ mod tests {
             DummyDevice {
                 dummy: 0,
                 queue_config: QUEUE_SIZES.iter().map(|&s| QueueConfig::new(s)).collect(),
+                ports: None,
             }
         }
     }
@@ -360,6 +807,10 @@ mod tests {
 
         fn queue_config(&self) -> &[QueueConfig] {
             &self.queue_config
+        }
+
+        fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
+            self.ports.map(|n| vec![("ports", n)]).unwrap_or_default()
         }
 
         fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -444,6 +895,75 @@ mod tests {
         );
     }
 
+    fn machine(types: &[u32]) -> MMIODeviceManager {
+        machine_with_ports(types, None)
+    }
+
+    /// A machine whose devices all report `ports` as their topology.
+    fn machine_with_ports(types: &[u32], ports: Option<u64>) -> MMIODeviceManager {
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x1000)]).unwrap();
+        let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+        for (i, &type_id) in types.iter().enumerate() {
+            manager
+                .register_virtio_device(
+                    guest_mem.clone(),
+                    Arc::new(Mutex::new(DummyDevice {
+                        ports,
+                        ..DummyDevice::new()
+                    })),
+                    &mut cmdline,
+                    type_id,
+                    &format!("dev{i}"),
+                )
+                .unwrap();
+        }
+        manager
+    }
+
+    /// A windowed VM (the GPU, three input devices, then vsock) suspended and resumed without
+    /// its window: vsock slides into the first input device's slot, and the guest's vsock driver
+    /// is left ringing an address nothing answers. The resume must see that the devices moved.
+    #[test]
+    fn a_resume_without_the_input_devices_sees_the_devices_moved() {
+        let windowed = machine(&[16, 18, 18, 18, 19]).device_slots();
+        let headless = machine(&[16, 19]).device_slots();
+        let diff = crate::vmm::snapshot::slot_mismatch(&windowed, &headless)
+            .expect("the vsock device moved; the resume must be refused");
+        assert!(diff.contains("virtio-input"), "{diff}");
+        assert!(diff.contains("virtio-vsock"), "{diff}");
+        assert_eq!(
+            crate::vmm::snapshot::slot_mismatch(&windowed, &windowed),
+            None
+        );
+    }
+
+    /// The same devices at the same slots, one of them with another port count: the slot check
+    /// passes it, and the fingerprints read off the real transports name the change.
+    #[test]
+    fn a_resume_onto_a_device_with_other_ports_sees_the_change() {
+        let before = machine_with_ports(&[3, 19], Some(1));
+        let after = machine_with_ports(&[3, 19], Some(2));
+        assert_eq!(
+            crate::vmm::snapshot::slot_mismatch(&before.device_slots(), &after.device_slots()),
+            None
+        );
+        let prints = before.device_fingerprints();
+        assert_eq!(prints.len(), 2);
+        assert_eq!(prints[0].queues as usize, QUEUE_SIZES.len());
+        assert_eq!(prints[0].topology, vec![("ports".to_string(), 1)]);
+        let diff =
+            crate::vmm::snapshot::fingerprint_mismatch(&prints, &after.device_fingerprints())
+                .expect("the port count changed; the resume must be refused");
+        assert!(diff.contains("virtio-console"), "{diff}");
+        assert!(diff.contains("ports 1, and now offers"), "{diff}");
+        assert!(diff.ends_with("ports 2"), "{diff}");
+        assert_eq!(
+            crate::vmm::snapshot::fingerprint_mismatch(&prints, &before.device_fingerprints()),
+            None
+        );
+    }
+
     #[test]
     fn test_dummy_device() {
         let dummy = DummyDevice::new();
@@ -514,5 +1034,11 @@ mod tests {
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].irq
             );
         }
+        let id = "bar";
+        assert!(
+            device_manager
+                .get_device(DeviceType::Virtio(type_id), id)
+                .is_none()
+        );
     }
 }

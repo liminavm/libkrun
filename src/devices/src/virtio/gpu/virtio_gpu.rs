@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::io::IoSliceMut;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::{AsFd, AsRawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -15,71 +14,50 @@ use super::protocol::{
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{Sender, unbounded};
 use krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
+    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBackendInstance,
+    Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(any(
-    all(target_os = "linux", feature = "virgl_resource_map2"),
-    target_os = "macos"
-))]
-use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
-#[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_SHM;
+use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
+#[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
+use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
+#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
+#[cfg(target_os = "macos")]
+use rutabaga_gfx::SurfaceDesc;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
-    RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
-    RUTABAGA_MAP_ACCESS_WRITE, RUTABAGA_PATH_TYPE_PIPEWIRE, RUTABAGA_PATH_TYPE_X11,
+    RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
+    RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
 };
 use rutabaga_gfx::{
-    RUTABAGA_MAP_CACHE_MASK, RUTABAGA_PATH_TYPE_WAYLAND, ResourceCreate3D, ResourceCreateBlob,
-    Rutabaga, RutabagaBuilder, RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler,
-    RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D, VirtioFsLookup,
+    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_FLAG_PRESENT, RUTABAGA_MAP_CACHE_MASK,
+    ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
+    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
 
+use super::journal::{GpuJournal, GpuJournalOp};
+use super::trace::GpuTraceStats;
 use super::{GpuError, Result};
-use crate::display::DisplayInfo;
+use crate::display::{DisplayInfo, DisplayInfoEdid, EdidParams};
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
-use crate::virtio::{InterruptTransport, VirtioShmRegion};
+use crate::virtio::{DumpGate, InterruptTransport, VirtioShmRegion};
 
-// These constants match libkrun.h and virglrenderer.
-const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
-const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
-const VIRGLRENDERER_VENUS: u32 = 1 << 6;
-const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
-const VIRGLRENDERER_DRM: u32 = 1 << 10;
-
-struct ExportTableLookup {
-    table: ExportTable,
+/// Hand a scanout IOSurface back to the supervisor after it dropped ours from its bounded store.
+/// Only meaningful on macOS, where the surfaces exist at all.
+#[cfg(target_os = "macos")]
+fn republish_surface(id: u32) -> std::result::Result<(), rutabaga_gfx::RutabagaError> {
+    rutabaga_gfx::republish_iosurface(id)
 }
 
-impl ExportTableLookup {
-    fn new(table: ExportTable) -> Self {
-        Self { table }
-    }
-}
-
-impl VirtioFsLookup for ExportTableLookup {
-    fn get_exported_descriptor(
-        &self,
-        fs_id: u64,
-        handle: u64,
-    ) -> RutabagaResult<RutabagaDescriptor> {
-        let table = self.table.lock().unwrap();
-        let file = table
-            .get(&(fs_id, handle))
-            .ok_or(rutabaga_gfx::RutabagaError::InvalidResourceId)?
-            .try_clone()
-            .map_err(|_| rutabaga_gfx::RutabagaError::InvalidResourceId)?;
-
-        Ok(file.into())
-    }
+#[cfg(not(target_os = "macos"))]
+fn republish_surface(_id: u32) -> std::result::Result<(), rutabaga_gfx::RutabagaError> {
+    Err(rutabaga_gfx::RutabagaError::Unsupported)
 }
 
 fn sglist_to_rutabaga_iovecs(
@@ -104,7 +82,7 @@ fn sglist_to_rutabaga_iovecs(
     Ok(rutabaga_iovecs)
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VirtioGpuRing {
     Global,
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
@@ -115,12 +93,143 @@ struct FenceDescriptor {
     fence_id: u64,
     desc_index: u16,
     len: u32,
+    /// limina M9.3 trace: when the descriptor parked (age of an outstanding fence).
+    created_at: std::time::Instant,
+    /// Where `create_fence` sent this fence, for the stale-fence report.
+    route: FenceRoute,
+    /// Whether the stale-fence watch has already reported this fence.
+    reported: bool,
 }
+
+/// Where `create_fence` sent a guest fence. A parked fence that never retires is stuck in a
+/// different place depending on this, which is what the stale-fence report needs to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceRoute {
+    /// Handed to the renderer, which signals it through the fence handler.
+    Renderer,
+    /// A fenced flush held until its parked frames present (`GuestFlushHold`).
+    FlushHold,
+    /// Completed at creation; such a fence never parks unless something is wrong.
+    Sync,
+    /// The renderer refused it and it was retired as lost.
+    Refused,
+}
+
+/// How old a parked guest fence must be before the stale-fence watch reports it. Comfortably
+/// past any healthy fence: a held flush fence completes by its 500 ms ceiling, and a GPU job
+/// that runs for two seconds is itself worth a line.
+pub(crate) const STALE_FENCE_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// At most this many stale fences are described per watch pass; the rest are counted, so a
+/// wedged ring the guest keeps fencing cannot flood the log.
+pub(crate) const STALE_FENCE_LINES: usize = 8;
 
 #[derive(Default)]
 pub struct FenceState {
     descs: Vec<FenceDescriptor>,
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
+    /// The highest fence id the renderer has signalled on each ring, recorded before the
+    /// handler knows whether there is a queue to retire it into. A parked fence at or below
+    /// this was signalled and never reached the guest.
+    signalled: BTreeMap<VirtioGpuRing, u64>,
+}
+
+impl FenceState {
+    /// Whether no guest fence is parked.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.descs.is_empty()
+    }
+
+    /// Mark every parked fence at least [`STALE_FENCE_AGE`] old and not yet reported as
+    /// reported, and describe them: up to [`STALE_FENCE_LINES`] lines, plus how many more there
+    /// were. Each line says where the fence is stuck — never handed to the renderer, handed and
+    /// never signalled, or signalled and never returned to the guest.
+    pub(crate) fn take_stale(&mut self, now: std::time::Instant) -> (Vec<String>, usize) {
+        let mut lines = Vec::new();
+        let mut more = 0;
+        for desc in self.descs.iter_mut() {
+            let age = now.duration_since(desc.created_at);
+            if desc.reported || age < STALE_FENCE_AGE {
+                continue;
+            }
+            desc.reported = true;
+            if lines.len() == STALE_FENCE_LINES {
+                more += 1;
+                continue;
+            }
+            let ring = match desc.ring {
+                VirtioGpuRing::Global => "global ring".to_string(),
+                VirtioGpuRing::ContextSpecific { ctx_id, ring_idx } => {
+                    format!("ctx {ctx_id} ring {ring_idx}")
+                }
+            };
+            let submitted = match desc.route {
+                FenceRoute::Renderer => "yes",
+                FenceRoute::FlushHold => "no (held for its flush's present)",
+                FenceRoute::Sync => "no (completed at creation)",
+                FenceRoute::Refused => "no (refused by the renderer)",
+            };
+            let signalled = self.signalled.get(&desc.ring).copied().unwrap_or(0) >= desc.fence_id;
+            lines.push(format!(
+                "virtio-gpu: fence {} {ring} age {} ms — submitted to renderer: {submitted}, \
+                 renderer signalled: {}, guest notified: no",
+                desc.fence_id,
+                age.as_millis(),
+                if signalled { "yes" } else { "no" },
+            ));
+        }
+        (lines, more)
+    }
+
+    /// limina M9.3 trace: one-line summary of the outstanding (requested, never
+    /// signaled) fences — count, oldest age, and up to 8 entries with ring + age.
+    /// A post-restore wedge shows here as entries whose ages only ever climb.
+    pub(crate) fn outstanding_summary(&self, now: std::time::Instant) -> String {
+        if self.descs.is_empty() {
+            return "0".to_string();
+        }
+        let mut out = format!("{} [", self.descs.len());
+        for (i, desc) in self.descs.iter().take(8).enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let ring = match desc.ring {
+                VirtioGpuRing::Global => "global".to_string(),
+                VirtioGpuRing::ContextSpecific { ctx_id, ring_idx } => {
+                    format!("ctx{ctx_id}/r{ring_idx}")
+                }
+            };
+            out.push_str(&format!(
+                "{ring}#{}:{}ms",
+                desc.fence_id,
+                now.duration_since(desc.created_at).as_millis()
+            ));
+        }
+        if self.descs.len() > 8 {
+            out.push_str(" …");
+        }
+        out.push(']');
+        out
+    }
+}
+
+/// Mark a fence as already completed without a renderer (software-2D mode).
+///
+/// Bumps the ring's completed-fence watermark to at least `fence.fence_id`, so a
+/// following `process_fence()` sees the fence as already signaled and retires the
+/// descriptor immediately. Used when `rutabaga` is `None`: there is no async fence
+/// callback to ever signal it otherwise, and 2D commands are synchronous anyway.
+fn mark_fence_completed_sync(fence_state: &Mutex<FenceState>, fence: &RutabagaFence) {
+    let ring = match fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+        0 => VirtioGpuRing::Global,
+        _ => VirtioGpuRing::ContextSpecific {
+            ctx_id: fence.ctx_id,
+            ring_idx: fence.ring_idx,
+        },
+    };
+    let mut fence_state = fence_state.lock().unwrap();
+    let entry = fence_state.completed_fences.entry(ring).or_insert(0);
+    *entry = (*entry).max(fence.fence_id);
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -154,6 +263,25 @@ struct VirtioGpuResource {
     size: u64, // only for blob resources
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
+    /// limina (#8): the context that created this resource (blob resources only;
+    /// 0 = none). A scanout flush injects its present fence on this context.
+    ctx_id: u32,
+    /// limina tier-2 (macOS): the IOSurface id we handed to the display backend for this
+    /// resource, or None if we never handed one over.
+    ///
+    /// This is the release key, deliberately, rather than whatever currently backs the resource.
+    /// A release undoes a PUBLISH, not a backing: the id is recorded at the set_scanout resolve,
+    /// the one moment it is provably alive and provably this resource's, and the receiver's own
+    /// retain then keeps that surface alive -- so the id cannot be recycled out from under us for
+    /// as long as the release is owed. Reading the backing at unref instead is what let a release
+    /// name a stranger's surface: venus frees a scanout image's surface before the guest unrefs
+    /// the resource, so the id read there could already belong to someone else.
+    #[cfg(target_os = "macos")]
+    published_iosurface_id: Option<u32>,
+    /// A surface the extension's renderer draws into: the renderer here can neither fence its
+    /// presents nor copy it, and the guest waits for its rendering before it flushes.
+    #[cfg(target_os = "macos")]
+    extension_surface: bool,
 }
 
 impl VirtioGpuResource {
@@ -175,41 +303,604 @@ impl VirtioGpuResource {
             format,
             shmem_offset: None,
             rutabaga_external_mapping: false,
+            ctx_id: 0,
+            #[cfg(target_os = "macos")]
+            published_iosurface_id: None,
+            #[cfg(target_os = "macos")]
+            extension_surface: false,
         }
+    }
+}
+
+/// limina fence-accurate presents (#8/#31): state for deferring zero-copy scanout
+/// presents until the guest's GPU work completes. A flush parks the frame here and
+/// injects a fence on the context's reserved present ring (vkr ring 63); the fence
+/// handler pushes the retired cookie + kicks `event`; the worker drains it on its
+/// epoll and presents. Parked frames are keyed by cookie and EVERY one presents on
+/// its own retirement (retirement is in flush order per context, so presents stay
+/// chronological — merely latency-shifted). Never drop a parked frame in favor of
+/// a newer one: if GPU latency exceeds the flip interval, dropping would starve
+/// the display forever.
+struct PresentFenceState {
+    /// Cookies retired by the fence handler (vkr sync threads) awaiting present.
+    /// Retired cookies, with when the fence retired: the gap to the present that takes them is
+    /// time the worker spent elsewhere.
+    retired: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
+    /// Wakes the worker epoll when `retired` gains entries.
+    event: utils::eventfd::EventFd,
+    next_cookie: u64,
+    /// cookie -> parked flush, bounded by in-flight fences (every cookie retires).
+    parked: BTreeMap<u64, ParkedFlush>,
+
+    /// limina (#8 half 2) — guest flush-fence holds. The patched guest kernel fences
+    /// blob-scanout RESOURCE_FLUSH and dma_fence_wait()s it before completing the
+    /// commit (whose fake flip event paces mutter). We hold the flush's virtio
+    /// fence descriptor until the parked frame has been shown AND the compositor
+    /// latch window passed, then retire it via the regular fence handler — giving
+    /// the guest honest flip pacing and race-free buffer reuse.
+    ///
+    /// Cookies parked by the currently-executing flush command, each with its scanout
+    /// (consumed by the flush's trailing FLAG_FENCE, cleared on every flush).
+    flush_parked_cookies: Vec<(u64, u32)>,
+    /// Held guest fences, each waiting for its flush's cookies to present (+latch).
+    guest_holds: Vec<GuestFlushHold>,
+    /// Completes held fences after a delay (clone of the rutabaga fence handler —
+    /// it owns the desc-retirement bookkeeping). With shown acks this is only the
+    /// safety fallback; completion is idempotent.
+    latch_tx: std::sync::mpsc::Sender<(std::time::Instant, RutabagaFence)>,
+    /// Present -> guest-visible-completion delay when there is NO ack channel:
+    /// covers the supervisor's display timer tick plus Core Animation's latch.
+    latch_delay: std::time::Duration,
+
+    /// #8 leg 2 — supervisor "shown <id>" acks (the truthful CA latch boundary).
+    /// True when the ack reader thread is running; holds then complete on acks
+    /// (with `latch_tx` as a generous fallback) instead of the open-loop delay.
+    ack_active: bool,
+    /// Surface ids acked by the supervisor (reader thread -> worker via `event`).
+    shown: Arc<Mutex<Vec<u32>>>,
+    /// limina: surface ids the supervisor asked for back that the renderer does not know
+    /// (reader thread -> worker via `event`). The DISPLAY BACKEND owns those — the software-2D
+    /// scanout ring and the cursor images — and only the worker thread may touch it, so the ack
+    /// reader parks the id here instead of answering itself.
+    resurface: Arc<Mutex<Vec<u32>>>,
+    /// Presented-but-not-yet-acked frames in apply order: (iosurface_id, cookie).
+    /// An ack for id X confirms every entry up to and including the first X —
+    /// frames applied before X are certainly off glass once X latched.
+    awaiting_shown: std::collections::VecDeque<(u32, u64)>,
+    /// Completes ack-confirmed holds immediately (same handler the latch thread uses).
+    guest_fence_handler: RutabagaFenceHandler,
+}
+
+impl PresentFenceState {
+    /// Whether the plumbing holds work that references the current activation's queue.
+    /// Only the trio that does — parked flushes (their fences retire into presents),
+    /// held guest fences (completion writes the used ring) and unprocessed retirements
+    /// (their pump presents and completes holds) — counts. `flush_parked_cookies` and
+    /// `awaiting_shown` are deliberately excluded: they are forward-looking bookkeeping
+    /// (a cookie waits for a trailing flush fence, an entry waits for a supervisor ack)
+    /// that a guest freeze routinely strands — the freeze-time device reset drops
+    /// in-queue commands, splitting a flush from its trailing fence — and that no drain
+    /// can shrink once the reset is in progress. Counting them turned every synoik
+    /// s2idle wake into a fail-closed wipe (2026-08-10); the park path discards them
+    /// via `take_stale_bookkeeping` instead.
+    fn quiescent(&self) -> bool {
+        self.parked.is_empty()
+            && self.guest_holds.is_empty()
+            && self.retired.lock().unwrap().is_empty()
+    }
+
+    /// `p`, parked as `cookie`, is about to be presented: the holds waiting on it stop waiting for
+    /// the present, and for its confirmation too when there is nothing more to confirm -- no acks,
+    /// or a copy, whose fence retired once the guest's buffer had been read. The rest wait for
+    /// the display to say it is shown.
+    fn presenting(&mut self, cookie: u64, p: &ParkedFlush) {
+        let confirmed = !self.ack_active || p.copied;
+        for hold in self.guest_holds.iter_mut() {
+            hold.unpresented.remove(&cookie);
+            if confirmed {
+                hold.unconfirmed.remove(&cookie);
+            }
+        }
+        if self.ack_active && !p.copied {
+            self.awaiting_shown.push_back((p.iosurface_id, cookie));
+        }
+    }
+
+    /// Whether the fence handler or the ack reader has left the worker something to present or
+    /// answer. Asked between commands of a long control-queue drain, so it reads the three
+    /// hand-off lists and nothing else -- no eventfd, which a drain must never block on.
+    fn has_work(&self) -> bool {
+        !self.retired.lock().unwrap().is_empty()
+            || !self.shown.lock().unwrap().is_empty()
+            || !self.resurface.lock().unwrap().is_empty()
+    }
+
+    /// Drain the forward-looking bookkeeping a device reset strands: cookies whose
+    /// trailing flush fence the guest's freeze-time reset dropped, and shown-ack
+    /// entries whose ack cannot arrive during a reset. Left behind, a stale cookie
+    /// turns the next activation's first trailing fence into a spurious guest hold
+    /// and a stale awaiting-shown entry skews the pop-to-first ack drain forever.
+    fn take_stale_bookkeeping(&mut self) -> (usize, usize) {
+        let cookies = std::mem::take(&mut self.flush_parked_cookies).len();
+        let shown = self.awaiting_shown.len();
+        self.awaiting_shown.clear();
+        (cookies, shown)
+    }
+}
+
+struct GuestFlushHold {
+    fence: RutabagaFence,
+    /// Cookies whose frames haven't presented yet.
+    unpresented: std::collections::BTreeSet<u64>,
+    /// Cookies presented but not yet latch-confirmed (ack or no-ack policy).
+    unconfirmed: std::collections::BTreeSet<u64>,
+    /// Safety fallback deadline (ack mode), set once all frames presented:
+    /// completion is idempotent, so the fallback and the ack path may both fire.
+    /// Past the deadline the hold is dropped (the latch thread completed it).
+    fallback_at: Option<std::time::Instant>,
+    /// Hard ceiling: the latch thread completes the fence at creation+500ms no
+    /// matter what (scheduled at creation; completion is idempotent). A display
+    /// fence held past that is already pathological — wedging the guest's whole
+    /// scanout pipeline on it is never the right outcome. Holds older than the
+    /// ceiling are dropped by process_retired_presents.
+    created_at: std::time::Instant,
+}
+
+struct ParkedFlush {
+    scanout_id: u32,
+    iosurface_id: u32,
+    /// The flushed resource — needed by the deferred readback fallback (a sink
+    /// without zero-copy reads the IOSurface's pixels back via the resource).
+    resource_id: u32,
+    rect: Rect,
+    /// When the flush parked, so a present that waited long for its fence says how long.
+    parked_at: std::time::Instant,
+    /// Where this flush stands in [`PresentOrder`].
+    seq: u64,
+    /// Whether what goes up is a copy, out of the guest's reach once it retires: then the guest's
+    /// buffer is free when the copy is done, not when the display has let go of it.
+    copied: bool,
+}
+
+/// Which flush each scanout last put on glass, so a present that would show an older frame over a
+/// newer one says so.
+///
+/// A flush is presented down one of two roads -- parked on a fence and shown when it retires, or
+/// shown at once -- and a frame on the quick road can land while an older one still waits on the
+/// slow one. That older frame then goes up on top: the window steps back a frame.
+#[derive(Default)]
+struct PresentOrder {
+    next: u64,
+    shown: HashMap<u32, u64>,
+    backwards: u64,
+    overtakes: u64,
+    unfenced: u64,
+}
+
+impl PresentOrder {
+    #[cfg(target_os = "macos")]
+    fn stamp(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    fn shown(&mut self, scanout_id: u32, seq: u64, iosurface_id: u32, road: &str) {
+        let last = self.shown.entry(scanout_id).or_default();
+        if seq < *last {
+            self.backwards += 1;
+            warn!(
+                "virtio-gpu: scanout {scanout_id} stepped back: flush #{seq} (iosurface \
+                 {iosurface_id}, {road}) shown after flush #{last} ({} so far)",
+                self.backwards
+            );
+        } else {
+            *last = seq;
+        }
+    }
+
+    /// A present about to go straight up while older frames of the same scanout are still parked.
+    #[cfg(target_os = "macos")]
+    fn overtaking(&mut self, scanout_id: u32, parked: usize, why: &str) {
+        self.overtakes += 1;
+        if self.overtakes == 1 || self.overtakes.is_multiple_of(100) {
+            warn!(
+                "virtio-gpu: scanout {scanout_id} presents at once past {parked} parked frame(s) \
+                 ({why}; {} such presents so far)",
+                self.overtakes
+            );
+        }
+    }
+
+    /// A flush that parked frames arrived without a trailing fence, so nothing holds the guest
+    /// off the buffers it presented.
+    fn unfenced_flush(&mut self) {
+        self.unfenced += 1;
+        if self.unfenced == 1 || self.unfenced.is_multiple_of(1000) {
+            warn!(
+                "virtio-gpu: a scanout flush parked frames without a fence to hold the guest \
+                 off their buffers ({} such flushes so far)",
+                self.unfenced
+            );
+        }
+    }
+}
+
+/// Whether the guest is held off each scanout's presented buffers, as last told to the display.
+///
+/// A fenced scanout flush that parked frames becomes a [`GuestFlushHold`]: the guest waits on it
+/// until the frames are on glass, so it cannot draw into a buffer the display still shows. A
+/// flush whose parked frames get no fence -- a stock guest kernel's -- leaves the guest free to
+/// reuse them at once, and a display sampling the surface zero-copy then shows frames out of
+/// order. A scanout can also be held two ways, by a copy on glass or by a fence, and a guest that
+/// starts fencing moves from one to the other without its answer changing. Each change of either
+/// is logged; the display, which only needs the answer, is told when that changes.
+#[derive(Default)]
+struct ScanoutHolds(HashMap<u32, Hold>);
+
+/// How a scanout's presented buffers are kept from the guest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hold {
+    /// Not at all.
+    Free,
+    /// Glass shows copies the guest cannot reach.
+    Copies,
+    /// The guest's flushes are fenced until their frames leave glass.
+    Fenced,
+}
+
+impl Hold {
+    fn held(self) -> bool {
+        self != Hold::Free
+    }
+
+    /// How a scanout is held, from whether it is (`held`), whether its flushes carry a fence and
+    /// whether glass shows copies. A fence says it first: a fenced guest is held whatever goes up,
+    /// and a transport scanout is copied and fenced both.
+    fn of(held: bool, fenced: bool, copying: bool) -> Hold {
+        match (held, fenced, copying) {
+            (false, _, _) => Hold::Free,
+            (true, true, _) | (true, false, false) => Hold::Fenced,
+            (true, false, true) => Hold::Copies,
+        }
+    }
+}
+
+impl ScanoutHolds {
+    /// Record `hold` for `scanout_id`; returns the one it replaces, unless it is the same.
+    fn note(&mut self, scanout_id: u32, hold: Hold) -> Option<Option<Hold>> {
+        let was = self.0.insert(scanout_id, hold);
+        (was != Some(hold)).then_some(was)
+    }
+}
+
+/// Per scanout: whether the guest fences its flushes, and whether its presents are copies.
+///
+/// A guest whose flushes carry no fence is never held off the buffers it flips, and draws its
+/// next frame into the one the flip released. A venus scanout of such a guest is presented as a
+/// copy the renderer takes on the guest's own queue, ordered ahead of that next frame
+/// (`present_copy`); what is on glass is then out of the guest's reach, so the display is told the
+/// scanout is held and shows it as it is. A guest that fences is held until its frame has left
+/// glass, and needs no copy.
+#[derive(Default)]
+struct ScanoutCopies {
+    /// Whether the scanout's last flush that parked frames carried a fence. Unknown until one has.
+    fenced: HashMap<u32, bool>,
+    /// Whether the scanout's last parked present was a copy.
+    copying: HashMap<u32, bool>,
+    /// Frames dropped because every copy surface was still in use, and presents that fell back to
+    /// the guest's own surface because no ordered copy could be taken. Counted so a run says how
+    /// often each happened.
+    dropped: u64,
+    refused: u64,
+}
+
+impl ScanoutCopies {
+    /// Whether a present of `scanout_id` should be a copy: unless the guest is known to fence.
+    fn wanted(&self, scanout_id: u32) -> bool {
+        self.fenced.get(&scanout_id) != Some(&true)
+    }
+
+    fn copying(&self, scanout_id: u32) -> bool {
+        self.copying.get(&scanout_id) == Some(&true)
     }
 }
 
 pub struct VirtioGpuScanout {
     resource_id: u32,
+    /// limina: the SET_SCANOUT rect dimensions — the visible region the guest scans out, and
+    /// the size of the host staging buffer (`configure_scanout` is called with these). The
+    /// backing *resource* can be LARGER (mutter pads its framebuffer, e.g. a 1000×708 mode
+    /// backed by a 1024×768 resource), so the 2D readback must extract this rect at the
+    /// resource's own stride — a flat copy shears. See `flush_resource`.
+    width: u32,
+    height: u32,
+    /// limina tier-2: if `Some`, this scanout's resource is backed by a global IOSurface
+    /// (venus SET_SCANOUT_BLOB) and `flush_resource` presents it zero-copy via
+    /// `present_surface` instead of the readback + `present_frame` path.
+    #[cfg(target_os = "macos")]
+    iosurface_id: Option<u32>,
+    /// limina: consecutive `sync_iosurface` failures on this scanout, and whether the last flush
+    /// took the zero-copy path or the readback fallback.
+    ///
+    /// State, not an event, and deliberately so. The fallback is entered by clearing
+    /// `iosurface_id`, which the next `SET_SCANOUT` re-arms — and `SET_SCANOUT` arrives once per
+    /// page-flip, so a warning at the moment of the switch would print at flip rate while
+    /// telling a reader who arrives later nothing at all. Logging the transitions and keeping
+    /// the count makes "is this scanout on the fallback, and how often did it get there" a
+    /// question that can be asked after the fact.
+    #[cfg(target_os = "macos")]
+    sync_failures: u64,
+    #[cfg(target_os = "macos")]
+    on_readback_fallback: bool,
+}
+
+/// A host-side software 2D resource (limina patch).
+///
+/// libkrun normally routes `RESOURCE_CREATE_2D` through virglrenderer as a GL render
+/// target — which has no host context on macOS, so creation fails and nothing ever
+/// reaches the display. To give a working *software* scanout (the degraded-but-correct
+/// baseline tier, e.g. fbcon, EFI GOP, simpledrm), limina shadows 2D resources entirely in
+/// host CPU memory, never touching rutabaga:
+///   CREATE_2D -> allocate `host`; ATTACH_BACKING -> remember the guest `backing`
+///   iovecs; TRANSFER_TO_HOST_2D -> copy backing -> `host`; FLUSH -> hand `host` to the
+///   display backend. No GL/Metal involved. The accelerated path (Venus/blob, 3D
+///   resources) is untouched and still goes through rutabaga.
+struct Sw2dResource {
+    /// `width * height * BYTES_PER_PIXEL`, in the resource's pixel format. (Geometry +
+    /// format live in the matching `resources` entry.)
+    host: Vec<u8>,
+    /// Guest backing as host pointers (from `sglist_to_rutabaga_iovecs`), valid for the
+    /// lifetime of the guest memory mapping; only read on the GPU worker thread.
+    backing: Vec<RutabagaIovec>,
+}
+
+impl Sw2dResource {
+    /// Gather the guest backing into the host buffer (the guest holds the full current
+    /// framebuffer in its backing, so copying it whole satisfies any transfer rect).
+    fn copy_from_backing(&mut self) {
+        let mut off = 0usize;
+        for iov in &self.backing {
+            if off >= self.host.len() {
+                break;
+            }
+            let n = iov.len.min(self.host.len() - off);
+            // SAFETY: `iov` is a host pointer/len pair derived from the guest memory
+            // mapping (sglist_to_rutabaga_iovecs); `host` owns `off..off+n`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    iov.base as *const u8,
+                    self.host.as_mut_ptr().add(off),
+                    n,
+                );
+            }
+            off += n;
+        }
+    }
+}
+
+/// limina: copy the top-left rect of a (possibly wider) source framebuffer into a tightly-strided
+/// destination, row by row — de-shearing a padded resource. The guest's scanout *resource* can be
+/// wider than the visible scanout rect (mutter pads its framebuffer, e.g. a 1000×708 mode backed by
+/// a 1024×768 resource); the host staging buffer is `dst_stride`-wide, so a flat byte copy would
+/// drift every row by `(src_stride − dst_stride)` px. When the strides match (the common case) this
+/// is a single flat copy. `src_stride >= dst_stride` is expected; rows that would read/write out of
+/// bounds are skipped. See `flush_resource`.
+fn blit_scanout_rect(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    rows: usize,
+) {
+    if src_stride == dst_stride {
+        let n = dst.len().min(src.len());
+        dst[..n].copy_from_slice(&src[..n]);
+        return;
+    }
+    for y in 0..rows {
+        let s = y * src_stride;
+        let d = y * dst_stride;
+        if s + dst_stride > src.len() || d + dst_stride > dst.len() {
+            break;
+        }
+        dst[d..d + dst_stride].copy_from_slice(&src[s..s + dst_stride]);
+    }
 }
 
 pub struct VirtioGpu {
-    rutabaga: Rutabaga,
+    /// The host 3D renderer. `None` in limina software-2D-only mode, where the device serves
+    /// only the 2D scanout path (see [`Sw2dResource`]) and never initializes
+    /// virglrenderer/rutabaga — so a GL-less host (e.g. macOS without a usable Metal/GL
+    /// context) doesn't pay for, or hang on, renderer init. All renderer-backed commands
+    /// (3D/blob/context/capset/fence) degrade to `ErrUnspec` in that mode; the guest sees a
+    /// plain 2D virtio-gpu (no VIRGL feature, no capsets — see `Gpu`) and won't issue them.
+    rutabaga: Option<Rutabaga>,
     resources: BTreeMap<u32, VirtioGpuResource>,
+    /// limina software 2D resources, keyed by resource id (see [`Sw2dResource`]).
+    sw2d: BTreeMap<u32, Sw2dResource>,
     fence_state: Arc<Mutex<FenceState>>,
+    /// Retires guest fences from any thread; the extension answers its fences through it.
+    fence_handler: RutabagaFenceHandler,
+    /// Wakes the stale-fence watch when the first fence parks (it sleeps while none is).
+    fence_watch: Arc<std::sync::Condvar>,
+    /// The route `create_fence` took for the fence `process_fence` is about to park.
+    next_fence_route: FenceRoute,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackendInstance,
+    /// limina (#8): present-fence state; `None` when the renderer is absent.
+    present_fence: Option<PresentFenceState>,
+    /// limina M9.3: counted GPU health probes (stale-ctx submissions, fence ledger).
+    trace: Arc<GpuTraceStats>,
+    /// limina M9.3 P0: the rutabaga-layer half of the snapshot-replay journal
+    /// (the vkr wire half lives in virglrenderer). Worker-thread-only.
+    journal: GpuJournal,
+    /// limina M9.3 P3: the last cursor-overlay state handed to the display backend
+    /// (pixels included), carried in the snapshot payload so a restored session
+    /// keeps its cursor (UPDATE/MOVE_CURSOR are not journaled ops).
+    cursor_state: Option<super::journal::CursorSnapshot>,
+    /// limina (vrend fence honesty): the renderer's poll descriptor, held for the device's
+    /// lifetime (it's a dup that closes on drop). virglrs holds a context fence behind a GL
+    /// query that was not ready until someone pumps `poll()` on the GL thread — the gpu
+    /// worker registers this fd in its epoll and calls [`Self::renderer_event_poll`] when it
+    /// fires, and its fence drains pump it themselves. venus never needs the pump.
+    renderer_poll: Option<rutabaga_gfx::RutabagaDescriptor>,
+    /// limina: true once any non-venus (vrend/GL) 3D context exists this session. From
+    /// that point Global-ring fences route through virglrenderer's GL timeline
+    /// (`virgl_renderer_create_fence` → glFenceSync → ASYNC_FENCE_CB → fence handler)
+    /// instead of being marked completed at decode: a vrend guest's `glFinish` must wait
+    /// for real GL/Metal completion. (Sync-marking every Global fence made vrend fences
+    /// loose — crossmark 2026-07-28 measured a stock guest's fenced desktop frame
+    /// "faster" than host-native references.) Before any vrend context — firmware GOP,
+    /// venus-only sessions, software-2D — the sync mark keeps its wedge-free behavior
+    /// and the hot venus scanout-flush path stays untouched. Reset with the session;
+    /// snapshot restore re-derives it by replaying CtxCreate through `create_context`.
+    vrend_ctx_seen: bool,
+    /// limina leak forensics: see [`ScanoutLedger`].
+    scanout_ledger: ScanoutLedger,
+    present_order: PresentOrder,
+    held_scanouts: ScanoutHolds,
+    /// How each scanout's presents are kept from the guest: see [`ScanoutCopies`].
+    scanout_copies: ScanoutCopies,
+    /// Whether a guest OS driver has taken the device over from boot firmware, reported to the
+    /// display backend once per run. The firmware's virtio-gpu driver programs scanout 0 and
+    /// never reads an EDID, so the first `GET_EDID` is the handover.
+    guest_driver_seen: bool,
+}
+
+/// The display path's per-resource ledger, answering one question: does the worker's display
+/// path ever let go of a scanout resource?
+///
+/// Motivation (spikes/venus-churn-retention): a compositor that mints a fresh scanout resource
+/// every frame leaves gigabytes of host memory that no guest-side release reclaims. The venus
+/// IOSurface census is balanced and the CF wrappers demonstrably deallocate, so the holder is
+/// something *outside* that ledger — and the display path is the one per-resource state a probe
+/// that never presents cannot reach. (It answered "not here": the retention turned out to live
+/// in the supervisor, billed to this process because IOSurface storage bills to its creator.
+/// The ledger stays as the standing check that this path keeps balancing.)
+///
+/// `stranded` names the one code path that can orphan a resource for the process's life:
+/// `unref_resource` removes the metadata *before* refusing a still-scanned-out resource, so the
+/// rutabaga resource survives with nothing left that can address it.
+#[derive(Default)]
+struct ScanoutLedger {
+    /// Resource ids bound to a scanout and not yet unref'd.
+    live: HashSet<u32>,
+    /// SET_SCANOUT / SET_SCANOUT_BLOB commands that bound a resource.
+    binds: u64,
+    /// Binds of an id not already in `live` — the display path "seeing" a new resource.
+    fresh: u64,
+    /// Zero-copy presents (`present_surface`), immediate + deferred.
+    presents: u64,
+    /// Unrefs that released an id the display path had seen.
+    released: u64,
+    /// Unrefs refused for a still-enabled scanout (see the struct doc).
+    stranded: u64,
+}
+
+impl ScanoutLedger {
+    /// Report every `REPORT_EVERY` binds. Binds happen per flip, so on an ordinary desktop this
+    /// is a steady trickle forever — hence `debug!`. A strand is `warn!`: it should never happen.
+    const REPORT_EVERY: u64 = 256;
+
+    fn bind(&mut self, resource_id: u32) {
+        self.binds += 1;
+        if self.live.insert(resource_id) {
+            self.fresh += 1;
+        }
+        if self.binds.is_multiple_of(Self::REPORT_EVERY) {
+            self.report();
+        }
+    }
+
+    fn unref(&mut self, resource_id: u32, refused: bool) {
+        if refused {
+            self.stranded += 1;
+            warn!(
+                "[SCANOUT-LEDGER] resource {resource_id} STRANDED (its metadata is already gone, \
+                 so the rutabaga resource is now unreachable)"
+            );
+            self.report();
+            return;
+        }
+        if self.live.remove(&resource_id) {
+            self.released += 1;
+        }
+    }
+
+    fn present(&mut self) {
+        self.presents += 1;
+    }
+
+    fn report(&self) {
+        debug!(
+            "[SCANOUT-LEDGER] seen {} (fresh {}) released {} still-held {} | presents {} stranded {}",
+            self.binds,
+            self.fresh,
+            self.released,
+            self.live.len(),
+            self.presents,
+            self.stranded,
+        );
+    }
+}
+
+/// The per-activation transport the fence handler retires guest fences into.
+///
+/// limina (renderer-singleton fix): `virgl_renderer_init` is a process-global, init-once,
+/// thread-bound singleton, so the `Rutabaga`/renderer (and the fence handler registered into
+/// it) must outlive any single device activation. But the control queue, guest memory, and
+/// interrupt are recreated on every `activate()` (driver rebind, EFI→kernel hand-off, reboot).
+/// So the long-lived fence handler reaches them indirectly through a shared cell the worker
+/// swaps on each activate and clears on reset; `None` means the device is currently inactive
+/// (a fence that completes in that window has nothing to retire into). See `worker.rs`.
+#[derive(Clone)]
+pub(crate) struct GpuActivation {
+    pub(crate) mem: GuestMemoryMmap,
+    pub(crate) control_queue: Arc<Mutex<VirtQueue>>,
+    pub(crate) interrupt: InterruptTransport,
 }
 
 impl VirtioGpu {
     fn create_fence_handler(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
+        active: Arc<Mutex<Option<GpuActivation>>>,
         fence_state: Arc<Mutex<FenceState>>,
-        interrupt: InterruptTransport,
+        present_retired: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
+        present_event: utils::eventfd::EventFd,
+        trace: Arc<GpuTraceStats>,
+        dump_gate: Arc<DumpGate>,
     ) -> RutabagaFenceHandler {
+        // limina wake-trace (LIMINA_WAKE_TRACE=1): guest-fence callback/signal rates,
+        // ~5s cadence — see docs/perf/overhead-inventory.md. Shared across the fence
+        // threads, hence the mutex (trace-only, env-gated).
+        type WakeTrace = Arc<Mutex<(std::time::Instant, [u64; 3])>>;
+        let wake_trace: Option<WakeTrace> = std::env::var("LIMINA_WAKE_TRACE")
+            .ok()
+            .map(|_| Arc::new(Mutex::new((std::time::Instant::now(), [0u64; 3]))));
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
             debug!(
                 "XXX - fence called: id={}, ring_idx={}",
                 completed_fence.fence_id, completed_fence.ring_idx
             );
 
-            let mut queue = queue_ctl.lock().unwrap();
-            let mut fence_state = fence_state.lock().unwrap();
-            let mut i = 0;
+            // limina (#8): a present fence is host-injected — it carries a parked-present
+            // cookie, not a guest fence id, and names no context or ring because it was
+            // asked for about a resource. Hand it to the worker thread (which owns the
+            // display backend) and stay clear of the guest fence bookkeeping below.
+            if completed_fence.flags & RUTABAGA_FLAG_PRESENT != 0 {
+                present_retired
+                    .lock()
+                    .unwrap()
+                    .push((completed_fence.fence_id, std::time::Instant::now()));
+                if let Err(e) = present_event.write(1) {
+                    error!("present fence eventfd write failed: {e}");
+                }
+                return;
+            }
+            // Everything below may retire the fence into the used ring.
+            let _section = dump_gate.enter();
 
             let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                 0 => VirtioGpuRing::Global,
@@ -218,13 +909,41 @@ impl VirtioGpu {
                     ring_idx: completed_fence.ring_idx,
                 },
             };
+            // Recorded before the activation check below, which drops the completion: the
+            // stale-fence watch must be able to tell "signalled, never returned" from "never
+            // signalled".
+            {
+                let mut fence_state = fence_state.lock().unwrap();
+                let signalled = fence_state.signalled.entry(ring).or_insert(0);
+                *signalled = (*signalled).max(completed_fence.fence_id);
+            }
 
+            // Retire the guest fence into the *current* activation's queue. If the device is
+            // inactive (between reset and re-activate), there's nothing to retire into — drop
+            // it (the descriptors it would have retired were cleared by `reset_session`).
+            let Some(GpuActivation {
+                mem,
+                control_queue,
+                interrupt,
+            }) = active.lock().unwrap().clone()
+            else {
+                return;
+            };
+
+            let mut queue = control_queue.lock().unwrap();
+            let mut fence_state = fence_state.lock().unwrap();
+            let mut i = 0;
+
+            let mut retired_any = false;
             while i < fence_state.descs.len() {
                 debug!("XXX - fence_id: {}", fence_state.descs[i].fence_id);
                 if fence_state.descs[i].ring == ring
                     && fence_state.descs[i].fence_id <= completed_fence.fence_id
                 {
                     let completed_desc = fence_state.descs.remove(i);
+                    trace
+                        .fences_retired
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     debug!(
                         "XXX - found fence: desc_index={}",
                         completed_desc.desc_index
@@ -235,10 +954,38 @@ impl VirtioGpu {
                     {
                         error!("failed to add used elements to the queue: {e:?}");
                     }
-
-                    interrupt.signal_used_queue();
+                    retired_any = true;
                 } else {
                     i += 1;
+                }
+            }
+            // One interrupt per completion callback, not per retired descriptor — and with
+            // EVENT_IDX negotiated only when the guest's used_event says it's waiting
+            // (`needs_notification` is always true otherwise, preserving stock behavior).
+            let mut signaled = false;
+            if retired_any && queue.needs_notification(&mem).unwrap_or(true) {
+                interrupt.signal_used_queue();
+                signaled = true;
+            }
+            if let Some(tr) = wake_trace.as_ref() {
+                let mut t = tr.lock().unwrap();
+                t.1[0] += 1;
+                if retired_any {
+                    t.1[1] += 1;
+                }
+                if signaled {
+                    t.1[2] += 1;
+                }
+                let secs = t.0.elapsed().as_secs_f64();
+                if secs >= 5.0 {
+                    eprintln!(
+                        "[WAKETRACE fence] callbacks={:.0}/s retiring={:.0}/s irq_signals={:.0}/s",
+                        t.1[0] as f64 / secs,
+                        t.1[1] as f64 / secs,
+                        t.1[2] as f64 / secs,
+                    );
+                    t.1 = [0; 3];
+                    t.0 = std::time::Instant::now();
                 }
             }
             // Update the last completed fence for this context.
@@ -251,13 +998,35 @@ impl VirtioGpu {
         })
     }
 
+    /// The rutabaga capsets our renderer actually backs for this `virgl_flags` set.
+    ///
+    /// Upstream passes `capset_mask = 0` to `RutabagaBuilder`, which registers ALL nine
+    /// capsets regardless of the renderer config; the guest then enumerates and probes
+    /// capsets we can't serve (e.g. a virgl GL context under `NO_VIRGL`, rejected with a
+    /// harmless-but-noisy EINVAL). Advertise only what these flags support: venus, plus
+    /// virgl/virgl2 when GL is enabled. The device's `num_capsets` config field is the
+    /// pop-count of this mask, so the guest enumerates exactly the real set.
+    pub(crate) fn capset_mask_from_virgl_flags(virgl_flags: u32) -> u64 {
+        // Mirror of the `VirglRendererFlags` bit layout in rutabaga_utils.rs.
+        const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+
+        let mut mask = 0u64;
+        if virgl_flags & VIRGLRENDERER_VENUS != 0 {
+            mask |= 1u64 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
+        }
+        if virgl_flags & VIRGLRENDERER_NO_VIRGL == 0 {
+            mask |= 1u64 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
+            mask |= 1u64 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
+        }
+        mask
+    }
+
     pub fn create_rutabaga(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
-        interrupt: InterruptTransport,
-        fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
         export_table: Option<ExportTable>,
+        pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
+        fence: RutabagaFenceHandler,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
             Ok(dir) => dir,
@@ -270,9 +1039,9 @@ impl VirtioGpu {
         let path = PathBuf::from(format!("{xdg_runtime_dir}/{wayland_display}"));
 
         #[allow(unused_mut)]
-        let mut rutabaga_paths: Vec<RutabagaPath> = vec![RutabagaPath {
-            path,
-            path_type: RUTABAGA_PATH_TYPE_WAYLAND,
+        let mut rutabaga_channels: Vec<RutabagaChannel> = vec![RutabagaChannel {
+            base_channel: path,
+            channel_type: RUTABAGA_CHANNEL_TYPE_WAYLAND,
         }];
 
         #[cfg(target_os = "linux")]
@@ -280,9 +1049,9 @@ impl VirtioGpu {
             && let Some(x_display) = x_display.strip_prefix(":")
         {
             let x_path = PathBuf::from(format!("/tmp/.X11-unix/X{x_display}"));
-            rutabaga_paths.push(RutabagaPath {
-                path: x_path,
-                path_type: RUTABAGA_PATH_TYPE_X11,
+            rutabaga_channels.push(RutabagaChannel {
+                base_channel: x_path,
+                channel_type: RUTABAGA_CHANNEL_TYPE_X11,
             });
         }
         #[cfg(target_os = "linux")]
@@ -293,109 +1062,1271 @@ impl VirtioGpu {
             let name = env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".to_string());
             let mut pw_path = PathBuf::from(pw_sock_dir);
             pw_path.push(name);
-            rutabaga_paths.push(RutabagaPath {
-                path: pw_path,
-                path_type: RUTABAGA_PATH_TYPE_PIPEWIRE,
+            rutabaga_channels.push(RutabagaChannel {
+                base_channel: pw_path,
+                channel_type: RUTABAGA_CHANNEL_TYPE_PW,
             });
         }
+        let rutabaga_channels_opt = Some(rutabaga_channels);
 
-        let fence =
-            Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
+        let builder = RutabagaBuilder::new(
+            rutabaga_gfx::RutabagaComponentType::VirglRenderer,
+            virgl_flags,
+            Self::capset_mask_from_virgl_flags(virgl_flags),
+        )
+        .set_rutabaga_channels(rutabaga_channels_opt);
+        let builder = if let Some(export_table) = export_table {
+            builder.set_export_table(export_table)
+        } else {
+            builder
+        };
+        let builder = if let Some(key) = pipeline_cache_key {
+            builder.set_pipeline_cache_key(key)
+        } else {
+            builder
+        };
 
-        let capset_mask: u64 = virgl_flags_to_capsets(virgl_flags);
-
-        let use_egl = virgl_flags & VIRGLRENDERER_USE_EGL != 0;
-        let use_gles = virgl_flags & VIRGLRENDERER_USE_GLES != 0;
-        let use_render_server = virgl_flags & VIRGLRENDERER_RENDER_SERVER != 0;
-
-        let mut builder = RutabagaBuilder::new(capset_mask, fence)
-            .set_default_component(rutabaga_gfx::RutabagaComponentType::VirglRenderer)
-            .set_use_egl(use_egl)
-            .set_use_gles(use_gles)
-            .set_rutabaga_paths(Some(rutabaga_paths))
-            .set_use_render_server(use_render_server);
-
-        if let Some(export_table) = export_table {
-            let lookup: Arc<dyn VirtioFsLookup> = Arc::new(ExportTableLookup::new(export_table));
-            builder = builder.set_virtiofs_lookup(lookup);
+        match builder.clone().build(fence.clone(), None) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!("create_rutabaga(virgl_flags={virgl_flags:#x}) build failed: {e:?}");
+                None
+            }
         }
-
-        builder.build().ok()
-    }
-
-    pub fn create_fallback_rutabaga(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
-        interrupt: InterruptTransport,
-        fence_state: Arc<Mutex<FenceState>>,
-    ) -> Option<Rutabaga> {
-        let fence =
-            Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-
-        // Fallback with minimal capset mask and no EGL/GLES
-        let capset_mask = 0;
-
-        RutabagaBuilder::new(capset_mask, fence)
-            .set_default_component(rutabaga_gfx::RutabagaComponentType::VirglRenderer)
-            .build()
-            .ok()
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mem: GuestMemoryMmap,
-        queue_ctl: Arc<Mutex<VirtQueue>>,
-        interrupt: InterruptTransport,
+        active: Arc<Mutex<Option<GpuActivation>>>,
         virgl_flags: u32,
+        software_2d: bool,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
+        pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend,
+        dump_gate: Arc<DumpGate>,
     ) -> Self {
-        let fence_state = Arc::new(Mutex::new(Default::default()));
+        let fence_state: Arc<Mutex<FenceState>> = Arc::new(Mutex::new(Default::default()));
 
-        let rutabaga = match Self::create_rutabaga(
-            mem.clone(),
-            queue_ctl.clone(),
-            interrupt.clone(),
+        // limina M9.3: probe counters, shared with the fence handler (retire counts) and
+        // the opt-in tick reporter (LIMINA_GPU_TRACE=1).
+        let trace: Arc<GpuTraceStats> = Arc::new(Default::default());
+        super::trace::maybe_spawn_reporter(trace.clone(), fence_state.clone());
+        let fence_watch = Arc::new(std::sync::Condvar::new());
+        super::trace::spawn_stale_fence_watch(fence_state.clone(), fence_watch.clone());
+
+        // limina (#8): present-fence plumbing — built up front because the fence handler
+        // needs its endpoints.
+        let present_retired: Arc<Mutex<Vec<(u64, std::time::Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let present_event = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK)
+            .expect("failed to create present-fence eventfd");
+
+        // limina (renderer-singleton fix): the handler is registered into the process-global
+        // renderer once and lives as long as it does, so it reaches the per-activation queue/
+        // mem/interrupt through `active` rather than capturing them directly.
+        let fence_handler = Self::create_fence_handler(
+            active,
             fence_state.clone(),
-            virgl_flags,
-            export_table.clone(),
-        ) {
-            Some(rutabaga) => rutabaga,
-            None => {
-                warn!(
-                    "Failed to create virtio_gpu backend with the requested parameters. Falling back to safe defaults."
-                );
-                Self::create_fallback_rutabaga(
-                    mem.clone(),
-                    queue_ctl.clone(),
-                    interrupt.clone(),
-                    fence_state.clone(),
-                )
-                .expect("Fallback rutabaga initialization failed")
+            present_retired.clone(),
+            present_event.try_clone().expect("eventfd clone"),
+            trace.clone(),
+            dump_gate,
+        );
+
+        // limina software-2D-only mode: skip renderer init entirely (no virglrenderer/Metal).
+        // Coexist mode (software_2d == false): try the (Venus) renderer for 3D while the
+        // software-2D path keeps serving 2D/scanout. If the renderer fails to init, degrade
+        // gracefully to software-2D only (rutabaga = None): 2D keeps working and the guest's
+        // 3D commands return ErrUnspec, so Mesa falls back to llvmpipe rather than the worker
+        // crashing. We deliberately do NOT fall back to a NO_VIRGL rutabaga — it can't serve
+        // 2D either (CREATE_2D -> virgl GL render target, dead on macOS) and just wedges boot.
+        let rutabaga = if software_2d {
+            None
+        } else {
+            match Self::create_rutabaga(
+                virgl_flags,
+                export_table.clone(),
+                pipeline_cache_key,
+                fence_handler.clone(),
+            ) {
+                Some(rutabaga) => Some(rutabaga),
+                None => {
+                    warn!("virtio-gpu: renderer init failed; degrading to software-2D (no 3D)");
+                    None
+                }
             }
         };
+
+        // limina (#8 half 2): the latch thread completes held guest flush fences a fixed
+        // delay after their frames presented (supervisor tick + CA latch); completion
+        // goes through the regular fence handler, which owns desc retirement.
+        let present_fence = rutabaga.as_ref().map(|_| {
+            let (latch_tx, latch_rx) =
+                std::sync::mpsc::channel::<(std::time::Instant, RutabagaFence)>();
+            let latch_handler = fence_handler.clone();
+            std::thread::Builder::new()
+                .name("gpu latch".into())
+                .spawn(move || {
+                    while let Ok((deadline, fence)) = latch_rx.recv() {
+                        let now = std::time::Instant::now();
+                        if deadline > now {
+                            std::thread::sleep(deadline - now);
+                        }
+                        latch_handler.call(fence);
+                    }
+                })
+                .expect("failed to spawn gpu latch thread");
+            let latch_ms = std::env::var("LIMINA_FENCE_LATCH_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(35);
+            // #8 leg 2: read the supervisor's "shown <id>" acks off the control
+            // socketpair (rendezvous'd via env by limina-vmm main). The display backend
+            // only ever writes that fd; the supervisor's acks are the only inbound
+            // bytes. The reader wakes the worker through the same present eventfd.
+            let shown: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let resurface: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let ack_active = if let Some(fd) = std::env::var("LIMINA_SHOWN_ACK_FD")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .filter(|fd| *fd >= 0)
+            {
+                let dup = unsafe { libc::dup(fd) };
+                if dup >= 0 {
+                    let shown = shown.clone();
+                    let resurface = resurface.clone();
+                    let wake = present_event.try_clone().expect("eventfd clone");
+                    std::thread::Builder::new()
+                        .name("gpu shown-ack".into())
+                        .spawn(move || {
+                            use std::io::BufRead;
+                            // SAFETY: we own `dup`.
+                            let file = unsafe { std::fs::File::from_raw_fd(dup) };
+                            for line in std::io::BufReader::new(file).lines() {
+                                let Ok(line) = line else { break };
+                                let mut parts = line.split_whitespace();
+                                match parts.next() {
+                                    Some("shown") => {
+                                        if let Some(id) =
+                                            parts.next().and_then(|s| s.parse::<u32>().ok())
+                                        {
+                                            shown.lock().unwrap().push(id);
+                                            let _ = wake.write(1);
+                                        }
+                                    }
+                                    // The supervisor dropped this surface from its bounded store
+                                    // and the guest is still presenting it. Hand it back: these
+                                    // scanouts are non-global, so only we can mint a Mach port for
+                                    // one, and without this the display stays frozen for that id
+                                    // forever (spikes/scanout-blob-freeze/RESULTS.md). Answered as
+                                    // an ordinary publish on the surface port, which keeps the
+                                    // ordering that makes IOSurface id recycling safe.
+                                    Some("resurface") => {
+                                        if let Some(id) =
+                                            parts.next().and_then(|s| s.parse::<u32>().ok())
+                                        {
+                                            match republish_surface(id) {
+                                                Ok(()) => debug!(
+                                                    "gpu: re-published surface {id} on request"
+                                                ),
+                                                // Not the renderer's: the display backend's own
+                                                // surfaces (the software-2D ring, and every
+                                                // cursor image) live on the worker thread, which
+                                                // answers these on its next wake.
+                                                Err(_) => {
+                                                    resurface.lock().unwrap().push(id);
+                                                    let _ = wake.write(1);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            debug!("gpu shown-ack reader: channel closed");
+                        })
+                        .is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            PresentFenceState {
+                retired: present_retired,
+                event: present_event,
+                next_cookie: 1,
+                parked: BTreeMap::new(),
+                flush_parked_cookies: Vec::new(),
+                guest_holds: Vec::new(),
+                latch_tx,
+                latch_delay: std::time::Duration::from_millis(latch_ms),
+                ack_active,
+                shown,
+                resurface,
+                awaiting_shown: std::collections::VecDeque::new(),
+                guest_fence_handler: fence_handler.clone(),
+            }
+        });
 
         let display_backend = display_backend
             .create_instance()
             .expect("Failed to create display backend instance!");
 
+        let journal = GpuJournal::new(trace.clone());
+
+        // See the `renderer_poll` field doc: vrend's query-check pump. Only virglrenderer
+        // components expose a descriptor; None everywhere else keeps the worker's epoll
+        // unchanged.
+        let renderer_poll = rutabaga.as_ref().and_then(|r| r.poll_descriptor());
+
         Self {
             rutabaga,
+            renderer_poll,
             resources: Default::default(),
+            sw2d: Default::default(),
             fence_state,
+            fence_handler: fence_handler.clone(),
+            fence_watch,
+            next_fence_route: FenceRoute::Renderer,
             scanouts: Default::default(),
             displays,
             display_backend,
             #[cfg(target_os = "macos")]
             map_sender,
+            present_fence,
+            trace,
+            journal,
+            cursor_state: None,
+            vrend_ctx_seen: false,
+            scanout_ledger: ScanoutLedger::default(),
+            present_order: PresentOrder::default(),
+            held_scanouts: ScanoutHolds::default(),
+            scanout_copies: ScanoutCopies::default(),
+            guest_driver_seen: false,
         }
+    }
+
+    /// limina M9.3: the probe counters (shared; incremented from the worker's dispatch
+    /// sites and the fence handler, read by the tick reporter).
+    pub fn trace(&self) -> &Arc<GpuTraceStats> {
+        &self.trace
+    }
+
+    /// limina (vrend fence honesty): the renderer's poll eventfd for the worker's epoll,
+    /// or `None` when the renderer is absent or isn't virglrenderer. See `renderer_poll`.
+    pub fn renderer_poll_fd(&self) -> Option<i32> {
+        use rutabaga_gfx::AsRawDescriptor;
+        // The raw fd of the descriptor we hold — `renderer_poll` outlives every borrower
+        // (device lifetime), so handing out the raw fd is safe; no dup (a dropped clone
+        // would close it).
+        self.renderer_poll.as_ref().map(|d| d.as_raw_descriptor())
+    }
+
+    /// limina (vrend fence honesty): pump the renderer's `poll()` — drains the poll
+    /// descriptor, answers the GL queries parked since they were first asked for, and
+    /// releases the fences held for them. Must be called from the gpu worker thread.
+    pub fn renderer_event_poll(&self) {
+        if let Some(r) = self.rutabaga.as_ref() {
+            r.event_poll();
+        }
+    }
+
+    /// limina M9.3 P0: the rutabaga-layer snapshot-replay journal (worker thread only).
+    pub fn journal_mut(&mut self) -> &mut GpuJournal {
+        &mut self.journal
+    }
+
+    pub fn journal(&self) -> &GpuJournal {
+        &self.journal
+    }
+
+    /// limina M9.3: the number of outstanding guest fences (requested, not yet retired
+    /// to the used ring), plus a summary for logging. The snapshot path drains these to
+    /// zero before capture: guest waiters hold sync_files backed by them, and a fence
+    /// whose completion misses the snapshot never signals in the restored epoch.
+    pub fn outstanding_fences(&self) -> (usize, String) {
+        let fs = self.fence_state.lock().unwrap();
+        (
+            fs.descs.len(),
+            fs.outstanding_summary(std::time::Instant::now()),
+        )
+    }
+
+    /// limina M9.3 P1: the venus wire-journal watermark for `ctx_id`, stamped on
+    /// rutabaga journal entries as the cross-layer replay fence.
+    pub fn journal_vkr_seq(&self, ctx_id: u32) -> u64 {
+        self.rutabaga
+            .as_ref()
+            .map(|r| r.limina_journal_seq(ctx_id))
+            .unwrap_or(0)
+    }
+
+    /// limina M9.3: release the vkr journal pin a venus blob create took on its
+    /// backing VkDeviceMemory (+ dedicated object). Called at global resource unref.
+    pub fn journal_unpin(&self, ctx_id: u32, blob_id: u64) {
+        if let Some(r) = self.rutabaga.as_ref() {
+            r.limina_journal_unpin(ctx_id, blob_id);
+        }
+    }
+
+    /// limina M9.3 P1: read a mapped blob's bytes through its host mapping (the
+    /// venus vkMapMemory pointer rutabaga resolves). None for unmappable blobs.
+    fn blob_content_read(&mut self, resource_id: u32) -> Option<Vec<u8>> {
+        let size = self.resources.get(&resource_id)?.size as usize;
+        let rutabaga = self.rutabaga.as_mut()?;
+        let ptr = rutabaga.map_ptr(resource_id).ok()?;
+        // Safe: the mapping is alive as long as the resource exists (worker thread
+        // owns both), and `size` is the blob's own size.
+        Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, size) }.to_vec())
+    }
+
+    fn blob_content_write(&mut self, resource_id: u32, bytes: &[u8]) -> bool {
+        let Some(resource) = self.resources.get(&resource_id) else {
+            return false;
+        };
+        let size = (resource.size as usize).min(bytes.len());
+        let Some(rutabaga) = self.rutabaga.as_mut() else {
+            return false;
+        };
+        let Ok(ptr) = rutabaga.map_ptr(resource_id) else {
+            return false;
+        };
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, size) };
+        true
+    }
+
+    /// limina M9.3 P1 snapshot: assemble the GPU section — the rutabaga journal,
+    /// each venus context's vkr wire journal, and every guest-mapped blob's raw
+    /// The pixels the host is presenting on each enabled scanout, for the v8 payload.
+    ///
+    /// This is the one copy of the screen that certainly exists at snapshot time. The venus
+    /// capture cannot reach a Vulkan compositor's framebuffers — they are device-local, so
+    /// `vkMapMemory` refuses them — and a damage-tracking compositor has no reason to repaint
+    /// after a restore, so without this the desktop comes back blank and stays blank until
+    /// something unrelated forces a full recomposite.
+    ///
+    /// Read the same two ways `flush_resource` does, and for the same reason: a software-2D
+    /// scanout's pixels are already in a host buffer, and a venus scanout's live in the
+    /// IOSurface being displayed. A classic vrend scanout needs neither — its resource content
+    /// is captured by the classic content dump — so it is left alone here.
+    fn capture_scanout_frames(&mut self) -> Vec<super::journal::ScanoutFrame> {
+        use super::journal::ScanoutFrame;
+        let mut frames = Vec::new();
+        for scanout_id in 0..VIRTIO_GPU_MAX_SCANOUTS {
+            let Some(scanout) = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+            else {
+                continue;
+            };
+            let (resource_id, width, height) = (scanout.resource_id, scanout.width, scanout.height);
+            #[cfg(target_os = "macos")]
+            let iosurface_id = scanout.iosurface_id;
+            #[cfg(not(target_os = "macos"))]
+            let iosurface_id: Option<u32> = None;
+
+            let stride = width as usize * 4;
+            let Some(len) = stride.checked_mul(height as usize) else {
+                continue;
+            };
+            let mut pixels = vec![0u8; len];
+
+            // The backing resource can be WIDER than the scanout rect (a padded framebuffer),
+            // so a software-2D read has to walk it at the RESOURCE's stride and extract this
+            // rect — a flat copy shears, exactly as it does in `flush_resource`.
+            let src_stride = self
+                .resources
+                .get(&resource_id)
+                .map(|r| r.width as usize * ResourceFormat::BYTES_PER_PIXEL)
+                .unwrap_or(stride);
+
+            let read = if let Some(sw) = self.sw2d.get(&resource_id) {
+                blit_scanout_rect(&mut pixels, stride, &sw.host, src_stride, height as usize);
+                true
+            } else if iosurface_id.is_some() {
+                match self.rutabaga.as_ref() {
+                    Some(r) => {
+                        // `dst_stride` is BYTES, not pixels. Passing the pixel width puts a
+                        // quarter-width image on screen four times over, squashed 4x
+                        // vertically — which is what the first version of this did.
+                        match r.read_iosurface(resource_id, &mut pixels, stride as u32, height) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!(
+                                    "gpu snapshot: scanout {scanout_id} (res {resource_id}) \
+                                     pixels unreadable: {e} — this desktop will come back blank \
+                                     until something repaints it"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                // Classic vrend scanout: its content rides the classic dump.
+                false
+            };
+
+            if read {
+                // Count the ink. A read that succeeds and returns an all-zero buffer looks
+                // identical in the ledger to one that captured the desktop, and the difference
+                // is the whole point of the frame.
+                let ink = pixels.iter().filter(|b| **b != 0).count();
+                info!(
+                    "gpu snapshot: scanout {scanout_id} (res {resource_id}) captured \
+                     {width}x{height}, {ink} non-zero byte(s) of {len}"
+                );
+                frames.push(ScanoutFrame {
+                    scanout_id,
+                    width,
+                    height,
+                    pixels,
+                });
+            }
+        }
+        if !frames.is_empty() {
+            info!(
+                "gpu snapshot: captured {} presented scanout frame(s)",
+                frames.len()
+            );
+        }
+        frames
+    }
+
+    /// bytes (host allocations, invisible to the guest-RAM dump). Worker thread.
+    /// `ext` is the native-context extension's section, carried as it is.
+    pub fn snapshot_gpu_payload(&mut self, ext: Vec<u8>) -> Option<Vec<u8>> {
+        // Hardware decodes run on threads of their own, so a quiesced guest is not a quiet
+        // renderer: a decode may still be writing a target. Everything below reads resource
+        // contents, so every decode is brought to rest first.
+        if let Some(rutabaga) = self.rutabaga.as_ref() {
+            rutabaga.limina_settle_video();
+        }
+        if self.rutabaga.is_none() || (self.journal.entries().is_empty() && ext.is_empty()) {
+            return None;
+        }
+
+        let mut payload = super::journal::GpuSnapshotPayload {
+            ops: Vec::new(),
+            vkr_journals: Vec::new(),
+            blob_contents: Vec::new(),
+            memory_contents: Vec::new(),
+            sync_states: Vec::new(),
+            cursor: self.cursor_state.clone(),
+            classic_contents: Vec::new(),
+            displays: self.displays.to_vec(),
+            scanout_frames: self.capture_scanout_frames(),
+            ext,
+        };
+
+        let mut ctxs: Vec<(u32, u32)> = Vec::new();
+        let mut mapped: Vec<u32> = Vec::new();
+        for e in self.journal.entries() {
+            match &e.op {
+                GpuJournalOp::CtxCreate {
+                    ctx_id,
+                    context_init,
+                    ..
+                } => ctxs.push((*ctx_id, *context_init)),
+                GpuJournalOp::MapBlob { resource_id, .. } => mapped.push(*resource_id),
+                _ => {}
+            }
+            payload.ops.push(super::journal::GpuJournalEntry {
+                seq: e.seq,
+                vkr_seq: e.vkr_seq,
+                op: e.op.clone(),
+            });
+        }
+
+        for (ctx_id, context_init) in ctxs {
+            // Task #19: classic contexts export their vrend journal through the SAME
+            // FFI (routed by context type, same VKJR wire format). Venus-only state
+            // (sync objects, device memories) is gated on the recorded capset.
+            let is_venus = (context_init & 0xff) == 4; // VIRTGPU_DRM_CAPSET_VENUS
+            match self
+                .rutabaga
+                .as_ref()
+                .and_then(|r| r.limina_journal_export(ctx_id))
+            {
+                Some(bytes) => payload.vkr_journals.push((ctx_id, bytes)),
+                // Normal for journal-less contexts (the kernel's ctx 1, VREND_JOURNAL=0).
+                None => {
+                    debug!("gpu snapshot: no wire journal for ctx {ctx_id}");
+                    continue;
+                }
+            }
+            if !is_venus {
+                // P2: the classic analogue of the venus memory capture below — a
+                // texture uploaded once (icon atlas, glyph cache) has its only copy
+                // in the host GL object; without this the restored world is
+                // structurally sound but shows gray blocks.
+                match self
+                    .rutabaga
+                    .as_ref()
+                    .and_then(|r| r.limina_classic_content_export(ctx_id))
+                {
+                    Some(bytes) => payload.classic_contents.push((ctx_id, bytes)),
+                    None => warn!("gpu snapshot: content export failed for classic ctx {ctx_id}"),
+                }
+                continue;
+            }
+            // P2.1: fence status + timeline semaphore counter values (opaque vkr
+            // blob) for the restore-time sync fast-forward.
+            match self
+                .rutabaga
+                .as_ref()
+                .and_then(|r| r.limina_sync_export(ctx_id))
+            {
+                Some(bytes) => payload.sync_states.push((ctx_id, bytes)),
+                None => warn!("gpu snapshot: sync export failed for venus ctx {ctx_id}"),
+            }
+            // P2: every capturable VkDeviceMemory's raw bytes. The census excludes
+            // map_ptr-exported blobs (the mapped-blob loop below captures those) and
+            // imports (they alias another storage); what remains — textures, render
+            // targets, non-staging buffers — lives only in host heaps.
+            let Some(census) = self
+                .rutabaga
+                .as_ref()
+                .and_then(|r| r.limina_memory_census(ctx_id))
+            else {
+                warn!("gpu snapshot: memory census failed for venus ctx {ctx_id}");
+                continue;
+            };
+            for (mem_id, size) in census {
+                let mut bytes = vec![0u8; size as usize];
+                if self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_memory_read(ctx_id, mem_id, &mut bytes))
+                {
+                    payload.memory_contents.push((ctx_id, mem_id, bytes));
+                } else {
+                    warn!(
+                        "gpu snapshot: content read failed for ctx {ctx_id} mem {mem_id} ({size} bytes)"
+                    );
+                }
+            }
+        }
+
+        for res_id in mapped {
+            match self.blob_content_read(res_id) {
+                Some(bytes) => payload.blob_contents.push((res_id, bytes)),
+                None => warn!("gpu snapshot: mapped blob {res_id} content unreadable"),
+            }
+        }
+
+        let content_bytes: usize = payload
+            .memory_contents
+            .iter()
+            .map(|(_, _, b)| b.len())
+            .sum();
+        let classic_bytes: usize = payload.classic_contents.iter().map(|(_, b)| b.len()).sum();
+        info!(
+            "gpu snapshot: {} ops, {} vkr journals, {} blob contents, {} memory contents ({} MiB), {} classic contents ({} MiB)",
+            payload.ops.len(),
+            payload.vkr_journals.len(),
+            payload.blob_contents.len(),
+            payload.memory_contents.len(),
+            content_bytes >> 20,
+            payload.classic_contents.len(),
+            classic_bytes >> 20
+        );
+        Some(payload.to_bytes())
+    }
+
+    /// limina M9.3 P1 restore: replay the GPU section into the fresh renderer —
+    /// rutabaga ops interleaved with venus wire entries by the recorded vkr_seq
+    /// fences, blob contents restored at their creates (before the ring-creates
+    /// that read them), ring threads started at the end. Worker thread, before
+    /// the guest resumes. Returns false on any replay failure (the session then
+    /// restarts, i.e. today's fresh-renderer behavior — never a wedge).
+    #[cfg(target_os = "macos")]
+    pub fn restore_gpu_payload(
+        &mut self,
+        payload: super::journal::GpuSnapshotPayload,
+        shm_region: &VirtioShmRegion,
+        mem: &GuestMemoryMmap,
+    ) -> bool {
+        use super::journal::GpuSnapshotPayload;
+        use std::collections::HashMap;
+
+        let GpuSnapshotPayload {
+            mut ops,
+            vkr_journals,
+            blob_contents,
+            memory_contents,
+            sync_states,
+            cursor,
+            classic_contents,
+            displays,
+            scanout_frames,
+            ext: _,
+        } = payload;
+
+        // The restored device was built with the default display configuration, but the guest
+        // driver is already running and re-probes the moment it resumes — so it must find the
+        // scanouts exactly as it left them (sizes, arrangement, EDID identity, connectedness).
+        // Anything else is a monitor change to the guest's compositor, which rescales and
+        // re-constrains every window before the host's own display push can land.
+        // RED lever for the L2 landmark gate (l2_desktop_restore_landmarks): with
+        // LIMINA_RESTORE_SKIP_DISPLAYS=1 the restored device keeps its DEFAULTS, which is the
+        // pre-fix behaviour — the guest re-probes onto virtio's 10" EDID, its compositor
+        // rescales, and every window is displaced. A test for a fixed bug is worth only as
+        // much as its ability to fail, and this is how that is demonstrated.
+        let skip_displays = std::env::var_os("LIMINA_RESTORE_SKIP_DISPLAYS").is_some();
+        if skip_displays {
+            warn!("gpu restore: LIMINA_RESTORE_SKIP_DISPLAYS set — leaving device defaults");
+        }
+        for (i, d) in displays.iter().enumerate() {
+            if skip_displays {
+                break;
+            }
+            match self.displays.get_mut(i) {
+                Some(slot) => *slot = d.clone(),
+                None => warn!("gpu restore: snapshot has display {i}, device has no such scanout"),
+            }
+        }
+
+        // The journal is the renderer's, and opaque here: we hold the bytes, hand them back at
+        // replay_begin, and say how far to get. Its format, its per-command classes and the
+        // routing of a ring-stream entry to its ring are all facts about a renderer this layer
+        // does not otherwise model, and the classic and venus journals do not even share a
+        // format. Parsing it here meant re-deciding all of that on every renderer change, and
+        // deciding it WRONG was indistinguishable from a stale reference (see the drop histogram
+        // this replaced: it sorted losses into classes libkrun was not positioned to judge).
+        let journaled: HashMap<u32, &[u8]> = vkr_journals
+            .iter()
+            .map(|(c, b)| (*c, b.as_slice()))
+            .collect();
+        let contents: HashMap<u32, &Vec<u8>> =
+            blob_contents.iter().map(|(id, b)| (*id, b)).collect();
+
+        // A structural rutabaga failure (context/blob/mapping) leaves guest-visible state
+        // missing and fails the replay. Journal drops are not that: the renderer absorbs and
+        // names each one itself, and reports the set at replay_end — so a fed call failing here
+        // means the feed could not run at all, never that an entry was lost.
+        let mut op_failed = 0u32;
+        // Advance ctx's journal to `fence` (u64::MAX = to the end). The renderer holds the
+        // cursor, because it holds the journal.
+        macro_rules! journal_upto {
+            ($ctx:expr, $fence:expr) => {
+                if journaled.contains_key(&$ctx)
+                    && !self
+                        .rutabaga
+                        .as_ref()
+                        .is_some_and(|r| r.limina_journal_replay_upto($ctx, $fence))
+                {
+                    error!(
+                        "gpu restore: journal_replay_upto ctx={} fence={} failed",
+                        $ctx, $fence
+                    );
+                    op_failed += 1;
+                }
+            };
+        }
+
+        for entry in &mut ops {
+            // GENERATION REBASE (the 2nd-resume disk of the journal): a CreateBlob's
+            // vkr_seq fence is meaningful only against the wire journal that recorded it.
+            // The fresh context re-records the replayed wire commands from seq 1, so the
+            // fence must be rewritten to the NEW journal's watermark at the exact point
+            // its old fence was satisfied — otherwise the next generation's merge is
+            // cross-epoch garbage (the first old fence, ~1M, drains the entire new wire
+            // journal, and every later import replays before its exporter blob exists:
+            // the observed fd_type=-999 cascade + KK descriptor assert). Set in the
+            // CreateBlob arm below; carrying it as a local keeps entry.op's borrow short.
+            let mut rebased_fence: Option<u64> = None;
+            match &entry.op {
+                GpuJournalOp::CtxCreate {
+                    ctx_id,
+                    context_init,
+                    name,
+                } => {
+                    if self
+                        .create_context(*ctx_id, *context_init, name.as_deref())
+                        .is_err()
+                    {
+                        error!("gpu restore: create_context {ctx_id} failed");
+                        return false;
+                    }
+                    // Only venus contexts (the ones with a wire journal) have vkr state to
+                    // replay into; the kernel's virgl/none context has nothing host-side.
+                    // The create is proxied to the (same-process) render-server thread and
+                    // applies asynchronously, so the vkr context may not exist yet — poll.
+                    // Each FFI call takes/releases the renderer lock, letting the server in.
+                    if let Some(bytes) = journaled.get(ctx_id) {
+                        let mut began = false;
+                        for _ in 0..2000 {
+                            if self
+                                .rutabaga
+                                .as_ref()
+                                .is_some_and(|r| r.limina_replay_begin(*ctx_id))
+                            {
+                                began = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        if !began {
+                            error!("gpu restore: replay_begin {ctx_id} failed (2s timeout)");
+                            return false;
+                        }
+                        // Hand the renderer its own journal back. It is stored, not replayed:
+                        // nothing is fed until a fence below says how far to go, because what
+                        // the entries name is created on THIS side as the loop walks on.
+                        if !self
+                            .rutabaga
+                            .as_ref()
+                            .is_some_and(|r| r.limina_journal_restore(*ctx_id, bytes))
+                        {
+                            error!(
+                                "gpu restore: journal_restore {ctx_id} refused ({} bytes)",
+                                bytes.len()
+                            );
+                            return false;
+                        }
+                    }
+                }
+                GpuJournalOp::CreateBlob {
+                    ctx_id,
+                    resource_id,
+                    blob_mem,
+                    blob_flags,
+                    blob_id,
+                    size,
+                    backing,
+                } => {
+                    journal_upto!(*ctx_id, entry.vkr_seq);
+                    debug!(
+                        "gpu restore: CREATE_BLOB res {resource_id} ctx {ctx_id} blob_id {blob_id} fence {}",
+                        entry.vkr_seq
+                    );
+                    let create = ResourceCreateBlob {
+                        blob_mem: *blob_mem,
+                        blob_flags: *blob_flags,
+                        blob_id: *blob_id,
+                        size: *size,
+                    };
+                    let vecs: Vec<(GuestAddress, usize)> = backing
+                        .iter()
+                        .map(|(a, l)| (GuestAddress(*a), *l))
+                        .collect();
+                    // Rebase the fence into the new journal's epoch (see the loop head):
+                    // journal_vkr_seq is the new journal's last-assigned seq — everything
+                    // this fence fed has just re-recorded, so this IS the old fence's
+                    // position translated. Journaled contexts only.
+                    if journaled.contains_key(ctx_id) {
+                        rebased_fence = Some(self.journal_vkr_seq(*ctx_id));
+                    }
+                    if self
+                        .resource_create_blob(*ctx_id, *resource_id, create, vecs, mem)
+                        .is_err()
+                    {
+                        error!("gpu restore: CREATE_BLOB res {resource_id} failed");
+                        op_failed += 1;
+                        continue;
+                    }
+                    if let Some(bytes) = contents.get(resource_id)
+                        && !self.blob_content_write(*resource_id, bytes)
+                    {
+                        warn!("gpu restore: content restore for blob {resource_id} failed");
+                    }
+                }
+                GpuJournalOp::MapBlob {
+                    resource_id,
+                    offset,
+                } => {
+                    if self
+                        .resource_map_blob(*resource_id, shm_region, *offset)
+                        .is_err()
+                    {
+                        error!("gpu restore: MAP_BLOB res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                // Attached even when the guest has since detached it: the replay needs it where
+                // the context used it. The detach is applied once the replay is done, below.
+                GpuJournalOp::CtxAttachResource {
+                    ctx_id,
+                    resource_id,
+                    ..
+                } => {
+                    if self.context_attach_resource(*ctx_id, *resource_id).is_err() {
+                        error!("gpu restore: ATTACH ctx {ctx_id} res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                GpuJournalOp::SetScanoutBlob {
+                    scanout_id,
+                    resource_id,
+                    width,
+                    height,
+                    format,
+                } => {
+                    if self
+                        .set_scanout_blob(*scanout_id, *resource_id, *width, *height, *format)
+                        .is_err()
+                    {
+                        warn!("gpu restore: SET_SCANOUT_BLOB scanout {scanout_id} failed");
+                    }
+                }
+                GpuJournalOp::ResourceCreate3d {
+                    resource_id,
+                    target,
+                    format,
+                    bind,
+                    width,
+                    height,
+                    depth,
+                    array_size,
+                    last_level,
+                    nr_samples,
+                    flags,
+                } => {
+                    let create = ResourceCreate3D {
+                        target: *target,
+                        format: *format,
+                        bind: *bind,
+                        width: *width,
+                        height: *height,
+                        depth: *depth,
+                        array_size: *array_size,
+                        last_level: *last_level,
+                        nr_samples: *nr_samples,
+                        flags: *flags,
+                    };
+                    if self.resource_create_3d(*resource_id, create).is_err() {
+                        error!("gpu restore: RESOURCE_CREATE_3D res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                GpuJournalOp::ResourceCreate2d {
+                    resource_id,
+                    format,
+                    width,
+                    height,
+                } => {
+                    if self
+                        .resource_create_2d(*resource_id, *format, *width, *height)
+                        .is_err()
+                    {
+                        error!("gpu restore: RESOURCE_CREATE_2D res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                GpuJournalOp::AttachBacking {
+                    resource_id,
+                    backing,
+                } => {
+                    let vecs: Vec<(GuestAddress, usize)> = backing
+                        .iter()
+                        .map(|(a, l)| (GuestAddress(*a), *l))
+                        .collect();
+                    if self.attach_backing(*resource_id, mem, vecs).is_err() {
+                        error!("gpu restore: ATTACH_BACKING res {resource_id} failed");
+                        op_failed += 1;
+                    }
+                }
+                // Classic scanouts apply in phase C — after the wire replay and the
+                // content transfers, so the first flip shows restored pixels.
+                GpuJournalOp::SetScanout { .. } => {}
+            }
+            if let Some(fence) = rebased_fence {
+                entry.vkr_seq = fence;
+            }
+        }
+
+        // Drain each context's remaining wire entries, restore its device-memory
+        // contents (the allocs exist now, and the rings — which consume parked
+        // commands the moment they start — haven't started yet), then start the
+        // rings. A failed content write is recoverable in the same sense as a journal
+        // entry the renderer could not rebuild: the memory whose alloc was dropped is
+        // garbage-if-accessed either way.
+        let ctxs: Vec<u32> = journaled.keys().copied().collect();
+        let mut content_failed = 0u32;
+        for ctx_id in ctxs {
+            journal_upto!(ctx_id, u64::MAX);
+            for (mem_ctx, mem_id, bytes) in &memory_contents {
+                if *mem_ctx != ctx_id {
+                    continue;
+                }
+                if !self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_memory_write(ctx_id, *mem_id, bytes))
+                {
+                    content_failed += 1;
+                    debug!(
+                        "gpu restore: content write failed for ctx {ctx_id} mem {mem_id} ({} bytes)",
+                        bytes.len()
+                    );
+                }
+            }
+            // P2.1: fast-forward the context's sync objects (fences, timeline +
+            // binary semaphores) to their retired pre-suspend state BEFORE the
+            // rings start — a started ring may immediately consume a guest wait
+            // rooted in the pre-suspend epoch (the mutter WSI-semaphore wedge).
+            if let Some((_, blob)) = sync_states.iter().find(|(c, _)| *c == ctx_id)
+                && !self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_sync_restore(ctx_id, blob))
+            {
+                warn!("gpu restore: sync fast-forward failed for ctx {ctx_id}");
+            }
+            // A dropped command is state the guest holds and the host lost: the restore fails
+            // here, rather than at the first frame that touches what was lost. The renderer has
+            // named each one in its log.
+            match self
+                .rutabaga
+                .as_ref()
+                .and_then(|r| r.limina_replay_end(ctx_id))
+            {
+                Some(0) => {}
+                Some(dropped) => {
+                    error!("gpu restore: ctx {ctx_id}: the replay dropped {dropped} commands");
+                    op_failed += 1;
+                }
+                None => {
+                    error!("gpu restore: replay_end {ctx_id} failed");
+                    op_failed += 1;
+                }
+            }
+        }
+        if content_failed > 0 {
+            warn!(
+                "gpu restore: {content_failed} of {} memory-content writes failed (allocs \
+                 whose replay was dropped — garbage-if-accessed before and after)",
+                memory_contents.len()
+            );
+        }
+
+        // Task #19 phase C (classic content + scanout): the wire replay above re-created the
+        // vrend object world; now put the classic pixels back (P2, below) and re-bind the
+        // classic scanouts.
+        //
+        // There used to be a guest-shadow re-upload here as well: a full-box transfer_write
+        // per backed classic resource, from the guest backing store in restored RAM. P2
+        // superseded it and it was doing harm on its own — the box comes from the resource's
+        // CREATE dimensions, so vrend refuses every resource whose backing does not span the
+        // whole surface (`resource_contains_box` / `check_iov_bounds`), 61-97 per restore on a
+        // poke VM and 244 on the dogfood Mac. Those refusals were counted as lost content,
+        // which is what the loss ledger is for, so a healthy restore reported hundreds of
+        // blank resources. Measured: P2 exports 194 resources and skips 0, restores 194 and
+        // drops 0, across 7 contexts — it is the account, and this loop was noise on top of it.
+        {
+            let mut p2_failures = 0u32;
+            // P2: the authoritative classic bytes, read back from the host GL objects at
+            // snapshot — including the textures whose only copy lived there (icon atlases,
+            // glyph caches, corner masks: the gray-blocks class). Runs BEFORE the scanout
+            // flips so the first presented frame composites from restored content.
+            for (ctx_id, blob) in &classic_contents {
+                if !self
+                    .rutabaga
+                    .as_ref()
+                    .is_some_and(|r| r.limina_classic_content_restore(*ctx_id, blob))
+                {
+                    p2_failures += 1;
+                    warn!(
+                        "gpu restore: classic content restore failed for ctx {ctx_id} ({} bytes)",
+                        blob.len()
+                    );
+                }
+            }
+            let mut flips = 0u32;
+            for e in &ops {
+                if let GpuJournalOp::SetScanout {
+                    scanout_id,
+                    resource_id,
+                    width,
+                    height,
+                } = &e.op
+                {
+                    if self
+                        .set_scanout(*scanout_id, *resource_id, *width, *height)
+                        .is_err()
+                    {
+                        warn!("gpu restore: SET_SCANOUT scanout {scanout_id} failed");
+                        continue;
+                    }
+                    // Re-BIND the scanout, but only PRESENT it when nothing better follows.
+                    // On a guest whose desktop is Vulkan, the last classic SET_SCANOUT in
+                    // the journal is the early-boot console: flushing it puts the boot text
+                    // on screen for the moment before the saved frame lands — the flash on
+                    // every resume. The saved frame is the better first picture wherever it
+                    // exists, so leave the presenting to it.
+                    let have_saved = scanout_frames.iter().any(|f| f.scanout_id == *scanout_id);
+                    if !have_saved {
+                        let _ = self.flush_resource(
+                            *resource_id,
+                            Rect {
+                                x: 0,
+                                y: 0,
+                                width: *width,
+                                height: *height,
+                            },
+                        );
+                    }
+                    flips += 1;
+                }
+            }
+            // v8: put the pre-suspend picture back on screen. The flips above re-bound the
+            // scanouts, but nothing has DRAWN into them — a Vulkan compositor's framebuffer
+            // content could not be captured, and the guest, tracking damage, has no reason to
+            // repaint a screen it believes is already correct. So the first frame the user
+            // sees comes from here or it does not come at all until something unrelated
+            // damages the screen. Runs after the flips so it lands in the configured buffer.
+            // RED lever: with LIMINA_RESTORE_SKIP_SCANOUT set, do not put the saved picture
+            // back. The screen then shows what the GUEST actually has after a restore, which
+            // is the only way to observe a client whose own buffers did not survive — the
+            // re-present is otherwise indistinguishable from a healthy restore, and any damage
+            // generated to look past it is also what repaints the client and heals it.
+            let skip_scanout = std::env::var_os("LIMINA_RESTORE_SKIP_SCANOUT").is_some();
+            if skip_scanout && !scanout_frames.is_empty() {
+                warn!(
+                    "gpu restore: LIMINA_RESTORE_SKIP_SCANOUT set — {} saved frame(s) NOT \
+                     re-presented",
+                    scanout_frames.len()
+                );
+            }
+            let mut restored_frames = 0u32;
+            for f in scanout_frames.iter().filter(|_| !skip_scanout) {
+                let expect = f.width as usize * 4 * f.height as usize;
+                if f.pixels.len() != expect {
+                    warn!(
+                        "gpu restore: scanout {} frame is {} bytes, expected {expect} — not \
+                         re-presenting it",
+                        f.scanout_id,
+                        f.pixels.len()
+                    );
+                    continue;
+                }
+                match self.display_backend.alloc_frame(f.scanout_id) {
+                    Ok((frame_id, buffer)) => {
+                        let n = buffer.len().min(f.pixels.len());
+                        buffer[..n].copy_from_slice(&f.pixels[..n]);
+                        info!(
+                            "gpu restore: scanout {} re-presenting {}x{}, {} non-zero byte(s) \
+                             into a {}-byte buffer",
+                            f.scanout_id,
+                            f.width,
+                            f.height,
+                            f.pixels.iter().filter(|b| **b != 0).count(),
+                            buffer.len()
+                        );
+                        if self
+                            .display_backend
+                            .present_frame(f.scanout_id, frame_id, None)
+                            .is_err()
+                        {
+                            warn!(
+                                "gpu restore: presenting the saved frame for scanout {} failed",
+                                f.scanout_id
+                            );
+                        } else {
+                            restored_frames += 1;
+                        }
+                    }
+                    Err(e) => warn!(
+                        "gpu restore: no frame buffer for scanout {}: {e:?} — the saved picture \
+                         cannot be put back",
+                        f.scanout_id
+                    ),
+                }
+            }
+            if restored_frames > 0 {
+                info!("gpu restore: re-presented {restored_frames} saved scanout frame(s)");
+            }
+
+            if p2_failures > 0 {
+                warn!(
+                    "gpu restore: classic content restore FAILED for {p2_failures} context(s) — \
+                     their resources come back with no content until something repaints them"
+                );
+            }
+            if flips > 0 || !classic_contents.is_empty() {
+                info!(
+                    "gpu restore: classic content restored ({} contexts, {p2_failures} failed), \
+                     {flips} scanout flips",
+                    classic_contents.len()
+                );
+            }
+        }
+
+        // The detaches the attach records carry, now that nothing is left to replay against
+        // them. A failure leaves the context able to reach one resource the guest had let go
+        // of, which it cannot name anyway.
+        for e in &ops {
+            if let GpuJournalOp::CtxAttachResource {
+                ctx_id,
+                resource_id,
+                detached: true,
+            } = &e.op
+                && self.context_detach_resource(*ctx_id, *resource_id).is_err()
+            {
+                warn!("gpu restore: DETACH ctx {ctx_id} res {resource_id} failed");
+            }
+        }
+
+        if op_failed > 0 {
+            error!("gpu restore: replay FAILED — {op_failed} structural failures");
+            return false;
+        }
+        // What the journal could not rebuild is named by the renderer at replay_end, in its own
+        // log and in its own vocabulary. Counting it a second time here, in classes this layer
+        // guesses at, is how a recorder gap came to read as a benign stale reference.
+        info!("gpu restore: replay complete (session state re-created)");
+        // The re-created world is the payload's world (minus dropped stale writes); adopt
+        // its journal so the next suspend records from a warm, accurate baseline.
+        self.journal.restore_entries(ops);
+        // P3: re-apply the captured cursor overlay — the restored guest believes its cursor
+        // is set and won't re-send UPDATE_CURSOR until it next changes. Cosmetic: failures
+        // (or a backend without cursor support) degrade to the default cursor, never an error.
+        if let Some(c) = cursor {
+            match ResourceFormat::try_from(c.format) {
+                Ok(format) => {
+                    let _ = self.display_backend.set_cursor(
+                        c.scanout_id,
+                        c.width,
+                        c.height,
+                        c.hot_x,
+                        c.hot_y,
+                        format,
+                        &c.pixels,
+                    );
+                    let _ = self.display_backend.move_cursor(c.scanout_id, c.x, c.y);
+                    info!(
+                        "gpu restore: cursor overlay re-applied ({}x{} at {},{})",
+                        c.width, c.height, c.x, c.y
+                    );
+                    self.cursor_state = Some(c);
+                }
+                Err(()) => warn!(
+                    "gpu restore: captured cursor has unknown format {}; skipped",
+                    c.format
+                ),
+            }
+        }
+        true
+    }
+
+    /// limina M9.3: dump the renderer's live context table (serviced on the worker
+    /// thread, the only thread allowed to call into the renderer singleton).
+    pub fn dump_renderer_state(&self) {
+        match self.rutabaga.as_ref() {
+            Some(rutabaga) => rutabaga.limina_dump_state(),
+            None => warn!("[GPUTRACE] renderer state dump requested, but no renderer is live"),
+        }
+    }
+
+    /// limina (renderer-singleton fix): reset the per-VM-session bookkeeping on a device reset,
+    /// while **keeping** the process-global renderer (`rutabaga`), the display backend, and the
+    /// present-fence infrastructure alive. The guest re-initializes virtio-gpu from scratch
+    /// (driver rebind, EFI→kernel hand-off, reboot), so our resource/scanout maps must start
+    /// empty; critically, any in-flight fence descriptors index into the now-freed control
+    /// queue and MUST NOT be retired into the next activation's queue. (Resources the guest
+    /// owned in the renderer are released by its own CTX_DESTROY/RESOURCE_UNREF before the
+    /// reset; a guest that resets dirty is a separate, narrower concern.)
+    pub fn reset_session(&mut self) {
+        self.resources.clear();
+        self.sw2d.clear();
+        self.scanouts = Default::default();
+        // Dirty-reset hardening: a guest that crashed (or a firmware→kernel hand-off) never sent
+        // CTX_DESTROY/RESOURCE_UNREF, so its contexts/resources survive in the process-global
+        // renderer and collide with the re-initialized guest's reused ids — InvalidContextId /
+        // InvalidResourceId, which cascade-crashes the recovering session's GPU clients. Drop that
+        // leaked per-session renderer state so the next session starts clean. (A *clean* reset
+        // already emptied these via the guest's own teardown, so this is a no-op there.)
+        if let Some(rutabaga) = self.rutabaga.as_mut() {
+            rutabaga.reset_session_state();
+        }
+        // The re-creation journal describes the session state just dropped; clear it so the
+        // next session's recording (or a pending snapshot replay) starts from empty.
+        self.journal.reset();
+        // The cursor belonged to the dropped session; the re-initialized guest re-sets it.
+        self.cursor_state = None;
+        // The dropped session's contexts are gone; Global-ring fence routing returns to
+        // the sync mark until the next session creates a vrend context.
+        self.vrend_ctx_seen = false;
+        // The ledger's live ids belonged to the dropped session; the running totals stay so a
+        // reboot mid-investigation doesn't hide what came before.
+        self.scanout_ledger.live.clear();
+        // The next session may run another kernel; its first flushes report afresh.
+        self.held_scanouts = ScanoutHolds::default();
+        self.scanout_copies = ScanoutCopies::default();
+        {
+            let mut fs = self.fence_state.lock().unwrap();
+            fs.descs.clear();
+            fs.completed_fences.clear();
+            fs.signalled.clear();
+        }
+        if let Some(pf) = self.present_fence.as_mut() {
+            // Drop parked frames and held flush fences: their cookies/descriptors belong to the
+            // freed queue. Keep the retired/event/latch/ack plumbing (tied to the renderer).
+            pf.parked.clear();
+            pf.flush_parked_cookies.clear();
+            pf.guest_holds.clear();
+            pf.awaiting_shown.clear();
+            pf.retired.lock().unwrap().clear();
+        }
+    }
+
+    /// limina (host-sleep s2idle): whether the present-fence plumbing holds NOTHING that
+    /// references the current activation's queue — no parked flushes, held guest flush
+    /// fences, or completed-but-unretired presents. Together with an empty fence ledger
+    /// this makes the session safe to PARK across a device reset instead of wiping it
+    /// (see the worker's defer-and-classify path); anything pending here indexes the
+    /// about-to-be-freed queue and forces the fail-closed wipe. Stranded forward-looking
+    /// bookkeeping does NOT count — see `PresentFenceState::quiescent` — but must be
+    /// discarded before parking (`discard_stale_present_bookkeeping`).
+    pub fn present_quiescent(&self) -> bool {
+        match self.present_fence.as_ref() {
+            Some(pf) => pf.quiescent(),
+            None => true,
+        }
+    }
+
+    /// Drop bookkeeping stranded by a device reset (stale flush-parked cookies and
+    /// awaiting-shown entries); returns how many of each were dropped. Call when
+    /// parking a quiescent session so the stale state can't leak into the next
+    /// activation. See `PresentFenceState::take_stale_bookkeeping`.
+    pub fn discard_stale_present_bookkeeping(&mut self) -> (usize, usize) {
+        match self.present_fence.as_mut() {
+            Some(pf) => pf.take_stale_bookkeeping(),
+            None => (0, 0),
+        }
+    }
+
+    /// What the present-fence plumbing still holds, for the defer-and-classify WARN —
+    /// the couve 2026-07-30 wipe logged "NOT quiescent (0 outstanding fence(s): 0)",
+    /// which read as a contradiction because only the FENCE half was summarized; the
+    /// non-quiescent half (this one) was invisible.
+    pub fn present_pending_summary(&self) -> String {
+        let Some(pf) = self.present_fence.as_ref() else {
+            return "present: none".to_string();
+        };
+        format!(
+            "present: {} parked, {} parked-flush-cookies, {} guest-holds, \
+             {} awaiting-shown, {} retired-unprocessed",
+            pf.parked.len(),
+            pf.flush_parked_cookies.len(),
+            pf.guest_holds.len(),
+            pf.awaiting_shown.len(),
+            pf.retired.lock().unwrap().len(),
+        )
     }
 
     // Non-public function -- no doc comment needed!
     fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
-        match self.rutabaga.resource3d_info(resource_id) {
+        let Some(rutabaga) = self.rutabaga.as_ref() else {
+            return OkNoData;
+        };
+        match rutabaga.query(resource_id) {
             Ok(query) => {
                 let mut plane_info = Vec::with_capacity(4);
                 for plane_index in 0..4 {
@@ -415,7 +2346,45 @@ impl VirtioGpu {
     }
 
     pub fn force_ctx_0(&self) {
-        self.rutabaga.force_ctx_0()
+        // Called for every command; a no-op in software-2D-only mode (no rutabaga).
+        if let Some(rutabaga) = self.rutabaga.as_ref() {
+            rutabaga.force_ctx_0()
+        }
+    }
+
+    /// Creates a software 2D resource (limina patch) — see [`Sw2dResource`]. Unlike the
+    /// stock path (which maps CREATE_2D onto a virgl GL render target and fails on a
+    /// GL-less host such as macOS), this allocates a host CPU buffer and never touches
+    /// rutabaga. The matching metadata entry in `resources` carries the format/scanout
+    /// bookkeeping that `set_scanout`/`flush_resource`/`unref_resource` rely on.
+    pub fn resource_create_2d(
+        &mut self,
+        resource_id: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+    ) -> VirtioGpuResult {
+        let format = ResourceFormat::try_from(format).map_err(|()| {
+            warn!("resource_create_2d: unsupported format {format} for resource {resource_id}");
+            ErrUnspec
+        })?;
+        let len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(ResourceFormat::BYTES_PER_PIXEL))
+            .ok_or(ErrUnspec)?;
+
+        self.sw2d.insert(
+            resource_id,
+            Sw2dResource {
+                host: vec![0u8; len],
+                backing: Vec::new(),
+            },
+        );
+        self.resources.insert(
+            resource_id,
+            VirtioGpuResource::new(resource_id, width, height, Some(format), 0),
+        );
+        Ok(OkNoData)
     }
 
     /// Creates a 3D resource with the given properties and resource_id.
@@ -425,6 +2394,8 @@ impl VirtioGpu {
         resource_create_3d: ResourceCreate3D,
     ) -> VirtioGpuResult {
         self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
             .resource_create_3d(resource_id, resource_create_3d)?;
 
         let format = ResourceFormat::try_from(resource_create_3d.format).ok();
@@ -448,8 +2419,39 @@ impl VirtioGpu {
         Ok(self.result_from_query(resource_id))
     }
 
+    /// limina tier-2 (macOS): remember the IOSurface id we are handing to the display backend for
+    /// `resource_id`, so RESOURCE_UNREF can release exactly what was published (see
+    /// [`VirtioGpuResource::published_iosurface_id`]). Releases any id this displaces: a guest
+    /// that re-scans-out the same resource onto a new surface owes the receiver a release for the
+    /// old one, or it holds that framebuffer until its store cap pushes it out.
+    #[cfg(target_os = "macos")]
+    fn note_published(&mut self, resource_id: u32, iosurface_id: Option<u32>) {
+        let Some(resource) = self.resources.get_mut(&resource_id) else {
+            return;
+        };
+        let previous = resource.published_iosurface_id;
+        if previous == iosurface_id {
+            return;
+        }
+        resource.published_iosurface_id = iosurface_id;
+        if let Some(old) = previous {
+            let _ = self.display_backend.release_surface(old);
+        }
+    }
+
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
+        // A backend that handed this surface to another process has no other way to learn it is
+        // finished with, and on macOS the storage bills to the task that created it, so the
+        // holder feels no pressure of its own to let go.
+        //
+        // We release what we PUBLISHED for this resource, not whatever backs it now: a release
+        // undoes a publish. Asking the renderer here reads the wrong thing in both directions --
+        // venus frees a scanout image's surface before the guest unrefs the resource, so the
+        // answer is either 0 (and the receiver keeps a framebuffer nobody will ever free) or an
+        // id that has since been recycled to someone else's surface (and we free THEIRS, which
+        // no one can undo: these surfaces are non-global, so only their creator can hand one
+        // over again). A resource we never published for releases nothing at all.
         let resource = self
             .resources
             .remove(&resource_id)
@@ -460,14 +2462,35 @@ impl VirtioGpu {
                 "The driver requested unref_resource, but resource {resource_id} has \
                      associated scanouts, refusing to delete the resource."
             );
+            self.scanout_ledger.unref(resource_id, true);
             return Err(ErrUnspec);
+        }
+        self.scanout_ledger.unref(resource_id, false);
+
+        // Must precede the rutabaga unref below, which is what drops the last host reference: an
+        // IOSurface id is reusable the moment its surface dies, so a release sent afterwards
+        // could name a surface that already belongs to someone else.
+        #[cfg(target_os = "macos")]
+        if let Some(id) = resource.published_iosurface_id {
+            let _ = self.display_backend.release_surface(id);
+        }
+
+        // limina software 2D resources have no rutabaga state.
+        if self.sw2d.remove(&resource_id).is_some() {
+            return Ok(OkNoData);
         }
 
         if resource.rutabaga_external_mapping {
-            self.rutabaga.unmap(resource_id)?;
+            self.rutabaga
+                .as_mut()
+                .ok_or(ErrUnspec)?
+                .unmap(resource_id)?;
         }
 
-        self.rutabaga.unref_resource(resource_id)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .unref_resource(resource_id)?;
         Ok(OkNoData)
     }
 
@@ -502,12 +2525,10 @@ impl VirtioGpu {
             return Ok(OkNoData);
         }
 
-        // Enable the scanout
         let resource = self
             .resources
-            .get_mut(&resource_id)
+            .get(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
-        resource.scanouts.enable(scanout_id);
 
         let Some(format) = resource.format else {
             warn!("Cannot use resource {resource_id} with unknown format for scanout");
@@ -528,38 +2549,219 @@ impl VirtioGpu {
             format,
         )?;
 
-        *scanout = Some(VirtioGpuScanout { resource_id });
+        // Only now does the resource own the scanout. Marking it before the backend accepts
+        // strands the resource on any failure above: unref_resource refuses a resource with
+        // associated scanouts, and nothing ever disables one the backend never configured.
+        self.resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?
+            .scanouts
+            .enable(scanout_id);
+
+        // limina vrend zero-copy scanout (docs/design/vrend-iosurface-scanout.md): a plain
+        // SET_SCANOUT resource may be IOSurface-backed too (vrend allocates the surface for
+        // SCANOUT-bound textures at create). Resolve exactly like set_scanout_blob; None
+        // keeps the readback path — a stock guest with an ineligible format loses nothing.
+        #[cfg(target_os = "macos")]
+        let iosurface_id = self
+            .rutabaga
+            .as_ref()
+            .and_then(|r| r.iosurface_id(resource_id).ok())
+            .filter(|&id| id != 0);
+        #[cfg(target_os = "macos")]
+        if let Some(id) = iosurface_id {
+            log::debug!(
+                "SET_SCANOUT scanout={scanout_id} res={resource_id} -> IOSurface {id} (vrend zero-copy)"
+            );
+        }
+
+        // Carried across the re-declaration, not reset by it: SET_SCANOUT arrives once per
+        // page-flip, so a counter rebuilt here would read zero forever no matter how often the
+        // zero-copy path failed.
+        #[cfg(target_os = "macos")]
+        let (sync_failures, on_readback_fallback) = scanout
+            .as_ref()
+            .map_or((0, false), |s| (s.sync_failures, s.on_readback_fallback));
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+            #[cfg(target_os = "macos")]
+            iosurface_id,
+            #[cfg(target_os = "macos")]
+            sync_failures,
+            #[cfg(target_os = "macos")]
+            on_readback_fallback,
+        });
+        self.scanout_ledger.bind(resource_id);
+        // After the scanout borrow ends: this needs `self` to release a displaced id.
+        #[cfg(target_os = "macos")]
+        self.note_published(resource_id, iosurface_id);
+        Ok(OkNoData)
+    }
+
+    /// limina tier-2: VIRTIO_GPU_CMD_SET_SCANOUT_BLOB. The guest (mutter on venus) scans out a
+    /// blob resource that is its KMS framebuffer; on macOS that blob's bound VkImage is backed
+    /// by a global IOSurface (vkr fix A + the bind linkage), which we present zero-copy.
+    ///
+    /// Mirrors `set_scanout`, but the format/size come from the command (a blob has no 2D
+    /// format of its own) and we resolve + remember the resource's IOSurface id so
+    /// `flush_resource` can `present_surface` it without a readback. If the resource is not
+    /// IOSurface-backed (e.g. a stock guest), `iosurface_id` stays `None` and flush falls back
+    /// to the readback path.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_scanout_blob(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> VirtioGpuResult {
+        let scanout = self
+            .scanouts
+            .get_mut(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        // Disable this scanout for any resource currently bound to it.
+        if let Some(prev) = scanout.as_ref().map(|s| s.resource_id)
+            && let Some(resource) = self.resources.get_mut(&prev)
+        {
+            resource.scanouts.disable(scanout_id);
+        }
+
+        // resource_id == 0 disables the scanout (virtio spec).
+        if resource_id == 0 {
+            debug!("Disabling scanout {scanout_id:?} (blob)");
+            *scanout = None;
+            self.display_backend.disable_scanout(scanout_id)?;
+            return Ok(OkNoData);
+        }
+
+        if !self.resources.contains_key(&resource_id) {
+            return Err(ErrInvalidResourceId);
+        }
+
+        let res_format = ResourceFormat::try_from(format).unwrap_or(ResourceFormat::BGRA);
+
+        let display_info = self
+            .displays
+            .get(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        self.display_backend.configure_scanout(
+            scanout_id,
+            display_info.width,
+            display_info.height,
+            width,
+            height,
+            res_format,
+        )?;
+
+        // Take the resource only once the backend has accepted the scanout — see set_scanout.
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.scanouts.enable(scanout_id);
+        resource.width = width;
+        resource.height = height;
+        resource.format = Some(res_format);
+
+        // Resolve the resource to its backing IOSurface (0/err -> not IOSurface-backed).
+        let iosurface_id = self
+            .rutabaga
+            .as_ref()
+            .and_then(|r| r.iosurface_id(resource_id).ok())
+            .filter(|&id| id != 0);
+        if let Some(id) = iosurface_id {
+            // Per-flip (mutter alternates swapchain buffers every frame) — debug, not info.
+            log::debug!(
+                "SET_SCANOUT_BLOB scanout={scanout_id} res={resource_id} -> IOSurface {id} (zero-copy)"
+            );
+        } else {
+            log::warn!(
+                "SET_SCANOUT_BLOB scanout={scanout_id} res={resource_id} not IOSurface-backed; using readback"
+            );
+        }
+
+        // See the counterpart in `set_scanout`: carried across, because this runs per flip.
+        let (sync_failures, on_readback_fallback) = scanout
+            .as_ref()
+            .map_or((0, false), |s| (s.sync_failures, s.on_readback_fallback));
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+            iosurface_id,
+            sync_failures,
+            on_readback_fallback,
+        });
+        self.scanout_ledger.bind(resource_id);
+        // After the scanout borrow ends: this needs `self` to release a displaced id.
+        self.note_published(resource_id, iosurface_id);
         Ok(OkNoData)
     }
 
     fn read_2d_resource(
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
+        width: u32,
+        height: u32,
         output: &mut [u8],
     ) -> VirtioGpuResult {
+        // limina: read the top-left `width`×`height` rect (the scanout's visible region) into a
+        // TIGHTLY packed `width*4`-stride output — the host staging buffer. The backing resource
+        // may be wider (mutter pads its framebuffer), but the box read extracts just the rect, so
+        // the output never shears regardless of the resource's own stride.
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: resource.width,
-            h: resource.height,
+            w: width,
+            h: height,
             d: 1,
             level: 0,
-            stride: resource.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: width * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
 
-        rutabaga
-            .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+        if let Err(e) =
+            rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
+        {
+            // A blob / 3D (Venus) scanout resource has no 2D readback path -> EINVAL.
+            // Never panic the GPU worker (that wedges the whole guest); report the failure
+            // so the caller logs it and returns an error response for the flush.
+            log::warn!(
+                "transfer_read failed for scanout resource {} (blob/3D, no 2D readback): {e}",
+                resource.id
+            );
+            return Err(ErrUnspec);
+        }
 
         Ok(OkNoData)
     }
 
     /// If the resource is the scanout resource, flush it to the display.
     pub fn flush_resource(&mut self, resource_id: u32, rect: Rect) -> VirtioGpuResult {
+        // limina (#8 half 2): the parked-cookie list is per flush command — it feeds the
+        // flush's own trailing FLAG_FENCE and must never leak into a later command.
+        let unfenced: Vec<u32> = self
+            .present_fence
+            .as_mut()
+            .map(|pf| pf.flush_parked_cookies.drain(..).map(|(_, s)| s).collect())
+            .unwrap_or_default();
+        if !unfenced.is_empty() {
+            self.present_order.unfenced_flush();
+            for scanout_id in unfenced {
+                self.scanout_copies.fenced.insert(scanout_id, false);
+                // A copy on glass is out of the guest's reach, fence or not.
+                let held = self.scanout_copies.copying(scanout_id);
+                self.note_scanout_held(scanout_id, held);
+            }
+        }
         if resource_id == 0 {
             return Ok(OkNoData);
         }
@@ -570,42 +2772,971 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            // limina tier-2: an IOSurface-backed SET_SCANOUT_BLOB scanout is presented zero-copy
+            // (venus already rendered into the IOSurface) — no alloc_frame, no readback.
+            #[cfg(target_os = "macos")]
+            if log::log_enabled!(log::Level::Debug) {
+                let dbg_ios = self
+                    .scanouts
+                    .get(scanout_id as usize)
+                    .and_then(|s| s.as_ref())
+                    .and_then(|s| s.iosurface_id);
+                log::debug!(
+                    "[FLUSHDBG] flush res={resource_id} scanout={scanout_id} iosurface_id={dbg_ios:?}"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(iosurface_id) = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .and_then(|s| s.iosurface_id)
+            {
+                // limina vrend zero-copy scanout: non-blob (ctx_id == 0) scanouts are vrend
+                // textures. Their renders still have to complete before the surface is
+                // presented; what differs from a venus blob is only that the resource itself
+                // names no context to fence. On failure (vrend poisons the surface and keeps
+                // the resource alive) clear the cached id and take the readback path from now on.
+                if resource.ctx_id == 0 {
+                    // The same wait, off this thread, when the renderer can name one context
+                    // whose completion the contents depend on. `sync_iosurface` below blocks the
+                    // thread that services virtio-gpu for every guest context, so one surface's
+                    // GPU completion stalls all of them -- measured at about 12.6 ms per present,
+                    // 30-60 times a second, and 55% of that thread under a frame-paced workload.
+                    //
+                    // Refusing to park is not a failure: it says this present cannot be
+                    // answered by a single fence (no surface, nothing attached, or several
+                    // contexts attached, any of which would have the frame presented while
+                    // someone's renders were still outstanding), so the blocking path is correct
+                    // for it and is what runs. Which context to fence is the renderer's to
+                    // decide, from what the guest attached the resource to; asking first and
+                    // passing the answer back would be the same question answered twice.
+                    let seq = self.present_order.stamp();
+                    if self.try_park_present(
+                        scanout_id,
+                        iosurface_id,
+                        resource_id,
+                        &rect,
+                        seq,
+                        false,
+                    ) {
+                        continue;
+                    }
+                    self.note_overtake(scanout_id, "parking refused");
+                    // Presented at once, so no hold can form on this flush.
+                    self.scanout_copies.copying.insert(scanout_id, false);
+                    self.note_scanout_held(scanout_id, false);
+                    if let Err(e) = self
+                        .rutabaga
+                        .as_ref()
+                        .ok_or(ErrUnspec)
+                        .and_then(|r| r.sync_iosurface(resource_id).map_err(|_| ErrUnspec))
+                    {
+                        if let Some(Some(s)) = self.scanouts.get_mut(scanout_id as usize) {
+                            s.iosurface_id = None;
+                            s.sync_failures += 1;
+                            // Only the transition is logged. The next SET_SCANOUT re-arms
+                            // `iosurface_id`, and SET_SCANOUT arrives per page-flip, so a failure
+                            // that persists would otherwise warn at 60 Hz and bury every other
+                            // line in the log.
+                            if !s.on_readback_fallback {
+                                s.on_readback_fallback = true;
+                                log::warn!(
+                                    "vrend iosurface sync failed for res {resource_id} ({e:?}); \
+                                     scanout {scanout_id} is now on the readback fallback \
+                                     (failure {} on this scanout)",
+                                    s.sync_failures
+                                );
+                            }
+                        }
+                        // fall through to the readback path below
+                    } else {
+                        // The other transition: a scanout that was on the fallback and is now
+                        // syncing again. Without it the log says how a scanout got into the
+                        // fallback and never that it left, which reads as still-broken.
+                        if let Some(Some(s)) = self.scanouts.get_mut(scanout_id as usize)
+                            && s.on_readback_fallback
+                        {
+                            s.on_readback_fallback = false;
+                            log::warn!(
+                                "vrend iosurface sync recovered for res {resource_id}; scanout \
+                                 {scanout_id} is back on zero-copy after {} failure(s)",
+                                s.sync_failures
+                            );
+                        }
+                        self.name_frame_resource(scanout_id, resource_id);
+                        match self.display_backend.present_surface(
+                            scanout_id,
+                            iosurface_id,
+                            Some(&rect),
+                        ) {
+                            Ok(()) => {
+                                self.scanout_ledger.present();
+                                self.present_order
+                                    .shown(scanout_id, seq, iosurface_id, "at once");
+                                continue;
+                            }
+                            Err(DisplayBackendError::MethodNotSupported) => {}
+                            Err(e) => {
+                                log::error!("present_surface failed for scanout {scanout_id}: {e}");
+                                return Err(ErrUnspec);
+                            }
+                        }
+                    }
+                } else {
+                    // limina (#8): fence-accurate present — park the frame and inject a
+                    // present fence on the rendering context; the worker presents when it
+                    // retires (true GPU completion). Falls through to the immediate
+                    // present if parking isn't possible.
+                    let seq = self.present_order.stamp();
+                    let copy = self.scanout_copies.wanted(scanout_id);
+                    if self.try_park_present(
+                        scanout_id,
+                        iosurface_id,
+                        resource_id,
+                        &rect,
+                        seq,
+                        copy,
+                    ) {
+                        continue;
+                    }
+                    self.note_overtake(scanout_id, "parking refused");
+                    self.scanout_copies.copying.insert(scanout_id, false);
+                    self.note_scanout_held(scanout_id, false);
+                    self.name_frame_resource(scanout_id, resource_id);
+                    match self.display_backend.present_surface(
+                        scanout_id,
+                        iosurface_id,
+                        Some(&rect),
+                    ) {
+                        Ok(()) => {
+                            self.scanout_ledger.present();
+                            self.present_order
+                                .shown(scanout_id, seq, iosurface_id, "at once");
+                            continue;
+                        }
+                        Err(DisplayBackendError::MethodNotSupported) => {
+                            // Backend has no zero-copy path (e.g. headless capture); fall through
+                            // to the readback path below.
+                        }
+                        Err(e) => {
+                            log::error!("present_surface failed for scanout {scanout_id}: {e}");
+                            return Err(ErrUnspec);
+                        }
+                    }
+                }
+            }
+
+            // limina: the scanout's visible rect = the staging-buffer size (`configure_scanout`
+            // was called with it). The backing resource may be LARGER — mutter pads its
+            // framebuffer (e.g. a 1000×708 mode backed by a 1024×768 resource) — so we must
+            // extract this rect at the resource's own stride. A flat copy shears every row by
+            // (resource.width − scan_w) px. Falls back to the resource dims if unknown.
+            let (scan_w, scan_h) = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .map(|s| (s.width, s.height))
+                .filter(|&(w, h)| w != 0 && h != 0)
+                .unwrap_or((resource.width, resource.height));
+            let bpp = ResourceFormat::BYTES_PER_PIXEL;
+            let dst_stride = scan_w as usize * bpp;
+            let src_stride = resource.width as usize * bpp;
+
+            // limina: an IOSurface-backed (venus zero-copy) scanout whose present_surface fell
+            // through to readback — i.e. a display sink with no zero-copy path, the headless
+            // capture sink. venus blobs have no CPU transfer_read, so read the presented
+            // IOSurface's shared storage directly instead of read_2d_resource (which EINVALs).
+            #[cfg(target_os = "macos")]
+            let scan_iosurface_id = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .and_then(|s| s.iosurface_id);
+            #[cfg(not(target_os = "macos"))]
+            let scan_iosurface_id: Option<u32> = None;
+
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
-                log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
+            // limina software 2D: the pixels already live in the host buffer; copy them out.
+            // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
+            if let Some(sw) = self.sw2d.get(&resource_id) {
+                blit_scanout_rect(buffer, dst_stride, &sw.host, src_stride, scan_h as usize);
+            } else if let Some(iosurface_id) = scan_iosurface_id {
+                match self.rutabaga.as_ref() {
+                    Some(rutabaga) => {
+                        if let Err(e) =
+                            rutabaga.read_iosurface(resource_id, buffer, dst_stride as u32, scan_h)
+                        {
+                            log::error!(
+                                "Failed to read IOSurface {iosurface_id} for scanout {scanout_id} (res {resource_id}): {e}"
+                            );
+                            return Err(ErrUnspec);
+                        }
+                    }
+                    None => return Err(ErrUnspec),
+                }
+            } else if let Some(rutabaga) = self.rutabaga.as_mut() {
+                // limina DIAG (flicker hunt): tunable pre-readback delay. `echo N >
+                // /tmp/limina-readback-delay` sleeps N ms before transfer_read, giving the
+                // host GPU time to finish rendering this buffer. If the incomplete-frame
+                // rate collapses with N>0, the flicker is a readback-vs-render race (the
+                // readback path lacks the #8 fence-accurate present the zero-copy path has).
+                if let Ok(s) = std::fs::read_to_string("/tmp/limina-readback-delay")
+                    && let Ok(ms) = s.trim().parse::<u64>()
+                    && ms > 0
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                if let Err(e) = Self::read_2d_resource(rutabaga, resource, scan_w, scan_h, buffer) {
+                    log::error!(
+                        "Failed to read resource {resource_id} for scanout {scanout_id}: {e}"
+                    );
+                    return Err(ErrUnspec);
+                }
+            } else {
+                // No software-2D buffer and no renderer: nothing to present.
                 return Err(ErrUnspec);
             }
+            // limina DIAG (flicker hunt): characterise every readback present. Pins whether the
+            // flicker is multi-buffer divergence (resource_id cycles, hash differs per buffer),
+            // a large damage rect overwriting good canvas, or a stride mismatch (dims != scanout).
+            // FNV-1a over a sparse sample of the staging readback — cheap, but reveals content
+            // oscillation: same res with two alternating hashes = the guest re-renders it stale.
+            {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                let n = buffer.len();
+                let mut i = 0usize;
+                while i < n {
+                    h = (h ^ buffer[i] as u64).wrapping_mul(0x0100_0000_01b3);
+                    i += 1021;
+                }
+                log::trace!(
+                    "[FLUSH2] res={resource_id} scan={scanout_id} rect=({},{},{},{}) dims={}x{} hash={h:016x}",
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    resource.width,
+                    resource.height
+                );
+            }
+            // limina DIAG (`touch /tmp/limina-dump-staging`): dump the RAW readback (staging,
+            // BGRA, full frame) BEFORE any swizzle/canvas/ring, so we can run the duplicate-row
+            // detector directly on it. Answers: is the tear already in the readback (guest
+            // delivered a torn buffer) or introduced downstream (host present path)?
+            if resource.width == 1280
+                && resource.height == 800
+                && std::fs::metadata("/tmp/limina-dump-staging").is_ok()
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SEQ: AtomicU32 = AtomicU32::new(0);
+                let n = SEQ.fetch_add(1, Ordering::Relaxed);
+                if n < 80 {
+                    let _ = std::fs::write(format!("/tmp/limina-staging-{n:03}.raw"), &buffer[..]);
+                }
+            }
+            self.name_frame_resource(scanout_id, resource_id);
             self.display_backend
                 .present_frame(scanout_id, frame_id, Some(&rect))?
         }
 
         #[cfg(windows)]
-        match self.rutabaga.resource_flush(resource_id) {
-            Ok(_) => return Ok(OkNoData),
-            Err(RutabagaError::Unsupported) => {}
-            Err(e) => return Err(ErrRutabaga(e)),
+        if let Some(rutabaga) = self.rutabaga.as_mut() {
+            match rutabaga.resource_flush(resource_id) {
+                Ok(_) => return Ok(OkNoData),
+                Err(RutabagaError::Unsupported) => {}
+                Err(e) => return Err(ErrRutabaga(e)),
+            }
         }
 
         Ok(OkNoData)
     }
 
+    /// limina (#8): the fence-present policy, pure for testability.
+    ///
+    /// Explicit env wins: `LIMINA_FENCE_PRESENT=0`/`off` forces off, any other value
+    /// forces on. Unset defaults to **on exactly when the supervisor's shown-ack
+    /// channel exists** (`LIMINA_SHOWN_ACK_FD`, set only by windowed workers): the ack
+    /// path is what keeps held flush fences at display rate — without it the open-loop
+    /// latch delay serializes compositors, and on ack-less sinks (headless capture) a
+    /// parked frame's deferred `present_surface` is unsupported and would drop frames.
+    fn fence_present_policy(env: Option<&str>, ack_channel: bool) -> bool {
+        match env {
+            Some(v) => !(v == "0" || v.eq_ignore_ascii_case("off")),
+            None => ack_channel,
+        }
+    }
+
+    /// limina (#8): true when fence-accurate presents are armed. The policy decision is
+    /// cached (per-flush getenv serialized the draw path once before — round 24), and
+    /// the live force-OFF marker (`touch /tmp/disable-limina-fence-present` → immediate
+    /// presents, `rm` → parked again; mid-flight parked frames retire normally either
+    /// way) is polled by a dedicated thread every 500 ms into an atomic — NEVER stat'ed
+    /// on the flush path itself: a synchronous /tmp I/O there is a present-path stall
+    /// source of exactly the hard-to-attribute kind the present-miss work chases. The
+    /// flush path pays one relaxed load; the poller (windowed runs only) costs 2
+    /// wakes/s. Replaces the pre-default-on force-ON marker of the 0017 era.
+    /// Whether transport surfaces are presented as copies (`try_park_present`). On unless
+    /// `LIMINA_TRANSPORT_COPY=0`, which presents the guest's own surface and holds a fenced flush
+    /// until the display has let go of it.
+    fn transport_copy_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("LIMINA_TRANSPORT_COPY").map_or(true, |v| v != "0");
+            if !on {
+                info!("virtio-gpu: LIMINA_TRANSPORT_COPY=0: transport surfaces go up uncopied");
+            }
+            on
+        })
+    }
+
+    fn fence_present_enabled() -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static FORCE_OFF: AtomicBool = AtomicBool::new(false);
+        static POLLER: std::sync::Once = std::sync::Once::new();
+        let on = *POLICY.get_or_init(|| {
+            Self::fence_present_policy(
+                std::env::var("LIMINA_FENCE_PRESENT").ok().as_deref(),
+                std::env::var_os("LIMINA_SHOWN_ACK_FD").is_some(),
+            )
+        });
+        if !on {
+            return false;
+        }
+        POLLER.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("gpu fence-toggle".into())
+                .spawn(|| {
+                    loop {
+                        FORCE_OFF.store(
+                            std::fs::metadata("/tmp/disable-limina-fence-present").is_ok(),
+                            Ordering::Relaxed,
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                });
+        });
+        !FORCE_OFF.load(Ordering::Relaxed)
+    }
+
+    /// limina (#8): park a zero-copy scanout flush and inject a present fence on the
+    /// rendering context's reserved ring. Returns false when the frame must be
+    /// presented immediately instead (knob off, no renderer, unknown context, or
+    /// the injection failed).
+    ///
+    /// With `copy`, the fence also copies the scanout on the rendering context's queue and the
+    /// frame presents that copy (see [`ScanoutCopies`]). A renderer that cannot take an ordered
+    /// copy fences the present without one.
+    #[cfg(target_os = "macos")]
+    fn try_park_present(
+        &mut self,
+        scanout_id: u32,
+        iosurface_id: u32,
+        resource_id: u32,
+        rect: &Rect,
+        seq: u64,
+        copy: bool,
+    ) -> bool {
+        if !Self::fence_present_enabled() {
+            return false;
+        }
+        let extension_surface = self
+            .resources
+            .get(&resource_id)
+            .is_some_and(|r| r.extension_surface);
+        let (Some(pf), Some(rutabaga)) = (self.present_fence.as_mut(), self.rutabaga.as_mut())
+        else {
+            return false;
+        };
+
+        let cookie = pf.next_cookie;
+        pf.next_cookie += 1;
+        pf.parked.insert(
+            cookie,
+            ParkedFlush {
+                scanout_id,
+                iosurface_id,
+                resource_id,
+                rect: *rect,
+                parked_at: std::time::Instant::now(),
+                seq,
+                copied: false,
+            },
+        );
+        // The flush's trailing FLAG_FENCE (patched guest kernel) will hold on this.
+        pf.flush_parked_cookies.push((cookie, scanout_id));
+
+        // A transport surface is copied too, fenced or not: its renderer finished the frame before
+        // the flush, so the copy is one blit, and a fenced flush then holds the guest for that blit
+        // rather than until the display lets go of its buffer -- which comes a refresh after
+        // latch, and held every flip a refresh late (`spikes/transport-copy`).
+        let copy = copy || (extension_surface && Self::transport_copy_enabled());
+        // What goes up is the guest's own surface unless this present is a copy.
+        if !copy {
+            self.scanout_copies.copying.insert(scanout_id, false);
+        }
+
+        if copy {
+            match rutabaga.present_copy(resource_id, scanout_id, cookie) {
+                Ok(copied) => {
+                    let pf = self.present_fence.as_mut().unwrap();
+                    if let Some(p) = pf.parked.get_mut(&cookie) {
+                        p.iosurface_id = copied;
+                        p.copied = true;
+                    }
+                    if self.scanout_copies.copying.insert(scanout_id, true) != Some(true) {
+                        info!(
+                            "virtio-gpu: scanout {scanout_id} presents copies {}, out of its reach",
+                            if extension_surface {
+                                "the host blits as each flush arrives"
+                            } else {
+                                "taken on the guest's own queue"
+                            }
+                        );
+                    }
+                    return true;
+                }
+                Err(rutabaga_gfx::RutabagaError::ComponentError(e)) if e == -libc::EBUSY => {
+                    // Every copy surface is pending or on glass: the host is behind. The guest's
+                    // own surface must not go up in its place -- the display believes this scanout
+                    // shows copies the guest cannot reach -- so the frame is dropped, as a display
+                    // that falls behind drops frames anyway.
+                    let pf = self.present_fence.as_mut().unwrap();
+                    pf.parked.remove(&cookie);
+                    pf.flush_parked_cookies.retain(|(c, _)| *c != cookie);
+                    let copies = &mut self.scanout_copies;
+                    copies.dropped += 1;
+                    if copies.dropped == 1 || copies.dropped.is_multiple_of(1000) {
+                        warn!(
+                            "virtio-gpu: scanout {scanout_id} dropped a frame: every copy surface \
+                             was still in use ({} so far)",
+                            copies.dropped
+                        );
+                    }
+                    return true;
+                }
+                Err(_) => {
+                    let copies = &mut self.scanout_copies;
+                    copies.refused += 1;
+                    if copies.refused == 1 || copies.refused.is_multiple_of(1000) {
+                        info!(
+                            "virtio-gpu: scanout {scanout_id} could not be copied in order; \
+                             presenting the guest's own surface ({} such presents so far)",
+                            copies.refused
+                        );
+                    }
+                    if self.scanout_copies.copying.insert(scanout_id, false) == Some(true) {
+                        info!(
+                            "virtio-gpu: scanout {scanout_id} can no longer be copied in order; \
+                             presenting the guest's own surface"
+                        );
+                    }
+                }
+            }
+        }
+        // Nothing to wait for: the guest waited for the frame's rendering before it flushed. The
+        // frame still goes through the parked path, so a fenced flush holds the guest off the
+        // buffer until it has left glass.
+        if extension_surface {
+            let pf = self.present_fence.as_mut().unwrap();
+            pf.retired
+                .lock()
+                .unwrap()
+                .push((cookie, std::time::Instant::now()));
+            if let Err(e) = pf.event.write(1) {
+                error!("present eventfd write failed: {e}");
+            }
+            return true;
+        }
+        let Some(rutabaga) = self.rutabaga.as_mut() else {
+            return false;
+        };
+        if let Err(e) = rutabaga.present_fence(resource_id, cookie) {
+            warn!("present fence injection failed (resource {resource_id}): {e}; presenting now");
+            // Roll the cookie ALL the way back: leaving it in flush_parked_cookies
+            // poisons the next fenced flush's GuestFlushHold with a cookie that can
+            // never present (no parked frame, no injected fence) -> the guest's
+            // display fence never signals -> hard scanout wedge. Hit in the wild by
+            // direct scanout outliving its client: mutter keeps flipping an exited
+            // client's buffer, whose owning context is gone, so injection fails on
+            // every frame.
+            let pf = self.present_fence.as_mut().unwrap();
+            pf.parked.remove(&cookie);
+            pf.flush_parked_cookies.retain(|(c, _)| *c != cookie);
+            return false;
+        }
+        true
+    }
+
+    /// Tell the display which guest resource the next present on `scanout_id` shows: the one
+    /// whose flush produced it. Called right before each present of a guest flush, and only
+    /// then, so a present of anything else (a restore's saved pixels) names none.
+    fn name_frame_resource(&mut self, scanout_id: u32, resource_id: u32) {
+        let _ = self.display_backend.frame_resource(scanout_id, resource_id);
+    }
+
+    /// Tell the display whether the guest is held off `scanout_id`'s presented buffers, when
+    /// that changes.
+    fn note_scanout_held(&mut self, scanout_id: u32, held: bool) {
+        let hold = Hold::of(
+            held,
+            self.scanout_copies.fenced.get(&scanout_id) == Some(&true),
+            self.scanout_copies.copying(scanout_id),
+        );
+        let Some(was) = self.held_scanouts.note(scanout_id, hold) else {
+            return;
+        };
+        info!(
+            "virtio-gpu: scanout {scanout_id} {}",
+            match hold {
+                Hold::Free =>
+                    "flushes carry no fence; nothing holds the guest off buffers on glass",
+                Hold::Copies => "flushes carry no fence; glass shows copies the guest cannot reach",
+                Hold::Fenced =>
+                    "flushes are fenced; the guest is held until the host is done with \
+                                 each buffer",
+            }
+        );
+        if was.map(Hold::held) != Some(held) {
+            let _ = self.display_backend.scanout_held(scanout_id, held);
+        }
+    }
+
+    /// Tell [`PresentOrder`] when a present is about to skip past frames still parked for its
+    /// scanout.
+    #[cfg(target_os = "macos")]
+    fn note_overtake(&mut self, scanout_id: u32, why: &str) {
+        let parked = self.present_fence.as_ref().map_or(0, |pf| {
+            pf.parked
+                .values()
+                .filter(|p| p.scanout_id == scanout_id)
+                .count()
+        });
+        if parked > 0 {
+            self.present_order.overtaking(scanout_id, parked, why);
+        }
+    }
+
+    /// limina (#8): drain retired present-fence cookies and present their parked
+    /// frames. Runs on the worker thread (epoll on the present eventfd).
+    pub fn process_retired_presents(&mut self) {
+        self.take_retired_presents(true);
+    }
+
+    /// Present what has retired from inside a control-queue drain, if anything has.
+    ///
+    /// A drain runs until the guest stops refilling the queue, and a client submitting faster than
+    /// it is decoded keeps one going for seconds; the present eventfd is only read once it ends.
+    /// Measured at 15k aquarium fish: fences retired within 18 ms, and their frames then waited up
+    /// to 25 s for the drain to finish -- a window frozen on a GPU that had long since finished.
+    /// Taking them here, between commands, leaves a backlog delaying the guest's work but never the
+    /// frames it already rendered.
+    pub fn process_retired_presents_mid_drain(&mut self) {
+        if self.present_fence.as_ref().is_some_and(|pf| pf.has_work()) {
+            // The eventfd is left for the worker's epoll: reading it here could block, and the
+            // count it still holds costs one wake that finds nothing to do.
+            self.take_retired_presents(false);
+        }
+    }
+
+    fn take_retired_presents(&mut self, drain_event: bool) {
+        let Some(pf) = self.present_fence.as_mut() else {
+            return;
+        };
+        // Drain the eventfd (level cleared) before the cookies so a cookie pushed
+        // after the swap re-raises the event rather than getting lost.
+        if drain_event {
+            let _ = pf.event.read();
+        }
+        let cookies = std::mem::take(&mut *pf.retired.lock().unwrap());
+        let shown_ids = std::mem::take(&mut *pf.shown.lock().unwrap());
+        // limina: hand back surfaces the supervisor lost. This thread owns the display backend,
+        // which is why the ack reader parks the ids rather than answering them itself. A cursor
+        // image is the one that cannot wait for the guest to redraw: it is republished only on a
+        // shape change (dogfood 2026-08-26 — no pointer for minutes).
+        let wanted = std::mem::take(&mut *pf.resurface.lock().unwrap());
+        let mut hits: Vec<(u32, u32, u32, Rect, u64)> = Vec::new();
+        for (cookie, retired_at) in &cookies {
+            if let Some(p) = pf.parked.remove(cookie) {
+                // A frame that waited this long is a visible freeze. Said at warn with the split
+                // and the backlog behind it: the fence retiring late and the worker taking the
+                // retirement late are different faults that freeze the window identically.
+                let waited = p.parked_at.elapsed();
+                if waited >= std::time::Duration::from_millis(100) {
+                    warn!(
+                        "virtio-gpu: parked present of iosurface {} waited {} ms: {} ms for its \
+                         fence, {} ms for the worker to take it ({} more still parked)",
+                        p.iosurface_id,
+                        waited.as_millis(),
+                        retired_at.duration_since(p.parked_at).as_millis(),
+                        retired_at.elapsed().as_millis(),
+                        pf.parked.len()
+                    );
+                }
+                hits.push((p.scanout_id, p.iosurface_id, p.resource_id, p.rect, p.seq));
+                // limina (#8 half 2): the frame presents below (this same thread, before
+                // anything sleeps). With acks: confirmation comes from the supervisor's
+                // "shown"; without: presenting IS the confirmation (the open-loop latch
+                // delay supplies the margin).
+                pf.presenting(*cookie, &p);
+            }
+        }
+        // Ack path: a shown(X) confirms every awaited frame up to and including the
+        // first X — anything applied before X is off glass once X latched.
+        for id in &shown_ids {
+            if !pf.awaiting_shown.iter().any(|(i, _)| i == id) {
+                continue; // ack for a frame we didn't park (2D path, toggle transitions)
+            }
+            while let Some((i, cookie)) = pf.awaiting_shown.pop_front() {
+                for hold in pf.guest_holds.iter_mut() {
+                    hold.unconfirmed.remove(&cookie);
+                }
+                if i == *id {
+                    break;
+                }
+            }
+        }
+        // Complete / arm holds. Completion is idempotent (watermark max + desc scan),
+        // so the ack path and the fallback may both fire harmlessly.
+        let now = std::time::Instant::now();
+        let holds = std::mem::take(&mut pf.guest_holds);
+        for mut hold in holds {
+            // Past the creation-time ceiling the latch thread already completed the
+            // fence unconditionally — drop the hold (covers frames that can never
+            // present, e.g. the owning context died while its buffer was on scanout).
+            if now > hold.created_at + std::time::Duration::from_millis(500) {
+                warn!(
+                    "virtio-gpu: guest flush fence released by the 500 ms ceiling with {} frame(s) \
+                     not yet presented",
+                    hold.unpresented.len()
+                );
+                continue;
+            }
+            if hold.unconfirmed.is_empty() {
+                if pf.ack_active {
+                    // Acked = latched: complete immediately.
+                    pf.guest_fence_handler.call(hold.fence);
+                } else if let Err(e) = pf.latch_tx.send((now + pf.latch_delay, hold.fence)) {
+                    error!("latch thread gone: {e}");
+                }
+                continue;
+            }
+            match hold.fallback_at {
+                // Fallback elapsed with acks still missing: the latch thread already
+                // completed the fence — drop the hold (lost-ack cleanup).
+                Some(t) if now > t => continue,
+                Some(_) => {}
+                None => {
+                    if pf.ack_active && hold.unpresented.is_empty() {
+                        // All frames presented, acks outstanding: arm the safety
+                        // fallback in case an ack is lost (gen collapse, dropped write).
+                        let fallback = now + std::time::Duration::from_millis(150);
+                        hold.fallback_at = Some(fallback);
+                        if let Err(e) = pf.latch_tx.send((fallback, hold.fence)) {
+                            error!("latch thread gone: {e}");
+                        }
+                    }
+                }
+            }
+            pf.guest_holds.push(hold);
+        }
+        // Answer the resurface asks the renderer could not: these name the display backend's
+        // own surfaces. `InvalidParam` means we do not hold it either — it is gone, and saying so
+        // is what stops the supervisor's throttled asks from looking like a silent failure.
+        for id in wanted {
+            match self.display_backend.republish_surface(id) {
+                Ok(()) => debug!("gpu: display backend re-published surface {id} on request"),
+                Err(e) => warn!(
+                    "gpu: supervisor asked for surface {id} back but neither the renderer nor \
+                     the display backend holds it ({e}) — it is gone, not merely dropped"
+                ),
+            }
+        }
+        for (scanout_id, iosurface_id, resource_id, rect, seq) in hits {
+            // Engagement oracle: proves the fence-accurate path is live (a silent
+            // fallback to immediate presents would otherwise look identical). The FIRST
+            // deferred present logs at INFO — one line per boot, so a production log
+            // (default warn is quiet, but RUST_LOG=info costs nothing per-frame) can
+            // confirm the mode without enabling the per-fence debug/trace firehose,
+            // which measurably destabilizes frame pacing (~2k sync writes/s under a
+            // benchmark — observed as 40-60 fps ping-pong, 2026-07-27). The periodic
+            // counter stays at trace.
+            static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                log::info!(
+                    "virtio-gpu: fence-accurate presents ENGAGED (first deferred present, scanout {scanout_id}, iosurface {iosurface_id})"
+                );
+            } else if n.is_multiple_of(512) {
+                log::trace!(
+                    "[FENCEPRESENT] deferred presents={n} (scanout {scanout_id}, iosurface {iosurface_id})"
+                );
+            }
+            self.name_frame_resource(scanout_id, resource_id);
+            match self
+                .display_backend
+                .present_surface(scanout_id, iosurface_id, Some(&rect))
+            {
+                Ok(()) => {
+                    self.scanout_ledger.present();
+                    self.present_order
+                        .shown(scanout_id, seq, iosurface_id, "parked on a fence");
+                }
+                // A sink without zero-copy (headless capture): read the pixels back and
+                // present them as a software frame — the deferred twin of the immediate
+                // path's fallback in `flush_resource`. Before this, arming fence-present
+                // on such a sink silently dropped every parked frame.
+                #[cfg(target_os = "macos")]
+                Err(DisplayBackendError::MethodNotSupported) => {
+                    self.deferred_readback_present(scanout_id, resource_id, &rect);
+                }
+                Err(e) => {
+                    error!("deferred present_surface failed for scanout {scanout_id}: {e}");
+                }
+            }
+        }
+    }
+
+    /// limina (#8): readback fallback for a retired parked frame on a sink without
+    /// zero-copy support. Mirrors the venus-IOSurface readback in `flush_resource`
+    /// (the immediate path): pull the presented IOSurface's pixels through the
+    /// renderer into a staging frame and present that.
+    #[cfg(target_os = "macos")]
+    fn deferred_readback_present(&mut self, scanout_id: u32, resource_id: u32, rect: &Rect) {
+        let Some((scan_w, scan_h)) = self
+            .scanouts
+            .get(scanout_id as usize)
+            .and_then(|s| s.as_ref())
+            .map(|s| (s.width, s.height))
+            .filter(|&(w, h)| w != 0 && h != 0)
+        else {
+            error!("deferred readback: scanout {scanout_id} has no geometry");
+            return;
+        };
+        let dst_stride = scan_w as usize * ResourceFormat::BYTES_PER_PIXEL;
+        let Some(rutabaga) = self.rutabaga.as_ref() else {
+            return;
+        };
+        let (frame_id, buffer) = match self.display_backend.alloc_frame(scanout_id) {
+            Ok(fb) => fb,
+            Err(e) => {
+                error!("deferred readback: alloc_frame failed for scanout {scanout_id}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = rutabaga.read_iosurface(resource_id, buffer, dst_stride as u32, scan_h) {
+            error!("deferred readback: read_iosurface failed for resource {resource_id}: {e}");
+            return;
+        }
+        self.name_frame_resource(scanout_id, resource_id);
+        if let Err(e) = self
+            .display_backend
+            .present_frame(scanout_id, frame_id, Some(rect))
+        {
+            error!("deferred readback: present_frame failed for scanout {scanout_id}: {e}");
+        }
+    }
+
+    /// limina (#8): the eventfd the worker should poll for retired present fences.
+    pub fn present_event_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.present_fence.as_ref().map(|pf| pf.event.as_raw_fd())
+    }
+
+    /// limina: render the guest hardware cursor as a host overlay (`VIRTIO_GPU_CMD_UPDATE_CURSOR`).
+    ///
+    /// The cursor image is an ordinary 2D resource (`CREATE_2D` + `TRANSFER_TO_HOST_2D`), so its
+    /// pixels already live in the software-2D host buffer. `resource_id == 0` hides the cursor
+    /// (virtio-gpu spec). The display backend draws it as an overlay — never into the scanout —
+    /// so cursor motion never re-enters the framebuffer present path. A backend without cursor
+    /// support (headless capture, stock GTK) returns `MethodNotSupported`, which we treat as a
+    /// no-op: the guest keeps whatever software-cursor fallback it had.
+    pub fn update_cursor(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+    ) -> VirtioGpuResult {
+        if resource_id == 0 {
+            self.cursor_state = None;
+            Self::cursor_ok(self.display_backend.set_cursor(
+                scanout_id,
+                0,
+                0,
+                0,
+                0,
+                ResourceFormat::BGRA,
+                &[],
+            ))?;
+            return Ok(OkNoData);
+        }
+
+        let resource = *self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        let format = resource.format.unwrap_or(ResourceFormat::BGRA);
+        // The guest kernel creates ALL dumb buffers as XRGB (virtgpu_gem.c hardcodes
+        // DRM_FORMAT_HOST_XRGB8888), but cursor images carry real alpha in those X bytes —
+        // virtio-gpu treats cursor data as ARGB regardless (QEMU does the same). Promote the
+        // X formats to their alpha-carrying counterparts so the overlay keeps the transparent
+        // surround instead of compositing an opaque black rectangle around the cursor.
+        let format = match format {
+            ResourceFormat::BGRX => ResourceFormat::BGRA,
+            ResourceFormat::XRGB => ResourceFormat::ARGB,
+            ResourceFormat::RGBX => ResourceFormat::RGBA,
+            ResourceFormat::XBGR => ResourceFormat::ABGR,
+            f => f,
+        };
+        // Clone the (tiny, ~64x64) cursor pixels so we don't hold a borrow of `self` across the
+        // &mut self backend call.
+        let Some(pixels) = self.sw2d.get(&resource_id).map(|sw| sw.host.clone()) else {
+            warn!("update_cursor: resource {resource_id} has no software-2D pixels");
+            return Err(ErrUnspec);
+        };
+        Self::cursor_ok(self.display_backend.set_cursor(
+            scanout_id,
+            resource.width,
+            resource.height,
+            hot_x,
+            hot_y,
+            format,
+            &pixels,
+        ))?;
+        Self::cursor_ok(self.display_backend.move_cursor(scanout_id, x, y))?;
+        self.cursor_state = Some(super::journal::CursorSnapshot {
+            scanout_id,
+            width: resource.width,
+            height: resource.height,
+            hot_x,
+            hot_y,
+            format: format as u32,
+            x,
+            y,
+            pixels,
+        });
+        Ok(OkNoData)
+    }
+
+    /// limina: reposition the host cursor overlay (`VIRTIO_GPU_CMD_MOVE_CURSOR`).
+    pub fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
+        Self::cursor_ok(self.display_backend.move_cursor(scanout_id, x, y))?;
+        if let Some(c) = &mut self.cursor_state {
+            c.scanout_id = scanout_id;
+            c.x = x;
+            c.y = y;
+        }
+        Ok(OkNoData)
+    }
+
+    /// Map a cursor backend result to a GPU response, treating `MethodNotSupported` as success
+    /// (a backend without a cursor overlay simply ignores cursor commands — the queue still
+    /// drains so the guest never stalls).
+    fn cursor_ok(r: std::result::Result<(), DisplayBackendError>) -> VirtioGpuResult {
+        match r {
+            Ok(()) | Err(DisplayBackendError::MethodNotSupported) => Ok(OkNoData),
+            Err(e) => {
+                warn!("cursor backend error: {e}");
+                Err(ErrUnspec)
+            }
+        }
+    }
+
     pub fn display_info(&self) -> VirtioGpuResult {
+        // The third element is the scanout's `enabled` flag, which the guest driver turns
+        // directly into connector status (`virtio_gpu_conn_detect`) — so this is where a
+        // display unplug becomes visible. It was hardcoded `true` when scanouts could never
+        // come and go; limina drives it (see `DisplayUpdate::connected`).
         let display_info = self
             .displays
             .iter()
-            .map(|d| (d.width, d.height, true))
+            .map(|d| (d.position, (d.width, d.height), d.connected))
             .collect();
 
         Ok(OkDisplayInfo(display_info))
     }
 
-    pub fn get_edid(&self, scanout_id: u32) -> VirtioGpuResult {
+    pub fn get_edid(&mut self, scanout_id: u32) -> VirtioGpuResult {
         let display = self
             .displays
             .get(scanout_id as usize)
             .ok_or(ErrInvalidScanoutId)?;
+        let edid = display.edid_bytes();
 
-        Ok(OkEdid(display.edid_bytes()))
+        if !self.guest_driver_seen {
+            self.guest_driver_seen = true;
+            debug!("guest OS driver took the GPU over from firmware (first GET_EDID)");
+            let _ = self.display_backend.guest_driver_ready();
+        }
+
+        Ok(OkEdid(edid))
+    }
+
+    /// limina runtime resize: update a scanout's preferred mode (host window resize). The EDID
+    /// regenerates from these dimensions on the next `GET_EDID` (for the `Generated` case). The
+    /// caller (worker) raises a config-change interrupt so the guest re-reads `display_info()`
+    /// and re-modesets to the new `width`×`height`. See `docs/design/runtime-display-resize.md`.
+    pub fn set_display_size(&mut self, display_id: u32, width: u32, height: u32) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => {
+                debug!("set_display_size: scanout {display_id} -> {width}x{height}");
+                d.width = width;
+                d.height = height;
+            }
+            None => error!("set_display_size: invalid display id {display_id}"),
+        }
+    }
+
+    /// limina arrangement relay: update where a scanout sits in the guest's desktop (see
+    /// `DisplayInfo::position`). Takes effect on the next `GET_DISPLAY_INFO`; the caller
+    /// (worker) raises the config-change that makes the guest re-read it.
+    pub fn set_display_position(&mut self, display_id: u32, x: u32, y: u32) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => {
+                debug!("set_display_position: scanout {display_id} -> +{x}+{y}");
+                d.position = (x, y);
+            }
+            None => error!("set_display_position: invalid display id {display_id}"),
+        }
+    }
+
+    /// limina: replace a scanout's generated-EDID parameters — identity, mode list, refresh
+    /// range. Takes effect on the next `GET_EDID`, which the guest issues as part of handling
+    /// the config-change the caller raises (`virtio_gpu_config_changed_work_func` fetches EDID
+    /// *and* display info). A display configured with a caller-provided raw EDID blob keeps it:
+    /// the blob is the caller's own, and silently swapping it for a generated one would discard
+    /// whatever it was chosen to express.
+    /// See `docs/design/stable-edid-hotplug.md`.
+    pub fn set_display_edid(&mut self, display_id: u32, params: EdidParams) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => match &mut d.edid {
+                DisplayInfoEdid::Generated(current) => {
+                    debug!("set_display_edid: scanout {display_id} -> {params:?}");
+                    *current = params;
+                }
+                DisplayInfoEdid::Provided(_) => warn!(
+                    "set_display_edid: scanout {display_id} was configured with a raw EDID \
+                     blob; ignoring the generated-EDID update"
+                ),
+            },
+            None => error!("set_display_edid: invalid display id {display_id}"),
+        }
+    }
+
+    /// limina: connect or disconnect a scanout. The guest reports the connector as
+    /// disconnected while this is `false`, which is a real unplug as far as its compositor is
+    /// concerned. The caller raises the config-change that makes the guest re-probe.
+    pub fn set_display_connected(&mut self, display_id: u32, connected: bool) {
+        match self.displays.get_mut(display_id as usize) {
+            Some(d) => {
+                debug!("set_display_connected: scanout {display_id} -> {connected}");
+                d.connected = connected;
+            }
+            None => error!("set_display_connected: invalid display id {display_id}"),
+        }
     }
 
     /// Copies data to host resource from the attached iovecs. Can also be used to flush caches.
@@ -615,8 +3746,35 @@ impl VirtioGpu {
         resource_id: u32,
         transfer: Transfer3D,
     ) -> VirtioGpuResult {
-        self.rutabaga
-            .transfer_write(ctx_id, resource_id, transfer, None)?;
+        // limina software 2D: copy the guest backing into our host buffer.
+        if let Some(sw) = self.sw2d.get_mut(&resource_id) {
+            sw.copy_from_backing();
+            return Ok(OkNoData);
+        }
+        if std::env::var_os("LIMINA_TRACE_TRANSFER").is_some() {
+            log::error!(
+                "[XFER-WRITE] ctx {ctx_id} res {resource_id} box=({},{},{})+{}x{}x{} level={} stride={} layer_stride={} offset={}",
+                transfer.x,
+                transfer.y,
+                transfer.z,
+                transfer.w,
+                transfer.h,
+                transfer.d,
+                transfer.level,
+                transfer.stride,
+                transfer.layer_stride,
+                transfer.offset
+            );
+        }
+        let r =
+            self.rutabaga
+                .as_mut()
+                .ok_or(ErrUnspec)?
+                .transfer_write(ctx_id, resource_id, transfer);
+        if let Err(e) = &r {
+            log::error!("[XFER-WRITE] ctx {ctx_id} res {resource_id} FAILED: {e:?}");
+        }
+        r?;
         Ok(OkNoData)
     }
 
@@ -625,14 +3783,43 @@ impl VirtioGpu {
     ///    2) To the host resource's attached iovecs
     ///
     /// Can also be used to invalidate caches.
+    ///
+    /// limina: this is the virgl/vrend copy-model readback path (`TRANSFER_FROM_HOST_3D`).
+    /// venus (zero-copy, host-visible blobs) never needs it, so upstream left it a `panic!` —
+    /// but a stock 4 KiB guest on the coexist device drives vrend, and any GL readback
+    /// (`glReadPixels`, `glxinfo`, WebGL) issues `TRANSFER_FROM_HOST_3D`. Panicking here killed
+    /// the GPU worker thread and wedged the whole guest (every later command blocks on a fence
+    /// that never completes). Delegate to rutabaga like `transfer_write` does, and never panic.
     pub fn transfer_read(
         &mut self,
-        _ctx_id: u32,
-        _resource_id: u32,
-        _transfer: Transfer3D,
-        _buf: Option<VolatileSlice>,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
+        buf: Option<VolatileSlice>,
     ) -> VirtioGpuResult {
-        panic!("virtio_gpu: transfer_read unimplemented");
+        // limina software 2D: the guest backing already mirrors our host buffer (we copy it on
+        // write/flush), so a host->guest readback is a no-op for these resources.
+        if self.sw2d.contains_key(&resource_id) {
+            return Ok(OkNoData);
+        }
+        // The common `TRANSFER_FROM_HOST_3D` path passes `buf = None`: rutabaga copies from the
+        // host resource into the resource's attached guest iovecs. When a destination slice is
+        // given instead, hand it to rutabaga as an `IoSliceMut`.
+        // SAFETY: `s` is a writable guest-memory slice the descriptor chain keeps valid for the
+        // duration of this command; `IoSliceMut` only borrows it (same pattern as line ~62/968).
+        let mut dst = buf.map(|s| unsafe {
+            IoSliceMut::new(std::slice::from_raw_parts_mut(
+                s.ptr_guard_mut().as_ptr(),
+                s.len(),
+            ))
+        });
+        self.rutabaga.as_mut().ok_or(ErrUnspec)?.transfer_read(
+            ctx_id,
+            resource_id,
+            transfer,
+            dst.take(),
+        )?;
+        Ok(OkNoData)
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
@@ -645,13 +3832,42 @@ impl VirtioGpu {
         vecs: Vec<(GuestAddress, usize)>,
     ) -> VirtioGpuResult {
         let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
-        self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
+        // limina diagnostic: which guest resources reach the host as an iov backing, and
+        // with how scattered a page list. Answered "does a PRIME-imported foreign dmabuf
+        // arrive here at all?" on 2026-08-13 — it does NOT, which is why a zero-copy
+        // udmabuf import needs guest-kernel work first (roadmap M15 wave 6). Kept because
+        // the same question recurs for every new resource class.
+        if std::env::var_os("LIMINA_TRACE_ATTACH_BACKING").is_some() {
+            let total: usize = rutabaga_iovecs.iter().map(|v| v.len).sum();
+            log::error!(
+                "[ATTACH-BACKING] res {resource_id}: {} iovec(s), {total} bytes, first={:?}",
+                rutabaga_iovecs.len(),
+                rutabaga_iovecs.first().map(|v| (v.base as usize, v.len))
+            );
+        }
+        // limina software 2D: keep the backing host pointers; don't involve rutabaga.
+        if let Some(sw) = self.sw2d.get_mut(&resource_id) {
+            sw.backing = rutabaga_iovecs;
+            return Ok(OkNoData);
+        }
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .attach_backing(resource_id, rutabaga_iovecs)?;
         Ok(OkNoData)
     }
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> VirtioGpuResult {
-        self.rutabaga.detach_backing(resource_id)?;
+        // limina software 2D: drop the backing pointers.
+        if let Some(sw) = self.sw2d.get_mut(&resource_id) {
+            sw.backing.clear();
+            return Ok(OkNoData);
+        }
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .detach_backing(resource_id)?;
         Ok(OkNoData)
     }
 
@@ -673,7 +3889,11 @@ impl VirtioGpu {
 
     /// Gets rutabaga's capset information associated with `index`.
     pub fn get_capset_info(&self, index: u32) -> VirtioGpuResult {
-        let (capset_id, version, size) = self.rutabaga.get_capset_info(index)?;
+        let (capset_id, version, size) = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .get_capset_info(index)?;
         Ok(OkCapsetInfo {
             capset_id,
             version,
@@ -683,7 +3903,11 @@ impl VirtioGpu {
 
     /// Gets a capset from rutabaga.
     pub fn get_capset(&self, capset_id: u32, version: u32) -> VirtioGpuResult {
-        let capset = self.rutabaga.get_capset(capset_id, version)?;
+        let capset = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .get_capset(capset_id, version)?;
         Ok(OkCapset(capset))
     }
 
@@ -695,25 +3919,66 @@ impl VirtioGpu {
         context_name: Option<&str>,
     ) -> VirtioGpuResult {
         self.rutabaga
-            .create_context(ctx_id, context_init, context_name)?;
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .create_context(ctx_id, context_init, context_name)
+            .map_err(|e| {
+                warn!("CTX_CREATE failed ctx={ctx_id} init={context_init:#x} name={context_name:?}: {e}");
+                e
+            })?;
+        info!("CTX_CREATE ctx={ctx_id} init={context_init:#x} name={context_name:?}");
+        // A non-venus context means a vrend/GL guest is live: from here on, Global-ring
+        // fences must retire through virglrenderer's GL timeline, not the decode-time
+        // sync mark (see `vrend_ctx_seen`). capset id lives in the low byte of
+        // context_init; 0 = the pre-CONTEXT_INIT default, which is also virgl.
+        let capset_id = context_init & 0xff;
+        if capset_id != rutabaga_gfx::RUTABAGA_CAPSET_VENUS && !self.vrend_ctx_seen {
+            self.vrend_ctx_seen = true;
+            info!(
+                "vrend context ctx={ctx_id} (capset {capset_id}): \
+                 Global-ring fences now retire through virglrenderer"
+            );
+        }
         Ok(OkNoData)
     }
 
     /// Destroys a rutabaga context.
     pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
-        self.rutabaga.destroy_context(ctx_id)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .destroy_context(ctx_id)
+            .map_err(|e| {
+                warn!("CTX_DESTROY failed ctx={ctx_id}: {e}");
+                e
+            })?;
+        info!("CTX_DESTROY ctx={ctx_id}");
         Ok(OkNoData)
     }
 
     /// Attaches a resource to a rutabaga context.
     pub fn context_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
-        self.rutabaga.context_attach_resource(ctx_id, resource_id)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .context_attach_resource(ctx_id, resource_id)
+            .map_err(|e| {
+                warn!("CTX_ATTACH_RESOURCE failed ctx={ctx_id} res={resource_id}: {e}");
+                e
+            })?;
         Ok(OkNoData)
     }
 
     /// Detaches a resource from a rutabaga context.
     pub fn context_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> VirtioGpuResult {
-        self.rutabaga.context_detach_resource(ctx_id, resource_id)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .context_detach_resource(ctx_id, resource_id)
+            .map_err(|e| {
+                warn!("CTX_DETACH_RESOURCE failed ctx={ctx_id} res={resource_id}: {e}");
+                e
+            })?;
         Ok(OkNoData)
     }
 
@@ -724,14 +3989,173 @@ impl VirtioGpu {
         commands: &mut [u8],
         fence_ids: &[u64],
     ) -> VirtioGpuResult {
-        self.rutabaga.submit_command(ctx_id, commands, fence_ids)?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .submit_command(ctx_id, commands, fence_ids)?;
         Ok(OkNoData)
     }
 
     /// Creates a fence with the RutabagaFence that can be used to determine when the previous
-    /// command completed.
-    pub fn create_fence(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
-        self.rutabaga.create_fence(rutabaga_fence)?;
+    /// command completed. `is_flush` marks the fence as trailing a RESOURCE_FLUSH —
+    /// the only command whose fence may be held for fence-accurate presents.
+    pub fn create_fence(
+        &mut self,
+        rutabaga_fence: RutabagaFence,
+        is_flush: bool,
+    ) -> VirtioGpuResult {
+        // limina M9.3 trace: every guest fence request, whatever path it takes below.
+        self.trace
+            .fences_requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // limina (#8 half 2): a fenced flush whose frames were parked — hold the guest
+        // fence until those frames have presented + the latch delay. The descriptor
+        // parks in process_fence (watermark untouched); the latch thread retires it
+        // through the regular fence handler. The patched guest kernel's
+        // dma_fence_wait on this fence is what holds the commit (and the fake flip
+        // event), pacing mutter honestly and keeping the buffer unwritten while CA
+        // still samples it.
+        let context_ring = rutabaga_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0;
+        if is_flush
+            && !context_ring
+            && let Some(pf) = self.present_fence.as_mut()
+            && !pf.flush_parked_cookies.is_empty()
+        {
+            let cookies = std::mem::take(&mut pf.flush_parked_cookies);
+            let set: std::collections::BTreeSet<u64> = cookies.iter().map(|(c, _)| *c).collect();
+            let scanouts: std::collections::BTreeSet<u32> =
+                cookies.iter().map(|(_, s)| *s).collect();
+            let now = std::time::Instant::now();
+            // Wedge-proof ceiling: whatever happens to the parked frames
+            // (lost ack, dead context, any future leak class), the guest's
+            // display fence completes by now+500ms. Completion is
+            // idempotent with the ack/fallback paths.
+            let ceiling = now + std::time::Duration::from_millis(500);
+            if let Err(e) = pf.latch_tx.send((ceiling, rutabaga_fence)) {
+                error!("latch thread gone: {e}");
+            }
+            pf.guest_holds.push(GuestFlushHold {
+                fence: rutabaga_fence,
+                unpresented: set.clone(),
+                unconfirmed: set,
+                fallback_at: None,
+                created_at: now,
+            });
+            for scanout_id in scanouts {
+                self.scanout_copies.fenced.insert(scanout_id, true);
+                self.note_scanout_held(scanout_id, true);
+            }
+            self.next_fence_route = FenceRoute::FlushHold;
+            return Ok(OkNoData);
+        }
+        self.create_fence_inner(rutabaga_fence)
+    }
+
+    /// limina TEST SEAM: file-armed "fail the next context-ring fence" fault injection.
+    /// `LIMINA_GPU_TEST_FAIL_FENCE_FILE=<path>` (set at worker start) names a trigger
+    /// file; when it EXISTS at context-fence creation, it is consumed (unlinked) and the
+    /// fence takes the failure path — exactly the way a fenced submit decoded against a
+    /// wiped session fails. Lets the `venus_fence_lost` L2 guard poison a *chosen* fence
+    /// mid-run (the last one on its ring: a later healthy fence would mask the loss,
+    /// since the guest driver signals everything at-or-below the newest signaled id).
+    /// No-op unless the env var is set; the stat runs only for context-ring fences.
+    fn test_take_fail_next_fence() -> bool {
+        static TRIGGER: std::sync::OnceLock<Option<std::path::PathBuf>> =
+            std::sync::OnceLock::new();
+        let Some(path) = TRIGGER
+            .get_or_init(|| std::env::var_os("LIMINA_GPU_TEST_FAIL_FENCE_FILE").map(Into::into))
+        else {
+            return false;
+        };
+        // Consume-by-unlink makes the injection one-shot per arming; a lost race just
+        // means the other fence took the poison, which is equally valid.
+        std::fs::remove_file(path).is_ok()
+    }
+
+    fn create_fence_inner(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
+        // Route the fence by ring. Software-2D (Global-ring) commands finish synchronously
+        // before their response is encoded, so the fence is already signaled by the time we
+        // get here: record it as completed up-front and let process_fence() retire the
+        // descriptor immediately instead of parking it forever (which would hang any guest
+        // that fences a 2D command, e.g. GTK4, or the EDK2 firmware GOP).
+        //
+        // Context-specific fences belong to a real 3D context and go to rutabaga. Global-ring
+        // fences are two different animals depending on the session:
+        //  - Before any vrend context exists (firmware GOP, venus-only sessions, software-2D):
+        //    every Global-ring command completes synchronously before its response is encoded,
+        //    so mark the fence completed up-front. Routing it to a venus-only rutabaga would
+        //    fail with ComponentError and wedge the firmware (ctx 0 isn't a venus context).
+        //  - Once a vrend context exists (`vrend_ctx_seen`): the guest's GL work retires
+        //    asynchronously on the host GPU, so Global-ring fences MUST go through
+        //    virglrenderer (`virgl_renderer_create_fence` → glFenceSync on the sync thread →
+        //    ASYNC_FENCE_CB → fence handler), or a stock guest's glFinish returns at decode
+        //    time — loose fences, measured "faster than host-native" (crossmark 2026-07-28).
+        //    All Global fences must then take the one GL timeline: mixing sync-marked and
+        //    async fences on a single ring could retire a younger fence's watermark past an
+        //    older in-flight one. 2D fences riding the GL timeline is upstream semantics
+        //    (their work already completed synchronously; the sync only adds ordering).
+        let context_ring = rutabaga_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0;
+        match self.rutabaga.as_mut() {
+            Some(rutabaga) if context_ring => {
+                // limina TEST SEAM (`venus_fence_lost` L2): fail exactly one context-ring
+                // fence, exactly the way a fenced submit decoded against a wiped session
+                // fails (couve 2026-07-30: s2idle resume wipe → `create_fence 30247 ->
+                // ErrRutabaga(InvalidContextId)`). Armed by LIMINA_GPU_TEST_FAIL_NEXT_FENCE.
+                // Seam scope: queue rings only (ring_idx != 0). A venus submit emits a
+                // CPU-ring (ring 0) kick fence immediately before the queue fence-out
+                // that backs any exported sync_file — poisoning the kick proves nothing.
+                let injected = rutabaga_fence.ring_idx != 0 && Self::test_take_fail_next_fence();
+                if std::env::var_os("LIMINA_GPU_TEST_TRACE_FENCES").is_some() {
+                    warn!(
+                        "CTXFENCE id={} ctx={} ring={} injected={injected}",
+                        rutabaga_fence.fence_id, rutabaga_fence.ctx_id, rutabaga_fence.ring_idx
+                    );
+                }
+                let res = if injected {
+                    Err(rutabaga_gfx::RutabagaError::InvalidContextId)
+                } else {
+                    rutabaga.create_fence(rutabaga_fence)
+                };
+                if let Err(e) = res {
+                    // A guest fence must never vanish: the guest's dma_fence has no
+                    // timeout and no error path, and a KMS commit waiting on it wedges
+                    // the DRM device for every later session (the §22 wedge, caught
+                    // live 2026-07-30: the fail-closed resume wipe made this replayed
+                    // fence unfulfillable, and the parked response withheld even the
+                    // error from the guest). Retire it as lost instead: bump the ring
+                    // watermark so process_fence() delivers the error response
+                    // immediately — the guest driver signals the fence from the
+                    // response itself, error or not.
+                    warn!(
+                        "context fence {} (ctx {} ring {}) refused by renderer ({e}); \
+                         retiring as lost",
+                        rutabaga_fence.fence_id, rutabaga_fence.ctx_id, rutabaga_fence.ring_idx
+                    );
+                    mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                    self.next_fence_route = FenceRoute::Refused;
+                    return Err(e.into());
+                }
+                self.next_fence_route = FenceRoute::Renderer;
+            }
+            Some(rutabaga) if self.vrend_ctx_seen => {
+                if let Err(e) = rutabaga.create_fence(rutabaga_fence) {
+                    // Never wedge on a renderer refusal: fall back to the sync mark (the
+                    // pre-vrend behavior) and say so once per incident class in the log.
+                    warn!(
+                        "global fence {} (ctx {}) refused by renderer ({e}); completing sync",
+                        rutabaga_fence.fence_id, rutabaga_fence.ctx_id
+                    );
+                    mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                    self.next_fence_route = FenceRoute::Refused;
+                } else {
+                    self.next_fence_route = FenceRoute::Renderer;
+                }
+            }
+            _ => {
+                mark_fence_completed_sync(&self.fence_state, &rutabaga_fence);
+                self.next_fence_route = FenceRoute::Sync;
+            }
+        }
         Ok(OkNoData)
     }
 
@@ -751,10 +4175,20 @@ impl VirtioGpu {
                 fence_id,
                 desc_index,
                 len,
+                created_at: std::time::Instant::now(),
+                route: self.next_fence_route,
+                reported: false,
             });
+            if fence_state.descs.len() == 1 {
+                self.fence_watch.notify_one();
+            }
 
             false
         } else {
+            // Already signaled at creation — retired without ever parking.
+            self.trace
+                .fences_retired
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
     }
@@ -776,20 +4210,122 @@ impl VirtioGpu {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
         }
+        if std::env::var_os("LIMINA_TRACE_BLOB").is_some() {
+            let (n, total) = rutabaga_iovecs
+                .as_ref()
+                .map(|v| (v.len(), v.iter().map(|i| i.len).sum::<usize>()))
+                .unwrap_or((0, 0));
+            log::error!(
+                "[BLOB-CREATE] ctx {ctx_id} res {resource_id} blob_mem={} blob_flags={:#x} size={} -> {n} iovec(s), {total} bytes",
+                resource_create_blob.blob_mem,
+                resource_create_blob.blob_flags,
+                resource_create_blob.size
+            );
+        }
 
-        self.rutabaga.resource_create_blob(
-            ctx_id,
-            resource_id,
-            resource_create_blob,
-            rutabaga_iovecs,
-            None,
-        )?;
+        self.rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .resource_create_blob(
+                ctx_id,
+                resource_id,
+                resource_create_blob,
+                rutabaga_iovecs,
+                None,
+            )?;
 
-        let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
+        let mut resource =
+            VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
+        // limina (#8): remember the rendering context so a scanout flush of this blob
+        // can inject its present fence there.
+        resource.ctx_id = ctx_id;
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
         Ok(self.result_from_query(resource_id))
+    }
+
+    /// A resource whose storage is an IOSurface minted for the extension's renderer (see
+    /// `Rutabaga::resource_create_surface`); answers the send right for it.
+    #[cfg(target_os = "macos")]
+    /// A send right to the surface `resource_id` is presented from, with its shape.
+    #[cfg(target_os = "macos")]
+    pub fn resource_surface_port(
+        &self,
+        resource_id: u32,
+    ) -> std::result::Result<(u32, SurfaceDesc), GpuResponse> {
+        self.rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .resource_surface_port(resource_id)
+            .map_err(|e| {
+                debug!("virtio-gpu: resource {resource_id} has no surface to import: {e}");
+                ErrInvalidResourceId
+            })
+    }
+
+    /// Every surface [`Self::resource_create_surface`] made that still exists: (resource, the
+    /// context it was made for, shape).
+    #[cfg(target_os = "macos")]
+    pub fn embedder_surfaces(&self) -> Vec<(u32, u32, SurfaceDesc)> {
+        let Some(r) = self.rutabaga.as_ref() else {
+            return Vec::new();
+        };
+        r.embedder_surfaces()
+            .into_iter()
+            .map(|(resource, desc)| {
+                let ctx = self.resources.get(&resource).map_or(0, |r| r.ctx_id);
+                (resource, ctx, desc)
+            })
+            .collect()
+    }
+
+    /// The rows of the surface `resource_id` is presented from, at its own layout.
+    #[cfg(target_os = "macos")]
+    pub fn read_surface(&self, resource_id: u32, stride: u32, height: u32) -> Option<Vec<u8>> {
+        let mut rows = vec![0; stride as usize * height as usize];
+        let r = self.rutabaga.as_ref()?;
+        r.read_iosurface(resource_id, &mut rows, stride, height)
+            .map_err(|e| warn!("virtio-gpu: read surface {resource_id}: {e}"))
+            .ok()?;
+        Some(rows)
+    }
+
+    /// Puts back rows [`Self::read_surface`] read. Nothing may be using the surface meanwhile.
+    #[cfg(target_os = "macos")]
+    pub fn write_surface(&self, resource_id: u32, rows: &[u8], stride: u32, height: u32) -> bool {
+        self.rutabaga.as_ref().is_some_and(|r| {
+            r.write_iosurface(resource_id, rows, stride, height)
+                .map_err(|e| warn!("virtio-gpu: write surface {resource_id}: {e}"))
+                .is_ok()
+        })
+    }
+
+    pub fn resource_create_surface(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        surface: SurfaceDesc,
+    ) -> std::result::Result<u32, GpuResponse> {
+        let port = self
+            .rutabaga
+            .as_mut()
+            .ok_or(ErrUnspec)?
+            .resource_create_surface(resource_id, surface)
+            .map_err(|e| {
+                warn!("virtio-gpu: surface resource {resource_id}: {e}");
+                ErrInvalidParameter
+            })?;
+        let size = u64::from(surface.stride) * u64::from(surface.height);
+        let mut resource =
+            VirtioGpuResource::new(resource_id, surface.width, surface.height, None, size);
+        resource.ctx_id = ctx_id;
+        #[cfg(target_os = "macos")]
+        {
+            resource.extension_surface = true;
+        }
+        self.resources.insert(resource_id, resource);
+        Ok(port)
     }
 
     /// Uses the hypervisor to map the rutabaga blob resource.
@@ -810,12 +4346,11 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let rutabaga = self.rutabaga.as_ref().ok_or(ErrUnspec)?;
+        let map_info = rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id)
-            && let Some(mesa_handle) = export.as_mesa_handle()
-        {
-            if mesa_handle.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
+        if let Ok(export) = rutabaga.export_blob(resource_id) {
+            if export.handle_type != RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
                 let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
                     RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
                     RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
@@ -840,7 +4375,7 @@ impl VirtioGpu {
                         resource.size as usize,
                         prot,
                         libc::MAP_SHARED | libc::MAP_FIXED,
-                        mesa_handle.os_handle.as_fd().as_raw_fd(),
+                        export.os_handle.as_raw_fd(),
                         0 as libc::off_t,
                     )
                 };
@@ -872,7 +4407,12 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let map_info = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .map_info(resource_id)
+            .map_err(|_| ErrUnspec)?;
 
         let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
             RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
@@ -889,39 +4429,51 @@ impl VirtioGpu {
         )
         .ok_or(ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if let Some(mesa_handle) = export.as_mesa_handle() {
-                if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_SHM
-                    || mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF
-                {
-                    let ret = unsafe {
-                        libc::mmap(
-                            addr as *mut libc::c_void,
-                            resource.size as usize,
-                            prot,
-                            libc::MAP_SHARED | libc::MAP_FIXED,
-                            mesa_handle.os_handle.as_fd().as_raw_fd(),
-                            0 as libc::off_t,
-                        )
-                    };
-                    if ret == libc::MAP_FAILED {
-                        error!(
-                            "failed to mmap resource in shm region(handle_type={:#x})",
-                            mesa_handle.handle_type
-                        );
-                        return Err(ErrUnspec);
-                    }
-                } else {
-                    self.rutabaga.resource_map(
-                        resource_id,
-                        addr,
-                        resource.size,
+        if let Ok(export) = self
+            .rutabaga
+            .as_ref()
+            .ok_or(ErrUnspec)?
+            .export_blob(resource_id)
+        {
+            // SHM and DMABUF are both regular host fds whose pages can be exposed
+            // to the guest by mmap'ing them directly into the virtio shm region.
+            // For SHM (memfd) this has always worked. For DMABUF it had been
+            // delegated to virgl_renderer_resource_map2, which only handles
+            // virglrenderer-allocated GPU memory and silently no-ops for external
+            // dma-bufs — leaving the guest blob backed by zero pages. That broke
+            // muvm camera capture, where the v4l2 source exports kernel buffers
+            // via VIDIOC_EXPBUF as dma-bufs, the muvm bridge forwards the fd
+            // across SCM_RIGHTS, libkrun classifies it as DMABUF, and the guest's
+            // CREATE_BLOB allocates a host-backed-by-nothing blob. Mapping the
+            // dma-buf fd directly here gives the guest real, live pages.
+            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
+                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_DMABUF
+            {
+                let ret = unsafe {
+                    libc::mmap(
+                        addr as *mut libc::c_void,
+                        resource.size as usize,
                         prot,
                         libc::MAP_SHARED | libc::MAP_FIXED,
-                    )?;
+                        export.os_handle.as_raw_fd(),
+                        0 as libc::off_t,
+                    )
+                };
+                if ret == libc::MAP_FAILED {
+                    error!(
+                        "failed to mmap resource in shm region (handle_type={:#x})",
+                        export.handle_type
+                    );
+                    return Err(ErrUnspec);
                 }
             } else {
-                return Err(ErrUnspec);
+                self.rutabaga.as_mut().ok_or(ErrUnspec)?.resource_map(
+                    resource_id,
+                    addr,
+                    resource.size,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                )?;
             }
         }
 
@@ -943,41 +4495,38 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
+        let rutabaga = self.rutabaga.as_mut().ok_or(ErrUnspec)?;
+        let map_info = rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        // limina: `map_ptr` maps the (venus host-visible) blob and returns the host pointer; with
+        // upstream virglrenderer 1.3.0 this goes through `virgl_renderer_resource_map`. We then
+        // hv_vm_map that pointer into the guest's SHM window. The old slp `0.10.4e-krunkit` bottle
+        // gated this on `export_blob().handle_type == APPLE` (a krunkit-only blob fd type); upstream
+        // 1.3.0 has no APPLE fd type (only DMABUF/OPAQUE/SHM), so we no longer require it — the
+        // `map_ptr` call itself is the gate (it errors for a non-mappable resource).
+        let map_ptr = rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id)
-            && let Some(mesa_handle) = export.as_mesa_handle()
-        {
-            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
-                let guest_addr = checked_blob_map_addr(
-                    shm_region.guest_addr,
-                    offset,
-                    resource.size,
-                    shm_region.size as u64,
-                )
-                .ok_or(ErrUnspec)?;
-                debug!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
-                );
+        let guest_addr = checked_blob_map_addr(
+            shm_region.guest_addr,
+            offset,
+            resource.size,
+            shm_region.size as u64,
+        )
+        .ok_or(ErrUnspec)?;
+        debug!(
+            "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
+            map_ptr, guest_addr, resource.size
+        );
 
-                let (reply_sender, reply_receiver) = unbounded();
-                self.map_sender
-                    .send(WorkerMessage::GpuAddMapping(
-                        reply_sender,
-                        map_ptr,
-                        guest_addr,
-                        resource.size,
-                    ))
-                    .unwrap();
-                if !reply_receiver.recv().unwrap() {
-                    return Err(ErrUnspec);
-                }
-            } else {
-                return Err(ErrUnspec);
-            }
-        } else {
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                map_ptr,
+                guest_addr,
+                resource.size,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
             return Err(ErrUnspec);
         }
 
@@ -1061,6 +4610,76 @@ impl VirtioGpu {
     }
 }
 
+impl VirtioGpu {
+    pub fn fence_handler(&self) -> RutabagaFenceHandler {
+        self.fence_handler.clone()
+    }
+}
+
+/// limina: blob resources that are exported extension arenas (`ext`). Their pages belong to the
+/// extension, not to rutabaga, so they are mapped here from the address it gives.
+impl VirtioGpu {
+    #[cfg(target_os = "macos")]
+    pub fn map_ext_blob(
+        &self,
+        host_addr: u64,
+        size: u64,
+        shm_region: &VirtioShmRegion,
+        offset: u64,
+    ) -> VirtioGpuResult {
+        let guest_addr =
+            checked_blob_map_addr(shm_region.guest_addr, offset, size, shm_region.size as u64)
+                .ok_or(ErrUnspec)?;
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                host_addr,
+                guest_addr,
+                size,
+            ))
+            .map_err(|_| ErrUnspec)?;
+        if !reply_receiver.recv().unwrap_or(false) {
+            return Err(ErrUnspec);
+        }
+        // Arenas are shared-storage memory on a unified-memory host.
+        Ok(OkMapInfo {
+            map_info: rutabaga_gfx::RUTABAGA_MAP_CACHE_CACHED,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn unmap_ext_blob(
+        &self,
+        size: u64,
+        shm_region: &VirtioShmRegion,
+        offset: u64,
+    ) -> VirtioGpuResult {
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuRemoveMapping(
+                reply_sender,
+                shm_region.guest_addr + offset,
+                size,
+            ))
+            .map_err(|_| ErrUnspec)?;
+        if !reply_receiver.recv().unwrap_or(false) {
+            return Err(ErrUnspec);
+        }
+        Ok(OkNoData)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn map_ext_blob(&self, _: u64, _: u64, _: &VirtioShmRegion, _: u64) -> VirtioGpuResult {
+        Err(ErrUnspec)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn unmap_ext_blob(&self, _: u64, _: &VirtioShmRegion, _: u64) -> VirtioGpuResult {
+        Err(ErrUnspec)
+    }
+}
+
 // A guest-controlled `offset` that wraps `offset + size` or `base + offset` would
 // otherwise pass the size guard and place the mmap(MAP_FIXED) out of bounds.
 fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Option<u64> {
@@ -1073,6 +4692,439 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    fn bare_present_fence_state() -> super::PresentFenceState {
+        let (latch_tx, _latch_rx) = std::sync::mpsc::channel();
+        super::PresentFenceState {
+            retired: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            event: utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            next_cookie: 1,
+            parked: std::collections::BTreeMap::new(),
+            flush_parked_cookies: Vec::new(),
+            guest_holds: Vec::new(),
+            latch_tx,
+            latch_delay: std::time::Duration::from_millis(35),
+            ack_active: true,
+            shown: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            resurface: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            awaiting_shown: std::collections::VecDeque::new(),
+            guest_fence_handler: rutabaga_gfx::RutabagaFenceHandler::new(|_| {}),
+        }
+    }
+
+    // limina (s2idle wake wipe, 2026-08-10): `flush_parked_cookies` and `awaiting_shown`
+    // are forward-looking host bookkeeping — a stranded cookie waits for a trailing
+    // flush fence that the guest's freeze-time device reset already dropped, and an
+    // awaiting-shown entry waits for a supervisor ack that cannot arrive during a
+    // reset. Neither references the about-to-be-freed virtio queue, and no drain can
+    // ever shrink them once the activation is gone. Counting them against quiescence
+    // turned every synoik s2idle wake into a fail-closed wipe (compositor SIGABRT).
+    #[test]
+    fn stale_present_bookkeeping_does_not_block_quiescence() {
+        let mut pf = bare_present_fence_state();
+        pf.flush_parked_cookies.push((7, 0));
+        pf.awaiting_shown.push_back((42, 7));
+        assert!(
+            pf.quiescent(),
+            "stranded bookkeeping (no queue references) must not fail quiescence"
+        );
+    }
+
+    // The queue-referencing trio still forces the fail-closed wipe: parked flushes,
+    // held guest fences, and unprocessed retirements all index the freed queue.
+    #[test]
+    fn queue_referencing_present_state_blocks_quiescence() {
+        let mut pf = bare_present_fence_state();
+        assert!(pf.quiescent());
+        pf.parked.insert(
+            1,
+            super::ParkedFlush {
+                scanout_id: 0,
+                iosurface_id: 1,
+                resource_id: 1,
+                rect: super::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                parked_at: std::time::Instant::now(),
+                seq: 1,
+                copied: false,
+            },
+        );
+        assert!(!pf.quiescent());
+        pf.parked.clear();
+        pf.retired
+            .lock()
+            .unwrap()
+            .push((1, std::time::Instant::now()));
+        assert!(!pf.quiescent());
+    }
+
+    // A control-queue drain presents mid-drain only when one of the three hand-off lists holds
+    // something, and reads nothing else: a retired cookie, a shown ack and a resurface ask each
+    // have to wake it on their own, or a drain that runs for seconds starves that one.
+    #[test]
+    fn a_scanout_hold_is_reported_only_when_it_changes() {
+        use super::Hold::{Copies, Fenced, Free};
+        let mut holds = super::ScanoutHolds::default();
+        assert_eq!(holds.note(0, Free), Some(None), "the first answer is news");
+        assert_eq!(holds.note(0, Free), None, "the same answer again is not");
+        assert_eq!(
+            holds.note(1, Free),
+            Some(None),
+            "another scanout keeps its own answer"
+        );
+        assert_eq!(
+            holds.note(0, Copies),
+            Some(Some(Free)),
+            "a copy on glass holding the guest is news"
+        );
+        assert_eq!(
+            holds.note(0, Fenced),
+            Some(Some(Copies)),
+            "a guest that starts fencing is held another way, which is news too"
+        );
+        assert_eq!(holds.note(0, Fenced), None);
+    }
+
+    /// A held flush whose frame goes up as a copy is free once the copy retires: the guest's
+    /// buffer was read by then, and what the display shows is out of its reach. One whose frame
+    /// goes up as the guest's own buffer still waits for the display to say it is shown.
+    #[test]
+    fn a_copied_frame_frees_its_hold_without_waiting_for_the_display() {
+        let mut pf = bare_present_fence_state();
+        let parked = |copied| super::ParkedFlush {
+            scanout_id: 0,
+            iosurface_id: 9,
+            resource_id: 1,
+            rect: super::Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            parked_at: std::time::Instant::now(),
+            seq: 1,
+            copied,
+        };
+        let hold = |cookie| super::GuestFlushHold {
+            fence: rutabaga_gfx::RutabagaFence {
+                flags: 0,
+                fence_id: cookie,
+                ctx_id: 0,
+                ring_idx: 0,
+            },
+            unpresented: [cookie].into(),
+            unconfirmed: [cookie].into(),
+            fallback_at: None,
+            created_at: std::time::Instant::now(),
+        };
+        pf.guest_holds = vec![hold(1), hold(2)];
+
+        pf.presenting(1, &parked(true));
+        assert!(pf.guest_holds[0].unpresented.is_empty());
+        assert!(
+            pf.guest_holds[0].unconfirmed.is_empty(),
+            "a copy is confirmed by retiring"
+        );
+        assert!(
+            pf.awaiting_shown.is_empty(),
+            "nothing to wait for the display on"
+        );
+
+        pf.presenting(2, &parked(false));
+        assert!(pf.guest_holds[1].unpresented.is_empty());
+        assert_eq!(
+            pf.guest_holds[1].unconfirmed,
+            [2].into(),
+            "the guest's own buffer waits for the display"
+        );
+        assert_eq!(pf.awaiting_shown, [(9, 2)]);
+    }
+
+    /// A transport scanout is fenced and copied both, and is held by its fence: reporting it as
+    /// unfenced copies read as a guest that had stopped fencing.
+    #[test]
+    fn a_fenced_scanout_is_held_by_its_fence_whatever_goes_up() {
+        use super::Hold::{self, Copies, Fenced, Free};
+        assert_eq!(Hold::of(true, true, true), Fenced, "fenced, copied");
+        assert_eq!(
+            Hold::of(true, true, false),
+            Fenced,
+            "fenced, the guest's own buffer"
+        );
+        assert_eq!(Hold::of(true, false, true), Copies, "unfenced, copied");
+        assert_eq!(Hold::of(false, false, false), Free);
+    }
+
+    #[test]
+    fn a_frame_shown_after_a_newer_one_is_a_step_back() {
+        let mut order = super::PresentOrder::default();
+        let (older, newer) = (order.stamp(), order.stamp());
+        order.shown(0, newer, 2, "at once");
+        order.shown(0, older, 1, "parked on a fence");
+        assert_eq!(order.backwards, 1);
+        // Another scanout keeps its own order.
+        order.shown(1, older, 3, "at once");
+        assert_eq!(order.backwards, 1);
+        // And the step back did not move the mark: the next frame is judged against the newest.
+        order.shown(0, order.next, 4, "at once");
+        assert_eq!(order.backwards, 1);
+    }
+
+    #[test]
+    fn present_work_is_seen_on_every_hand_off_list() {
+        let pf = bare_present_fence_state();
+        assert!(!pf.has_work(), "an empty state has nothing to present");
+        pf.retired
+            .lock()
+            .unwrap()
+            .push((1, std::time::Instant::now()));
+        assert!(pf.has_work(), "a retired present fence is work");
+        pf.retired.lock().unwrap().clear();
+        pf.shown.lock().unwrap().push(9);
+        assert!(pf.has_work(), "a shown ack is work");
+        pf.shown.lock().unwrap().clear();
+        pf.resurface.lock().unwrap().push(9);
+        assert!(pf.has_work(), "a resurface ask is work");
+    }
+
+    // Parking a session across a reset must DISCARD the stranded bookkeeping: a stale
+    // cookie left behind would be consumed by the next activation's first trailing
+    // fence (a spurious guest hold), and a stale awaiting-shown entry skews the
+    // pop-to-first ack drain forever.
+    #[test]
+    fn take_stale_bookkeeping_drains_and_counts() {
+        let mut pf = bare_present_fence_state();
+        pf.flush_parked_cookies.push((7, 0));
+        pf.awaiting_shown.push_back((42, 7));
+        pf.awaiting_shown.push_back((43, 8));
+        assert_eq!(pf.take_stale_bookkeeping(), (1, 2));
+        assert!(pf.flush_parked_cookies.is_empty());
+        assert!(pf.awaiting_shown.is_empty());
+        assert_eq!(pf.take_stale_bookkeeping(), (0, 0));
+    }
+
+    // limina (#8): fence-accurate presents default ON exactly when the supervisor's
+    // shown-ack channel exists (windowed runs). Ack-less sinks (headless capture, GTK)
+    // must stay off — a parked frame's deferred present_surface is unsupported there
+    // and the no-ack fallback is the compositor-serializing open-loop latch. Explicit
+    // env always wins, `0`/`off` meaning off.
+    #[test]
+    fn fence_present_defaults_on_only_with_ack_channel() {
+        use super::VirtioGpu;
+        assert!(VirtioGpu::fence_present_policy(None, true));
+        assert!(!VirtioGpu::fence_present_policy(None, false));
+        assert!(VirtioGpu::fence_present_policy(Some("1"), false));
+        assert!(!VirtioGpu::fence_present_policy(Some("0"), true));
+        assert!(!VirtioGpu::fence_present_policy(Some("off"), true));
+        assert!(!VirtioGpu::fence_present_policy(Some("OFF"), true));
+        // The historical arming value ("any set value = on") keeps working.
+        assert!(VirtioGpu::fence_present_policy(Some(""), false));
+    }
+
+    // limina: a window-resize to a non-stride-aligned width gives a scanout whose visible rect is
+    // narrower than the guest's (padded) framebuffer resource (e.g. a 1000-wide mode backed by a
+    // 1024-wide resource). The 2D present must extract the rect at the *resource's* stride; a flat
+    // copy shears every row. This guards `blit_scanout_rect` against that regression (the real bug:
+    // a resized GNOME desktop rendered as diagonal stripes, pixel-confirmed 2026-06-23).
+    #[test]
+    fn blit_scanout_rect_de_shears_padded_resource() {
+        use super::blit_scanout_rect;
+        // 4px-wide visible scanout from a 6px-wide padded resource, 3 rows. Tag each pixel's first
+        // byte with row*10 + col so a shear (wrong row offset) is detectable.
+        let (src_w, dst_w, rows) = (6usize, 4usize, 3usize);
+        let (src_stride, dst_stride) = (src_w * 4, dst_w * 4);
+        let mut src = vec![0u8; src_stride * rows];
+        for y in 0..rows {
+            for x in 0..src_w {
+                src[y * src_stride + x * 4] = (y * 10 + x) as u8;
+            }
+        }
+        let mut dst = vec![0u8; dst_stride * rows];
+        blit_scanout_rect(&mut dst, dst_stride, &src, src_stride, rows);
+        // Each dst row must hold exactly the top-left dst_w pixels of the matching src row.
+        for y in 0..rows {
+            for x in 0..dst_w {
+                assert_eq!(
+                    dst[y * dst_stride + x * 4],
+                    (y * 10 + x) as u8,
+                    "sheared at row {y} col {x}"
+                );
+            }
+        }
+    }
+
+    // The matching-stride fast path (resource width == scanout width) is a plain flat copy.
+    #[test]
+    fn blit_scanout_rect_flat_copies_when_strides_match() {
+        use super::blit_scanout_rect;
+        let src: Vec<u8> = (0..(4 * 4 * 2) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        blit_scanout_rect(&mut dst, 4 * 4, &src, 4 * 4, 2);
+        assert_eq!(dst, src);
+    }
+
+    // Software-2D mode (rutabaga == None) has no async fence handler. A fence the
+    // guest requests on a 2D command must be retired synchronously, otherwise the
+    // response is parked forever and the guest hangs (observed: GTK4/nautilus on
+    // the tier-1 software-2D scanout). This guards mark_fence_completed_sync().
+    fn parked(
+        ring: super::VirtioGpuRing,
+        fence_id: u64,
+        age_ms: u64,
+        route: super::FenceRoute,
+        now: std::time::Instant,
+    ) -> super::FenceDescriptor {
+        super::FenceDescriptor {
+            ring,
+            fence_id,
+            desc_index: 0,
+            len: 0,
+            created_at: now - std::time::Duration::from_millis(age_ms),
+            route,
+            reported: false,
+        }
+    }
+
+    #[test]
+    fn a_stale_fence_is_reported_once_with_where_it_is_stuck() {
+        use super::{FenceRoute, FenceState, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let ring = VirtioGpuRing::ContextSpecific {
+            ctx_id: 3,
+            ring_idx: 0,
+        };
+        let mut fs = FenceState::default();
+        fs.descs
+            .push(parked(ring, 7, 2500, FenceRoute::Renderer, now));
+        fs.descs
+            .push(parked(ring, 8, 100, FenceRoute::Renderer, now));
+        let (lines, more) = fs.take_stale(now);
+        assert_eq!(more, 0);
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the fence past the threshold: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("fence 7 ctx 3 ring 0 age 2500 ms"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("submitted to renderer: yes"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("renderer signalled: no"), "{}", lines[0]);
+        assert!(fs.take_stale(now).0.is_empty(), "a fence is reported once");
+    }
+
+    #[test]
+    fn a_signalled_fence_that_never_returned_says_so() {
+        use super::{FenceRoute, FenceState, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let mut fs = FenceState::default();
+        fs.descs.push(parked(
+            VirtioGpuRing::Global,
+            5,
+            3000,
+            FenceRoute::Renderer,
+            now,
+        ));
+        fs.signalled.insert(VirtioGpuRing::Global, 9);
+        let (lines, _) = fs.take_stale(now);
+        assert!(lines[0].contains("global ring"), "{}", lines[0]);
+        assert!(lines[0].contains("renderer signalled: yes"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_fence_never_handed_on_names_its_route() {
+        use super::{FenceRoute, FenceState, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let mut fs = FenceState::default();
+        fs.descs.push(parked(
+            VirtioGpuRing::Global,
+            1,
+            3000,
+            FenceRoute::FlushHold,
+            now,
+        ));
+        let (lines, _) = fs.take_stale(now);
+        assert!(
+            lines[0].contains("submitted to renderer: no (held for its flush's present)"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_wedged_ring_is_described_in_bounded_lines() {
+        use super::{FenceRoute, FenceState, STALE_FENCE_LINES, VirtioGpuRing};
+        let now = std::time::Instant::now();
+        let mut fs = FenceState::default();
+        for id in 0..(STALE_FENCE_LINES as u64 + 5) {
+            fs.descs.push(parked(
+                VirtioGpuRing::Global,
+                id + 1,
+                4000,
+                FenceRoute::Renderer,
+                now,
+            ));
+        }
+        let (lines, more) = fs.take_stale(now);
+        assert_eq!(lines.len(), STALE_FENCE_LINES);
+        assert_eq!(more, 5);
+        assert_eq!(
+            fs.take_stale(now),
+            (Vec::new(), 0),
+            "and none of them again"
+        );
+    }
+
+    #[test]
+    fn test_software_2d_fence_retires_synchronously() {
+        use super::{FenceState, RutabagaFence, VirtioGpuRing, mark_fence_completed_sync};
+        use std::sync::Mutex;
+
+        let fence_state = Mutex::new(FenceState::default());
+        let fence = RutabagaFence {
+            flags: 0, // VIRTIO_GPU_FLAG_INFO_RING_IDX clear -> Global ring
+            fence_id: 1,
+            ctx_id: 0,
+            ring_idx: 0,
+        };
+
+        // Before: nothing completed, so process_fence() would defer (id > 0) and
+        // park the descriptor with no handler to ever wake it.
+        {
+            let st = fence_state.lock().unwrap();
+            let completed = *st
+                .completed_fences
+                .get(&VirtioGpuRing::Global)
+                .unwrap_or(&0);
+            assert!(
+                fence.fence_id > completed,
+                "precondition: fence not yet complete"
+            );
+        }
+
+        mark_fence_completed_sync(&fence_state, &fence);
+
+        // After: the watermark covers the fence, so process_fence() retires it now.
+        let st = fence_state.lock().unwrap();
+        let completed = *st
+            .completed_fences
+            .get(&VirtioGpuRing::Global)
+            .unwrap_or(&0);
+        assert!(
+            fence.fence_id <= completed,
+            "software-2D fence must be marked completed synchronously"
+        );
+    }
 
     #[test]
     fn checked_blob_map_addr_rejects_out_of_range_and_wrapping_offsets() {
@@ -1132,29 +5184,4 @@ mod test {
             .for_each(|scanout| scanouts.disable(scanout));
         assert!(!scanouts.has_any_enabled());
     }
-}
-
-/// Translate virglrenderer flags (which became part of the libkrun 1.x public API) to a rutabaga_gfx capset mask.
-/// Won't be necessary anymore when libkrun 2.x removes these from the API.
-pub fn virgl_flags_to_capsets(flags: u32) -> u64 {
-    let mut capset_mask = 0;
-
-    capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN;
-
-    if flags & VIRGLRENDERER_NO_VIRGL == 0 {
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
-    }
-
-    // Enable Venus if requested (requires render server mode)
-    if flags & VIRGLRENDERER_VENUS != 0 {
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
-    }
-
-    // Enable DRM native context if requested (in-process mode)
-    if flags & VIRGLRENDERER_DRM != 0 {
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
-    }
-
-    capset_mask
 }

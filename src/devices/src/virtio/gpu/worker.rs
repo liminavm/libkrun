@@ -1,116 +1,1133 @@
+use std::collections::VecDeque;
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd};
-use std::sync::{Arc, Mutex};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
-use rutabaga_gfx::{
-    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
-    ResourceCreateBlob, RutabagaFence, Transfer3D,
-};
+#[cfg(target_os = "macos")]
+use rutabaga_gfx::SurfaceDesc;
+use rutabaga_gfx::{ResourceCreate3D, ResourceCreateBlob, RutabagaFence, Transfer3D};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
-use super::protocol::{
-    GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
+use super::ext::{
+    ExtError, ExtState, GpuExtConfig, virtio_gpu_limina_surface_create,
+    virtio_gpu_limina_surface_import,
 };
-use super::virtio_gpu::VirtioGpu;
+#[cfg(target_os = "macos")]
+use super::ext::{ExtSnapshot, SurfaceShape};
+#[cfg(target_os = "macos")]
+use super::journal::GpuSnapshotPayload;
+use super::protocol::{
+    GpuCommand, GpuResponse, VIRTIO_GPU_BLOB_MEM_HOST3D, VirtioGpuResult, virtio_gpu_ctrl_hdr,
+    virtio_gpu_mem_entry,
+};
+use super::virtio_gpu::{GpuActivation, VirtioGpu};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
-use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
+use crate::virtio::gpu::device::DisplayUpdate;
+use crate::virtio::gpu::protocol::{
+    VIRTIO_GPU_EVENT_DISPLAY, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+};
 use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
-use crate::virtio::{InterruptTransport, VirtioShmRegion};
+use crate::virtio::{DumpGate, InterruptTransport, VirtioShmRegion};
 use krun_display::DisplayBackend;
 use krun_display::Rect;
 
+/// Commands the device sends to the long-lived worker thread.
+///
+/// limina (renderer-singleton fix): `virgl_renderer_init` is a process-global, init-once,
+/// thread-bound singleton, so the worker (which owns the `Rutabaga`/renderer) must live for the
+/// whole VMM process and stay on one thread. `activate()`/`reset()` no longer spawn/join it —
+/// they message it to bind/unbind the per-activation transport (the control/cursor queues, guest
+/// memory, and interrupt, which are recreated on every activation).
+pub enum WorkerCmd {
+    /// (Re)bind the transport and start servicing the queues.
+    Activate {
+        mem: GuestMemoryMmap,
+        control_q: DeviceQueue,
+        cursor_q: DeviceQueue,
+        interrupt: InterruptTransport,
+        /// limina (host-sleep s2idle): the transport re-armed this activation's queues
+        /// from the previous activation's register file — a no-PM-ops driver's
+        /// bus-fallback thaw, not a real re-init. Classifies a parked session (below).
+        thaw: bool,
+    },
+    /// Stop servicing and release the transport, but keep the renderer alive (device reset).
+    Deactivate,
+    /// Tear the worker down (device drop / VMM teardown).
+    Shutdown,
+    /// limina M9.3: serialize the GPU re-creation state (rutabaga journal + venus wire
+    /// journals + mapped-blob contents) for the VMM snapshot. Sent with the vCPUs quiesced,
+    /// so no queue traffic races the capture.
+    Snapshot {
+        reply: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+    },
+}
+
+/// How the inner service loop ended.
+enum InnerExit {
+    Deactivate,
+    Shutdown,
+}
+
+/// Gives up a send right nothing will take.
+#[cfg(target_os = "macos")]
+fn release_port(port: u32) {
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> i32;
+    }
+    // SAFETY: `port` is a send right this task owns and no one else will use; the task port is
+    // set before any code runs and never changes.
+    unsafe { mach_port_deallocate(mach_task_self_, port) };
+}
+
+/// The shape a surface is answered with, from what the renderer that made it says.
+#[cfg(target_os = "macos")]
+fn shape_of(d: SurfaceDesc) -> SurfaceShape {
+    SurfaceShape {
+        width: d.width,
+        height: d.height,
+        drm_fourcc: d.drm_fourcc,
+        stride: d.stride,
+    }
+}
+
 pub struct Worker {
-    control_evt: EventFd,
-    control_queue: Arc<Mutex<VirtQueue>>,
-    mem: GuestMemoryMmap,
-    interrupt: InterruptTransport,
+    /// Wakes the inner epoll loop when a [`WorkerCmd`] is waiting on `cmd_rx` (the queue fds
+    /// epoll can't observe the channel). Persistent across activations.
+    stop_fd: EventFd,
+    /// Activation/teardown commands from the device.
+    cmd_rx: std::sync::mpsc::Receiver<WorkerCmd>,
+    /// The current activation's transport, shared with the renderer's fence handler (which is
+    /// registered once and outlives any activation). `None` while inactive.
+    active: Arc<Mutex<Option<GpuActivation>>>,
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
+    /// limina: serve only the software-2D scanout path; don't init virglrenderer/rutabaga.
+    software_2d: bool,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
+    pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    /// limina runtime resize: config-space `events_read`, shared with the device. The worker
+    /// sets VIRTIO_GPU_EVENT_DISPLAY here before raising a config-change; the guest clears it.
+    events_read: Arc<AtomicU32>,
+    /// Wakes the service loop's epoll when a resize is pending (shared with the device + handle).
+    resize_evt: Arc<EventFd>,
+    /// Queued display updates; one is taken per `resize_evt` wake so each reaches the guest
+    /// as its own config-change event.
+    resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
+    /// limina M9.3: a staged GPU snapshot payload ('LGPU'), taken and replayed on the next
+    /// activation. Staged by the restore path; the guest's thaw resets the device (bus
+    /// fallback: reset → features → DRIVER_OK), so replay must run AFTER that reset's
+    /// `reset_session` and before any queue command — i.e. exactly at activation.
+    pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+    /// limina M9.3: flipped true (+ notify) once the staged replay finished; the device's
+    /// `activate` blocks the guest's DRIVER_OK on it (see `Gpu::restore_done`).
+    restore_done: Arc<(Mutex<bool>, Condvar)>,
+    /// Whether the guest has kicked this activation's cursor queue. Only then does a long
+    /// control-queue drain service it: a driver that never uses the queue (the firmware's) may
+    /// leave it unconfigured, and servicing one writes to wherever its rings point.
+    cursor_kicked: bool,
+    /// Held closed by a snapshot while it copies guest RAM; each wake of the service loop
+    /// passes through it.
+    dump_gate: Arc<DumpGate>,
+    /// limina: the device-side state of the native-context extension, if configured.
+    ext: Option<ExtState>,
 }
 
 impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        control_q: DeviceQueue,
-        mem: GuestMemoryMmap,
-        interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
+        software_2d: bool,
+        stop_fd: EventFd,
+        cmd_rx: std::sync::mpsc::Receiver<WorkerCmd>,
+        active: Arc<Mutex<Option<GpuActivation>>>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
+        pipeline_cache_key: Option<rutabaga_gfx::PipelineCacheKey>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
+        events_read: Arc<AtomicU32>,
+        resize_evt: Arc<EventFd>,
+        resize_pending: Arc<Mutex<VecDeque<DisplayUpdate>>>,
+        pending_restore: Arc<Mutex<Option<Vec<u8>>>>,
+        restore_done: Arc<(Mutex<bool>, Condvar)>,
+        dump_gate: Arc<DumpGate>,
+        ext: Option<GpuExtConfig>,
     ) -> Self {
-        // Clone the eventfd so we have our own file description, then set it to blocking mode.
-        let control_evt = control_q.event.try_clone().unwrap();
-        // SAFETY: control_evt is valid for the duration of the fcntl calls.
-        let fd = unsafe { BorrowedFd::borrow_raw(control_evt.as_raw_fd()) };
-        let flags =
-            OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
-
+        #[cfg(target_os = "macos")]
+        let ext = ext.map(|cfg| ExtState::new(cfg, map_sender.clone()));
+        #[cfg(not(target_os = "macos"))]
+        let ext = ext.map(ExtState::new);
         Self {
-            control_evt,
-            control_queue: Arc::new(Mutex::new(control_q.queue)),
-            mem,
-            interrupt,
+            ext,
+            stop_fd,
+            cmd_rx,
+            active,
             shm_region,
             virgl_flags,
+            software_2d,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table,
+            pipeline_cache_key,
             displays,
             display_backend,
+            events_read,
+            resize_evt,
+            resize_pending,
+            pending_restore,
+            restore_done,
+            cursor_kicked: false,
+            dump_gate,
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("gpu worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
+    /// The worker thread body: build the renderer ONCE (it's a process-global, thread-bound
+    /// singleton), then loop activating/deactivating as the device binds/unbinds transport.
     fn work(mut self) {
+        // The renderer + fence handler are created once and live for the whole process. The
+        // fence handler reaches the current activation's queue/mem/interrupt through `active`.
         let mut virtio_gpu = VirtioGpu::new(
-            self.mem.clone(),
-            self.control_queue.clone(),
-            self.interrupt.clone(),
+            self.active.clone(),
             self.virgl_flags,
+            self.software_2d,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
+            self.pipeline_cache_key.take(),
             self.displays.clone(),
             self.display_backend,
+            self.dump_gate.clone(),
         );
 
+        // limina (host-sleep s2idle, defer-and-classify): a device reset no longer wipes the
+        // session immediately — if it was quiescent, the bookkeeping is PARKED and this flag
+        // set, and the NEXT activation classifies it: a re-armed activation (`thaw`, the
+        // bus-fallback s2idle signature) adopts the parked world unchanged (the thawing guest
+        // is the same live kernel — its ids still match); a queue-programming activation is a
+        // real re-init (reboot, rebind, firmware hand-off) and runs the deferred wipe first.
+        let mut parked_session = false;
+
         loop {
-            if let Err(e) = self.control_evt.read() {
-                error!("Failed to read control_evt: {e:?}");
-                continue;
+            // Inactive: block on the next command from the device.
+            let (mem, control_q, cursor_q, interrupt, thaw) = match self.cmd_rx.recv() {
+                Ok(WorkerCmd::Activate {
+                    mem,
+                    control_q,
+                    cursor_q,
+                    interrupt,
+                    thaw,
+                }) => (mem, control_q, cursor_q, interrupt, thaw),
+                // A Deactivate while already inactive is a no-op; Shutdown / closed channel ends.
+                Ok(WorkerCmd::Deactivate) => continue,
+                Ok(WorkerCmd::Shutdown) | Err(_) => {
+                    if parked_session {
+                        virtio_gpu.reset_session();
+                        self.reset_ext();
+                    }
+                    return;
+                }
+                // limina M9.3: a snapshot request can arrive while inactive (unlikely — the
+                // production suspend path snapshots with the device DRIVER_OK — but harmless).
+                Ok(WorkerCmd::Snapshot { reply }) => {
+                    let ext = self.snapshot_ext(&virtio_gpu);
+                    Self::drain_fences(&virtio_gpu);
+                    let _ = reply.send(virtio_gpu.snapshot_gpu_payload(ext));
+                    continue;
+                }
+            };
+
+            // Classify a parked session against this activation (see `parked_session`).
+            if parked_session {
+                parked_session = false;
+                if thaw {
+                    info!(
+                        "gpu worker: adopting the parked session across a bus-fallback thaw \
+                         (in-place s2idle; no replay needed)"
+                    );
+                } else {
+                    info!(
+                        "gpu worker: dropping the parked session — this activation programmed \
+                         its queues (real driver re-init)"
+                    );
+                    virtio_gpu.reset_session();
+                    self.reset_ext();
+                }
             }
-            if self.process_queue(&mut virtio_gpu, &self.control_queue.clone())
-                && let Err(e) = self.interrupt.try_signal_used_queue()
-            {
-                error!("Error signaling queue: {e:?}");
+
+            // Own each activation's queue eventfds + queues; publish the transport so the
+            // long-lived fence handler retires guest fences into THIS activation's queue.
+            // limina wake-probe: watch the TRANSPORT's fd, not the try_clone below — try_clone
+            // dups, so the worker's copy has a different raw fd and would never match the
+            // doorbell the vCPU stamps. (This is exactly what the first run got wrong: every
+            // wake landed in `no_kick`.)
+            crate::virtio::wake_probe::watch(control_q.event.as_raw_fd());
+            let control_evt = control_q.event.try_clone().unwrap();
+            let cursor_evt = cursor_q.event.try_clone().unwrap();
+            let control_queue = Arc::new(Mutex::new(control_q.queue));
+            let cursor_queue = Arc::new(Mutex::new(cursor_q.queue));
+            self.cursor_kicked = false;
+            if let Some(ext) = self.ext.as_mut() {
+                ext.map_timing();
+            }
+            *self.active.lock().unwrap() = Some(GpuActivation {
+                mem: mem.clone(),
+                control_queue: control_queue.clone(),
+                interrupt: interrupt.clone(),
+            });
+
+            // limina M9.3: a staged GPU snapshot payload replays NOW — after the thaw
+            // reset's `reset_session` (which would have wiped it) and before the first
+            // queue command (whose venus state it re-creates). The guest's DRIVER_OK write
+            // is BLOCKED on `restore_done` for the duration (see `Gpu::activate`), keeping
+            // the thaw — and with it guest userspace — frozen until the blob mappings are
+            // re-established; without that hold, mesa's first post-thaw writes raced the
+            // replay and landed in unmapped shmem (run-14 ring FATAL).
+            let staged = self.pending_restore.lock().unwrap().take();
+            if let Some(data) = staged {
+                if self.gpu_restore(&mut virtio_gpu, &data, &mem) {
+                    info!("gpu worker: staged snapshot replay complete");
+                } else {
+                    warn!("gpu worker: staged snapshot replay failed; guest session will restart");
+                }
+                let (done_lock, done_cv) = &*self.restore_done;
+                *done_lock.lock().unwrap() = true;
+                done_cv.notify_all();
+            }
+
+            let exit = self.service(
+                &mut virtio_gpu,
+                &mem,
+                &control_evt,
+                &control_queue,
+                &cursor_evt,
+                &cursor_queue,
+                &interrupt,
+            );
+
+            // Unbind the transport. What happens to the session bookkeeping depends on how
+            // this activation ended (defer-and-classify, docs/design/host-sleep-s2idle.md §3):
+            //
+            // - Deactivate (guest device reset): DON'T wipe yet. If the session is quiescent —
+            //   fence ledger drained AND nothing in the present plumbing references the freed
+            //   queue — PARK it and let the next activation classify (thaw → adopt, re-init →
+            //   deferred wipe). A thaw's reset arrives after the whole suspend, so the drain
+            //   returns immediately there; a dirty reset with work in flight fails the check
+            //   and takes the fail-closed wipe (exactly the old behavior). This is what keeps
+            //   a seated venus session alive across in-place s2idle: the world was never lost,
+            //   only this wipe destroyed it.
+            // - Shutdown (device drop / VMM teardown): wipe as before — teardown ordering
+            //   frees per-session state while the renderer thread is still alive.
+            match exit {
+                InnerExit::Deactivate => {
+                    // Drain BEFORE unbinding the transport (§22 hardening, 2026-07-30):
+                    // fence retirement (the async fence callbacks), the guest-hold latch
+                    // (500 ms ceiling) and the present pump all need the live activation —
+                    // once `active` is cleared the fence handler drops completions on the
+                    // floor, so the old post-unbind drain could only ever succeed
+                    // vacuously. Draining here lets a session that was merely MID-FRAME
+                    // at the reset become quiescent and PARK instead of losing its whole
+                    // venus world: the couve aborted-sleep wipe was an s2idle entry
+                    // landing inside the compositor's fade-out animation.
+                    Self::drain_for_classify(&mut virtio_gpu);
+                    *self.active.lock().unwrap() = None;
+                    let (outstanding, summary) = virtio_gpu.outstanding_fences();
+                    if outstanding == 0 && virtio_gpu.present_quiescent() {
+                        let (cookies, shown) = virtio_gpu.discard_stale_present_bookkeeping();
+                        if shown > 100 {
+                            // A backlog this deep means shown acks stopped draining long
+                            // ago (every ack either missing or naming an unknown surface)
+                            // — the leak we want field logs to surface at default level.
+                            warn!(
+                                "gpu worker: dropped {shown} awaiting-shown entries at \
+                                 reset — the shown-ack loop was not draining this session \
+                                 ({cookies} flush-parked cookie(s) also discarded)"
+                            );
+                        } else if cookies != 0 || shown != 0 {
+                            info!(
+                                "gpu worker: dropped stale present bookkeeping stranded by \
+                                 the reset ({cookies} flush-parked cookie(s), {shown} \
+                                 awaiting-shown entr(y/ies)) — forward-looking state with \
+                                 no queue references"
+                            );
+                        }
+                        parked_session = true;
+                        info!(
+                            "gpu worker: device reset with a quiescent session — PARKED for \
+                             classification at the next activation"
+                        );
+                    } else {
+                        warn!(
+                            "gpu worker: device reset with the session NOT quiescent \
+                             (fences: {outstanding} outstanding [{summary}]; {}) — wiping \
+                             (fail-closed)",
+                            virtio_gpu.present_pending_summary()
+                        );
+                        virtio_gpu.reset_session();
+                        self.reset_ext();
+                    }
+                    continue;
+                }
+                InnerExit::Shutdown => {
+                    *self.active.lock().unwrap() = None;
+                    virtio_gpu.reset_session();
+                    self.reset_ext();
+                    return;
+                }
             }
         }
+    }
+
+    /// limina (§22 hardening): bounded present+fence drain before classifying a device
+    /// reset, run with the activation still bound. Pumps retired presents (this thread
+    /// owns the display backend, same as the service loop's present_ev handling) while
+    /// the async fence callbacks and the guest-hold latch retire the rest. The deadline
+    /// comfortably covers the guest-hold ceiling (500 ms) plus a shown-ack round trip;
+    /// a session that cannot drain (a guest that died mid-frame) pays it once and takes
+    /// the fail-closed wipe exactly as before.
+    fn drain_for_classify(virtio_gpu: &mut VirtioGpu) {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(1500);
+        loop {
+            virtio_gpu.process_retired_presents();
+            // This loop has the worker thread, so the epoll pump is not running: a fence held
+            // for a GL query check retires only if we pump here.
+            virtio_gpu.renderer_event_poll();
+            let (outstanding, _) = virtio_gpu.outstanding_fences();
+            if outstanding == 0 && virtio_gpu.present_quiescent() {
+                info!("gpu worker: reset drain quiesced in {:?}", start.elapsed());
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "gpu worker: reset drain timed out after {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// limina M9.3: drain in-flight guest fences before a snapshot capture. The guest
+    /// froze mid-frame and its waiters hold sync_files backed by these fences; a fence
+    /// whose completion misses the snapshot never signals in the restored epoch (eyeball
+    /// 2026-07-19: gnome-shell resumed wedged in `vn_GetSemaphoreFdKHR → poll()`). The
+    /// vCPUs are parked, so no new fences arrive; retirement runs on virglrenderer's
+    /// async fence-callback threads (ASYNC_FENCE_CB), so it proceeds while we poll. The
+    /// used-ring writes land in guest RAM (dumped after this) and the raised IRQs latch
+    /// in the GIC (saved after the GPU capture) — restored waiters see signaled fences.
+    fn drain_fences(virtio_gpu: &VirtioGpu) {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(5);
+        loop {
+            // As in `drain_for_classify`: nothing else pumps the renderer while we hold the
+            // worker thread, and a fence held for a GL query check needs it.
+            virtio_gpu.renderer_event_poll();
+            let (n, summary) = virtio_gpu.outstanding_fences();
+            if n == 0 {
+                info!(
+                    "gpu snapshot: fence ledger drained in {:?}",
+                    start.elapsed()
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!("gpu snapshot: fence drain TIMED OUT with {n} outstanding: {summary}");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// limina M9.3: replay a GPU snapshot section into the (fresh) renderer. macOS-only
+    /// mechanism today — the venus/KK stack this exists for; elsewhere report failure so
+    /// the caller falls back to fresh-renderer behavior.
+    fn gpu_restore(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        data: &[u8],
+        mem: &GuestMemoryMmap,
+    ) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(mut payload) = GpuSnapshotPayload::from_bytes(data) else {
+                error!("gpu restore: unparseable GPU snapshot section");
+                return false;
+            };
+            let ext = match std::mem::take(&mut payload.ext) {
+                bytes if bytes.is_empty() => None,
+                bytes => match ExtSnapshot::from_bytes(&bytes) {
+                    Some(s) => Some(s),
+                    None => {
+                        error!("gpu restore: unparseable extension section");
+                        return false;
+                    }
+                },
+            };
+            if let Some(s) = &ext
+                && !self.restore_ext_resources(virtio_gpu, s)
+            {
+                return false;
+            }
+            if !virtio_gpu.restore_gpu_payload(payload, &self.shm_region, mem) {
+                return false;
+            }
+            ext.is_none_or(|s| self.restore_ext_rings(virtio_gpu, &s))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (virtio_gpu, data, mem);
+            false
+        }
+    }
+
+    /// Service the bound transport's queues until the device deactivates or shuts down.
+    #[allow(clippy::too_many_arguments)]
+    fn service(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        mem: &GuestMemoryMmap,
+        control_evt: &EventFd,
+        control_queue: &Arc<Mutex<VirtQueue>>,
+        cursor_evt: &EventFd,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        interrupt: &InterruptTransport,
+    ) -> InnerExit {
+        let control_ev_fd = control_evt.as_raw_fd();
+        let cursor_ev_fd = cursor_evt.as_raw_fd();
+        let stop_ev_fd = self.stop_fd.as_raw_fd();
+        // limina runtime resize: the host (limina-vmm) kicks this fd to push a new display size.
+        let resize_ev_fd = self.resize_evt.as_raw_fd();
+        // limina (#8): retired present fences wake this fd; -1 (never matched) when
+        // the renderer is absent.
+        let present_ev_fd = virtio_gpu.present_event_fd().unwrap_or(-1);
+        // limina (vrend fence honesty): the renderer's poll descriptor. virglrs holds a context
+        // fence behind a GL query that was not ready until this thread (the GL thread) pumps
+        // `poll()`, which writes the result before the fence retires; unpumped, that fence and
+        // every one behind it wedges. -1 when there's no renderer.
+        let renderer_poll_fd = virtio_gpu.renderer_poll_fd().unwrap_or(-1);
+
+        // A stop signal left over from a Deactivate that arrived while we were inactive (the
+        // outer loop consumed the command but not the kick) just produces one spurious wake
+        // here, handled by the `TryRecvError::Empty` branch below — no entry drain needed (and
+        // draining here could eat a Deactivate kick that races this activation).
+        let mut epoll = Epoll::new().unwrap();
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            control_ev_fd,
+            &EpollEvent::new(EventSet::IN, control_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            cursor_ev_fd,
+            &EpollEvent::new(EventSet::IN, cursor_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_ev_fd,
+            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            resize_ev_fd,
+            &EpollEvent::new(EventSet::IN, resize_ev_fd as u64),
+        );
+        if present_ev_fd >= 0 {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                present_ev_fd,
+                &EpollEvent::new(EventSet::IN, present_ev_fd as u64),
+            );
+        }
+        if renderer_poll_fd >= 0 {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                renderer_poll_fd,
+                &EpollEvent::new(EventSet::IN, renderer_poll_fd as u64),
+            );
+        }
+
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        // limina wake-trace (LIMINA_WAKE_TRACE=1): per-source wake accounting for this
+        // loop, ~5s cadence — see docs/perf/overhead-inventory.md.
+        let mut wake_trace = std::env::var("LIMINA_WAKE_TRACE")
+            .ok()
+            .map(|_| (std::time::Instant::now(), [0u64; 6]));
+        // limina wake-probe (LIMINA_WAKE_PROBE=1): the VMM half of the venus wake chain —
+        // guest doorbell -> this thread scheduled -> control queue drained (which is where
+        // vkr_ring_notify happens) -> used-queue interrupt raised. Joins virglrenderer's
+        // LIMINA_RING_WAKE_PROFILE, which covers everything after cnd_signal.
+        let mut wake_probe = crate::virtio::wake_probe::Profile::new();
+        let dump_gate = self.dump_gate.clone();
+        // Test aid (LIMINA_GPU_TEST_DRAIN_DELAY_MS): hold each control-queue drain back, so
+        // the guest still has commands in flight when it suspends and the snapshot's fence
+        // drain completes them behind its back.
+        let drain_delay = std::env::var("LIMINA_GPU_TEST_DRAIN_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis);
+        loop {
+            let ev_cnt = match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!("gpu worker epoll wait failed: {e}");
+                    continue;
+                }
+            };
+            // Stamped before any per-event work, so `kick -> wake` is the scheduling latency
+            // alone and nothing this loop does afterwards leaks into it.
+            let wake_ns = if wake_probe.is_some() {
+                crate::virtio::wake_probe::now_ns()
+            } else {
+                0
+            };
+            let _section = dump_gate.enter();
+            if let Some((last, counts)) = wake_trace.as_mut() {
+                counts[0] += 1;
+                for event in &epoll_events[0..ev_cnt] {
+                    let source = event.fd();
+                    if source == control_ev_fd {
+                        counts[1] += 1;
+                    } else if source == cursor_ev_fd {
+                        counts[2] += 1;
+                    } else if present_ev_fd >= 0 && source == present_ev_fd {
+                        counts[3] += 1;
+                    } else if source == resize_ev_fd {
+                        counts[4] += 1;
+                    } else {
+                        counts[5] += 1;
+                    }
+                }
+                let secs = last.elapsed().as_secs_f64();
+                if secs >= 5.0 {
+                    eprintln!(
+                        "[WAKETRACE gpu_worker] wakes={:.0}/s control={:.0}/s cursor={:.0}/s present={:.0}/s resize={:.0}/s other={:.0}/s",
+                        counts[0] as f64 / secs,
+                        counts[1] as f64 / secs,
+                        counts[2] as f64 / secs,
+                        counts[3] as f64 / secs,
+                        counts[4] as f64 / secs,
+                        counts[5] as f64 / secs,
+                    );
+                    *counts = [0; 6];
+                    *last = std::time::Instant::now();
+                }
+            }
+            for event in &epoll_events[0..ev_cnt] {
+                let source = event.fd();
+                if source == stop_ev_fd {
+                    // A command awaits (the queue fds can't observe the channel). Drain the
+                    // wake and act on it.
+                    let _ = self.stop_fd.read();
+                    match self.cmd_rx.try_recv() {
+                        Ok(WorkerCmd::Deactivate) => return InnerExit::Deactivate,
+                        Ok(WorkerCmd::Shutdown) => return InnerExit::Shutdown,
+                        // limina M9.3: snapshot with the transport bound (vCPUs quiesced by
+                        // the caller, so the queues are idle). Drain in-flight fences first —
+                        // see drain_fences.
+                        Ok(WorkerCmd::Snapshot { reply }) => {
+                            let ext = self.snapshot_ext(virtio_gpu);
+                            Self::drain_fences(virtio_gpu);
+                            let _ = reply.send(virtio_gpu.snapshot_gpu_payload(ext));
+                        }
+                        // An Activate while already active shouldn't happen (the lifecycle is
+                        // activate→reset→activate); ignore it. Empty = spurious wake.
+                        Ok(WorkerCmd::Activate { .. })
+                        | Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return InnerExit::Shutdown;
+                        }
+                    }
+                }
+                if source == control_ev_fd {
+                    if let Err(e) = control_evt.read() {
+                        error!("Failed to read control_evt: {e:?}");
+                        continue;
+                    }
+                    // EVENT_IDX: drain inside a disable/enable-notification bracket so the
+                    // guest stops ringing the doorbell (a vmexit + this wake) while we're
+                    // already here; `enable_notification` re-arms and reports entries that
+                    // raced the re-arm. Signal only when the guest asked (used_event) —
+                    // without EVENT_IDX `needs_notification` is always true (stock behavior).
+                    // limina wake-probe: the doorbell behind this wake, if any. Taken before
+                    // the drain so a kick that lands mid-drain stays for the next wake rather
+                    // than being credited to this one.
+                    let kick_ns = wake_probe
+                        .as_mut()
+                        .and_then(|_| crate::virtio::wake_probe::consume_kick());
+                    // First pass only: that is the pass carrying the command the doorbell
+                    // announced (vkNotifyRingMESA included). Later passes are the
+                    // enable_notification re-arm race, a different question.
+                    let mut probe_pass = kick_ns;
+                    if let (Some(p), None) = (wake_probe.as_mut(), kick_ns) {
+                        p.record_no_kick();
+                    }
+                    // Nothing else on this thread runs until the drain below returns -- retired
+                    // presents included -- so a long one is a frozen window. Measured here, where
+                    // the time goes, rather than inferred from the presents it delays.
+                    if let Some(d) = drain_delay {
+                        thread::sleep(d);
+                    }
+                    let drain_began = std::time::Instant::now();
+                    let mut drain_passes = 0u32;
+                    loop {
+                        drain_passes += 1;
+                        let _ = control_queue.lock().unwrap().disable_notification(mem);
+                        let used_any = self.process_queue(
+                            virtio_gpu,
+                            control_queue,
+                            cursor_queue,
+                            interrupt,
+                            mem,
+                        );
+                        let drained_ns = probe_pass.map(|_| crate::virtio::wake_probe::now_ns());
+                        if let (Some(p), Some(k)) = (wake_probe.as_mut(), probe_pass) {
+                            p.arm(k);
+                        }
+                        if used_any
+                            && control_queue
+                                .lock()
+                                .unwrap()
+                                .needs_notification(mem)
+                                .unwrap_or(true)
+                        {
+                            // Arm the return-path measurement here, not with `arm` above: this
+                            // is the only branch that actually interrupts the guest, and the
+                            // guest can ack before this thread runs again.
+                            if let Some(p) = wake_probe.as_ref() {
+                                p.arm_irq();
+                            }
+                            if let Err(e) = interrupt.try_signal_used_queue() {
+                                error!("Error signaling queue: {e:?}");
+                            }
+                        }
+                        if let (Some(p), Some(k), Some(d)) =
+                            (wake_probe.as_mut(), probe_pass, drained_ns)
+                        {
+                            p.record(k, wake_ns, d, crate::virtio::wake_probe::now_ns());
+                            probe_pass = None;
+                        }
+                        match control_queue.lock().unwrap().enable_notification(mem) {
+                            Ok(true) => continue,
+                            Ok(false) => break,
+                            Err(e) => {
+                                error!("Error re-enabling control queue notification: {e:?}");
+                                break;
+                            }
+                        }
+                    }
+                    let drained = drain_began.elapsed();
+                    if drained >= std::time::Duration::from_millis(100) {
+                        warn!(
+                            "virtio-gpu: control queue drain ran {} ms over {drain_passes} pass(es); \
+                             nothing else on the worker ran meanwhile",
+                            drained.as_millis()
+                        );
+                    }
+                }
+                if source == cursor_ev_fd {
+                    if let Err(e) = cursor_evt.read() {
+                        error!("Failed to read cursor_evt: {e:?}");
+                        continue;
+                    }
+                    self.cursor_kicked = true;
+                    self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, mem);
+                }
+                // limina runtime resize: the host pushed a new display size. Apply it to the
+                // scanout's preferred mode, set the config-space display-event bit, and raise a
+                // virtio-gpu config-change interrupt so the guest re-reads GET_DISPLAY_INFO and
+                // re-modesets (the backend reallocates on the resulting SET_SCANOUT geometry).
+                if source == resize_ev_fd {
+                    let _ = self.resize_evt.read();
+                    // The guest acknowledges a config-change event with a read-then-clear, so
+                    // a second event raised between its read and its clear is silently wiped —
+                    // updates split across back-to-back events lose the second one (seen as an
+                    // arrangement move arriving and the connect right behind it never waking
+                    // the guest). Two guards close that race:
+                    //  - while an event is unconsumed, the queue HOLDS; the guest's ack
+                    //    (`events_clear`, see `write_config`) re-kicks this eventfd;
+                    //  - one event carries as many queued updates as can share it, which is
+                    //    safe because the guest only ever reads the final state. The one thing
+                    //    that must NOT coalesce is a second connectivity flip for a display
+                    //    already flipped in this batch — a disconnect+reconnect would collapse
+                    //    into "nothing happened" and the guest would never see the unplug.
+                    //    That case stops the batch and goes out as its own event after the ack.
+                    if self.events_read.load(Ordering::SeqCst) & VIRTIO_GPU_EVENT_DISPLAY != 0 {
+                        continue;
+                    }
+                    let (batch, more) = {
+                        let mut queue = self.resize_pending.lock().unwrap();
+                        let mut batch = Vec::new();
+                        let mut flipped = std::collections::HashSet::new();
+                        while let Some(next) = queue.front() {
+                            if next.connected.is_some() && flipped.contains(&next.display_id) {
+                                break;
+                            }
+                            let update = queue.pop_front().unwrap();
+                            if update.connected.is_some() {
+                                flipped.insert(update.display_id);
+                            }
+                            batch.push(update);
+                        }
+                        (batch, !queue.is_empty())
+                    };
+                    if !batch.is_empty() {
+                        for update in batch {
+                            let id = update.display_id;
+                            if let Some((w, h)) = update.size {
+                                virtio_gpu.set_display_size(id, w, h);
+                            }
+                            if let Some((x, y)) = update.position {
+                                virtio_gpu.set_display_position(id, x, y);
+                            }
+                            if let Some(params) = update.edid {
+                                virtio_gpu.set_display_edid(id, params);
+                            }
+                            if let Some(connected) = update.connected {
+                                virtio_gpu.set_display_connected(id, connected);
+                            }
+                        }
+                        self.events_read
+                            .fetch_or(VIRTIO_GPU_EVENT_DISPLAY, Ordering::SeqCst);
+                        if let Err(e) = interrupt.try_signal_config_change() {
+                            error!("display update: failed to signal config change: {e:?}");
+                        }
+                    }
+                    if more {
+                        let _ = self.resize_evt.write(1);
+                    }
+                }
+                // limina (#8): present fences retired — show their parked frames.
+                if present_ev_fd >= 0 && source == present_ev_fd {
+                    virtio_gpu.process_retired_presents();
+                }
+                // limina (vrend fence honesty): the renderer asked for a GL-thread query
+                // check. `poll()` drains the descriptor, answers the parked queries and
+                // releases the fences held for them.
+                if renderer_poll_fd >= 0 && source == renderer_poll_fd {
+                    virtio_gpu.renderer_event_poll();
+                }
+            }
+            // With no descriptor to register, pump on every wake instead: it costs nothing when
+            // the renderer has nothing parked, and a renderer without a fence waiter that
+            // still parks something must not be left waiting on a wake that never comes.
+            if renderer_poll_fd < 0 {
+                virtio_gpu.renderer_event_poll();
+            }
+            if let Some(p) = wake_probe.as_mut() {
+                p.maybe_report();
+            }
+        }
+    }
+
+    /// Whether `resource` is a blob wrapping an extension arena.
+    fn is_ext_blob(&self, resource: u32) -> bool {
+        self.ext.as_ref().is_some_and(|e| e.is_export(resource))
+    }
+
+    /// Resource `req.resource_id` becomes a surface the device mints and gives to extension
+    /// context `ctx`: the context renders into it, and every other context reaches it as an
+    /// ordinary resource (vrend adopts it, venus imports it).
+    #[cfg(target_os = "macos")]
+    fn create_ext_surface(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        ctx: u32,
+        req: virtio_gpu_limina_surface_create,
+    ) -> VirtioGpuResult {
+        let Some(ext) = self.ext.as_mut() else {
+            return Err(GpuResponse::ErrUnspec);
+        };
+        if !ext.has_context(ctx) {
+            return Err(GpuResponse::ErrInvalidContextId);
+        }
+        let surface = SurfaceDesc {
+            width: req.width,
+            height: req.height,
+            drm_fourcc: req.drm_fourcc,
+            stride: req.stride,
+        };
+        let port = virtio_gpu.resource_create_surface(ctx, req.resource_id, surface)?;
+        let shape = SurfaceShape {
+            width: req.width,
+            height: req.height,
+            drm_fourcc: req.drm_fourcc,
+            stride: req.stride,
+        };
+        if ext.bind_surface(ctx, req.resource_id, port, shape).is_err() {
+            let _ = virtio_gpu.unref_resource(req.resource_id);
+            return Err(GpuResponse::ErrUnspec);
+        }
+        Ok(GpuResponse::OkNoData)
+    }
+
+    /// `SURFACE_IMPORT`: the surface a resource is presented from, made by any renderer, is given
+    /// to extension context `ctx`. A resource with none is refused, never a fault of the context.
+    #[cfg(target_os = "macos")]
+    fn import_ext_surface(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        ctx: u32,
+        req: virtio_gpu_limina_surface_import,
+    ) -> VirtioGpuResult {
+        let Some(ext) = self.ext.as_mut() else {
+            return Err(GpuResponse::ErrUnspec);
+        };
+        if !ext.has_context(ctx) {
+            return Err(GpuResponse::ErrInvalidContextId);
+        }
+        // A context made only on this transport is never told its handles closed (the kernel
+        // attaches and detaches resources for contexts of its own only), so a guest importing a
+        // buffer again after letting go of it finds it still held: that hold stands until the
+        // resource goes, and answers again. Asked before a send right is made: one made and then
+        // not given would have no one to give it back to.
+        if let Some(shape) = ext.held_surface(ctx, req.resource_id) {
+            return Ok(GpuResponse::OkLiminaSurface(shape));
+        }
+        let (port, desc) = virtio_gpu.resource_surface_port(req.resource_id)?;
+        let shape = shape_of(desc);
+        ext.bind_surface(ctx, req.resource_id, port, shape)
+            .map_err(|_| GpuResponse::ErrUnspec)?;
+        Ok(GpuResponse::OkLiminaSurface(shape))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn import_ext_surface(
+        &mut self,
+        _virtio_gpu: &mut VirtioGpu,
+        _ctx: u32,
+        _req: virtio_gpu_limina_surface_import,
+    ) -> VirtioGpuResult {
+        Err(GpuResponse::ErrUnspec)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn create_ext_surface(
+        &mut self,
+        _virtio_gpu: &mut VirtioGpu,
+        _ctx: u32,
+        _req: virtio_gpu_limina_surface_create,
+    ) -> VirtioGpuResult {
+        Err(GpuResponse::ErrUnspec)
+    }
+
+    /// limina: the extension's section of a snapshot, empty without one. Every context is exported
+    /// first, which waits for its committed work (or loses the context), so the fence drain that
+    /// follows finds its fences answered.
+    fn snapshot_ext(&self, virtio_gpu: &VirtioGpu) -> Vec<u8> {
+        let Some(ext) = self.ext.as_ref() else {
+            return Vec::new();
+        };
+        #[allow(unused_mut)]
+        let mut s = ext.snapshot();
+        #[cfg(target_os = "macos")]
+        for (resource, ctx, desc) in virtio_gpu.embedder_surfaces() {
+            let rows = virtio_gpu
+                .read_surface(resource, desc.stride, desc.height)
+                .unwrap_or_else(|| {
+                    // The client draws it again; until then the window is blank.
+                    warn!("gpu snapshot: surface {resource}: rows not read");
+                    Vec::new()
+                });
+            s.made.push((resource, ctx, shape_of(desc), rows));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = virtio_gpu;
+        let bytes = s.to_bytes();
+        info!(
+            "gpu snapshot: extension: {} contexts ({} with rings), {} arenas, {} surfaces made, \
+             {} MiB",
+            s.contexts.len(),
+            s.contexts.iter().filter(|c| c.ring.is_some()).count(),
+            s.arenas.len(),
+            s.made.len(),
+            bytes.len() >> 20
+        );
+        debug!(
+            "gpu snapshot: extension resources: made {:?}, held {:?}, exports {:?}",
+            s.made.iter().map(|m| (m.0, m.1)).collect::<Vec<_>>(),
+            s.held,
+            s.exports.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>()
+        );
+        bytes
+    }
+
+    /// limina restore, before the other renderers' replay: the extension's contexts, arenas,
+    /// exports and imports, then the surfaces contexts made, which that replay names.
+    #[cfg(target_os = "macos")]
+    fn restore_ext_resources(&mut self, virtio_gpu: &mut VirtioGpu, s: &ExtSnapshot) -> bool {
+        let Some(ext) = self.ext.as_mut() else {
+            error!("gpu restore: the snapshot has an extension section and this device none");
+            return false;
+        };
+        let exports = match ext.restore(s) {
+            Ok(e) => e,
+            Err(e) => {
+                error!("gpu restore: extension: {e}");
+                return false;
+            }
+        };
+        for (resource, a) in exports {
+            let mapped = s.exports.iter().find(|e| e.0 == resource).and_then(|e| e.3);
+            if let Some(offset) = mapped
+                && virtio_gpu
+                    .map_ext_blob(a.host_addr, a.size, &self.shm_region, offset)
+                    .is_err()
+            {
+                error!("gpu restore: extension blob {resource} not mapped at {offset:#x}");
+                return false;
+            }
+        }
+        for (resource, ctx, shape, rows) in &s.made {
+            debug!("gpu restore: re-creating surface {resource} of context {ctx}");
+            let desc = SurfaceDesc {
+                width: shape.width,
+                height: shape.height,
+                drm_fourcc: shape.drm_fourcc,
+                stride: shape.stride,
+            };
+            let port = match virtio_gpu.resource_create_surface(*ctx, *resource, desc) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("gpu restore: surface {resource} of context {ctx}: {e:?}");
+                    return false;
+                }
+            };
+            if !rows.is_empty()
+                && !virtio_gpu.write_surface(*resource, rows, shape.stride, shape.height)
+            {
+                warn!("gpu restore: surface {resource}: rows not written; blank until redrawn");
+            }
+            // The right goes to one holder now; the others take theirs after the replay, with the
+            // surfaces they imported. A surface no context holds any more keeps only its resource.
+            let holder = s.held.iter().find(|h| h.1 == *resource).map(|h| h.0);
+            match holder {
+                Some(holder) if ext.bind_surface(holder, *resource, port, *shape).is_err() => {
+                    error!("gpu restore: surface {resource} not given to context {holder}");
+                    return false;
+                }
+                Some(_) => {}
+                None => release_port(port),
+            }
+        }
+        true
+    }
+
+    /// limina restore, after the other renderers' replay: surfaces contexts imported, which may
+    /// be resources that replay made, then every ring where it stopped.
+    #[cfg(target_os = "macos")]
+    fn restore_ext_rings(&mut self, virtio_gpu: &mut VirtioGpu, s: &ExtSnapshot) -> bool {
+        let Some(ext) = self.ext.as_mut() else {
+            return false;
+        };
+        for &(ctx, resource) in &s.held {
+            if ext.held_surface(ctx, resource).is_some() {
+                continue;
+            }
+            let bound =
+                virtio_gpu
+                    .resource_surface_port(resource)
+                    .ok()
+                    .is_some_and(|(port, desc)| {
+                        ext.bind_surface(ctx, resource, port, shape_of(desc))
+                            .is_ok()
+                    });
+            if !bound {
+                error!("gpu restore: surface {resource} not given back to context {ctx}");
+                return false;
+            }
+        }
+        match ext.restore_rings(s) {
+            Ok(()) => {
+                info!(
+                    "gpu restore: extension: {} contexts, {} arenas, {} surfaces back",
+                    s.contexts.len(),
+                    s.arenas.len(),
+                    s.held.len()
+                );
+                true
+            }
+            Err(e) => {
+                error!("gpu restore: extension rings: {e}");
+                false
+            }
+        }
+    }
+
+    /// The guest driver went away: its extension contexts and arenas go with it.
+    fn reset_ext(&mut self) {
+        if let Some(ext) = self.ext.as_mut() {
+            ext.reset();
+        }
+    }
+
+    fn process_ext_command(
+        &mut self,
+        hdr: virtio_gpu_ctrl_hdr,
+        cmd: GpuCommand,
+    ) -> VirtioGpuResult {
+        let Some(ext) = self.ext.as_mut() else {
+            return Err(GpuResponse::ErrUnspec);
+        };
+        let ctx = hdr.ctx_id;
+        let r = match cmd {
+            GpuCommand::LiminaInfo => Ok(GpuResponse::OkLiminaInfo(ext.info())),
+            GpuCommand::LiminaCtxCreate(_) => ext.create_context(ctx).map(GpuResponse::OkLiminaCtx),
+            GpuCommand::LiminaCtxDestroy => ext.destroy_context(ctx).map(|_| GpuResponse::OkNoData),
+            GpuCommand::LiminaArenaCreate(req) => {
+                ext.create_arena(ctx, req).map(GpuResponse::OkLiminaArena)
+            }
+            GpuCommand::LiminaArenaDestroy(req) => ext
+                .destroy_arena(ctx, req.arena_id)
+                .map(|_| GpuResponse::OkNoData),
+            GpuCommand::LiminaRingAttach(req) => {
+                ext.attach_ring(ctx, req).map(|_| GpuResponse::OkNoData)
+            }
+            GpuCommand::LiminaArenaImport(req) => {
+                ext.import_arena(ctx, req).map(GpuResponse::OkLiminaArena)
+            }
+            // The fence itself is taken with the response, in `process_queue`.
+            GpuCommand::LiminaFence(_) if hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 => {
+                if ext.has_context(ctx) {
+                    Ok(GpuResponse::OkNoData)
+                } else {
+                    Err(ExtError::InvalidContext)
+                }
+            }
+            GpuCommand::LiminaFence(_) => Err(ExtError::InvalidParameter),
+            _ => unreachable!("not an extension command"),
+        };
+        r.map_err(|e| match e {
+            ExtError::InvalidContext => GpuResponse::ErrInvalidContextId,
+            ExtError::InvalidParameter => GpuResponse::ErrInvalidParameter,
+            ExtError::OutOfMemory => GpuResponse::ErrOutOfMemory,
+            ExtError::Unspec => GpuResponse::ErrUnspec,
+        })
     }
 
     fn process_gpu_command(
@@ -124,33 +1141,95 @@ impl Worker {
         virtio_gpu.force_ctx_0();
 
         match cmd {
+            GpuCommand::LiminaInfo
+            | GpuCommand::LiminaCtxCreate(_)
+            | GpuCommand::LiminaCtxDestroy
+            | GpuCommand::LiminaArenaCreate(_)
+            | GpuCommand::LiminaArenaDestroy(_)
+            | GpuCommand::LiminaRingAttach(_)
+            | GpuCommand::LiminaArenaImport(_)
+            | GpuCommand::LiminaFence(_) => self.process_ext_command(hdr, cmd),
+            GpuCommand::LiminaSurfaceCreate(req) => {
+                self.create_ext_surface(virtio_gpu, hdr.ctx_id, req)
+            }
+            GpuCommand::LiminaSurfaceImport(req) => {
+                self.import_ext_surface(virtio_gpu, hdr.ctx_id, req)
+            }
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
-                let resource_id = info.resource_id;
-
-                let resource_create_3d = ResourceCreate3D {
-                    target: RUTABAGA_PIPE_TEXTURE_2D,
-                    format: info.format,
-                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
-                    width: info.width,
-                    height: info.height,
-                    depth: 1,
-                    array_size: 1,
-                    last_level: 0,
-                    nr_samples: 0,
-                    flags: 0,
-                };
-
-                virtio_gpu.resource_create_3d(resource_id, resource_create_3d)
+                // limina: handle 2D resources in software (host CPU memory) instead of
+                // mapping them onto a virgl GL render target — the stock path fails on a
+                // GL-less host (e.g. macOS). See VirtioGpu::resource_create_2d.
+                let r = virtio_gpu.resource_create_2d(
+                    info.resource_id,
+                    info.format,
+                    info.width,
+                    info.height,
+                );
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().resource_create_2d(
+                        info.resource_id,
+                        info.format,
+                        info.width,
+                        info.height,
+                    );
+                }
+                r
             }
-            GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
-            GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
-                info.scanout_id,
-                info.resource_id,
-                info.r.width,
-                info.r.height,
-            ),
+            GpuCommand::ResourceUnref(info) if self.is_ext_blob(info.resource_id) => {
+                let ext = self.ext.as_mut().expect("is_ext_blob checked it");
+                if let Some((a, Some(offset))) = ext.export(info.resource_id)
+                    && virtio_gpu
+                        .unmap_ext_blob(a.size, &self.shm_region, offset)
+                        .is_err()
+                {
+                    // Released, the export's arena would be freed under a mapping the guest
+                    // still has.
+                    error!(
+                        "limina ext: blob {} could not be unmapped; its arena is kept so the \
+                         guest never reaches freed memory",
+                        info.resource_id
+                    );
+                    return Ok(GpuResponse::OkNoData);
+                }
+                ext.release_export(info.resource_id);
+                Ok(GpuResponse::OkNoData)
+            }
+            GpuCommand::ResourceUnref(info) => {
+                let r = virtio_gpu.unref_resource(info.resource_id);
+                if r.is_ok() {
+                    // Only now: a refused unref leaves the resource standing, still held, and a
+                    // snapshot must keep carrying its holders.
+                    if let Some(ext) = self.ext.as_mut() {
+                        ext.release_surface(info.resource_id);
+                    }
+                    let pinned = virtio_gpu.journal_mut().resource_unref(info.resource_id);
+                    // The GLOBAL unref releases the vkr journal pin the blob create
+                    // took on its backing memory (per-ctx detach must not).
+                    if let Some((ctx_id, blob_id)) = pinned {
+                        virtio_gpu.journal_unpin(ctx_id, blob_id);
+                    }
+                }
+                r
+            }
+            GpuCommand::SetScanout(info) => {
+                let r = virtio_gpu.set_scanout(
+                    info.scanout_id,
+                    info.resource_id,
+                    info.r.width,
+                    info.r.height,
+                );
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().set_scanout(
+                        info.scanout_id,
+                        info.resource_id,
+                        info.r.width,
+                        info.r.height,
+                    );
+                }
+                r
+            }
             GpuCommand::ResourceFlush(info) => {
                 let rect = Rect {
                     x: info.r.x,
@@ -162,13 +1241,7 @@ impl Worker {
             }
             GpuCommand::TransferToHost2d(info) => {
                 let resource_id = info.resource_id;
-                let transfer = Transfer3D::new_2d(
-                    info.r.x,
-                    info.r.y,
-                    info.r.width,
-                    info.r.height,
-                    info.offset,
-                );
+                let transfer = Transfer3D::new_2d(info.r.x, info.r.y, info.r.width, info.r.height);
                 virtio_gpu.transfer_write(0, resource_id, transfer)
             }
             GpuCommand::ResourceAttachBacking(info) => {
@@ -186,18 +1259,36 @@ impl Worker {
                             Err(_) => return Err(GpuResponse::ErrUnspec),
                         }
                     }
-                    virtio_gpu.attach_backing(info.resource_id, mem, vecs)
+                    let backing: Vec<(u64, usize)> = vecs.iter().map(|(a, l)| (a.0, *l)).collect();
+                    let r = virtio_gpu.attach_backing(info.resource_id, mem, vecs);
+                    if r.is_ok() {
+                        virtio_gpu
+                            .journal_mut()
+                            .attach_backing(info.resource_id, backing);
+                    }
+                    r
                 } else {
                     error!("missing data for command {cmd:?}");
                     Err(GpuResponse::ErrUnspec)
                 }
             }
-            GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
-            GpuCommand::UpdateCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand:UpdateCursor unimplemented");
+            GpuCommand::ResourceDetachBacking(info) => {
+                let r = virtio_gpu.detach_backing(info.resource_id);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().detach_backing(info.resource_id);
+                }
+                r
             }
-            GpuCommand::MoveCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
+            GpuCommand::UpdateCursor(info) => virtio_gpu.update_cursor(
+                info.pos.scanout_id,
+                info.resource_id,
+                info.hot_x,
+                info.hot_y,
+                info.pos.x,
+                info.pos.y,
+            ),
+            GpuCommand::MoveCursor(info) => {
+                virtio_gpu.move_cursor(info.pos.scanout_id, info.pos.x, info.pos.y)
             }
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id;
@@ -210,14 +1301,48 @@ impl Worker {
 
             GpuCommand::CtxCreate(info) => {
                 let context_name: Option<String> = String::from_utf8(info.debug_name.to_vec()).ok();
-                virtio_gpu.create_context(hdr.ctx_id, info.context_init, context_name.as_deref())
+                let r = virtio_gpu.create_context(
+                    hdr.ctx_id,
+                    info.context_init,
+                    context_name.as_deref(),
+                );
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().ctx_create(
+                        hdr.ctx_id,
+                        info.context_init,
+                        context_name,
+                    );
+                }
+                r
             }
-            GpuCommand::CtxDestroy(_info) => virtio_gpu.destroy_context(hdr.ctx_id),
+            GpuCommand::CtxDestroy(_info) => {
+                let r = virtio_gpu.destroy_context(hdr.ctx_id);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().ctx_destroy(hdr.ctx_id);
+                }
+                r
+            }
             GpuCommand::CtxAttachResource(info) => {
-                virtio_gpu.context_attach_resource(hdr.ctx_id, info.resource_id)
+                let r = virtio_gpu.context_attach_resource(hdr.ctx_id, info.resource_id);
+                if r.is_ok() {
+                    virtio_gpu
+                        .journal_mut()
+                        .ctx_attach_resource(hdr.ctx_id, info.resource_id);
+                }
+                r
             }
             GpuCommand::CtxDetachResource(info) => {
-                virtio_gpu.context_detach_resource(hdr.ctx_id, info.resource_id)
+                // An extension context that imported the resource's surface lets go of it too.
+                if let Some(ext) = self.ext.as_mut() {
+                    ext.detach_surface(hdr.ctx_id, info.resource_id);
+                }
+                let r = virtio_gpu.context_detach_resource(hdr.ctx_id, info.resource_id);
+                if r.is_ok() {
+                    virtio_gpu
+                        .journal_mut()
+                        .ctx_detach_resource(hdr.ctx_id, info.resource_id);
+                }
+                r
             }
             GpuCommand::ResourceCreate3d(info) => {
                 let resource_id = info.resource_id;
@@ -234,7 +1359,23 @@ impl Worker {
                     flags: info.flags,
                 };
 
-                virtio_gpu.resource_create_3d(resource_id, resource_create_3d)
+                let r = virtio_gpu.resource_create_3d(resource_id, resource_create_3d);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().resource_create_3d(
+                        resource_id,
+                        info.target,
+                        info.format,
+                        info.bind,
+                        info.width,
+                        info.height,
+                        info.depth,
+                        info.array_size,
+                        info.last_level,
+                        info.nr_samples,
+                        info.flags,
+                    );
+                }
+                r
             }
             GpuCommand::TransferToHost3d(info) => {
                 let ctx_id = hdr.ctx_id;
@@ -275,9 +1416,13 @@ impl Worker {
                 virtio_gpu.transfer_read(ctx_id, resource_id, transfer, None)
             }
             GpuCommand::CmdSubmit3d(info) => {
+                // limina M9.3 trace: total submissions, the denominator for unknown_ctx.
+                virtio_gpu.trace().submits.fetch_add(1, Ordering::Relaxed);
                 if reader.available_bytes() != 0 {
                     let num_in_fences = info.num_in_fences as usize;
                     let cmd_size = info.size as usize;
+                    let trace_submit = std::env::var_os("LIMINA_TRACE_SUBMIT3D").is_some();
+                    let avail0 = reader.available_bytes();
                     let mut cmd_buf = vec![0; cmd_size];
                     let mut fence_ids: Vec<u64> = Vec::with_capacity(num_in_fences);
 
@@ -286,13 +1431,68 @@ impl Worker {
                             Ok(fence_id) => {
                                 fence_ids.push(fence_id);
                             }
-                            Err(_) => return Err(GpuResponse::ErrUnspec),
+                            Err(e) => {
+                                log::error!(
+                                    "[SUBMIT3D] ctx {} FENCE-READ failed: {e:?} (num_in_fences={num_in_fences}, cmd_size={cmd_size}, avail={avail0})",
+                                    hdr.ctx_id
+                                );
+                                return Err(GpuResponse::ErrUnspec);
+                            }
                         }
                     }
 
+                    let avail1 = reader.available_bytes();
                     if reader.read_exact(&mut cmd_buf[..]).is_ok() {
-                        virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids)
+                        // limina: decode the virgl command stream headers so a guest-side
+                        // divergence (different commands, or different SET_TYPE layout) is
+                        // visible without rebuilding mesa. VIRGL_CMD0 = cmd | obj<<8 | len<<16.
+                        if std::env::var_os("LIMINA_TRACE_CMDSTREAM").is_some() {
+                            let words: Vec<u32> = cmd_buf
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect();
+                            let mut i = 0usize;
+                            let mut summary: Vec<String> = Vec::new();
+                            while i < words.len() {
+                                let hdr = words[i];
+                                let cmd = hdr & 0xff;
+                                let obj = (hdr >> 8) & 0xff;
+                                let len = (hdr >> 16) as usize;
+                                if len == 0 && cmd == 0 {
+                                    break;
+                                }
+                                // 49 = VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE, 43 = TRANSFER3D
+                                if (cmd == 49 || cmd == 43) && i + len < words.len() {
+                                    let a: Vec<u32> =
+                                        words[i + 1..=(i + len).min(words.len() - 1)].to_vec();
+                                    summary.push(format!("cmd{cmd}/obj{obj}/len{len}{a:?}"));
+                                } else {
+                                    summary.push(format!("cmd{cmd}/obj{obj}/len{len}"));
+                                }
+                                i += 1 + len;
+                            }
+                            log::error!(
+                                "[CMDSTREAM] ctx {} size={cmd_size} -> {}",
+                                hdr.ctx_id,
+                                summary.join(" ")
+                            );
+                        }
+                        let r = virtio_gpu.submit_command(hdr.ctx_id, &mut cmd_buf[..], &fence_ids);
+                        if trace_submit || r.is_err() {
+                            log::error!(
+                                "[SUBMIT3D] ctx {} submit_command -> {:?} (cmd_size={cmd_size}, num_in_fences={num_in_fences}, avail_before_fences={avail0}, avail_before_cmd={avail1})",
+                                hdr.ctx_id,
+                                r.as_ref().map(|_| ()).map_err(|e| format!("{e:?}"))
+                            );
+                        }
+                        r
                     } else {
+                        log::error!(
+                            "[SUBMIT3D] ctx {} CMDBUF read_exact failed (cmd_size={cmd_size}, num_in_fences={num_in_fences}, avail_before_fences={avail0}, avail_before_cmd={avail1})",
+                            hdr.ctx_id
+                        );
                         Err(GpuResponse::ErrInvalidParameter)
                     }
                 } else {
@@ -300,6 +1500,19 @@ impl Worker {
                     // benchmarking.
                     Ok(GpuResponse::OkNoData)
                 }
+            }
+            // A host3d blob from an extension context wraps one of its shared arenas; rutabaga
+            // never sees an extension context.
+            GpuCommand::ResourceCreateBlob(info)
+                if self.ext.as_ref().is_some_and(|e| e.has_context(hdr.ctx_id)) =>
+            {
+                let ext = self.ext.as_mut().expect("checked above");
+                if info.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D || info.blob_id > u32::MAX as u64 {
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
+                ext.export_arena(hdr.ctx_id, info.blob_id as u32, info.resource_id, info.size)
+                    .map(|_| GpuResponse::OkNoData)
+                    .map_err(|_| GpuResponse::ErrInvalidParameter)
             }
             GpuCommand::ResourceCreateBlob(info) => {
                 let resource_id = info.resource_id;
@@ -329,25 +1542,105 @@ impl Worker {
                     }
                 }
 
-                virtio_gpu.resource_create_blob(
+                let backing: Vec<(u64, usize)> = vecs.iter().map(|(a, l)| (a.0, *l)).collect();
+                let r = virtio_gpu.resource_create_blob(
                     ctx_id,
                     resource_id,
                     resource_create_blob,
                     vecs,
                     mem,
-                )
+                );
+                if r.is_ok() {
+                    // The vkr wire watermark is the cross-layer replay fence: everything the
+                    // blob depends on (its vkAllocateMemory) is at or below this seq.
+                    let vkr_seq = virtio_gpu.journal_vkr_seq(ctx_id);
+                    debug!(
+                        "gpu journal: CREATE_BLOB res {} ctx {} blob_id {} recorded with vkr fence {}",
+                        resource_id, ctx_id, info.blob_id, vkr_seq
+                    );
+                    virtio_gpu.journal_mut().create_blob(
+                        ctx_id,
+                        resource_id,
+                        info.blob_mem,
+                        info.blob_flags,
+                        info.blob_id,
+                        info.size,
+                        backing,
+                        vkr_seq,
+                    );
+                }
+                r
             }
-            GpuCommand::SetScanoutBlob(_info) => {
-                panic!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+            GpuCommand::SetScanoutBlob(info) => {
+                // limina tier-2 (macOS): present an IOSurface-backed blob scanout zero-copy.
+                #[cfg(target_os = "macos")]
+                {
+                    let r = virtio_gpu.set_scanout_blob(
+                        info.scanout_id,
+                        info.resource_id,
+                        info.width,
+                        info.height,
+                        info.format,
+                    );
+                    if r.is_ok() {
+                        virtio_gpu.journal_mut().set_scanout_blob(
+                            info.scanout_id,
+                            info.resource_id,
+                            info.width,
+                            info.height,
+                            info.format,
+                        );
+                    }
+                    r
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = info;
+                    Err(GpuResponse::ErrUnspec)
+                }
+            }
+            GpuCommand::ResourceMapBlob(info) if self.is_ext_blob(info.resource_id) => {
+                let ext = self.ext.as_mut().expect("is_ext_blob checked it");
+                let (a, mapped) = ext
+                    .export(info.resource_id)
+                    .expect("is_ext_blob checked it");
+                if mapped.is_some() {
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
+                let r = virtio_gpu.map_ext_blob(a.host_addr, a.size, &self.shm_region, info.offset);
+                if r.is_ok() {
+                    ext.set_mapped(info.resource_id, Some(info.offset));
+                }
+                r
+            }
+            GpuCommand::ResourceUnmapBlob(info) if self.is_ext_blob(info.resource_id) => {
+                let ext = self.ext.as_mut().expect("is_ext_blob checked it");
+                let (a, mapped) = ext
+                    .export(info.resource_id)
+                    .expect("is_ext_blob checked it");
+                let offset = mapped.ok_or(GpuResponse::ErrInvalidParameter)?;
+                let r = virtio_gpu.unmap_ext_blob(a.size, &self.shm_region, offset);
+                if r.is_ok() {
+                    ext.set_mapped(info.resource_id, None);
+                }
+                r
             }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
                 let offset = info.offset;
-                virtio_gpu.resource_map_blob(resource_id, &self.shm_region, offset)
+                let r = virtio_gpu.resource_map_blob(resource_id, &self.shm_region, offset);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().map_blob(resource_id, offset);
+                }
+                r
             }
             GpuCommand::ResourceUnmapBlob(info) => {
                 let resource_id = info.resource_id;
-                virtio_gpu.resource_unmap_blob(resource_id, &self.shm_region)
+                let r = virtio_gpu.resource_unmap_blob(resource_id, &self.shm_region);
+                if r.is_ok() {
+                    virtio_gpu.journal_mut().unmap_blob(resource_id);
+                }
+                r
             }
         }
     }
@@ -356,10 +1649,31 @@ impl Worker {
         &mut self,
         virtio_gpu: &mut VirtioGpu,
         control_queue: &Arc<Mutex<VirtQueue>>,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        interrupt: &InterruptTransport,
+        mem: &GuestMemoryMmap,
     ) -> bool {
         let mut used_any = false;
-        let mem = self.mem.clone();
+        let mem = mem.clone();
 
+        // limina M9.3 trace: a renderer state dump was requested (first stale-ctx
+        // event, or a periodic LIMINA_GPU_TRACE_VKR tick). Service it here — this is
+        // the only thread allowed to call into the renderer singleton. Piggybacking
+        // on control-queue activity is fine: the interesting moments (guest submits
+        // into a fresh renderer; a healthy session under measurement) both kick.
+        if virtio_gpu
+            .trace()
+            .dump_requested
+            .swap(false, Ordering::Relaxed)
+        {
+            virtio_gpu.journal().dump();
+            virtio_gpu.dump_renderer_state();
+        }
+
+        // How long a drain may run before it stops to present what has retired: well inside a
+        // frame, and coarse enough that the check costs one clock read per command.
+        const PRESENT_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(2);
+        let mut last_present_pump = std::time::Instant::now();
         loop {
             let head = control_queue.lock().unwrap().pop(&mem);
 
@@ -378,7 +1692,12 @@ impl Worker {
 
                 match GpuCommand::decode(&mut reader) {
                     Ok((hdr, cmd)) => {
+                        // limina wake-probe: time each command so a drain that overruns can
+                        // name the command that caused it. Two clock reads per command, only
+                        // while the probe is on.
+                        let t0 = crate::virtio::wake_probe::cmd_start();
                         resp = self.process_gpu_command(virtio_gpu, &mem, hdr, cmd, &mut reader);
+                        crate::virtio::wake_probe::cmd_end(t0, hdr.type_);
                         ctrl_hdr = Some(hdr);
                         gpu_cmd = Some(cmd);
                     }
@@ -388,7 +1707,13 @@ impl Worker {
                 let mut gpu_response = match resp {
                     Ok(gpu_response) => gpu_response,
                     Err(gpu_response) => {
-                        debug!("{gpu_cmd:?} -> {gpu_response:?}");
+                        // limina M9.3 trace: count the error by class (stale ctx /
+                        // unknown resource / other) for the tick reporter.
+                        virtio_gpu.trace().classify_error(&gpu_response);
+                        // limina: error responses are load-bearing diagnostics (the guest sees
+                        // RESP_ERR and degrades silently — e.g. Firefox WebGL EGL_CREATE
+                        // failures); keep them visible at default log level.
+                        warn!("{gpu_cmd:?} -> {gpu_response:?}");
                         gpu_response
                     }
                 };
@@ -400,7 +1725,7 @@ impl Worker {
                     let mut ctx_id = 0;
                     let mut flags = 0;
                     let mut ring_idx = 0;
-                    if let Some(_cmd) = gpu_cmd {
+                    if let Some(cmd) = gpu_cmd {
                         let ctrl_hdr = ctrl_hdr.unwrap();
                         if ctrl_hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
                             flags = ctrl_hdr.flags;
@@ -414,13 +1739,36 @@ impl Worker {
                                 ctx_id,
                                 ring_idx,
                             };
-                            gpu_response = match virtio_gpu.create_fence(fence) {
-                                Ok(_) => gpu_response,
-                                Err(fence_resp) => {
-                                    warn!("create_fence {fence_id} -> {fence_resp:?}");
-                                    fence_resp
-                                }
-                            };
+                            // limina (#8 half 2): only a flush's fence may be held for
+                            // fence-accurate presents.
+                            if std::env::var_os("LIMINA_GPU_TEST_TRACE_FENCES").is_some() {
+                                warn!(
+                                    "FENCECMD id={fence_id} ctx={ctx_id} ring={ring_idx} \
+                                     cmd={cmd:?}"
+                                );
+                            }
+                            let is_flush = matches!(cmd, GpuCommand::ResourceFlush(_));
+                            if let (GpuCommand::LiminaFence(req), Some(ext)) =
+                                (cmd, self.ext.as_mut())
+                            {
+                                // An extension fence never reaches the renderer: the extension
+                                // answers it through the fence handler when its ring gets there.
+                                let handler = virtio_gpu.fence_handler();
+                                let _ = ext.fence(
+                                    ctx_id,
+                                    req.seqno,
+                                    req.completed_at,
+                                    Box::new(move || handler.call(fence)),
+                                );
+                            } else {
+                                gpu_response = match virtio_gpu.create_fence(fence, is_flush) {
+                                    Ok(_) => gpu_response,
+                                    Err(fence_resp) => {
+                                        warn!("create_fence {fence_id} -> {fence_resp:?}");
+                                        fence_resp
+                                    }
+                                };
+                            }
                         }
                     }
 
@@ -451,12 +1799,108 @@ impl Worker {
                     }
                     used_any = true;
                 }
+
+                // This drain can outlast many frames, and nothing else on this thread runs until
+                // it ends -- retired presents and pointer moves included. See
+                // `process_retired_presents_mid_drain`. Measured on a stock GNOME guest under a
+                // WebGL load: drains of 100-1500 ms (median 164), each a frozen pointer while the
+                // cursor queue waited. A cursor command cannot overtake the control queue: the
+                // guest waits for a new cursor image's transfer to complete before queueing it.
+                if last_present_pump.elapsed() >= PRESENT_PUMP_EVERY {
+                    last_present_pump = std::time::Instant::now();
+                    virtio_gpu.process_retired_presents_mid_drain();
+                    if self.cursor_kicked {
+                        self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, &mem);
+                    }
+                }
             } else {
                 break;
             }
         }
 
         debug!("gpu: process_queue exit");
+        used_any
+    }
+
+    /// Drain the cursor queue inside a disable/enable-notification bracket, signalling the guest
+    /// when it asked. Runs on a cursor kick and from inside a long control-queue drain; the
+    /// kick's eventfd is left to epoll, where it costs one wake that finds the queue empty.
+    fn service_cursor_queue(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        interrupt: &InterruptTransport,
+        mem: &GuestMemoryMmap,
+    ) {
+        loop {
+            let _ = cursor_queue.lock().unwrap().disable_notification(mem);
+            let used_any = self.process_cursor_queue(virtio_gpu, cursor_queue, mem);
+            if used_any
+                && cursor_queue
+                    .lock()
+                    .unwrap()
+                    .needs_notification(mem)
+                    .unwrap_or(true)
+                && let Err(e) = interrupt.try_signal_used_queue()
+            {
+                error!("Error signaling cursor queue: {e:?}");
+            }
+            // Go round again only after a pass that popped something. The firmware leaves the
+            // cursor queue unconfigured, and there `enable_notification` keeps reporting entries
+            // `pop` never returns: looping on that alone hung the worker before the guest kernel
+            // came up. An entry that races the re-arm is picked up by the next mid-drain check
+            // or the next cursor kick.
+            match cursor_queue.lock().unwrap().enable_notification(mem) {
+                Ok(true) if used_any => continue,
+                Ok(_) => break,
+                Err(e) => {
+                    error!("Error re-enabling cursor queue notification: {e:?}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// limina: drain the cursor queue. Each entry is an `UPDATE_CURSOR`/`MOVE_CURSOR` command
+    /// (read-only from the guest, no response payload), dispatched to the display backend as a
+    /// host overlay update. Draining it is what lets the guest use its hardware cursor plane;
+    /// an unserviced cursor queue makes the guest fall back to compositing the cursor into the
+    /// scanout (or stall once the ring fills).
+    fn process_cursor_queue(
+        &mut self,
+        virtio_gpu: &mut VirtioGpu,
+        cursor_queue: &Arc<Mutex<VirtQueue>>,
+        mem: &GuestMemoryMmap,
+    ) -> bool {
+        let mut used_any = false;
+        let mem = mem.clone();
+        let cursor_queue = cursor_queue.clone();
+
+        loop {
+            let head = cursor_queue.lock().unwrap().pop(&mem);
+            let Some(head) = head else { break };
+
+            let mut reader = Reader::new(&mem, head.clone())
+                .map_err(GpuError::QueueReader)
+                .unwrap();
+            match GpuCommand::decode(&mut reader) {
+                Ok((hdr, cmd)) => {
+                    if let Err(resp) =
+                        self.process_gpu_command(virtio_gpu, &mem, hdr, cmd, &mut reader)
+                    {
+                        debug!("cursor cmd {cmd:?} -> {resp:?}");
+                    }
+                }
+                Err(e) => debug!("cursor descriptor decode error: {e:?}"),
+            }
+
+            // Cursor commands carry no response data; return the descriptor with len 0 so the
+            // guest's cursor queue keeps making progress.
+            if let Err(e) = cursor_queue.lock().unwrap().add_used(&mem, head.index, 0) {
+                error!("failed to add used elements to the cursor queue: {e:?}");
+            }
+            used_any = true;
+        }
         used_any
     }
 }

@@ -33,6 +33,101 @@ pub trait DisplayBackendBasicFramebuffer {
         frame_id: u32,
         rect: Option<&Rect>,
     ) -> Result<(), DisplayBackendError>;
+
+    /// (Optional, limina) Set the hardware cursor image + hotspot on one scanout. `width`/
+    /// `height` of 0 (or an empty `buffer`) hides the cursor. Default: unsupported (backends
+    /// without an overlay simply don't get a hardware cursor — the guest keeps its software
+    /// fallback).
+    ///
+    /// `scanout_id` is load-bearing on a multi-head guest: a compositor enables the cursor plane
+    /// on only the CRTC the pointer is on and disables the others, so this is the whole signal
+    /// for which display should show the sprite.
+    #[allow(clippy::too_many_arguments)]
+    fn set_cursor(
+        &mut self,
+        _scanout_id: u32,
+        _width: u32,
+        _height: u32,
+        _hot_x: u32,
+        _hot_y: u32,
+        _format: ResourceFormat,
+        _buffer: &[u8],
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) Move the hardware cursor to (`x`, `y`) in `scanout_id`'s pixels.
+    /// Default: unsupported.
+    fn move_cursor(
+        &mut self,
+        _scanout_id: u32,
+        _x: u32,
+        _y: u32,
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) Present an externally-rendered global IOSurface to the display
+    /// zero-copy (venus SET_SCANOUT_BLOB scanouts). No prior `alloc_frame`; the surface is
+    /// owned by the renderer. Default: unsupported (device falls back to the readback path).
+    fn present_surface(
+        &mut self,
+        _scanout_id: u32,
+        _iosurface_id: u32,
+        _rect: Option<&Rect>,
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) The guest dropped its last reference to a scanout resource, and the
+    /// IOSurface behind it will not be presented again.
+    ///
+    /// A backend that hands surfaces to another process cannot otherwise learn this: the guest's
+    /// `RESOURCE_UNREF` is the only signal, and on macOS an IOSurface's storage bills to the task
+    /// that created it, so the holder sees no pressure of its own to let go. Default: unsupported.
+    fn release_surface(&mut self, _iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) Hand a surface this backend still owns to the consumer again.
+    ///
+    /// Surfaces passed by capability have no global name: once the consumer has dropped one, only
+    /// this backend can hand it over. `InvalidParam` means we do not hold it — it is gone, not
+    /// merely dropped. Default: unsupported.
+    fn republish_surface(&mut self, _iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) A guest OS driver has taken over the device — the first
+    /// `VIRTIO_GPU_CMD_GET_EDID` of the run, which boot firmware never sends.
+    ///
+    /// The two consumers of the device do not have the same constraints: firmware drivers
+    /// commonly hardcode scanout 0, an OS driver enumerates every scanout and follows hotplug.
+    /// A backend that arranges displays needs to know which one it is talking to. Default:
+    /// unsupported.
+    fn guest_driver_ready(&mut self) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) Whether the guest is held off `scanout_id`'s presented buffers. A
+    /// guest whose scanout flushes carry no fence cannot be, and may draw into a buffer the
+    /// consumer is still showing; a consumer should then show a copy. Called when the answer
+    /// changes. Default: unsupported.
+    fn scanout_held(&mut self, _scanout_id: u32, _held: bool) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// (Optional, limina) The next present on `scanout_id` shows guest resource `resource_id`
+    /// (never 0): the resource whose flush produced it. Called immediately before
+    /// `present_frame`/`present_surface`; a present with no such call before it shows no guest
+    /// resource. Default: unsupported.
+    fn frame_resource(
+        &mut self,
+        _scanout_id: u32,
+        _resource_id: u32,
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -132,6 +227,102 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
             from_rust_result(cast_instance::<I>(instance).present_frame(scanout_id, frame_id, rect))
         }
 
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn set_cursor_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            width: u32,
+            height: u32,
+            hot_x: u32,
+            hot_y: u32,
+            format: u32,
+            buffer: *const u8,
+            buffer_size: usize,
+        ) -> i32 {
+            // A hide (width/height 0) carries no pixels and no meaningful format; default it.
+            let format = if width == 0 || height == 0 {
+                ResourceFormat::BGRA
+            } else {
+                match ResourceFormat::try_from(format) {
+                    Ok(f) => f,
+                    Err(()) => {
+                        error!("set_cursor: unknown format: {format}");
+                        return DisplayBackendError::InvalidParam as i32;
+                    }
+                }
+            };
+            // SAFETY: the GPU device passes a valid pointer/len for the call's duration, or NULL.
+            let pixels: &[u8] = if buffer.is_null() || buffer_size == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(buffer, buffer_size) }
+            };
+            from_rust_result(
+                cast_instance::<I>(instance)
+                    .set_cursor(scanout_id, width, height, hot_x, hot_y, format, pixels),
+            )
+        }
+
+        extern "C" fn move_cursor_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            x: u32,
+            y: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).move_cursor(scanout_id, x, y))
+        }
+
+        extern "C" fn present_surface_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            iosurface_id: u32,
+            rect: *const Rect,
+        ) -> i32 {
+            // SAFETY: The pointer obtained from the bindings should be safe
+            let rect: Option<&Rect> = unsafe { ptr_to_option_ref(rect) };
+            from_rust_result(cast_instance::<I>(instance).present_surface(
+                scanout_id,
+                iosurface_id,
+                rect,
+            ))
+        }
+
+        extern "C" fn release_surface_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            iosurface_id: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).release_surface(iosurface_id))
+        }
+
+        extern "C" fn republish_surface_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            iosurface_id: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).republish_surface(iosurface_id))
+        }
+
+        extern "C" fn guest_driver_ready_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).guest_driver_ready())
+        }
+
+        extern "C" fn scanout_held_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            held: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).scanout_held(scanout_id, held != 0))
+        }
+
+        extern "C" fn frame_resource_fn<I: DisplayBackendBasicFramebuffer>(
+            instance: *mut c_void,
+            scanout_id: u32,
+            resource_id: u32,
+        ) -> i32 {
+            from_rust_result(cast_instance::<I>(instance).frame_resource(scanout_id, resource_id))
+        }
+
         DisplayBackend {
             create_userdata: userdata.map_or(null(), |t| ptr::from_ref(t) as *const c_void),
             create_userdata_lifetime: PhantomData,
@@ -144,6 +335,14 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     present_frame: Some(present_frame::<I>),
                     alloc_frame: Some(alloc_frame::<I>),
                     disable_scanout: Some(disable_scanout_fb::<I>),
+                    set_cursor: Some(set_cursor_fn::<I>),
+                    move_cursor: Some(move_cursor_fn::<I>),
+                    present_surface: Some(present_surface_fn::<I>),
+                    release_surface: Some(release_surface_fn::<I>),
+                    republish_surface: Some(republish_surface_fn::<I>),
+                    guest_driver_ready: Some(guest_driver_ready_fn::<I>),
+                    scanout_held: Some(scanout_held_fn::<I>),
+                    frame_resource: Some(frame_resource_fn::<I>),
                 },
             },
         }

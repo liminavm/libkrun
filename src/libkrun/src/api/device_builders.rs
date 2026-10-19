@@ -27,6 +27,10 @@ use devices::legacy::IrqChip;
 use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+#[cfg(feature = "gpu")]
+use devices::virtio::gpu::ext::{DOORBELL_STRIDE, DoorbellDevice, GpuExtConfig, GpuExtension};
+#[cfg(feature = "gpu")]
+use devices::virtio::gpu::timing::TimingPage;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::passthrough::PermissionSemantics;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
@@ -51,6 +55,9 @@ pub struct DeviceRequirements {
     /// GPU shared memory size, if this is a GPU device.
     #[cfg(feature = "gpu")]
     pub gpu_shm: Option<usize>,
+    /// limina: sizes of the GPU extension's (doorbell, arena) windows, if it is enabled.
+    #[cfg(feature = "gpu")]
+    pub gpu_ext: Option<(usize, usize)>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
 }
@@ -175,6 +182,33 @@ impl<'a> AttachContext<'a> {
                 size: r.size,
             }
         })
+    }
+
+    /// limina: the GPU extension's (doorbell, arena) windows as (guest address, size), if they
+    /// were allocated based on [`DeviceRequirements::gpu_ext`].
+    #[cfg(feature = "gpu")]
+    pub fn gpu_ext_windows(&self) -> Option<((u64, u64), (u64, u64))> {
+        self.shm_manager.gpu_ext_regions().map(|(d, a)| {
+            (
+                (d.guest_addr.raw_value(), d.size as u64),
+                (a.guest_addr.raw_value(), a.size as u64),
+            )
+        })
+    }
+
+    /// Put a device on the MMIO bus at `[base, base + len)`. Accesses there exit to the VMM on
+    /// the vCPU thread and reach the device directly.
+    pub fn insert_mmio_device(
+        &mut self,
+        device: Arc<Mutex<dyn devices::BusDevice>>,
+        base: u64,
+        len: u64,
+    ) -> Result<(), VmmError> {
+        self.vmm
+            .mmio_device_manager
+            .bus
+            .insert(device, base, len)
+            .map_err(|e| VmmError::Internal(format!("mmio insert: {e:?}")))
     }
 
     /// The index of the current device within its device manager.
@@ -689,6 +723,24 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
+    /// A *console* port (the guest sees it as `hvcN`, not a `vportNpM` data port) with
+    /// separate, non-tty input/output fds. Unlike [`add_tty_port`](Self::add_tty_port), the
+    /// fds need not be terminals (a file/FIFO is fine — a fixed terminal size is reported);
+    /// unlike [`add_inout_port`](Self::add_inout_port), the port is marked as a console so
+    /// `console=hvcN` binds to it. Pass `None` to disable that direction.
+    pub fn add_console_inout_port(
+        &mut self,
+        name: &str,
+        input_fd: Option<BorrowedFd<'a>>,
+        output_fd: Option<BorrowedFd<'a>>,
+    ) -> Result<u32, VmmError> {
+        let index = self.add_inout_port(name, input_fd, output_fd)?;
+        // Non-tty fds (file/FIFO) have no window size; report a fixed default. A console
+        // port (terminal = Some) is what makes the guest expose it as hvcN.
+        self.ports[index as usize].terminal = Some(port_io::term_fixed_size(0, 0));
+        Ok(index)
+    }
+
     /// Build the console device. At least one port must have been added.
     pub fn build(self) -> Result<ConsoleDevice<'a>, VmmError> {
         if self.ports.is_empty() {
@@ -1105,18 +1157,38 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
 /// A virtio balloon device for dynamic memory management.
 #[cfg(not(feature = "tee"))]
 pub struct BalloonDevice {
-    pub(crate) inner: Arc<Mutex<devices::virtio::Balloon>>,
+    free_page_reporting: bool,
+    deflate_on_oom: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl BalloonDevice {
     pub fn new() -> Result<Self, VmmError> {
-        let balloon = devices::virtio::Balloon::new()
-            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(balloon)),
+            free_page_reporting: false,
+            deflate_on_oom: false,
         })
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl BalloonDevice {
+    /// limina: advertise `VIRTIO_BALLOON_F_REPORTING` (FRQ fast-reclaim) to the guest. **Default
+    /// false**: a Linux guest with page-reporting enabled use-after-frees the reporting virtqueue on
+    /// suspend-to-idle (upstream `virtballoon_freeze` bug) and wedges. Enable only for enhanced-tier
+    /// guests carrying the kernel fix. See `devices::virtio::Balloon::new`.
+    pub fn free_page_reporting(mut self, enabled: bool) -> Self {
+        self.free_page_reporting = enabled;
+        self
+    }
+
+    /// limina: advertise `VIRTIO_BALLOON_F_DEFLATE_ON_OOM`. **Default false** (transparent
+    /// balloon accounting — see the AVAIL_FEATURES comment in devices::virtio::balloon):
+    /// the per-VM escape hatch re-advertises the guest kernel's OOM deflate net.
+    pub fn deflate_on_oom(mut self, enabled: bool) -> Self {
+        self.deflate_on_oom = enabled;
+        self
     }
 }
 
@@ -1125,8 +1197,113 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        ctx.subscribe_events(self.inner.clone())?;
-        ctx.register("balloon", self.inner)
+        let balloon = devices::virtio::Balloon::new(
+            self.free_page_reporting,
+            self.deflate_on_oom,
+            #[cfg(target_os = "macos")]
+            ctx.vmm.released_ram.clone(),
+        )
+        .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        let inner = Arc::new(Mutex::new(balloon));
+        ctx.subscribe_events(inner.clone())?;
+        // limina: capture the balloon control handle before the device is moved into the bus, so
+        // limina-vmm can drive the dynamic-memory target on the live device (M6).
+        ctx.vmm
+            .set_balloon_control_handle(inner.lock().unwrap().balloon_control_handle());
+        ctx.register("balloon", inner)
+    }
+}
+
+/// limina: a virtio-i2c adapter carrying an emulated SBS smart battery that mirrors the host
+/// battery (see `devices::virtio::i2c`), answering register reads from the provider callback.
+/// Add it only when the host has a battery — battery-less hosts simply don't get the device.
+#[cfg(not(feature = "tee"))]
+pub struct I2cBatteryDevice {
+    provider: devices::virtio::BatteryProvider,
+}
+
+#[cfg(not(feature = "tee"))]
+impl I2cBatteryDevice {
+    pub fn new(provider: devices::virtio::BatteryProvider) -> Self {
+        Self { provider }
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl<'a> AttachDevice<'a> for I2cBatteryDevice {
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        let i2c = devices::virtio::I2c::new(self.provider)
+            .map_err(|e| VmmError::Internal(format!("i2c: {e:?}")))?;
+        let inner = Arc::new(Mutex::new(i2c));
+        ctx.subscribe_events(inner.clone())?;
+        let id = inner.lock().unwrap().id().to_string();
+        ctx.register(&id, inner)
+    }
+}
+
+/// limina: native virtio-snd device (device ID 25) driving host audio. The guest's stock
+/// virtio_snd driver binds it and exposes an ALSA card (see `devices::virtio::snd`). Works
+/// on macOS (in-VMM, no vhost-user).
+#[cfg(feature = "snd")]
+#[derive(Default)]
+pub struct SndDevice {
+    capture: bool,
+    state_cb: Option<devices::virtio::PcmStateFn>,
+    audibility_cb: Option<(std::time::Duration, devices::virtio::PcmAudibilityFn)>,
+}
+
+#[cfg(feature = "snd")]
+impl SndDevice {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Advertise the mic-capture input stream. Opt-in and default-off for privacy (unlike
+    /// playback): enabling it lets the guest capture the host microphone (and triggers the
+    /// macOS mic TCC prompt on first PREPARE).
+    pub fn capture(mut self, enabled: bool) -> Self {
+        self.capture = enabled;
+        self
+    }
+
+    /// An optional hook told about every PCM stream lifecycle transition the guest makes on the
+    /// device. Mechanism only — the device reports what the guest did and takes no view on what
+    /// it means. limina uses it to know when the VM is holding its audio device open, which is
+    /// what makes it a media player as far as the host desktop is concerned.
+    pub fn pcm_state_callback(mut self, cb: devices::virtio::PcmStateFn) -> Self {
+        self.state_cb = Some(cb);
+        self
+    }
+
+    /// Told when the guest's playback stream crosses between sound and silence, with how long a
+    /// run of silence counts as a pause. The threshold is the embedder's: the device has no view
+    /// on what a pause is.
+    pub fn pcm_audibility_callback(
+        mut self,
+        silence: std::time::Duration,
+        cb: devices::virtio::PcmAudibilityFn,
+    ) -> Self {
+        self.audibility_cb = Some((silence, cb));
+        self
+    }
+}
+
+#[cfg(feature = "snd")]
+impl<'a> AttachDevice<'a> for SndDevice {
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        let mut snd = devices::virtio::Snd::new(self.capture)
+            .map_err(|e| VmmError::Internal(format!("snd: {e:?}")))?;
+        if let Some(cb) = self.state_cb {
+            snd.set_pcm_state_callback(cb);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some((silence, cb)) = self.audibility_cb {
+            snd.set_pcm_audibility_callback(silence, cb);
+        }
+        // The device services its queues on its own thread, not the shared event loop.
+        let inner = Arc::new(Mutex::new(snd));
+        let id = inner.lock().unwrap().id().to_string();
+        ctx.register(&id, inner)
     }
 }
 
@@ -1174,6 +1351,7 @@ pub struct VsockDevice {
     tsi_flags: devices::virtio::TsiFlags,
     host_port_map: HashMap<u16, u16>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    timesync: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -1188,6 +1366,7 @@ impl VsockDevice {
             tsi_flags,
             host_port_map: HashMap::new(),
             unix_ipc_port_map: HashMap::new(),
+            timesync: true,
         })
     }
 
@@ -1209,6 +1388,16 @@ impl VsockDevice {
     }
 }
 
+impl VsockDevice {
+    /// Send the guest a wall-clock datagram on port 123 every minute (macOS only). On by
+    /// default; only a guest listening there, such as libkrun's init, uses it, and any other
+    /// guest resets each one.
+    pub fn timesync(mut self, enabled: bool) -> Self {
+        self.timesync = enabled;
+        self
+    }
+}
+
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl<'a> AttachDevice<'a> for VsockDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
@@ -1217,9 +1406,14 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         let unix_ipc_port_map =
             (!self.unix_ipc_port_map.is_empty()).then_some(self.unix_ipc_port_map);
 
-        let vsock =
-            devices::virtio::Vsock::new(self.cid, host_port_map, unix_ipc_port_map, self.tsi_flags)
-                .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
+        let vsock = devices::virtio::Vsock::new(
+            self.cid,
+            host_port_map,
+            unix_ipc_port_map,
+            self.tsi_flags,
+            self.timesync,
+        )
+        .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
 
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;
@@ -1325,6 +1519,10 @@ export_bitflags! {
         pub struct NetFlags: u32 {
             /// Send the vfkit magic handshake on a unixgram socket.
             const VFKIT = 1;
+            /// The proxy's frames already carry correct checksums (it builds them in its own
+            /// network stack), so a guest that negotiated GUEST_CSUM may skip verifying them.
+            /// Never pass it for a proxy that relays frames from a wire.
+            const CSUM_VALID = 1 << 2;
         }
     }
 }
@@ -1353,6 +1551,7 @@ impl NetDevice {
             VirtioNetBackend::UnixgramPath(PathBuf::from(path), flags.contains(NetFlags::VFKIT)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1367,12 +1566,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixgramFd(std::os::fd::IntoRawFd::into_raw_fd(fd)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1385,12 +1584,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamPath(PathBuf::from(path)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1405,12 +1604,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamFd(std::os::fd::IntoRawFd::into_raw_fd(fd)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1425,6 +1624,8 @@ impl NetDevice {
                 VirtioNetBackend::Tap(tap_name.to_string()),
                 mac,
                 features,
+                // A tap relays the host kernel's own header; its flags are the kernel's to set.
+                NetFlags::empty(),
             )
         }
         #[cfg(not(target_os = "linux"))]
@@ -1448,12 +1649,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamPath(PathBuf::from(path)),
             mac,
             features,
+            flags,
         )
     }
 
@@ -1466,12 +1667,12 @@ impl NetDevice {
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
         use std::os::windows::io::RawSocket;
-        let _ = flags;
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamFd(handle.as_raw_handle() as RawSocket),
             mac,
             features,
+            flags,
         )
     }
 }
@@ -1483,10 +1684,17 @@ impl NetDevice {
         backend: devices::virtio::net::device::VirtioNetBackend,
         mac: &[u8],
         features: u32,
+        flags: NetFlags,
     ) -> Result<Self, VmmError> {
         let mac: [u8; 6] = mac.try_into().map_err(|_| VmmError::InvalidParam())?;
-        let net = devices::virtio::Net::new(id.to_string(), backend, mac, features)
-            .map_err(|e| VmmError::Internal(format!("net: {e:?}")))?;
+        let net = devices::virtio::Net::new(
+            id.to_string(),
+            backend,
+            mac,
+            features,
+            flags.contains(NetFlags::CSUM_VALID),
+        )
+        .map_err(|e| VmmError::Internal(format!("net: {e:?}")))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(net)),
         })
@@ -1499,6 +1707,12 @@ impl<'a> AttachDevice<'a> for NetDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let id = self.inner.lock().unwrap().id().to_string();
+        // The VMM leaves through `_exit`, which drops no backend: remove the socket files the
+        // datagram backends bound on the way out instead.
+        #[cfg(unix)]
+        ctx.push_exit_observer(Arc::new(Mutex::new(
+            devices::virtio::net::unlink_bound_sockets,
+        )));
         ctx.register(&id, self.inner)
     }
 }
@@ -1607,6 +1821,23 @@ impl DisplayBackend {
     }
 }
 
+/// limina: constructors for a Rust embedder, which holds a typed backend rather than a C vtable
+/// and needs [`DisplayInfo`] fields the builder does not expose (an EDID identity, a slot that
+/// boots disconnected).
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
+impl DisplayBackend {
+    pub fn from_backend(inner: krun_display::DisplayBackend<'static>) -> Self {
+        Self {
+            inner,
+            displays: Vec::new(),
+        }
+    }
+
+    pub fn add_display_info(&mut self, display: DisplayInfo) {
+        self.displays.push(display);
+    }
+}
+
 export_bitflags! {
     #[cfg(feature = "gpu")]
     bitflags::bitflags! {
@@ -1621,12 +1852,20 @@ export_bitflags! {
     }
 }
 
+/// limina: doorbell slots the GPU extension offers (one per guest context).
+#[cfg(feature = "gpu")]
+const EXT_DOORBELL_WINDOW: usize = 256 * DOORBELL_STRIDE as usize;
+
 /// A virtio GPU device with virgl 3D acceleration.
 #[cfg(feature = "gpu")]
 pub struct GpuDevice {
     virgl_flags: u32,
+    software_2d: bool,
     backend: DisplayBackend,
     shm_size: usize,
+    pipeline_cache_key: Option<devices::virtio::PipelineCacheKey>,
+    /// limina: the native-context extension's embedder and arena window size.
+    ext: Option<(Arc<dyn GpuExtension>, usize)>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
@@ -1637,13 +1876,42 @@ impl GpuDevice {
     pub fn new(virgl_flags: VirglRendererFlags, backend: DisplayBackend) -> Self {
         Self {
             virgl_flags: virgl_flags.bits(),
+            software_2d: false,
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
+            pipeline_cache_key: None,
+            ext: None,
         }
     }
 
     pub fn shm_size(mut self, size: usize) -> Self {
         self.shm_size = size;
+        self
+    }
+
+    /// limina: run the virtio-gpu in software-2D-only mode — skip virglrenderer/rutabaga init
+    /// (no host GL/Metal renderer) and serve only the 2D scanout path. The compatibility
+    /// floor (tier-1) for GL-less hosts. When false, the device inits the renderer normally.
+    pub fn software_2d(mut self, software_2d: bool) -> Self {
+        self.software_2d = software_2d;
+        self
+    }
+
+    /// limina: the 32-byte key the renderer signs the pipeline-cache data it hands the guest
+    /// with, and checks a guest's initial data against. Pass the same key on every launch of a
+    /// VM and its saved caches stay warm across boots; without one the renderer makes a key per
+    /// process, so a cache saved in an earlier boot is ignored. Keep it host-only.
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    pub fn pipeline_cache_key(mut self, key: [u8; 32]) -> Self {
+        self.pipeline_cache_key = Some(devices::virtio::PipelineCacheKey::new(key));
+        self
+    }
+
+    /// limina: offer the native-context extension (`devices::virtio::gpu::ext`), served by
+    /// `ext`, with an arena window of `arena_window` bytes of guest-physical space.
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    pub fn extension(mut self, ext: Arc<dyn GpuExtension>, arena_window: usize) -> Self {
+        self.ext = Some((ext, arena_window));
         self
     }
 }
@@ -1655,6 +1923,11 @@ impl<'a> AttachDevice<'a> for GpuDevice {
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
             gpu_shm: Some(self.shm_size),
+            gpu_ext: self
+                .ext
+                .as_ref()
+                .filter(|_| !self.software_2d)
+                .map(|(_, arenas)| (EXT_DOORBELL_WINDOW, *arenas)),
             ..Default::default()
         }
     }
@@ -1663,20 +1936,57 @@ impl<'a> AttachDevice<'a> for GpuDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let displays: Box<[DisplayInfo]> = self.backend.displays.into_boxed_slice();
 
-        let gpu = devices::virtio::Gpu::new(
+        let mut gpu = devices::virtio::Gpu::new(
             self.virgl_flags,
+            self.software_2d,
             displays,
             self.backend.inner,
             #[cfg(target_os = "macos")]
             ctx.map_sender().expect("macOS requires map_sender for GPU"),
         )
         .map_err(|e| VmmError::Internal(format!("gpu: {e:?}")))?;
+        if let Some(key) = self.pipeline_cache_key {
+            gpu.set_pipeline_cache_key(key);
+        }
 
         let inner = Arc::new(Mutex::new(gpu));
 
         if let Some(region) = ctx.resolved_gpu_shm_region() {
             inner.lock().unwrap().set_shm_region(region.into());
         }
+
+        if let (Some((ext, _)), Some(((db_addr, db_len), (ar_addr, ar_len)))) =
+            (self.ext, ctx.gpu_ext_windows())
+        {
+            let bell = Arc::new(Mutex::new(DoorbellDevice::new(ext.clone())));
+            ctx.insert_mmio_device(bell, db_addr, db_len)?;
+            let timing = match TimingPage::new() {
+                Ok(t) => Some(Arc::new(t)),
+                Err(e) => {
+                    log::warn!("gpu: no timing page ({e}); the guest keeps its own vblank timer");
+                    None
+                }
+            };
+            if let Some(t) = &timing {
+                ctx.vmm.set_gpu_timing(t.clone());
+            }
+            inner.lock().unwrap().set_extension(GpuExtConfig {
+                ext,
+                arenas_guest_addr: ar_addr,
+                arenas_size: ar_len,
+                doorbells_guest_addr: db_addr,
+                doorbells_size: db_len,
+                timing,
+            });
+        }
+
+        // limina: capture the runtime display-resize handle before the device is moved into the
+        // bus, so limina-vmm can apply window-resize requests to the live device.
+        ctx.vmm
+            .set_gpu_resize_handle(inner.lock().unwrap().display_resize_handle());
+
+        // limina M9.3: keep a handle to the device for GPU snapshot/replay round-trips.
+        ctx.vmm.set_gpu_device(inner.clone());
 
         let id = inner.lock().unwrap().id().to_string();
         ctx.register(&id, inner)
@@ -1791,6 +2101,7 @@ impl<'a> AttachDevice<'a> for VhostUserDevice {
 pub struct InputDevice<'a> {
     config_backend: krun_input::InputConfigBackend<'a>,
     events_backend: krun_input::InputEventProviderBackend<'a>,
+    id: Option<String>,
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -1833,6 +2144,7 @@ impl<'a> InputDevice<'a> {
         Ok(Self {
             config_backend,
             events_backend,
+            id: None,
             _lifetime: PhantomData,
         })
     }
@@ -1859,8 +2171,33 @@ impl<'a> InputDevice<'a> {
         Ok(Self {
             config_backend,
             events_backend,
+            id: None,
             _lifetime: PhantomData,
         })
+    }
+}
+
+/// limina: a Rust embedder hands over typed backends rather than C vtables.
+#[cfg(feature = "input")]
+impl<'a> InputDevice<'a> {
+    pub fn from_backends(
+        config_backend: krun_input::InputConfigBackend<'a>,
+        events_backend: krun_input::InputEventProviderBackend<'a>,
+    ) -> Self {
+        Self {
+            config_backend,
+            events_backend,
+            id: None,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// The device's bus id. Every input device reports the same `id()`, so without one each
+    /// would register under the same name and replace the last in the device manager's table;
+    /// the default is unique per device.
+    pub fn id(mut self, id: &str) -> Self {
+        self.id = Some(id.to_string());
+        self
     }
 }
 
@@ -1888,7 +2225,9 @@ impl<'a> AttachDevice<'a> for InputDevice<'a> {
         let input = Input::new(config_backend, events_backend)
             .map_err(|e| VmmError::Internal(format!("input: {e:?}")))?;
         let inner = Arc::new(Mutex::new(input));
-        let id = inner.lock().unwrap().id().to_string();
+        let id = self
+            .id
+            .unwrap_or_else(|| format!("input{}", ctx.device_index()));
         ctx.register(&id, inner)
     }
 }
