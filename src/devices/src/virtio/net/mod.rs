@@ -32,7 +32,7 @@ fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
     VNET_HDR_LEN
 }
 
-pub use self::device::Net;
+pub use self::device::{Net, NetLink};
 #[cfg(unix)]
 pub use self::unixgram::unlink_bound_sockets;
 #[derive(Debug)]
