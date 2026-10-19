@@ -30,12 +30,15 @@ use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::{AsSocket, BorrowedSocket, OwnedSocket, RawSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(not(windows))]
 use std::thread::JoinHandle;
 #[cfg(not(windows))]
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use virtio_bindings::virtio_net::{VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_MAC};
+use virtio_bindings::virtio_net::{
+    VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_MAC, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
+};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
@@ -93,6 +96,44 @@ pub enum VirtioNetBackend {
     External(super::backend::ExternalBackend),
 }
 
+/// The NIC's carrier, which the embedder can take away and give back while the guest runs: a
+/// guest's network manager takes the link down with it, and on its return asks for a fresh lease,
+/// as on a cable pulled and plugged back in.
+#[derive(Default)]
+pub struct NetLink {
+    down: AtomicBool,
+    /// The running device's interrupt, from activation to reset.
+    interrupt: Mutex<Option<InterruptTransport>>,
+}
+
+impl NetLink {
+    /// Raises or drops the carrier, and tells a running guest when it changes.
+    pub fn set_up(&self, up: bool) {
+        if self.down.swap(!up, Ordering::SeqCst) == up {
+            let interrupt = self.interrupt.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(interrupt) = interrupt.as_ref() {
+                interrupt.signal_config_change();
+            }
+        }
+    }
+
+    pub fn is_up(&self) -> bool {
+        !self.down.load(Ordering::SeqCst)
+    }
+
+    fn set_interrupt(&self, interrupt: Option<InterruptTransport>) {
+        *self.interrupt.lock().unwrap_or_else(|p| p.into_inner()) = interrupt;
+    }
+
+    fn status(&self) -> u16 {
+        if self.is_up() {
+            VIRTIO_NET_S_LINK_UP as u16
+        } else {
+            0
+        }
+    }
+}
+
 pub struct Net {
     id: String,
     pub cfg_backend: VirtioNetBackend,
@@ -103,6 +144,7 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+    link: Arc<NetLink>,
     // The backend's frames already carry correct checksums; see `rx_data_valid`.
     rx_csum_valid: bool,
 
@@ -138,6 +180,7 @@ impl Net {
     ) -> Result<Self> {
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
+            | (1 << VIRTIO_NET_F_STATUS)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
 
@@ -156,6 +199,7 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+            link: Arc::default(),
             rx_csum_valid,
             #[cfg(windows)]
             worker_socket: None,
@@ -179,6 +223,11 @@ impl Net {
     /// Provides the virtio-net backend of this net device.
     pub fn backend(&self) -> &VirtioNetBackend {
         &self.cfg_backend
+    }
+
+    /// The device's carrier, to drop and raise while the guest runs.
+    pub fn link(&self) -> Arc<NetLink> {
+        self.link.clone()
     }
 }
 
@@ -212,7 +261,11 @@ impl VirtioDevice for Net {
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
-        let config_slice = self.config.as_slice();
+        let config = VirtioNetConfig {
+            status: self.link.status().to_le(),
+            ..self.config
+        };
+        let config_slice = config.as_slice();
         let config_len = config_slice.len() as u64;
         if offset >= config_len {
             error!("Failed to read config space");
@@ -333,6 +386,7 @@ impl VirtioDevice for Net {
             #[cfg(unix)]
             let worker = worker.with_dump_gate(self.dump_gate.clone());
             self.worker_thread = Some(worker.run());
+            self.link.set_interrupt(Some(interrupt.clone()));
             self.device_state = DeviceState::Activated(mem, interrupt);
             Ok(())
         }
@@ -372,6 +426,7 @@ impl VirtioDevice for Net {
                     ),
                 }
             }
+            self.link.set_interrupt(None);
             self.device_state = DeviceState::Inactive;
             true
         }
@@ -395,6 +450,60 @@ mod tests {
     use super::*;
 
     const GUEST_CSUM: u64 = 1 << VIRTIO_NET_F_GUEST_CSUM;
+
+    fn status(net: &Net) -> u16 {
+        let mut b = [0u8; 2];
+        net.read_config(6, &mut b);
+        u16::from_le_bytes(b)
+    }
+
+    /// The carrier is up from the start, and a drop and a return each tell a running guest once.
+    #[test]
+    fn the_link_drops_and_returns_with_a_config_interrupt_each_way() {
+        use crate::virtio::device::{InterruptHandler, InterruptType};
+
+        /// Records whether the device signaled a config change since the last look.
+        #[derive(Default)]
+        struct ConfigChanges(AtomicBool);
+
+        impl InterruptHandler for ConfigChanges {
+            fn try_signal(
+                &self,
+                interrupt: InterruptType,
+            ) -> std::result::Result<(), crate::Error> {
+                if let InterruptType::ConfigChange = interrupt {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        let net = Net::new(
+            "net-test".into(),
+            VirtioNetBackend::UnixstreamPath(PathBuf::new()),
+            [0; 6],
+            0,
+            false,
+        )
+        .unwrap();
+        assert_ne!(net.avail_features() & (1 << VIRTIO_NET_F_STATUS), 0);
+        assert_eq!(status(&net), VIRTIO_NET_S_LINK_UP as u16);
+
+        let changes = Arc::new(ConfigChanges::default());
+        let interrupt = InterruptTransport::from_handler(changes.clone());
+        let config_signalled = || changes.0.swap(false, Ordering::SeqCst);
+        let link = net.link();
+        link.set_interrupt(Some(interrupt.clone()));
+
+        link.set_up(false);
+        assert_eq!(status(&net), 0);
+        assert!(config_signalled(), "the guest is told the link went down");
+        link.set_up(false);
+        assert!(!config_signalled(), "and only once");
+        link.set_up(true);
+        assert_eq!(status(&net), VIRTIO_NET_S_LINK_UP as u16);
+        assert!(config_signalled(), "the guest is told the link is back");
+    }
 
     #[test]
     fn a_vouched_backend_marks_frames_valid_for_a_csum_guest() {

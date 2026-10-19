@@ -1912,6 +1912,12 @@ impl NetDevice {
         )
     }
 
+    /// limina: the device's carrier, to drop and raise while the guest runs; see
+    /// [`NetLink`](devices::virtio::net::NetLink).
+    pub fn link(&self) -> Arc<devices::virtio::net::NetLink> {
+        self.inner.lock().unwrap().link()
+    }
+
     fn new_inner(
         id: &str,
         backend: devices::virtio::net::device::VirtioNetBackend,
