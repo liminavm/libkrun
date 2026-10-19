@@ -181,6 +181,8 @@ impl NetWorker {
             &EpollEvent::new(EventSet::IN, virtq_tx_ev_fd as u64),
         );
         register_backend(&epoll, backend_socket);
+        let mut extra_fds = Vec::new();
+        sync_extra_fds(&epoll, &mut extra_fds, self.backend.extra_fds(), false);
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         let dump_gate = self.dump_gate.clone();
@@ -205,7 +207,7 @@ impl NetWorker {
                             EventSet::IN if source == virtq_tx_ev_fd => {
                                 self.process_tx_queue_event();
                             }
-                            _ if source == backend_socket => {
+                            _ if source == backend_socket || extra_fds.contains(&source) => {
                                 if event_set.contains(EventSet::HANG_UP)
                                     || event_set.contains(EventSet::READ_HANG_UP)
                                 {
@@ -232,7 +234,8 @@ impl NetWorker {
                         }
                     }
 
-                    if self.try_reconnect(Instant::now()) {
+                    let reconnected = self.try_reconnect(Instant::now());
+                    if reconnected {
                         let fd = self.backend.raw_socket_fd();
                         if fd != backend_socket {
                             let _ = epoll.ctl(
@@ -243,6 +246,14 @@ impl NetWorker {
                             backend_socket = fd;
                             register_backend(&epoll, backend_socket);
                         }
+                    }
+                    sync_extra_fds(
+                        &epoll,
+                        &mut extra_fds,
+                        self.backend.extra_fds(),
+                        reconnected,
+                    );
+                    if reconnected {
                         self.process_tx_loop();
                         self.process_backend_socket_readable();
                     }
@@ -658,6 +669,33 @@ impl NetWorker {
     }
 }
 
+/// Watches `wanted`, the backend's extra descriptors, in place of `watched`: the ones it dropped
+/// are forgotten, new ones are watched for reads and hang-ups, and with `all` every one is
+/// registered again, for descriptors a reconnect may have replaced under the same number.
+fn sync_extra_fds(epoll: &Epoll, watched: &mut Vec<RawFd>, wanted: Vec<RawFd>, all: bool) {
+    if !all && *watched == wanted {
+        return;
+    }
+    for &fd in watched.iter().filter(|fd| !wanted.contains(fd)) {
+        let _ = epoll.ctl(
+            ControlOperation::Delete,
+            fd,
+            &EpollEvent::new(EventSet::IN, fd as u64),
+        );
+    }
+    for &fd in wanted.iter().filter(|fd| all || !watched.contains(fd)) {
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            fd,
+            &EpollEvent::new(
+                EventSet::IN | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
+                fd as u64,
+            ),
+        );
+    }
+    *watched = wanted;
+}
+
 fn register_backend(epoll: &Epoll, fd: RawFd) {
     let _ = epoll.ctl(
         ControlOperation::Add,
@@ -693,6 +731,8 @@ mod tests {
         link: Arc<Link>,
         /// A descriptor for the worker's epoll to watch, for a test that runs the worker loop.
         socket: Option<std::os::unix::net::UnixDatagram>,
+        /// Another, offered as an extra descriptor.
+        extra: Option<std::os::unix::net::UnixDatagram>,
     }
 
     /// Whether the proxy is there, and what reached it.
@@ -735,6 +775,9 @@ mod tests {
         fn raw_socket_fd(&self) -> RawFd {
             self.socket.as_ref().map_or(-1, |s| s.as_raw_fd())
         }
+        fn extra_fds(&self) -> Vec<RawFd> {
+            self.extra.iter().map(|s| s.as_raw_fd()).collect()
+        }
     }
 
     /// An external backend is built from the features the guest acked, and is the worker's.
@@ -749,6 +792,7 @@ mod tests {
                 synthesizes: true,
                 link: Arc::default(),
                 socket: None,
+                extra: None,
             }) as Box<dyn NetBackend + Send>)
         });
         let mut backend = connect_backend(VirtioNetBackend::External(build), 0x8f).unwrap();
@@ -806,6 +850,7 @@ mod tests {
             synthesizes,
             link: Arc::default(),
             socket: None,
+            extra: None,
         };
         let worker = NetWorker::new(
             queue(rx),
@@ -936,6 +981,7 @@ mod tests {
             synthesizes: true,
             link: Arc::default(),
             socket: Some(ours),
+            extra: None,
         });
         let gate = Arc::new(DumpGate::new());
         let worker = worker.with_dump_gate(gate.clone());
@@ -966,6 +1012,40 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// A backend gathering several sources wakes the worker through an extra descriptor, and the
+    /// frames waiting behind it reach the guest.
+    #[test]
+    fn a_wake_on_an_extra_descriptor_brings_the_frames_in() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, _interrupt) = worker(&mem, &rx, &tx, 8, 0);
+        let (main, _main_peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let (extra, extra_peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        worker.backend = Box::new(Proxy {
+            frames: (0..2).map(|_| vec![0xab; 60]).collect(),
+            synthesizes: true,
+            link: Arc::default(),
+            socket: Some(main),
+            extra: Some(extra),
+        });
+        let stop = worker.stop_fd.try_clone().unwrap();
+        let thread = worker.run();
+
+        extra_peer.send(&[1]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rx.used.idx.get() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            rx.used.idx.get(),
+            2,
+            "the extra descriptor's wake brought both frames"
+        );
+        stop.write(1).unwrap();
+        thread.join().unwrap();
+    }
+
     /// Queue `count` guest frames on the TX ring, after the `posted` already there.
     fn post_tx(tx: &GuestQueue, posted: u16, count: u16) {
         for i in posted..posted + count {
@@ -989,6 +1069,7 @@ mod tests {
             synthesizes: true,
             link: link.clone(),
             socket: None,
+            extra: None,
         });
 
         link.down.store(true, Ordering::SeqCst);

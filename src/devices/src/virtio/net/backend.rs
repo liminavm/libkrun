@@ -92,6 +92,15 @@ pub trait NetBackend {
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
     fn raw_socket_fd(&self) -> RawFd;
 
+    /// Descriptors besides [`raw_socket_fd`](Self::raw_socket_fd) whose readiness means frames may
+    /// be waiting, for a backend that gathers several sources. The worker watches them for reads
+    /// and hang-ups only, and takes the set again after every pass, so it may change with any call
+    /// into the backend; a descriptor replaced by another of the same number is taken up again
+    /// only after a reconnect.
+    fn extra_fds(&self) -> Vec<RawFd> {
+        Vec::new()
+    }
+
     /// Whether `read_frame` writes a blank virtio-net header in front of the frame. A backend
     /// that relays one (a tap, from the host kernel) returns false, so the header is left alone.
     fn synthesizes_vnet_hdr(&self) -> bool {
