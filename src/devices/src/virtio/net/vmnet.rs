@@ -179,8 +179,29 @@ pub struct Vmnet {
 // backend and is its only user.
 unsafe impl Send for Vmnet {}
 
+/// The name `vmnet.h` gives a status.
+fn status_name(status: VmnetReturn) -> Option<&'static str> {
+    Some(match status {
+        1000 => "VMNET_SUCCESS",
+        1001 => "VMNET_FAILURE",
+        1002 => "VMNET_MEM_FAILURE",
+        1003 => "VMNET_INVALID_ARGUMENT",
+        1004 => "VMNET_SETUP_INCOMPLETE",
+        1005 => "VMNET_INVALID_ACCESS",
+        1006 => "VMNET_PACKET_TOO_BIG",
+        1007 => "VMNET_BUFFER_EXHAUSTED",
+        1008 => "VMNET_TOO_MANY_PACKETS",
+        1009 => "VMNET_SHARING_SERVICE_BUSY",
+        1010 => "VMNET_NOT_AUTHORIZED",
+        _ => return None,
+    })
+}
+
 fn vmnet_error(what: &str, status: VmnetReturn) -> ConnectError {
-    ConnectError::Vmnet(format!("{what} failed with vmnet status {status}"))
+    ConnectError::Vmnet(match status_name(status) {
+        Some(name) => format!("{what} failed with {name} ({status})"),
+        None => format!("{what} failed with vmnet status {status}"),
+    })
 }
 
 impl Vmnet {
