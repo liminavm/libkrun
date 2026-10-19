@@ -17,6 +17,8 @@ use crate::virtio::net::device::{FrontendError, RxError, TxError, VirtioNetBacke
 use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
+#[cfg(target_os = "macos")]
+use crate::virtio::net::vmnet::Vmnet;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, VNET_HDR_LEN};
 use crate::virtio::{DeviceQueue, DumpGate, InterruptTransport};
 
@@ -71,7 +73,7 @@ pub(crate) fn connect_backend(
     cfg_backend: VirtioNetBackend,
     vnet_features: u64,
 ) -> Result<Box<dyn NetBackend + Send>, ConnectError> {
-    let _ = vnet_features; // only the Tap backend (Linux) uses it
+    let _ = vnet_features; // only the Tap (Linux) and vmnet (macOS) backends use it
     Ok(match cfg_backend {
         VirtioNetBackend::UnixstreamFd(fd) => {
             // SAFETY: we need to trust that the library user has configured
@@ -94,6 +96,10 @@ pub(crate) fn connect_backend(
         #[cfg(target_os = "linux")]
         VirtioNetBackend::Tap(tap_name) => {
             Box::new(Tap::new(tap_name, vnet_features)?) as Box<dyn NetBackend + Send>
+        }
+        #[cfg(target_os = "macos")]
+        VirtioNetBackend::Vmnet(config) => {
+            Box::new(Vmnet::start(config, vnet_features)?) as Box<dyn NetBackend + Send>
         }
     })
 }
