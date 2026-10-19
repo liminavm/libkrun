@@ -427,6 +427,7 @@ impl BlockWorker {
                 error!("invalid descriptor chain: {e:?}");
                 self.complete_request(
                     head_index,
+                    0,
                     status_writer,
                     Err(RequestError::InvalidDataLength),
                 );
@@ -439,6 +440,7 @@ impl BlockWorker {
                 error!("invalid request header: {e:?}");
                 self.complete_request(
                     head_index,
+                    0,
                     status_writer,
                     Err(RequestError::ReadingFromDescriptor(e)),
                 );
@@ -460,6 +462,7 @@ impl BlockWorker {
             if !data_len.is_multiple_of(512) {
                 self.complete_request(
                     head_index,
+                    0,
                     status_writer,
                     Err(RequestError::InvalidDataLength),
                 );
@@ -483,20 +486,21 @@ impl BlockWorker {
         }
 
         let result = Self::process_request(request_header, &mut reader, &mut writer, &self.disk);
-        self.complete_request(head_index, status_writer, result);
+        self.complete_request(head_index, writer.bytes_written(), status_writer, result);
     }
 
     fn complete_request(
         &mut self,
         head_index: u16,
+        data_written: usize,
         mut writer: Writer,
-        result: result::Result<usize, RequestError>,
+        result: result::Result<(), RequestError>,
     ) {
-        let (status, len): (u8, usize) = match result {
-            Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
+        let status: u8 = match result {
+            Ok(()) => VIRTIO_BLK_S_OK.try_into().unwrap(),
             Err(e) => {
                 error!("error processing request: {e:?}");
-                (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
+                VIRTIO_BLK_S_IOERR.try_into().unwrap()
             }
         };
 
@@ -507,7 +511,7 @@ impl BlockWorker {
                 0
             }
         };
-        self.add_used(head_index, (len + status_len) as u32);
+        self.add_used(head_index, (data_written + status_len) as u32);
         self.signal_used_queue();
     }
 
@@ -516,7 +520,7 @@ impl BlockWorker {
         reader: &mut Reader,
         writer: &mut Writer,
         disk: &DiskProperties,
-    ) -> result::Result<usize, RequestError> {
+    ) -> result::Result<(), RequestError> {
         match request_header.request_type {
             VIRTIO_BLK_T_IN => {
                 let data_len = writer.available_bytes();
@@ -529,6 +533,7 @@ impl BlockWorker {
                 } else {
                     writer
                         .write_from_at(disk, data_len, offset)
+                        .map(drop)
                         .map_err(RequestError::WritingToDescriptor)
                 }
             }
@@ -539,6 +544,7 @@ impl BlockWorker {
                 } else {
                     reader
                         .read_to_at(disk, data_len, request_header.sector * 512)
+                        .map(drop)
                         .map_err(RequestError::ReadingFromDescriptor)
                 }
             }
@@ -546,10 +552,9 @@ impl BlockWorker {
                 CacheType::Writeback => {
                     let diskfile = disk.file.write().unwrap();
                     diskfile.flush().map_err(RequestError::FlushingToDisk)?;
-                    diskfile.sync().map_err(RequestError::FlushingToDisk)?;
-                    Ok(0)
+                    diskfile.sync().map_err(RequestError::FlushingToDisk)
                 }
-                CacheType::Unsafe => Ok(0),
+                CacheType::Unsafe => Ok(()),
             },
             VIRTIO_BLK_T_GET_ID => {
                 let data_len = writer.available_bytes();
@@ -559,8 +564,7 @@ impl BlockWorker {
                 } else {
                     writer
                         .write_all(disk_id)
-                        .map_err(RequestError::WritingToDescriptor)?;
-                    Ok(disk_id.len())
+                        .map_err(RequestError::WritingToDescriptor)
                 }
             }
             VIRTIO_BLK_T_DISCARD => {
@@ -575,7 +579,7 @@ impl BlockWorker {
                         discard_write_data.num_sectors as u64 * 512,
                     )
                     .map_err(RequestError::Discarding)?;
-                Ok(0)
+                Ok(())
             }
             VIRTIO_BLK_T_WRITE_ZEROES => {
                 let discard_write_data: DiscardWriteData = reader
@@ -598,7 +602,7 @@ impl BlockWorker {
                         )
                         .map_err(RequestError::WritingZeroes)?;
                 }
-                Ok(0)
+                Ok(())
             }
             _ => Err(RequestError::UnknownRequest),
         }
