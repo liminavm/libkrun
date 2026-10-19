@@ -67,6 +67,15 @@ const GTDT_REVISION: u8 = 3;
 /// A GTDT field that names no memory-mapped counter.
 const GTDT_NO_COUNTER_BLOCK: u64 = u64::MAX;
 
+const SPCR_REVISION: u8 = 2;
+const SPCR_INTERFACE_PL011: u8 = 3;
+/// Generic Address Structure: system memory, 32-bit registers, dword access.
+const GAS_SYSTEM_MEMORY: u8 = 0;
+const GAS_ACCESS_DWORD: u8 = 3;
+const SPCR_INTERRUPT_GIC: u8 = 1 << 3;
+/// Keep whatever rate the UART is already programmed with.
+const SPCR_BAUD_AS_IS: u8 = 0;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// The machine's interrupt controller is not a GICv3, the only one these tables describe.
@@ -87,6 +96,7 @@ pub fn create_acpi_tables<T: DeviceInfoForFDT + Clone + Debug>(
     vcpu_mpidr: &[u64],
     device_info: &HashMap<(DeviceType, String), T>,
     gic_device: &IrqChip,
+    spcr: bool,
 ) -> Result<bool> {
     if guest_mem.find_region(GuestAddress(ACPI_START)).is_none() {
         return Ok(false);
@@ -99,7 +109,7 @@ pub fn create_acpi_tables<T: DeviceInfoForFDT + Clone + Debug>(
             maint_ppi: gic.fdt_maint_irq(),
         }
     };
-    let blob = build_tables(ACPI_START, vcpu_mpidr, device_info, &gic)?;
+    let blob = build_tables(ACPI_START, vcpu_mpidr, device_info, &gic, spcr)?;
     if blob.len() > ACPI_SIZE {
         return Err(Error::TooLarge(blob.len()));
     }
@@ -116,13 +126,15 @@ struct Gic {
     maint_ppi: u32,
 }
 
-/// Lays the tables out from `base`: RSDP, XSDT, FADT, MADT, GTDT, PPTT, the TPM2 table when
-/// there is a TPM, then the DSDT, each 8-byte aligned.
+/// Lays the tables out from `base`: RSDP, XSDT, FADT, MADT, GTDT, PPTT, the SPCR when asked
+/// for and there is a serial port, the TPM2 table when there is a TPM, then the DSDT, each
+/// 8-byte aligned.
 fn build_tables<T: DeviceInfoForFDT + Clone + Debug>(
     base: u64,
     vcpu_mpidr: &[u64],
     device_info: &HashMap<(DeviceType, String), T>,
     gic: &Gic,
+    spcr: bool,
 ) -> Result<Vec<u8>> {
     if gic.compatible != "arm,gic-v3" {
         return Err(Error::UnsupportedGic(gic.compatible.clone()));
@@ -132,6 +144,13 @@ fn build_tables<T: DeviceInfoForFDT + Clone + Debug>(
         build_gtdt(),
         build_pptt(vcpu_mpidr.len()),
     ];
+    let uart = device_info
+        .iter()
+        .find(|((t, _), _)| *t == DeviceType::Serial)
+        .map(|(_, info)| info);
+    if let (true, Some(uart)) = (spcr, uart) {
+        tables.push(build_spcr(uart.addr(), uart.irq()));
+    }
     if device_info.keys().any(|(t, _)| *t == DeviceType::Tpm) {
         tables.push(build_tpm2());
     }
@@ -248,6 +267,39 @@ fn build_gtdt() -> Vec<u8> {
     gtdt.append([0u32, 0u32]);
     gtdt.update_checksum();
     gtdt.as_slice().to_vec()
+}
+
+/// The serial console. arm64 Linux makes the SPCR's UART its preferred console, and unlike the
+/// device tree's `stdout-path` its only one: `/dev/console` leaves the display, so it is opt-in.
+fn build_spcr(base: u64, gsiv: u32) -> Vec<u8> {
+    let mut spcr = Sdt::new(
+        *b"SPCR",
+        36,
+        SPCR_REVISION,
+        OEM_ID,
+        *b"LIMNSPCR",
+        OEM_REVISION,
+    );
+    spcr.append(SPCR_INTERFACE_PL011);
+    spcr.append([0u8; 3]);
+    spcr.append([GAS_SYSTEM_MEMORY, 32, 0, GAS_ACCESS_DWORD]);
+    spcr.append(base);
+    spcr.append(SPCR_INTERRUPT_GIC);
+    // No PC-AT IRQ.
+    spcr.append(0u8);
+    spcr.append(gsiv);
+    spcr.append(SPCR_BAUD_AS_IS);
+    // No parity, one stop bit, no flow control, VT100.
+    spcr.append([0u8, 1, 0, 0]);
+    // Language, then "not a PCI device": device and vendor IDs 0xFFFF, the rest zero.
+    spcr.append(0u8);
+    spcr.append([0xFFFFu16, 0xFFFF]);
+    spcr.append([0u8; 3]);
+    spcr.append(0u32);
+    spcr.append(0u8);
+    spcr.append(0u32);
+    spcr.update_checksum();
+    spcr.as_slice().to_vec()
 }
 
 /// The TPM's TIS registers are memory-mapped (start method 6) and it has no CRB control area.
@@ -789,7 +841,7 @@ mod tests {
         };
         let devices: HashMap<(DeviceType, String), Info> = HashMap::new();
         let base = 0x0408_0000;
-        let blob = build_tables(base, &[0], &devices, &gic).unwrap();
+        let blob = build_tables(base, &[0], &devices, &gic, false).unwrap();
         assert_eq!(&blob[..8], b"RSD PTR ");
         let xsdt = table_at(&blob, (u64_at(&blob, 24) - base) as usize);
         assert_eq!(&xsdt[..4], b"XSDT");
@@ -810,6 +862,62 @@ mod tests {
         assert_eq!(signatures, [b"FACP", b"APIC", b"GTDT", b"PPTT"]);
     }
 
+    fn signatures(blob: &[u8], base: u64) -> Vec<Vec<u8>> {
+        let xsdt = table_at(blob, (u64_at(blob, 24) - base) as usize);
+        xsdt[36..]
+            .chunks(8)
+            .map(|e| {
+                table_at(
+                    blob,
+                    (u64::from_le_bytes(e.try_into().unwrap()) - base) as usize,
+                )[..4]
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_spcr_is_written_only_when_asked_for_and_there_is_a_uart() {
+        let gic = Gic {
+            compatible: "arm,gic-v3".into(),
+            properties: vec![0x1000, 0x1_0000, 0x2000, 0x4_0000],
+            maint_ppi: 9,
+        };
+        let base = 0x0408_0000;
+        let none: HashMap<(DeviceType, String), Info> = HashMap::new();
+        let mut uart = HashMap::new();
+        uart.insert(
+            (DeviceType::Serial, "uart".into()),
+            Info {
+                addr: 0x0900_0000,
+                irq: 33,
+            },
+        );
+        let has_spcr = |devices: &HashMap<(DeviceType, String), Info>, spcr| {
+            let blob = build_tables(base, &[0], devices, &gic, spcr).unwrap();
+            signatures(&blob, base).contains(&b"SPCR".to_vec())
+        };
+        assert!(has_spcr(&uart, true));
+        assert!(!has_spcr(&uart, false));
+        assert!(!has_spcr(&none, true));
+    }
+
+    #[test]
+    fn the_spcr_names_the_pl011_and_its_interrupt() {
+        let spcr = build_spcr(0x0900_0000, 33);
+        assert!(checksum_ok(&spcr));
+        assert_eq!(&spcr[..4], b"SPCR");
+        assert_eq!(spcr.len(), 80);
+        assert_eq!(spcr[8], 2);
+        assert_eq!(spcr[36], SPCR_INTERFACE_PL011);
+        assert_eq!(spcr[40..44], [0, 32, 0, 3]);
+        assert_eq!(u64_at(&spcr, 44), 0x0900_0000);
+        assert_eq!(spcr[52], 1 << 3);
+        assert_eq!(u32::from_le_bytes(spcr[54..58].try_into().unwrap()), 33);
+        assert_eq!(spcr[60], 1);
+        assert_eq!(spcr[64..68], [0xFF; 4]);
+    }
+
     #[test]
     fn a_tpm_adds_its_table_and_a_device_without_an_interrupt() {
         let gic = Gic {
@@ -826,7 +934,7 @@ mod tests {
             },
         );
         let base = 0x0408_0000;
-        let blob = build_tables(base, &[0], &devices, &gic).unwrap();
+        let blob = build_tables(base, &[0], &devices, &gic, false).unwrap();
         let xsdt = table_at(&blob, (u64_at(&blob, 24) - base) as usize);
         let mut tpm2 = None;
         let mut dsdt = None;
