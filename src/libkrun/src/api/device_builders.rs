@@ -1890,6 +1890,28 @@ impl NetDevice {
 
 #[cfg(feature = "net")]
 impl NetDevice {
+    /// limina: create a net device on a backend the embedder implements; see
+    /// [`ExternalBackend`](devices::virtio::net::backend::ExternalBackend). `flags` are the
+    /// backend's to choose, as for the socket backends: `CSUM_VALID` when its frames carry
+    /// correct checksums.
+    #[cfg(unix)]
+    pub fn new_external(
+        id: &str,
+        backend: devices::virtio::net::backend::ExternalBackend,
+        mac: &[u8],
+        features: u32,
+        flags: NetFlags,
+    ) -> Result<Self, VmmError> {
+        use devices::virtio::net::device::VirtioNetBackend;
+        Self::new_inner(
+            id,
+            VirtioNetBackend::External(backend),
+            mac,
+            features,
+            flags,
+        )
+    }
+
     fn new_inner(
         id: &str,
         backend: devices::virtio::net::device::VirtioNetBackend,
