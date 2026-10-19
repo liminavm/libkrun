@@ -578,6 +578,72 @@ mod tests {
         assert!(block.reset());
     }
 
+    /// Completes one single-sector request of `request_type` and returns the used length.
+    fn used_len_of_one_sector_request(request_type: u32) -> u32 {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(16 * SECTOR_SIZE)
+            .expect("size backing file");
+        let mut block = Block::new(
+            "used-len".to_string(),
+            None,
+            CacheType::Unsafe,
+            backing.as_path().to_str().unwrap().to_string(),
+            DiskFormat::Raw,
+            false,
+            false,
+            SyncMode::None,
+        )
+        .unwrap();
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let vq = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        mem.write_obj(request_type, GuestAddress(0x8000)).unwrap();
+        mem.write_obj(0u64, GuestAddress(0x8008)).unwrap();
+        let data_flags = if request_type == VIRTIO_BLK_T_IN {
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
+        } else {
+            VIRTQ_DESC_F_NEXT
+        };
+        vq.dtable[0].set(0x8000, 16, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable[1].set(0x9000, SECTOR_SIZE as u32, data_flags, 2);
+        vq.dtable[2].set(0xa000, 1, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+        let kick = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let queue = DeviceQueue::new(vq.create_queue(), kick.clone());
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "blk-test".to_string()).unwrap();
+
+        block
+            .activate(mem.clone(), interrupt.clone(), vec![queue])
+            .unwrap();
+        kick.write(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vq.used.idx.get() < 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(vq.used.idx.get(), 1, "the worker answered the request");
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(0xa000)).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        assert!(block.reset());
+        vq.used.ring[0].get().len
+    }
+
+    /// The used length is the bytes written into the device-writable buffers (virtio 1.2
+    /// §2.7.8.1): a read writes the sector and the status byte, a write only the status byte.
+    #[test]
+    fn the_used_length_counts_the_bytes_written_to_the_guest() {
+        assert_eq!(
+            used_len_of_one_sector_request(VIRTIO_BLK_T_IN),
+            SECTOR_SIZE as u32 + 1
+        );
+        assert_eq!(used_len_of_one_sector_request(VIRTIO_BLK_T_OUT), 1);
+    }
+
     #[test]
     fn disk_image_id_prefers_supplied_block_id() {
         let backing = TempFile::new().expect("create backing file");
