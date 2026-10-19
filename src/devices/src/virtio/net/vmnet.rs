@@ -2,7 +2,8 @@
 //! (NAT), host-only or bridged mode, with the virtio-net header passed through in both directions
 //! so segmentation and checksum offload reach vmnet instead of being undone on the way.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::sync::mpsc;
@@ -74,6 +75,8 @@ unsafe extern "C" {
     static vmnet_max_packet_size_key: *const c_char;
     static vmnet_read_max_packets_key: *const c_char;
     static vmnet_write_max_packets_key: *const c_char;
+    static vmnet_start_address_key: *const c_char;
+    static vmnet_subnet_mask_key: *const c_char;
 
     fn vmnet_start_interface(
         desc: XpcObject,
@@ -113,6 +116,7 @@ unsafe extern "C" {
     fn xpc_dictionary_set_bool(dict: XpcObject, key: *const c_char, value: bool);
     fn xpc_dictionary_set_string(dict: XpcObject, key: *const c_char, value: *const c_char);
     fn xpc_dictionary_get_uint64(dict: XpcObject, key: *const c_char) -> u64;
+    fn xpc_dictionary_get_string(dict: XpcObject, key: *const c_char) -> *const c_char;
     fn xpc_release(object: XpcObject);
     fn dispatch_queue_create(label: *const c_char, attr: *mut c_void) -> DispatchQueue;
     fn dispatch_release(object: DispatchQueue);
@@ -134,11 +138,30 @@ struct Started {
     max_packet: usize,
     read_max: usize,
     write_max: usize,
+    subnet: Option<(Ipv4Addr, Ipv4Addr)>,
+}
+
+/// An IPv4 address vmnet reports as a string under `key`.
+///
+/// # Safety
+///
+/// `params` must be the live parameters of a start handler.
+unsafe fn ipv4_param(params: XpcObject, key: *const c_char) -> Option<Ipv4Addr> {
+    // SAFETY: the caller's; the string lives as long as the parameters.
+    let s = unsafe { xpc_dictionary_get_string(params, key) };
+    if s.is_null() {
+        return None;
+    }
+    // SAFETY: a NUL-terminated string from the dictionary.
+    unsafe { CStr::from_ptr(s) }.to_str().ok()?.parse().ok()
 }
 
 pub struct Vmnet {
     interface: InterfaceRef,
     queue: DispatchQueue,
+    /// The host's address on the interface's subnet, which guests reach it and the NAT at, and the
+    /// subnet's mask (shared and host-only modes).
+    subnet: Option<(Ipv4Addr, Ipv4Addr)>,
     /// The packets-available callback writes a byte here, which is what the worker's epoll
     /// waits on: vmnet itself has no descriptor to poll.
     wake_rx: UnixDatagram,
@@ -216,6 +239,8 @@ impl Vmnet {
                         as usize,
                     write_max: xpc_dictionary_get_uint64(params, vmnet_write_max_packets_key)
                         as usize,
+                    subnet: ipv4_param(params, vmnet_start_address_key)
+                        .zip(ipv4_param(params, vmnet_subnet_mask_key)),
                 });
                 let _ = tx.send((status, started));
             });
@@ -249,12 +274,16 @@ impl Vmnet {
             )));
         }
         info!(
-            "vmnet: {:?} interface up{}: mtu {}, packets up to {} bytes, TSO {}, up to {} \
+            "vmnet: {:?} interface up{}{}: mtu {}, packets up to {} bytes, TSO {}, up to {} \
              packets per read and {} per write",
             config.mode,
             bridged
                 .as_ref()
                 .map(|n| format!(" on {}", n.to_string_lossy()))
+                .unwrap_or_default(),
+            started
+                .subnet
+                .map(|(host, mask)| format!(", host at {host} mask {mask}"))
                 .unwrap_or_default(),
             started.mtu,
             started.max_packet,
@@ -265,6 +294,7 @@ impl Vmnet {
 
         let batch = started.read_max.clamp(1, RX_BATCH);
         let mut backend = Self::new(interface, queue, wake_rx, wake_tx, batch);
+        backend.subnet = started.subnet;
         for buf in &mut backend.rx_bufs {
             buf.resize(rx_buf_len, 0);
         }
@@ -282,6 +312,7 @@ impl Vmnet {
         Self {
             interface,
             queue,
+            subnet: None,
             wake_rx,
             _wake_tx: wake_tx,
             rx_bufs: vec![Vec::new(); batch],
@@ -312,6 +343,13 @@ impl Vmnet {
             return Err(vmnet_error("vmnet_interface_set_event_callback", status));
         }
         Ok(())
+    }
+
+    /// The host's address on the interface's subnet (vmnet's start address, the guests' gateway)
+    /// and the subnet's mask, in the shared and host-only modes: where the guests' addresses are,
+    /// and what the host routes to the interface.
+    pub fn subnet(&self) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        self.subnet
     }
 
     /// Fetch the next batch of frames from vmnet into `rx_bufs`.
