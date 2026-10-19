@@ -332,15 +332,7 @@ impl NetWorker {
         if let Err(e) = self.rx_q.event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
         }
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by queue event)")
-        };
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
+        self.process_rx_and_rearm("queue event");
     }
 
     fn process_tx_queue_event(&mut self) {
@@ -353,14 +345,32 @@ impl NetWorker {
     }
 
     fn process_backend_socket_readable(&mut self) {
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
-        };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+        self.process_rx_and_rearm("backend socket readable");
+    }
+
+    /// Moves the backend's frames into the guest. A frame left waiting for RX buffers asks the
+    /// guest to kick the queue when it posts more, armed only after the buffers in hand are used:
+    /// armed before, it points at buffers already taken, and the guest never kicks. Buffers posted
+    /// before the arming are taken here.
+    fn process_rx_and_rearm(&mut self, trigger: &str) {
+        loop {
+            if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
+                error!("error disabling queue notifications: {e:?}");
+            }
+            if let Err(e) = self.process_rx() {
+                log::error!("Failed to process rx: {e:?} (triggered by {trigger})");
+            }
+            if !self.rx_has_deferred_frame {
+                return;
+            }
+            match self.rx_q.queue.enable_notification(&self.mem) {
+                Ok(true) => continue,
+                Ok(false) => return,
+                Err(e) => {
+                    error!("error enabling queue notifications: {e:?}");
+                    return;
+                }
+            }
         }
     }
 
@@ -840,6 +850,27 @@ mod tests {
         assert!(
             !take_interrupt(&interrupt),
             "used index 2 has not passed used_event 8"
+        );
+    }
+
+    /// The guest's RX ring fills with frames still waiting: the guest has to be asked to kick the
+    /// queue when it posts more buffers, or the waiting frame stays until the backend happens to
+    /// wake the worker again, which a backend that rings only when the worker parks never does.
+    #[test]
+    fn a_frame_left_waiting_for_buffers_has_the_guest_kick_for_more() {
+        let mem = memory();
+        let rx = GuestQueue::new(GuestAddress(0x1000), &mem, 16);
+        let tx = GuestQueue::new(GuestAddress(0x3000), &mem, 16);
+        let (mut worker, _interrupt) = worker(&mem, &rx, &tx, 2, 4);
+
+        worker.process_backend_socket_readable();
+
+        assert_eq!(rx.used.idx.get(), 2, "both buffers were filled");
+        assert!(worker.rx_has_deferred_frame, "a frame waits for more");
+        assert_eq!(
+            rx.used.event.get(),
+            2,
+            "avail_event asks for a kick at the guest's next buffer"
         );
     }
 
