@@ -73,7 +73,7 @@ pub(crate) fn connect_backend(
     cfg_backend: VirtioNetBackend,
     vnet_features: u64,
 ) -> Result<Box<dyn NetBackend + Send>, ConnectError> {
-    let _ = vnet_features; // only the Tap (Linux) and vmnet (macOS) backends use it
+    let _ = vnet_features; // only the Tap (Linux), vmnet (macOS) and external backends use it
     Ok(match cfg_backend {
         VirtioNetBackend::UnixstreamFd(fd) => {
             // SAFETY: we need to trust that the library user has configured
@@ -101,6 +101,7 @@ pub(crate) fn connect_backend(
         VirtioNetBackend::Vmnet(config) => {
             Box::new(Vmnet::start(config, vnet_features)?) as Box<dyn NetBackend + Send>
         }
+        VirtioNetBackend::External(build) => build(vnet_features)?,
     })
 }
 
@@ -723,6 +724,33 @@ mod tests {
         fn raw_socket_fd(&self) -> RawFd {
             self.socket.as_ref().map_or(-1, |s| s.as_raw_fd())
         }
+    }
+
+    /// An external backend is built from the features the guest acked, and is the worker's.
+    #[test]
+    fn an_external_backend_is_built_from_the_acked_features() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let build: crate::virtio::net::backend::ExternalBackend = Arc::new(move |features| {
+            s.store(features as usize, Ordering::SeqCst);
+            Ok(Box::new(Proxy {
+                frames: VecDeque::from([vec![0xcd; 60]]),
+                synthesizes: true,
+                link: Arc::default(),
+                socket: None,
+            }) as Box<dyn NetBackend + Send>)
+        });
+        let mut backend = connect_backend(VirtioNetBackend::External(build), 0x8f).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 0x8f);
+        let mut buf = [0u8; 128];
+        assert_eq!(backend.read_frame(&mut buf).unwrap(), VNET_HDR_LEN + 60);
+
+        let refuse: crate::virtio::net::backend::ExternalBackend =
+            Arc::new(|_| Err(ConnectError::External("no netd".into())));
+        assert!(matches!(
+            connect_backend(VirtioNetBackend::External(refuse), 0),
+            Err(ConnectError::External(_))
+        ));
     }
 
     fn memory() -> GuestMemoryMmap {
