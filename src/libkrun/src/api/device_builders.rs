@@ -1787,6 +1787,43 @@ impl NetDevice {
         )
     }
 
+    /// Create a net device on a vmnet interface (macOS). `mode` is a `vmnet_mode_t` from
+    /// `<vmnet/vmnet.h>`: 1000 host-only, 1001 shared (NAT), 1002 bridged onto the host
+    /// interface `bridged_interface` (ignored in the other modes). The process needs the
+    /// `com.apple.security.virtualization` entitlement.
+    // FIXME: use #[cfg(target_os = "macos")] on the method, as for `new_tap`.
+    pub fn new_vmnet(
+        id: &str,
+        mode: u32,
+        bridged_interface: &str,
+        mac: &[u8],
+        features: u32,
+    ) -> Result<Self, VmmError> {
+        #[cfg(target_os = "macos")]
+        {
+            use devices::virtio::net::device::VirtioNetBackend;
+            use devices::virtio::net::vmnet::{VmnetConfig, VmnetMode};
+            let mode = VmnetMode::try_from(mode).map_err(|_| VmmError::InvalidParam())?;
+            Self::new_inner(
+                id,
+                VirtioNetBackend::Vmnet(VmnetConfig {
+                    mode,
+                    bridged_interface: (!bridged_interface.is_empty())
+                        .then(|| bridged_interface.to_string()),
+                }),
+                mac,
+                features,
+                // vmnet hands over its own header; its flags are vmnet's to set.
+                NetFlags::empty(),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (id, mode, bridged_interface, mac, features);
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+
     // FIXME: use #[cfg(target_os = "linux")] on the method once ffier supports
     // per-method cfg inside #[cfg_attr(feature = "ffi", ffier::export)] impl blocks.
     pub fn new_tap(id: &str, tap_name: &str, mac: &[u8], features: u32) -> Result<Self, VmmError> {
