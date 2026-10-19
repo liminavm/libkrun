@@ -128,6 +128,9 @@ pub struct VmResources {
     /// only): the VMM also writes ACPI tables for the firmware to hand the OS in place of the
     /// device tree.
     pub acpi_enabled: bool,
+    /// aarch64 ACPI only: name the serial port in an SPCR, which makes it the OS's preferred
+    /// console the way the device tree's `stdout-path` does, but as its only console.
+    pub acpi_spcr: bool,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
@@ -312,6 +315,7 @@ mod tests {
             ipa_granule: None,
             split_irqchip: false,
             acpi_enabled: false,
+            acpi_spcr: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
             usb: false,
