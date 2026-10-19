@@ -32,6 +32,8 @@ pub enum ConnectError {
     TunSetVnetHdrSz(io::Error),
     #[cfg(not(target_os = "windows"))]
     TunSetOffload(io::Error),
+    #[cfg(target_os = "macos")]
+    Vmnet(String),
 }
 
 #[allow(dead_code)]

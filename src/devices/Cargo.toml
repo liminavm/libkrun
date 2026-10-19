@@ -56,6 +56,7 @@ nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs", 
 vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap", "rawfd"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
 lru = ">=0.9"
 
