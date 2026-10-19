@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(unix)]
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -34,6 +36,9 @@ pub enum ConnectError {
     TunSetOffload(io::Error),
     #[cfg(target_os = "macos")]
     Vmnet(String),
+    /// An [`ExternalBackend`] could not be built.
+    #[cfg(unix)]
+    External(String),
 }
 
 #[allow(dead_code)]
@@ -108,6 +113,13 @@ pub trait NetBackend {
         Reconnect::Unsupported
     }
 }
+
+/// Builds a backend the embedder implements, once the guest has acked its virtio-net features
+/// (the argument), so offloads can follow what the guest took. Called on the device's first
+/// activation; the backend then survives resets like the built-in ones.
+#[cfg(unix)]
+pub type ExternalBackend =
+    Arc<dyn Fn(u64) -> Result<Box<dyn NetBackend + Send>, ConnectError> + Send + Sync>;
 
 #[cfg(windows)]
 #[derive(Debug, PartialEq, Eq)]
