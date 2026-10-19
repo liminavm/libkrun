@@ -1598,6 +1598,7 @@ pub fn build_microvm(
         &payload_config.initrd_config,
         &vm_resources.smbios_oem_strings,
         vm_resources.acpi_enabled,
+        vm_resources.acpi_spcr,
         &virtio_mmio_devices,
         payload_config.pvh,
     )

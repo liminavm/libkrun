@@ -886,6 +886,7 @@ impl Vmm {
         initrd: &Option<InitrdConfig>,
         _smbios_oem_strings: &Option<Vec<String>>,
         _acpi_enabled: bool,
+        _acpi_spcr: bool,
         _virtio_mmio_devices: &[(u64, u32)],
         _pvh: bool,
     ) -> Result<()> {
@@ -932,6 +933,7 @@ impl Vmm {
                     &vcpu_mpidr,
                     self.mmio_device_manager.get_device_info(),
                     _intc,
+                    _acpi_spcr,
                 )
                 .map_err(Error::SetupAcpi)?;
             }
