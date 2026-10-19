@@ -18,6 +18,8 @@ mod tap;
 #[cfg(unix)]
 mod unixgram;
 mod unixstream;
+#[cfg(target_os = "macos")]
+pub mod vmnet;
 mod worker;
 
 // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2050006

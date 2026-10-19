@@ -79,6 +79,8 @@ pub enum VirtioNetBackend {
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
+    #[cfg(target_os = "macos")]
+    Vmnet(super::vmnet::VmnetConfig),
 }
 
 pub struct Net {
