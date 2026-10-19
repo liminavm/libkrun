@@ -314,7 +314,7 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
         let battery;
         let mut extra: Vec<&dyn Aml> = Vec::new();
         let mut irq = Some(info.irq());
-        let (name, hid, uid, coherent) = match device_type {
+        let (name, hid, uid) = match device_type {
             DeviceType::Virtio(virtio_type) => {
                 virtio_uid += 1;
                 let name = format!("VR{:02X}", virtio_uid - 1);
@@ -325,28 +325,28 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
                 }
                 #[cfg(feature = "tee")]
                 let _ = virtio_type;
-                (name, "LNRO0005", virtio_uid - 1, false)
+                (name, "LNRO0005", virtio_uid - 1)
             }
-            DeviceType::Serial => ("COM0".to_string(), "ARMH0011", 0, false),
-            DeviceType::Xhci => ("USB0".to_string(), "PNP0D10", 0, true),
+            DeviceType::Serial => ("COM0".to_string(), "ARMH0011", 0),
+            DeviceType::Xhci => ("USB0".to_string(), "PNP0D10", 0),
             DeviceType::Gpio => {
                 Device::new(Path::new("PWRB"), vec![&pwrb_hid, &button_uid])
                     .to_aml_bytes(&mut body);
                 Device::new(Path::new("SLPB"), vec![&slpb_hid, &button_uid])
                     .to_aml_bytes(&mut body);
                 extra = gpio_events.children();
-                ("GPO0".to_string(), "ARMH0061", 0, false)
+                ("GPO0".to_string(), "ARMH0061", 0)
             }
             // No interrupt: tpm_tis polls, as it does for the device-tree node.
             DeviceType::Tpm => {
                 irq = None;
-                ("TPM0".to_string(), "MSFT0101", 0, false)
+                ("TPM0".to_string(), "MSFT0101", 0)
             }
             // Not described yet: the virtual cpufreq controller. The PL031 has no ACPI binding;
             // the OS reaches the clock through the firmware's GetTime.
             _ => continue,
         };
-        body.extend(mmio_device(&name, hid, uid, info, irq, coherent, &extra)?);
+        body.extend(mmio_device(&name, hid, uid, info, irq, &extra)?);
     }
 
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, *b"LIMNDSDT", OEM_REVISION);
@@ -362,7 +362,6 @@ fn mmio_device<T: DeviceInfoForFDT>(
     uid: u32,
     info: &T,
     irq: Option<u32>,
-    coherent: bool,
     extra: &[&dyn Aml],
 ) -> Result<Vec<u8>> {
     let base = u32::try_from(info.addr()).map_err(|_| Error::DeviceAbove4G(info.addr()))?;
@@ -376,11 +375,10 @@ fn mmio_device<T: DeviceInfoForFDT>(
     let hid = Name::new(Path::new("_HID"), &hid);
     let uid = Name::new(Path::new("_UID"), &uid);
     let crs = Name::new(Path::new("_CRS"), &resources);
+    // Every device's DMA is the host reading guest memory, which is cache-coherent. Without
+    // `_CCA`, arm64 Linux gives the device the dummy DMA ops and every mapping fails.
     let cca = Name::new(Path::new("_CCA"), &1u8);
-    let mut children: Vec<&dyn Aml> = vec![&hid, &uid, &crs];
-    if coherent {
-        children.push(&cca);
-    }
+    let mut children: Vec<&dyn Aml> = vec![&hid, &uid, &crs, &cca];
     children.extend_from_slice(extra);
     let mut bytes = Vec::new();
     Device::new(Path::new(name), children).to_aml_bytes(&mut bytes);
@@ -679,6 +677,27 @@ mod tests {
         // The RTC has no ACPI binding and is left out.
         let irq36 = [0x89, 6, 0, 0x03, 1, 36, 0, 0, 0];
         assert!(!dsdt.windows(irq36.len()).any(|w| w == irq36));
+    }
+
+    /// arm64 Linux gives a device without `_CCA` the dummy DMA ops, whose every mapping fails:
+    /// virtio-gpu's fbdev then cannot map its buffer and the guest has no console in the window.
+    #[test]
+    fn every_device_declares_coherent_dma() {
+        let mut devices = HashMap::new();
+        for (kind, name, addr) in [
+            (
+                DeviceType::Virtio(crate::virtio::TYPE_GPU),
+                "gpu",
+                0x0a00_2000,
+            ),
+            (DeviceType::Serial, "uart", 0x0a00_1000),
+            (DeviceType::Xhci, "usb", 0x0a00_3000),
+        ] {
+            devices.insert((kind, name.into()), Info { addr, irq: 40 });
+        }
+        let dsdt = build_dsdt(1, &devices).unwrap();
+        let cca = dsdt.windows(4).filter(|w| *w == b"_CCA").count();
+        assert_eq!(cca, 3);
     }
 
     #[test]
