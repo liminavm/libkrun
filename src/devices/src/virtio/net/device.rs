@@ -89,6 +89,8 @@ pub enum VirtioNetBackend {
     Tap(String),
     #[cfg(target_os = "macos")]
     Vmnet(super::vmnet::VmnetConfig),
+    #[cfg(unix)]
+    External(super::backend::ExternalBackend),
 }
 
 pub struct Net {
