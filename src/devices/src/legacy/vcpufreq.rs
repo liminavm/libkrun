@@ -33,6 +33,23 @@
 //! Two contract details worth stating, because both would be silent failures: the driver probes
 //! `PERFTBL_LEN` for **every possible CPU** and refuses to load unless each answers `1..=64`, and
 //! it groups CPUs into one cpufreq policy per distinct `PERF_DOMAIN` value.
+//!
+//! On the ACPI machine the guest finds no `qemu,virtual-cpufreq`; each processor device's `_CPC`
+//! names three more registers in the same window instead, for `cppc_cpufreq` (ACPI 6.5 §8.4.6):
+//!
+//! | offset | dir | width | meaning                                              |
+//! |--------|-----|-------|------------------------------------------------------|
+//! | `0x18` | RW  | 32    | desired performance, in the `_CPC`'s abstract units  |
+//! | `0x20` | R   | 64    | reference performance counter                        |
+//! | `0x28` | R   | 64    | delivered performance counter                        |
+//!
+//! The counters echo the request, as `REG_CUR_PERF_STATE` does: the reference counter counts
+//! wall-clock nanoseconds and the delivered one falls behind it by the share of each interval the
+//! desired level stood below the highest. Wall-clock time and a shortfall that only grows keep
+//! both counters monotonic across a snapshot restore, which builds this device afresh: the
+//! delivered counter can only jump forward then, which `cppc_cpufreq` clamps.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::BusDevice;
 
@@ -43,6 +60,10 @@ const REG_PERFTBL_LEN: u64 = 0x08;
 const REG_PERFTBL_SEL: u64 = 0x0c;
 const REG_PERFTBL_RD: u64 = 0x10;
 const REG_PERF_DOMAIN: u64 = 0x14;
+/// CPPC registers (ACPI machine); see the module docs.
+pub const REG_CPPC_DESIRED: u64 = 0x18;
+pub const REG_CPPC_REFERENCE: u64 = 0x20;
+pub const REG_CPPC_DELIVERED: u64 = 0x28;
 
 /// Bytes of MMIO per CPU (the driver's `PER_CPU_OFFSET`).
 pub const PER_CPU_OFFSET: u64 = 0x1000;
@@ -89,7 +110,39 @@ pub const CAPACITY_LITTLE: u32 = 1024 * 100 / 375;
 /// frequency-invariance scale from `cur / max`.
 pub const DEFAULT_FREQS_KHZ: [u32; 5] = [600_000, 1_200_000, 1_800_000, 2_400_000, 3_200_000];
 
+/// One vCPU's `_CPC` performance levels: abstract units in which the highest is the capacity, so
+/// that Linux's `topology_init_cpu_capacity_cppc` derives the same capacities the device tree's
+/// `capacity-dmips-mhz` gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CppcLevels {
+    pub highest: u32,
+    pub nominal: u32,
+    pub lowest_nonlinear: u32,
+    pub lowest: u32,
+    pub lowest_mhz: u32,
+    pub nominal_mhz: u32,
+}
+
 impl VcpuPerfDomain {
+    /// The `_CPC` levels for this vCPU. The lowest sits where the frequency ladder's lowest step
+    /// does relative to its highest, and it is also the lowest nonlinear level: with that equal
+    /// to the highest, Linux would collapse the cpufreq policy to one point and schedutil could
+    /// never ask for less.
+    pub fn cppc_levels(&self) -> CppcLevels {
+        let top = *self.freqs.iter().max().expect("non-empty");
+        let bottom = *self.freqs.iter().min().expect("non-empty");
+        let lowest =
+            ((u64::from(self.capacity) * u64::from(bottom) / u64::from(top)) as u32).max(1);
+        CppcLevels {
+            highest: self.capacity,
+            nominal: self.capacity,
+            lowest_nonlinear: lowest,
+            lowest,
+            lowest_mhz: bottom / 1000,
+            nominal_mhz: top / 1000,
+        }
+    }
+
     /// The per-vCPU topology for `num_cpus` vCPUs of which the **last** `little` are little.
     ///
     /// Little vCPUs come last so that CPU0 — which takes the boot path and the GIC's default
@@ -127,12 +180,68 @@ struct CpuRegs {
     cur: u32,
     /// The index `REG_PERFTBL_RD` will return next.
     sel: u32,
+    cppc: Cppc,
+}
+
+/// One vCPU's CPPC state: the desired level, and the delivered counter's shortfall.
+#[derive(Debug)]
+struct Cppc {
+    highest: u32,
+    desired: u32,
+    /// Nanoseconds the delivered counter has fallen behind the reference counter.
+    shortfall: u64,
+    /// The clock when `shortfall` was last brought up to date.
+    at: u64,
+    /// The reference value latched by a delivered-counter read, for the reference read that
+    /// follows it: Linux reads the pair one after the other, and two clock readings would make
+    /// every ratio a little low.
+    latched: Option<u64>,
+}
+
+impl Cppc {
+    fn new(highest: u32, now: u64) -> Self {
+        Cppc {
+            highest,
+            desired: highest,
+            shortfall: 0,
+            at: now,
+            latched: None,
+        }
+    }
+
+    /// Account the time since the last update at the desired level, returning the reference
+    /// counter's value now.
+    fn advance(&mut self, now: u64) -> u64 {
+        let now = now.max(self.at);
+        let below = u64::from(self.highest.saturating_sub(self.desired));
+        let elapsed = now - self.at;
+        let lost = u128::from(elapsed) * u128::from(below) / u128::from(self.highest.max(1));
+        self.shortfall += lost as u64;
+        self.at = now;
+        now
+    }
 }
 
 /// The device. One 4 KiB window per vCPU, in logical-CPU order.
-#[derive(Debug)]
 pub struct VirtCpuFreq {
     cpus: Vec<CpuRegs>,
+    /// Nanoseconds for the CPPC counters: wall-clock time, so they keep counting forward across
+    /// a restore into a new process.
+    clock: Box<dyn Fn() -> u64 + Send>,
+}
+
+impl std::fmt::Debug for VirtCpuFreq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtCpuFreq")
+            .field("cpus", &self.cpus)
+            .finish()
+    }
+}
+
+fn wall_clock_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
 }
 
 impl VirtCpuFreq {
@@ -141,6 +250,11 @@ impl VirtCpuFreq {
     /// Each CPU starts at the top of its own table, which is what a guest that has not yet run
     /// schedutil should see: no throttling it did not ask for.
     pub fn new(per_cpu: Vec<VcpuPerfDomain>) -> VirtCpuFreq {
+        Self::with_clock(per_cpu, Box::new(wall_clock_ns))
+    }
+
+    fn with_clock(per_cpu: Vec<VcpuPerfDomain>, clock: Box<dyn Fn() -> u64 + Send>) -> VirtCpuFreq {
+        let now = clock();
         let cpus = per_cpu
             .into_iter()
             .map(|mut perf| {
@@ -154,10 +268,16 @@ impl VirtCpuFreq {
                 perf.freqs.sort_unstable();
                 perf.freqs.dedup();
                 let cur = *perf.freqs.last().expect("non-empty");
-                CpuRegs { perf, cur, sel: 0 }
+                let cppc = Cppc::new(perf.cppc_levels().highest, now);
+                CpuRegs {
+                    perf,
+                    cur,
+                    sel: 0,
+                    cppc,
+                }
             })
             .collect();
-        VirtCpuFreq { cpus }
+        VirtCpuFreq { cpus, clock }
     }
 
     /// The MMIO window this device needs for `num_cpus` vCPUs.
@@ -174,11 +294,29 @@ impl VirtCpuFreq {
 
 impl BusDevice for VirtCpuFreq {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        let cpu = (offset / PER_CPU_OFFSET) as usize;
+        let reg = offset % PER_CPU_OFFSET;
+        // The CPPC counters are the 64-bit registers, read whole.
+        if data.len() == 8 {
+            let now = (self.clock)();
+            let value = match self.cpus.get_mut(cpu) {
+                Some(state) if reg == REG_CPPC_DELIVERED => {
+                    let reference = state.cppc.advance(now);
+                    state.cppc.latched = Some(reference);
+                    reference - state.cppc.shortfall
+                }
+                Some(state) if reg == REG_CPPC_REFERENCE => match state.cppc.latched.take() {
+                    Some(reference) => reference,
+                    None => state.cppc.advance(now),
+                },
+                _ => 0,
+            };
+            data.copy_from_slice(&value.to_le_bytes());
+            return;
+        }
         if data.len() != 4 {
             return;
         }
-        let cpu = (offset / PER_CPU_OFFSET) as usize;
-        let reg = offset % PER_CPU_OFFSET;
         let Some(state) = self.cpus.get(cpu) else {
             // A read outside the window we advertised. Answer zero rather than panicking: for
             // PERFTBL_LEN that is exactly the "invalid" the driver checks for, so it declines to
@@ -198,6 +336,7 @@ impl BusDevice for VirtCpuFreq {
                 // than 0, which cpufreq would take as a valid frequency of zero.
                 .unwrap_or_else(|| *state.perf.freqs.last().expect("non-empty")),
             REG_PERF_DOMAIN => state.perf.domain,
+            REG_CPPC_DESIRED => state.cppc.desired,
             // SET/SEL are write-only; reads of them and of anything else read as zero.
             _ => 0,
         };
@@ -219,6 +358,10 @@ impl BusDevice for VirtCpuFreq {
             // current state; the host scheduler decides what the vCPU thread actually gets.
             REG_SET_PERF_STATE => state.cur = value,
             REG_PERFTBL_SEL => state.sel = value,
+            REG_CPPC_DESIRED => {
+                state.cppc.advance((self.clock)());
+                state.cppc.desired = value;
+            }
             _ => {}
         }
     }
@@ -358,6 +501,95 @@ mod tests {
                 assert_eq!(topo[0].capacity, CAPACITY_UNIFORM, "little={little}");
             }
         }
+    }
+
+    fn read64(d: &mut VirtCpuFreq, cpu: usize, reg: u64) -> u64 {
+        let mut buf = [0u8; 8];
+        d.read(0, cpu as u64 * PER_CPU_OFFSET + reg, &mut buf);
+        u64::from_le_bytes(buf)
+    }
+
+    /// A device on a clock the test moves.
+    fn cppc_dev(little: usize) -> (VirtCpuFreq, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let clock = std::sync::Arc::new(AtomicU64::new(1_000));
+        let c = clock.clone();
+        let d = VirtCpuFreq::with_clock(
+            VcpuPerfDomain::topology(2, little),
+            Box::new(move || c.load(Ordering::SeqCst)),
+        );
+        (d, clock)
+    }
+
+    /// Linux reads the counters with 64-bit loads; a device that answered only 32-bit ones left
+    /// them unread, and frequency invariance silently off.
+    #[test]
+    fn the_cppc_counters_answer_64_bit_reads_and_start_non_zero() {
+        let (mut d, _) = cppc_dev(0);
+        assert_ne!(read64(&mut d, 0, REG_CPPC_DELIVERED), 0);
+        assert_ne!(read64(&mut d, 0, REG_CPPC_REFERENCE), 0);
+    }
+
+    /// Delivered over reference is the desired level over the highest, which starts at the top.
+    #[test]
+    fn delivered_follows_the_desired_level() {
+        use std::sync::atomic::Ordering;
+        let (mut d, clock) = cppc_dev(1);
+        let top = VcpuPerfDomain::topology(2, 1)[0].cppc_levels().highest;
+        assert_eq!(read32(&mut d, 0, REG_CPPC_DESIRED), top);
+        let (d0, r0) = (
+            read64(&mut d, 0, REG_CPPC_DELIVERED),
+            read64(&mut d, 0, REG_CPPC_REFERENCE),
+        );
+        clock.fetch_add(1_000_000, Ordering::SeqCst);
+        let (d1, r1) = (
+            read64(&mut d, 0, REG_CPPC_DELIVERED),
+            read64(&mut d, 0, REG_CPPC_REFERENCE),
+        );
+        assert_eq!((d1 - d0, r1 - r0), (1_000_000, 1_000_000));
+        write32(&mut d, 0, REG_CPPC_DESIRED, top / 4);
+        assert_eq!(read32(&mut d, 0, REG_CPPC_DESIRED), top / 4);
+        clock.fetch_add(1_000_000, Ordering::SeqCst);
+        let (d2, r2) = (
+            read64(&mut d, 0, REG_CPPC_DELIVERED),
+            read64(&mut d, 0, REG_CPPC_REFERENCE),
+        );
+        assert_eq!(r2 - r1, 1_000_000);
+        assert_eq!(d2 - d1, 250_000);
+    }
+
+    /// A clock stepped back must not run either counter backwards.
+    #[test]
+    fn the_counters_never_go_backwards() {
+        use std::sync::atomic::Ordering;
+        let (mut d, clock) = cppc_dev(0);
+        clock.store(5_000_000, Ordering::SeqCst);
+        let (d0, r0) = (
+            read64(&mut d, 1, REG_CPPC_DELIVERED),
+            read64(&mut d, 1, REG_CPPC_REFERENCE),
+        );
+        clock.store(2_000_000, Ordering::SeqCst);
+        let (d1, r1) = (
+            read64(&mut d, 1, REG_CPPC_DELIVERED),
+            read64(&mut d, 1, REG_CPPC_REFERENCE),
+        );
+        assert!(d1 >= d0 && r1 >= r0);
+    }
+
+    /// The levels put the highest at the capacity and leave the policy a range to move in.
+    #[test]
+    fn cppc_levels_follow_capacity_and_the_frequency_ladder() {
+        let topo = VcpuPerfDomain::topology(4, 2);
+        let big = topo[0].cppc_levels();
+        let little = topo[3].cppc_levels();
+        assert_eq!(
+            (big.highest, big.nominal),
+            (CAPACITY_UNIFORM, CAPACITY_UNIFORM)
+        );
+        assert_eq!(little.highest, CAPACITY_LITTLE);
+        assert_eq!(big.lowest, CAPACITY_UNIFORM * 600 / 3200);
+        assert!(big.lowest_nonlinear < big.nominal);
+        assert_eq!((big.lowest_mhz, big.nominal_mhz), (600, 3200));
     }
 
     /// A uniform machine has exactly one domain and one capacity — nothing for EAS to find.
