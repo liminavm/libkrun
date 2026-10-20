@@ -88,7 +88,10 @@ pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
 #[cfg(target_arch = "aarch64")]
-pub use self::vcpufreq::{PER_CPU_OFFSET as VCPUFREQ_PER_CPU_OFFSET, VcpuPerfDomain, VirtCpuFreq};
+pub use self::vcpufreq::{
+    CppcLevels, PER_CPU_OFFSET as VCPUFREQ_PER_CPU_OFFSET, REG_CPPC_DELIVERED, REG_CPPC_DESIRED,
+    REG_CPPC_REFERENCE, VcpuPerfDomain, VirtCpuFreq,
+};
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::pit::Pit;
 
