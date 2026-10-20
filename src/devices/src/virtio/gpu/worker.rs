@@ -694,6 +694,7 @@ impl Worker {
                         thread::sleep(d);
                     }
                     let drain_began = std::time::Instant::now();
+                    crate::virtio::wake_probe::drain_reset();
                     let mut drain_passes = 0u32;
                     loop {
                         drain_passes += 1;
@@ -743,9 +744,12 @@ impl Worker {
                     }
                     let drained = drain_began.elapsed();
                     if drained >= std::time::Duration::from_millis(100) {
+                        let breakdown = crate::virtio::wake_probe::drain_breakdown(drained)
+                            .map(|b| format!(" -- {b}"))
+                            .unwrap_or_default();
                         warn!(
                             "virtio-gpu: control queue drain ran {} ms over {drain_passes} pass(es); \
-                             nothing else on the worker ran meanwhile",
+                             nothing else on the worker ran meanwhile{breakdown}",
                             drained.as_millis()
                         );
                     }
@@ -1698,6 +1702,12 @@ impl Worker {
                         let t0 = crate::virtio::wake_probe::cmd_start();
                         resp = self.process_gpu_command(virtio_gpu, &mem, hdr, cmd, &mut reader);
                         crate::virtio::wake_probe::cmd_end(t0, hdr.type_);
+                        crate::virtio::wake_probe::drain_cmd_end(
+                            t0,
+                            hdr.type_,
+                            hdr.ctx_id,
+                            &|| format!("{cmd:?}"),
+                        );
                         ctrl_hdr = Some(hdr);
                         gpu_cmd = Some(cmd);
                     }
@@ -1720,6 +1730,7 @@ impl Worker {
 
                 let mut add_to_queue = true;
 
+                let fences_began = crate::virtio::wake_probe::span_start();
                 if writer.available_bytes() != 0 {
                     let mut fence_id = 0;
                     let mut ctx_id = 0;
@@ -1788,6 +1799,10 @@ impl Worker {
                         add_to_queue = virtio_gpu.process_fence(ring, fence_id, head.index, len);
                     }
                 }
+                crate::virtio::wake_probe::span_end(
+                    fences_began,
+                    crate::virtio::wake_probe::DrainPhase::Fences,
+                );
 
                 if add_to_queue {
                     if let Err(e) = control_queue
@@ -1808,9 +1823,19 @@ impl Worker {
                 // guest waits for a new cursor image's transfer to complete before queueing it.
                 if last_present_pump.elapsed() >= PRESENT_PUMP_EVERY {
                     last_present_pump = std::time::Instant::now();
+                    let presents_began = crate::virtio::wake_probe::span_start();
                     virtio_gpu.process_retired_presents_mid_drain();
+                    crate::virtio::wake_probe::span_end(
+                        presents_began,
+                        crate::virtio::wake_probe::DrainPhase::Presents,
+                    );
                     if self.cursor_kicked {
+                        let cursor_began = crate::virtio::wake_probe::span_start();
                         self.service_cursor_queue(virtio_gpu, cursor_queue, interrupt, &mem);
+                        crate::virtio::wake_probe::span_end(
+                            cursor_began,
+                            crate::virtio::wake_probe::DrainPhase::Cursor,
+                        );
                     }
                 }
             } else {

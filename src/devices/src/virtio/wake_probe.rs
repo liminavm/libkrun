@@ -351,6 +351,94 @@ pub fn cmd_end(start_ns: u64, cmd_type: u32) {
     }
 }
 
+/// Where a control-queue drain spends its time, beyond the commands themselves. A drain also
+/// presents retired frames, services the cursor queue and books fences, all on the same
+/// thread, and the per-command timer alone left most of a 292 ms drain unaccounted for.
+#[derive(Clone, Copy)]
+pub enum DrainPhase {
+    Commands,
+    Fences,
+    Presents,
+    Cursor,
+}
+
+static DRAIN_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static DRAIN_CMDS: AtomicU64 = AtomicU64::new(0);
+static DRAIN_WORST_NS: AtomicU64 = AtomicU64::new(0);
+static DRAIN_WORST_TYPE: AtomicU64 = AtomicU64::new(0);
+
+/// A command slower than this is named on its own line, with its context.
+const SLOW_CMD_MS: f64 = 20.0;
+
+/// Start timing one span of a drain. Returns 0 (and costs one relaxed load) when off.
+pub fn span_start() -> u64 {
+    if enabled() { now_ns() } else { 0 }
+}
+
+pub fn span_end(start_ns: u64, phase: DrainPhase) {
+    if start_ns == 0 {
+        return;
+    }
+    DRAIN_NS[phase as usize].fetch_add(now_ns().saturating_sub(start_ns), Ordering::Relaxed);
+}
+
+/// The command half of `span_end`: also keeps the drain's worst command and names any command
+/// slower than `SLOW_CMD_MS`.
+pub fn drain_cmd_end(start_ns: u64, cmd_type: u32, ctx_id: u32, detail: &dyn Fn() -> String) {
+    if start_ns == 0 {
+        return;
+    }
+    let dt = now_ns().saturating_sub(start_ns);
+    DRAIN_NS[DrainPhase::Commands as usize].fetch_add(dt, Ordering::Relaxed);
+    DRAIN_CMDS.fetch_add(1, Ordering::Relaxed);
+    if dt > DRAIN_WORST_NS.load(Ordering::Relaxed) {
+        DRAIN_WORST_NS.store(dt, Ordering::Relaxed);
+        DRAIN_WORST_TYPE.store(cmd_type as u64, Ordering::Relaxed);
+    }
+    if ms(dt) >= SLOW_CMD_MS {
+        eprintln!(
+            "[GPUSLOW] realtime={:.6} {} ctx={ctx_id} {:.3} ms | {}",
+            realtime_s(),
+            cmd_name(cmd_type),
+            ms(dt),
+            detail()
+        );
+    }
+}
+
+/// Clear the drain accumulators; called when a drain begins.
+pub fn drain_reset() {
+    for n in &DRAIN_NS {
+        n.store(0, Ordering::Relaxed);
+    }
+    DRAIN_CMDS.store(0, Ordering::Relaxed);
+    DRAIN_WORST_NS.store(0, Ordering::Relaxed);
+    DRAIN_WORST_TYPE.store(0, Ordering::Relaxed);
+}
+
+/// The drain's time split by phase, for the overrun warning. `None` when the probe is off.
+pub fn drain_breakdown(total: std::time::Duration) -> Option<String> {
+    if !enabled() {
+        return None;
+    }
+    let [cmds, fences, presents, cursor] =
+        std::array::from_fn(|i| DRAIN_NS[i].load(Ordering::Relaxed));
+    let total_ns = total.as_nanos() as u64;
+    let other = total_ns.saturating_sub(cmds + fences + presents + cursor);
+    Some(format!(
+        "{} cmds {:.1} ms (worst {} {:.1} ms), fences {:.1} ms, mid-drain presents {:.1} ms, \
+         cursor {:.1} ms, other {:.1} ms",
+        DRAIN_CMDS.load(Ordering::Relaxed),
+        ms(cmds),
+        cmd_name(DRAIN_WORST_TYPE.load(Ordering::Relaxed) as u32),
+        ms(DRAIN_WORST_NS.load(Ordering::Relaxed)),
+        ms(fences),
+        ms(presents),
+        ms(cursor),
+        ms(other),
+    ))
+}
+
 /// virtio-gpu control command names, for the outlier line. Unknown codes print as hex rather
 /// than being dropped — an unnamed stall is still worth seeing.
 fn cmd_name(t: u32) -> String {
