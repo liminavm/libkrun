@@ -40,12 +40,12 @@ use std::time::Duration;
 #[cfg(all(test, loom))]
 use loom::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 #[cfg(not(all(test, loom)))]
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
@@ -390,6 +390,10 @@ pub struct Hold {
     /// after loading the word, whose release/acquire pair carries them.
     armed_at: AtomicU64,
     armed_cpu_us: AtomicU64,
+    /// The guest has powered the vCPU off (PSCI `CPU_OFF`) or has yet to start it: its thread is
+    /// parked where the band does it no good, so the sampler never offers it one. Set by the
+    /// thread itself ([`BandGuard::powered_off`]).
+    powered_off: AtomicBool,
 }
 
 const OUT: u64 = 0;
@@ -404,6 +408,7 @@ impl Hold {
             word: AtomicU64::new(OUT),
             armed_at: AtomicU64::new(0),
             armed_cpu_us: AtomicU64::new(0),
+            powered_off: AtomicBool::new(false),
         }
     }
 
@@ -414,6 +419,7 @@ impl Hold {
             word: AtomicU64::new((PHASE + 1) | IN),
             armed_at: AtomicU64::new(armed_at),
             armed_cpu_us: AtomicU64::new(cpu_us),
+            powered_off: AtomicBool::new(false),
         }
     }
 
@@ -569,7 +575,19 @@ fn next_state(armed: bool, share: f64) -> bool {
 /// not get it when there is no room, and a thread already holding one gives it back when the room
 /// has gone — which is how a cap that is already exceeded walks itself back down instead of
 /// waiting for every holder to get busy.
-fn decide(armed: bool, share: f64, armed_now: usize, cap: usize) -> Option<bool> {
+///
+/// A powered-off vCPU is the idlest thread there is, and would otherwise hold a slot of the cap for
+/// as long as the guest kept it off, shutting out a vCPU that is running.
+fn decide(
+    armed: bool,
+    share: f64,
+    armed_now: usize,
+    cap: usize,
+    powered_off: bool,
+) -> Option<bool> {
+    if powered_off {
+        return armed.then_some(false);
+    }
     if armed && armed_now > cap {
         return Some(false);
     }
@@ -656,7 +674,8 @@ fn sample_one<O: BandOs>(os: &O, t: &mut Sampled, band: Band, armed_now: &mut us
     let share = (now_us.saturating_sub(t.cpu_us)) as f64 / SAMPLE_INTERVAL.as_micros() as f64;
     t.cpu_us = now_us;
     let seen = t.hold.load();
-    let Some(want) = decide(Hold::counts(seen), share, *armed_now, cap) else {
+    let powered_off = t.hold.powered_off.load(Ordering::Acquire);
+    let Some(want) = decide(Hold::counts(seen), share, *armed_now, cap, powered_off) else {
         return;
     };
     let ok = if want {
@@ -709,6 +728,20 @@ pub struct BandGuard<O: BandOs = Mach> {
 }
 
 impl<O: BandOs> BandGuard<O> {
+    /// Record that the guest powered this vCPU off (PSCI `CPU_OFF`, or not started yet) or back
+    /// on. Powering off gives the band back at once, from this thread, rather than at the
+    /// sampler's next look.
+    pub fn powered_off(&self, off: bool) {
+        self.hold.powered_off.store(off, Ordering::Release);
+        if !off {
+            return;
+        }
+        let seen = self.hold.load();
+        if seen & PHASE == IN && self.hold.disarm(&self.os, self.port, seen) {
+            log::info!("[VCPU-RT] a vCPU gave the band back as the guest powered it off");
+        }
+    }
+
     /// How long this thread may compute without parking. The kicker that forces a saturated
     /// guest back out to us uses it too, since a check the thread never reaches is not a check.
     pub fn kick_interval(&self) -> Duration {
@@ -922,25 +955,34 @@ mod tests {
     #[test]
     fn the_cap_bounds_the_band_whatever_the_threads_are_doing() {
         // An idle thread takes the band while there is room.
-        assert_eq!(decide(false, 0.10, 0, 2), Some(true));
+        assert_eq!(decide(false, 0.10, 0, 2, false), Some(true));
         // And is refused once there is not, however idle it is.
         assert_eq!(
-            decide(false, 0.00, 2, 2),
+            decide(false, 0.00, 2, 2, false),
             None,
             "a full cap refuses an idle thread"
         );
         // A thread already holding one gives it back when the room has gone -- the case that
         // walks an exceeded cap back down rather than waiting for its holders to get busy.
         assert_eq!(
-            decide(true, 0.00, 3, 2),
+            decide(true, 0.00, 3, 2, false),
             Some(false),
             "over the cap, the band goes back"
         );
         // Saturation still disarms on its own, which is the ordinary path.
-        assert_eq!(decide(true, 0.95, 1, 2), Some(false));
+        assert_eq!(decide(true, 0.95, 1, 2, false), Some(false));
         // And the hysteresis is not lost: between the thresholds, nothing changes.
-        assert_eq!(decide(true, 0.50, 1, 2), None);
-        assert_eq!(decide(false, 0.50, 1, 2), None);
+        assert_eq!(decide(true, 0.50, 1, 2, false), None);
+        assert_eq!(decide(false, 0.50, 1, 2, false), None);
+    }
+
+    /// A vCPU the guest powered off is never offered the band and gives back one it holds, however
+    /// idle its parked thread looks: it held a slot of the cap for minutes on abacate, shutting
+    /// vCPU 0 out.
+    #[test]
+    fn a_powered_off_vcpu_never_holds_the_band() {
+        assert_eq!(decide(false, 0.00, 0, 2, true), None);
+        assert_eq!(decide(true, 0.00, 1, 2, true), Some(false));
     }
 
     /// The cap always leaves the host something, on any machine.
