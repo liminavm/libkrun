@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use acpi_tables::aml::{
-    Device, Interrupt, Memory32Fixed, Method, Name, Notify, Package, Path, ResourceTemplate, Scope,
-    Uuid,
+    And, Arg, BufferData, CreateDWordField, Device, Else, Equal, If, Interrupt, Memory32Fixed,
+    Method, Name, Notify, Or, Package, Path, ResourceTemplate, Return, Scope, Uuid,
 };
 use acpi_tables::fadt::{FADTBuilder, Flags};
 use acpi_tables::madt::{
@@ -30,8 +30,11 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use crate::DeviceType;
 use crate::fdt::DeviceInfoForFDT;
-use crate::legacy::IrqChip;
 use crate::legacy::gic::GICDevice;
+use crate::legacy::{
+    CppcLevels, IrqChip, REG_CPPC_DELIVERED, REG_CPPC_DESIRED, REG_CPPC_REFERENCE,
+    VCPUFREQ_PER_CPU_OFFSET, VcpuPerfDomain,
+};
 
 const OEM_ID: [u8; 6] = *b"LIMINA";
 const OEM_REVISION: u32 = 1;
@@ -76,6 +79,25 @@ const SPCR_INTERRUPT_GIC: u8 = 1 << 3;
 /// Keep whatever rate the UART is already programmed with.
 const SPCR_BAUD_AS_IS: u8 = 0;
 
+/// `_CPC` revision 3 (ACPI 6.5 §8.4.6.1): 23 entries, NumEntries and Revision included. Linux
+/// reads as many elements as NumEntries says without checking the package's own count.
+const CPC_REVISION: u32 = 3;
+const CPC_ENTRIES: u32 = 23;
+/// Generic Register Descriptor access sizes: dword and qword.
+const GAS_ACCESS_QWORD: u8 = 4;
+/// The platform-wide `_OSC` (ACPI 6.5 §6.2.11.2) and the capabilities it grants: CPPC, CPPC2,
+/// and CPPC registers in system memory ("flexible address space"), without which arm64 Linux
+/// refuses a `_CPC` whose registers are memory (`cppc_acpi.c`, `osc_cpc_flexible_adr_space_confirmed`).
+const OSC_PLATFORM_UUID: &str = "0811B06E-4A27-44F9-8D60-3CBBC22E7B48";
+const OSC_SB_CPC: u32 = 1 << 5;
+const OSC_SB_CPCV2: u32 = 1 << 6;
+const OSC_SB_CPC_FLEXIBLE_ADR_SPACE: u32 = 1 << 14;
+/// `_OSC` status: the UUID is not one this method knows.
+const OSC_UNRECOGNIZED_UUID: u32 = 1 << 2;
+/// MADT GICC processor power efficiency classes: a little vCPU is the more efficient.
+const EFFICIENCY_BIG: u8 = 1;
+const EFFICIENCY_LITTLE: u8 = 0;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// The machine's interrupt controller is not a GICv3, the only one these tables describe.
@@ -97,6 +119,7 @@ pub fn create_acpi_tables<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     gic_device: &IrqChip,
     spcr: bool,
+    vcpu_perf: &[VcpuPerfDomain],
 ) -> Result<bool> {
     if guest_mem.find_region(GuestAddress(ACPI_START)).is_none() {
         return Ok(false);
@@ -109,7 +132,7 @@ pub fn create_acpi_tables<T: DeviceInfoForFDT + Clone + Debug>(
             maint_ppi: gic.fdt_maint_irq(),
         }
     };
-    let blob = build_tables(ACPI_START, vcpu_mpidr, device_info, &gic, spcr)?;
+    let blob = build_tables(ACPI_START, vcpu_mpidr, device_info, &gic, spcr, vcpu_perf)?;
     if blob.len() > ACPI_SIZE {
         return Err(Error::TooLarge(blob.len()));
     }
@@ -126,6 +149,47 @@ struct Gic {
     maint_ppi: u32,
 }
 
+/// CPPC for a machine with little vCPUs: where the cpufreq device's per-vCPU windows start, and
+/// each vCPU's levels. `None` for a uniform machine, which gets no energy model from CPPC
+/// (`cppc_cpufreq` registers one only when the efficiency classes differ) and so has no use for
+/// counters the guest would read on every tick.
+struct Cppc {
+    base: u64,
+    levels: Vec<CppcLevels>,
+}
+
+impl Cppc {
+    fn new<T: DeviceInfoForFDT>(
+        device_info: &HashMap<(DeviceType, String), T>,
+        vcpu_perf: &[VcpuPerfDomain],
+    ) -> Option<Cppc> {
+        let first = vcpu_perf.first()?.capacity;
+        if vcpu_perf.iter().all(|p| p.capacity == first) {
+            return None;
+        }
+        let base = device_info
+            .iter()
+            .find(|((t, _), _)| *t == DeviceType::CpuFreq)
+            .map(|(_, info)| info.addr())?;
+        Some(Cppc {
+            base,
+            levels: vcpu_perf.iter().map(VcpuPerfDomain::cppc_levels).collect(),
+        })
+    }
+
+    /// The MADT efficiency class of each vCPU: big where its capacity is the highest.
+    fn efficiency_classes(&self) -> Vec<u8> {
+        let top = self.levels.iter().map(|l| l.highest).max().unwrap_or(0);
+        self.levels
+            .iter()
+            .map(|l| match l.highest == top {
+                true => EFFICIENCY_BIG,
+                false => EFFICIENCY_LITTLE,
+            })
+            .collect()
+    }
+}
+
 /// Lays the tables out from `base`: RSDP, XSDT, FADT, MADT, GTDT, PPTT, the SPCR when asked
 /// for and there is a serial port, the TPM2 table when there is a TPM, then the DSDT, each
 /// 8-byte aligned.
@@ -135,12 +199,20 @@ fn build_tables<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     gic: &Gic,
     spcr: bool,
+    vcpu_perf: &[VcpuPerfDomain],
 ) -> Result<Vec<u8>> {
     if gic.compatible != "arm,gic-v3" {
         return Err(Error::UnsupportedGic(gic.compatible.clone()));
     }
+    let cppc = Cppc::new(device_info, vcpu_perf);
+    let classes = cppc.as_ref().map(Cppc::efficiency_classes);
     let mut tables = vec![
-        build_madt(vcpu_mpidr, &gic.properties, gic.maint_ppi),
+        build_madt(
+            vcpu_mpidr,
+            &gic.properties,
+            gic.maint_ppi,
+            classes.as_deref(),
+        ),
         build_gtdt(),
         build_pptt(vcpu_mpidr.len()),
     ];
@@ -154,7 +226,7 @@ fn build_tables<T: DeviceInfoForFDT + Clone + Debug>(
     if device_info.keys().any(|(t, _)| *t == DeviceType::Tpm) {
         tables.push(build_tpm2());
     }
-    let dsdt = build_dsdt(vcpu_mpidr.len(), device_info)?;
+    let dsdt = build_dsdt(vcpu_mpidr.len(), device_info, cppc.as_ref())?;
 
     let rsdp_len = aml_bytes(&Rsdp::new(OEM_ID, 0)).len();
     let xsdt_len = build_xsdt(&vec![0; tables.len() + 1]).len();
@@ -220,7 +292,12 @@ fn build_fadt(dsdt_addr: u64) -> Vec<u8> {
     bytes
 }
 
-fn build_madt(vcpu_mpidr: &[u64], gic_properties: &[u64], maint_ppi: u32) -> Vec<u8> {
+fn build_madt(
+    vcpu_mpidr: &[u64],
+    gic_properties: &[u64],
+    maint_ppi: u32,
+    efficiency_classes: Option<&[u8]>,
+) -> Vec<u8> {
     let mut madt = MADT::new(
         OEM_ID,
         *b"LIMNAPIC",
@@ -233,7 +310,12 @@ fn build_madt(vcpu_mpidr: &[u64], gic_properties: &[u64], maint_ppi: u32) -> Vec
                 .cpu_interface_number(index as u32)
                 .acpi_processor_uid(index as u32)
                 .mpidr(mpidr & 0xFF_00FF_FFFF)
-                .maintenance_interrupt(PPI_BASE + maint_ppi, Trigger::Level),
+                .maintenance_interrupt(PPI_BASE + maint_ppi, Trigger::Level)
+                .power_efficiency_class(
+                    efficiency_classes
+                        .and_then(|c| c.get(index).copied())
+                        .unwrap_or(0),
+                ),
         );
     }
     madt.add_structure(Gicd::new(0, gic_properties[0], GicVersion::GICv3));
@@ -343,6 +425,7 @@ fn build_pptt(vcpus: usize) -> Vec<u8> {
 fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
     vcpus: usize,
     device_info: &HashMap<(DeviceType, String), T>,
+    cppc: Option<&Cppc>,
 ) -> Result<Vec<u8>> {
     let mut devices: Vec<_> = device_info
         .iter()
@@ -351,10 +434,25 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
     devices.sort_by_key(|(_, info)| info.addr());
 
     let mut body = Vec::new();
+    if cppc.is_some() {
+        platform_osc(&mut body);
+    }
     for index in 0..vcpus {
         let hid = Name::new(Path::new("_HID"), &"ACPI0007");
         let uid = Name::new(Path::new("_UID"), &(index as u32));
-        Device::new(Path::new(&format!("C{index:03X}")), vec![&hid, &uid]).to_aml_bytes(&mut body);
+        let cpc = cppc.and_then(|c| {
+            let levels = c.levels.get(index)?;
+            Some(CpcPackage::new(
+                c.base + index as u64 * VCPUFREQ_PER_CPU_OFFSET,
+                levels,
+            ))
+        });
+        let cpc = cpc.as_ref().map(|p| Name::new(Path::new("_CPC"), p));
+        let mut children: Vec<&dyn Aml> = vec![&hid, &uid];
+        if let Some(cpc) = &cpc {
+            children.push(cpc);
+        }
+        Device::new(Path::new(&format!("C{index:03X}")), children).to_aml_bytes(&mut body);
     }
     let pwrb_hid = Name::new(Path::new("_HID"), &"PNP0C0C");
     let slpb_hid = Name::new(Path::new("_HID"), &"PNP0C0E");
@@ -394,8 +492,9 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
                 irq = None;
                 ("TPM0".to_string(), "MSFT0101", 0)
             }
-            // Not described yet: the virtual cpufreq controller. The PL031 has no ACPI binding;
-            // the OS reaches the clock through the firmware's GetTime.
+            // The cpufreq device is not a device here: its registers are what the processors'
+            // `_CPC`s name. The PL031 has no ACPI binding; the OS reaches the clock through the
+            // firmware's GetTime.
             _ => continue,
         };
         body.extend(mmio_device(&name, hid, uid, info, irq, &extra)?);
@@ -404,6 +503,99 @@ fn build_dsdt<T: DeviceInfoForFDT + Clone + Debug>(
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, OEM_ID, *b"LIMNDSDT", OEM_REVISION);
     dsdt.append_slice(&Scope::raw(Path::new("\\_SB_"), body));
     Ok(dsdt.as_slice().to_vec())
+}
+
+/// A Generic Register Descriptor (ACPI 6.5 §6.4.3.7) for a register in system memory, as a
+/// buffer: the form a `_CPC` register entry takes. Written out rather than through
+/// `acpi_tables::aml::Register`, whose descriptor length is wrong (0x12 for 0x0C).
+fn memory_register(addr: u64, access: u8) -> BufferData {
+    // Access sizes count from 1 = byte, so a dword is 32 bits and a qword 64.
+    let bits = 8u8 << (access - 1);
+    let mut bytes = vec![0x82, 0x0c, 0x00, GAS_SYSTEM_MEMORY, bits, 0, access];
+    bytes.extend_from_slice(&addr.to_le_bytes());
+    bytes.extend_from_slice(&[0x79, 0x00]);
+    BufferData::new(bytes)
+}
+
+/// A vCPU's `_CPC`: its fixed levels, and the desired level and feedback counters in its window
+/// of the cpufreq device. Every register it does not name is an Integer 0, which Linux reads as
+/// "not supported"; the counters are 64-bit and never wrap, so the wraparound time is 0 too.
+struct CpcPackage {
+    levels: CppcLevels,
+    desired: BufferData,
+    reference: BufferData,
+    delivered: BufferData,
+}
+
+impl CpcPackage {
+    fn new(window: u64, levels: &CppcLevels) -> Self {
+        CpcPackage {
+            levels: *levels,
+            desired: memory_register(window + REG_CPPC_DESIRED, GAS_ACCESS_DWORD),
+            reference: memory_register(window + REG_CPPC_REFERENCE, GAS_ACCESS_QWORD),
+            delivered: memory_register(window + REG_CPPC_DELIVERED, GAS_ACCESS_QWORD),
+        }
+    }
+}
+
+impl Aml for CpcPackage {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        let l = &self.levels;
+        let unsupported = 0u32;
+        // In `_CPC` order (ACPI 6.5 Table 8.31), which Linux indexes as `enum cppc_regs`.
+        let entries: [&dyn Aml; CPC_ENTRIES as usize] = [
+            &CPC_ENTRIES,
+            &CPC_REVISION,
+            &l.highest,
+            &l.nominal,
+            &l.lowest_nonlinear,
+            &l.lowest,
+            &unsupported, // guaranteed performance
+            &self.desired,
+            &unsupported, // minimum performance
+            &unsupported, // maximum performance
+            &unsupported, // performance reduction tolerance
+            &unsupported, // time window
+            &unsupported, // counter wraparound time
+            &self.reference,
+            &self.delivered,
+            &unsupported, // performance limited
+            &unsupported, // CPPC enable
+            &unsupported, // autonomous selection
+            &unsupported, // autonomous activity window
+            &unsupported, // energy performance preference
+            &l.nominal,   // reference performance: the reference counter counts at nominal
+            &l.lowest_mhz,
+            &l.nominal_mhz,
+        ];
+        Package::new(entries.to_vec()).to_aml_bytes(sink);
+    }
+}
+
+/// `\_SB._OSC`: for the platform-wide UUID, of what the OS asks it grants only CPPC with its
+/// registers in system memory; any other UUID it says it does not know. It never sets an error
+/// bit for the platform UUID, which Linux 6.19 would take as a failed negotiation.
+fn platform_osc(sink: &mut dyn AmlSink) {
+    let (sts, cap) = (Path::new("STS0"), Path::new("CAP0"));
+    let (arg0, arg3) = (Arg(0), Arg(3));
+    let (sts_at, cap_at) = (0u8, 4u8);
+    let create_sts = CreateDWordField::new(&sts, &arg3, &sts_at);
+    let create_cap = CreateDWordField::new(&cap, &arg3, &cap_at);
+    let uuid = Uuid::new(OSC_PLATFORM_UUID);
+    let mask = OSC_SB_CPC | OSC_SB_CPCV2 | OSC_SB_CPC_FLEXIBLE_ADR_SPACE;
+    let grant = And::new(&cap, &cap, &mask);
+    let refuse = Or::new(&sts, &sts, &OSC_UNRECOGNIZED_UUID);
+    let is_platform = Equal::new(&arg0, &uuid);
+    let if_platform = If::new(&is_platform, vec![&grant]);
+    let otherwise = Else::new(vec![&refuse]);
+    let ret = Return::new(&arg3);
+    Method::new(
+        Path::new("_OSC"),
+        4,
+        false,
+        vec![&create_sts, &create_cap, &if_platform, &otherwise, &ret],
+    )
+    .to_aml_bytes(sink);
 }
 
 /// One MMIO window and, if the device has one, an edge-triggered SPI: HVF's in-kernel GIC only
@@ -651,6 +843,7 @@ mod tests {
             &[0x8000_0000, 0x8000_0001],
             &[0x1000, 0x1_0000, 0x2000, 0x4_0000],
             9,
+            None,
         );
         assert_eq!(&madt[..4], b"APIC");
         assert!(checksum_ok(&madt));
@@ -714,7 +907,7 @@ mod tests {
                 irq: 36,
             },
         );
-        let dsdt = build_dsdt(2, &devices).unwrap();
+        let dsdt = build_dsdt(2, &devices, None).unwrap();
         assert!(checksum_ok(&dsdt));
         for needle in [
             &b"ACPI0007"[..],
@@ -747,7 +940,7 @@ mod tests {
         ] {
             devices.insert((kind, name.into()), Info { addr, irq: 40 });
         }
-        let dsdt = build_dsdt(1, &devices).unwrap();
+        let dsdt = build_dsdt(1, &devices, None).unwrap();
         let cca = dsdt.windows(4).filter(|w| *w == b"_CCA").count();
         assert_eq!(cca, 3);
     }
@@ -762,7 +955,7 @@ mod tests {
                 irq: 37,
             },
         );
-        let dsdt = build_dsdt(1, &devices).unwrap();
+        let dsdt = build_dsdt(1, &devices, None).unwrap();
         assert!(checksum_ok(&dsdt));
         for needle in [
             &b"ARMH0061"[..],
@@ -790,7 +983,7 @@ mod tests {
                 irq: 48,
             },
         );
-        let dsdt = build_dsdt(1, &devices).unwrap();
+        let dsdt = build_dsdt(1, &devices, None).unwrap();
         assert!(checksum_ok(&dsdt));
         for needle in [
             &b"BAT0"[..],
@@ -841,7 +1034,7 @@ mod tests {
         };
         let devices: HashMap<(DeviceType, String), Info> = HashMap::new();
         let base = 0x0408_0000;
-        let blob = build_tables(base, &[0], &devices, &gic, false).unwrap();
+        let blob = build_tables(base, &[0], &devices, &gic, false, &[]).unwrap();
         assert_eq!(&blob[..8], b"RSD PTR ");
         let xsdt = table_at(&blob, (u64_at(&blob, 24) - base) as usize);
         assert_eq!(&xsdt[..4], b"XSDT");
@@ -894,7 +1087,7 @@ mod tests {
             },
         );
         let has_spcr = |devices: &HashMap<(DeviceType, String), Info>, spcr| {
-            let blob = build_tables(base, &[0], devices, &gic, spcr).unwrap();
+            let blob = build_tables(base, &[0], devices, &gic, spcr, &[]).unwrap();
             signatures(&blob, base).contains(&b"SPCR".to_vec())
         };
         assert!(has_spcr(&uart, true));
@@ -934,7 +1127,7 @@ mod tests {
             },
         );
         let base = 0x0408_0000;
-        let blob = build_tables(base, &[0], &devices, &gic, false).unwrap();
+        let blob = build_tables(base, &[0], &devices, &gic, false, &[]).unwrap();
         let xsdt = table_at(&blob, (u64_at(&blob, 24) - base) as usize);
         let mut tpm2 = None;
         let mut dsdt = None;
@@ -963,5 +1156,71 @@ mod tests {
         // TPM0 is the last device, so the rest of the table is its _CRS.
         assert!(dsdt[crs..].contains(&0x86));
         assert!(!dsdt[crs..].contains(&0x89));
+    }
+
+    fn cpufreq_at(addr: u64) -> HashMap<(DeviceType, String), Info> {
+        HashMap::from([(
+            (DeviceType::CpuFreq, "cpufreq".to_string()),
+            Info { addr, irq: 0 },
+        )])
+    }
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
+    /// CPPC, and the `_OSC` arm64 Linux needs before it accepts memory registers in a `_CPC`,
+    /// come only with little vCPUs: a uniform machine gets no energy model from them.
+    #[test]
+    fn cppc_is_described_only_for_a_machine_with_little_vcpus() {
+        let devices = cpufreq_at(0x0a00_0000);
+        for (little, cpcs) in [(0, 0), (1, 2)] {
+            let cppc = Cppc::new(&devices, &VcpuPerfDomain::topology(2, little));
+            let dsdt = build_dsdt(2, &devices, cppc.as_ref()).unwrap();
+            assert_eq!(count(&dsdt, b"_CPC"), cpcs, "little={little}");
+            assert_eq!(count(&dsdt, b"_OSC"), cpcs / 2, "little={little}");
+        }
+        assert!(Cppc::new(&cpufreq_at(0), &[]).is_none());
+    }
+
+    /// The little vCPU is the efficient one; the MADT says so in each GICC.
+    #[test]
+    fn the_madt_marks_little_vcpus_as_the_efficient_class() {
+        let cppc = Cppc::new(&cpufreq_at(0x0a00_0000), &VcpuPerfDomain::topology(2, 1)).unwrap();
+        let classes = cppc.efficiency_classes();
+        assert_eq!(classes, [EFFICIENCY_BIG, EFFICIENCY_LITTLE]);
+        let madt = build_madt(
+            &[0x8000_0000, 0x8000_0001],
+            &[0x1000, 0x1_0000, 0x2000, 0x4_0000],
+            9,
+            Some(&classes),
+        );
+        assert!(checksum_ok(&madt));
+        assert_eq!([madt[44 + 76], madt[44 + 82 + 76]], [1, 0]);
+    }
+
+    /// A `_CPC` revision 3 package has 23 entries, and its registers name the vCPU's own window.
+    #[test]
+    fn a_cpc_names_its_vcpus_registers() {
+        let levels = VcpuPerfDomain::topology(2, 1)[1].cppc_levels();
+        let mut aml = Vec::new();
+        CpcPackage::new(0x0a00_1000, &levels).to_aml_bytes(&mut aml);
+        assert_eq!(aml[0], 0x12, "a package");
+        let count_at = 1 + (aml[1] >> 6) as usize + 1;
+        assert_eq!(aml[count_at], CPC_ENTRIES as u8);
+        let addr = |reg: u64| (0x0a00_1000 + reg).to_le_bytes();
+        // Linux masks a read with GENMASK(bit_width - 1, 0): a width past 64 shifts out of range.
+        for (reg, bits, access) in [
+            (REG_CPPC_DESIRED, 32, GAS_ACCESS_DWORD),
+            (REG_CPPC_REFERENCE, 64, GAS_ACCESS_QWORD),
+            (REG_CPPC_DELIVERED, 64, GAS_ACCESS_QWORD),
+        ] {
+            let mut gas = vec![0x82, 0x0c, 0x00, 0, bits, 0, access];
+            gas.extend_from_slice(&addr(reg));
+            assert_eq!(count(&aml, &gas), 1, "register {reg:#x}");
+        }
     }
 }
