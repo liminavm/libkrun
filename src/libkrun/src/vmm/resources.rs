@@ -131,6 +131,9 @@ pub struct VmResources {
     /// aarch64 ACPI only: name the serial port in an SPCR, which makes it the OS's preferred
     /// console the way the device tree's `stdout-path` does, but as its only console.
     pub acpi_spcr: bool,
+    /// limina, firmware boots: arguments the firmware adds to a Linux kernel's command line as it
+    /// starts it, handed over in the device tree's `/chosen/libkrun,extra-bootargs`.
+    pub extra_bootargs: Option<String>,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
@@ -316,6 +319,7 @@ mod tests {
             split_irqchip: false,
             acpi_enabled: false,
             acpi_spcr: false,
+            extra_bootargs: None,
             serial_consoles: Vec::new(),
             kernel_console: None,
             usb: false,
