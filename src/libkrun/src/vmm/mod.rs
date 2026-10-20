@@ -920,6 +920,7 @@ impl Vmm {
         _smbios_oem_strings: &Option<Vec<String>>,
         _acpi_enabled: bool,
         _acpi_spcr: bool,
+        _extra_bootargs: Option<&str>,
         _virtio_mmio_devices: &[(u64, u32)],
         _pvh: bool,
         #[cfg(target_arch = "riscv64")] riscv_isa_info: &Option<
@@ -969,6 +970,7 @@ impl Vmm {
                 _intc,
                 initrd,
                 self.mmio_device_manager.vcpu_capacities(),
+                _extra_bootargs,
             )
             .map_err(Error::SetupFDT)?;
             if _acpi_enabled {
