@@ -735,7 +735,9 @@ impl Vcpu {
                 VcpuPower::Running => {}
                 VcpuPower::Offline => {
                     self.vcpu_list.set_online(hvf_vcpuid, false);
+                    band_powered_off(&band_guard, true);
                     self.handle_offline(&mut hvf_vcpu);
+                    band_powered_off(&band_guard, false);
                     self.vcpu_list.set_parked(hvf_vcpuid, false);
                 }
                 VcpuPower::SystemSuspended { entry, context_id } => {
@@ -745,7 +747,10 @@ impl Vcpu {
             }
         } else {
             let entry_addr = if self.boot_receiver.is_some() {
-                match self.wait_for_boot_entry(&mut hvf_vcpu) {
+                band_powered_off(&band_guard, true);
+                let entry = self.wait_for_boot_entry(&mut hvf_vcpu);
+                band_powered_off(&band_guard, false);
+                match entry {
                     Some(entry) => {
                         // Onlined: executing again from here until the next WFx wait.
                         self.vcpu_list.set_parked(hvf_vcpu.id(), false);
@@ -789,7 +794,9 @@ impl Vcpu {
                 // matching CPU_ON re-onlines it — zero host CPU/wakeups, vs the busy-spin + VM
                 // wedge of leaving CPU_OFF unmodeled.
                 Ok(VcpuEmulation::CpuOff) => {
+                    band_powered_off(&band_guard, true);
                     self.handle_offline(&mut hvf_vcpu);
+                    band_powered_off(&band_guard, false);
                     self.vcpu_list.set_parked(hvf_vcpuid, false);
                 }
                 // The guest suspended the whole system (PSCI SYSTEM_SUSPEND). Park exactly as
@@ -1317,6 +1324,14 @@ enum VcpuEmulation {
     WaitForEvent,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
+}
+
+/// Tell the band this vCPU is parked powered off, or running again (see
+/// [`vcpu_sched::BandGuard::powered_off`]).
+fn band_powered_off(guard: &Option<vcpu_sched::BandGuard>, off: bool) {
+    if let Some(guard) = guard {
+        guard.powered_off(off);
+    }
 }
 
 #[cfg(test)]
