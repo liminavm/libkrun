@@ -3308,6 +3308,7 @@ pub mod tests {
             false,
             &[],
             None,
+            None,
             false,
             &Payload::Firmware,
             #[cfg(target_os = "macos")]
