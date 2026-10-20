@@ -1715,6 +1715,7 @@ pub fn build_microvm(
         &vm_resources.smbios_oem_strings,
         vm_resources.acpi_enabled,
         vm_resources.acpi_spcr,
+        vm_resources.extra_bootargs.as_deref(),
         &virtio_mmio_devices,
         payload_config.pvh,
     )

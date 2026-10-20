@@ -99,6 +99,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     gic_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
     vcpu_capacities: &[u32],
+    extra_bootargs: Option<&str>,
 ) -> Result<Vec<u8>> {
     // Alocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -121,7 +122,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_efi_vars_node(&mut fdt, guest_mem)?;
     create_acpi_tables_node(&mut fdt, guest_mem)?;
-    create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
+    create_chosen_node(&mut fdt, cmdline, initrd, device_info, extra_bootargs)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
     create_clock_node(&mut fdt)?;
@@ -297,9 +298,14 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
     cmdline: &str,
     initrd: &Option<InitrdConfig>,
     dev_info: &HashMap<(DeviceType, String), T>,
+    extra_bootargs: Option<&str>,
 ) -> Result<()> {
     let chosen_node = fdt.begin_node("chosen")?;
     fdt.property_string("bootargs", cmdline)?;
+    // limina: for a firmware boot, where the kernel's command line is the loader's.
+    if let Some(args) = extra_bootargs {
+        fdt.property_string("libkrun,extra-bootargs", args)?;
+    }
 
     // If we have a legacy serial device, tell the guest this is the default console.
     // Clever guests will still switch to a better console (like virtio-console) if
