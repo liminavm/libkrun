@@ -911,8 +911,16 @@ impl Worker {
         // resource goes, and answers again. Asked before a send right is made: one made and then
         // not given would have no one to give it back to.
         if let Some(shape) = ext.held_surface(ctx, req.resource_id) {
+            debug!(
+                "limina ext: ctx {ctx} imports resource {} again: held",
+                req.resource_id
+            );
             return Ok(GpuResponse::OkLiminaSurface(shape));
         }
+        debug!(
+            "limina ext: ctx {ctx} imports resource {}: binding",
+            req.resource_id
+        );
         let (port, desc) = virtio_gpu.resource_surface_port(req.resource_id)?;
         let shape = shape_of(desc);
         ext.bind_surface(ctx, req.resource_id, port, shape)
