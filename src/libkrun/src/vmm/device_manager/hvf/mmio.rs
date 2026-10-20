@@ -96,6 +96,9 @@ pub struct MMIODeviceManager {
     /// limina: one `capacity-dmips-mhz` per vCPU, for the FDT's CPU nodes. Empty unless the
     /// virtual cpufreq device was registered with an asymmetric topology.
     vcpu_capacities: Vec<u32>,
+    /// limina: the cpufreq device's per-vCPU topology, for the ACPI machine's `_CPC`s. Empty
+    /// unless the device was registered.
+    vcpu_perf: Vec<devices::legacy::VcpuPerfDomain>,
 }
 
 impl MMIODeviceManager {
@@ -103,6 +106,11 @@ impl MMIODeviceManager {
     /// `create_cpu_nodes`: it is all-or-nothing.
     pub fn vcpu_capacities(&self) -> &[u32] {
         &self.vcpu_capacities
+    }
+
+    /// The cpufreq device's per-vCPU topology, or empty when there is none.
+    pub fn vcpu_perf(&self) -> &[devices::legacy::VcpuPerfDomain] {
+        &self.vcpu_perf
     }
 
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
@@ -120,6 +128,7 @@ impl MMIODeviceManager {
             gpio: None,
             tpm: None,
             vcpu_capacities: Vec::new(),
+            vcpu_perf: Vec::new(),
             #[cfg(feature = "usb")]
             xhci: None,
         }
@@ -391,6 +400,7 @@ impl MMIODeviceManager {
         // Kept for the FDT, which emits them on the CPU nodes. Capacities and perf domains are
         // described together (see VcpuPerfDomain::capacity) so they cannot drift apart.
         self.vcpu_capacities = per_cpu.iter().map(|p| p.capacity).collect();
+        self.vcpu_perf = per_cpu.clone();
         let dev = Arc::new(Mutex::new(devices::legacy::VirtCpuFreq::new(per_cpu)));
 
         self.bus

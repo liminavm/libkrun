@@ -955,6 +955,7 @@ impl Vmm {
                     self.mmio_device_manager.get_device_info(),
                     _intc,
                     _acpi_spcr,
+                    self.mmio_device_manager.vcpu_perf(),
                 )
                 .map_err(Error::SetupAcpi)?;
             }
