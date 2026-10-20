@@ -132,9 +132,61 @@ pub struct FenceState {
     /// handler knows whether there is a queue to retire it into. A parked fence at or below
     /// this was signalled and never reached the guest.
     signalled: BTreeMap<VirtioGpuRing, u64>,
+    /// Held flush fences whose hold ended while an older fence on their ring was still parked.
+    deferred_holds: Vec<(VirtioGpuRing, u64)>,
 }
 
 impl FenceState {
+    /// Take the parked fences a completion of `fence_id` on `ring` retires.
+    ///
+    /// The guest driver signals every fence at or below an id the moment that id's response
+    /// arrives, so a fence must never reach the guest ahead of an older one on its ring. The
+    /// renderer's timeline completes in order, but a held flush fence completes when its frames
+    /// have presented, which can be while an older fence is still on the GPU: a client's GL
+    /// work under the Metal transport, whose compositor would then sample that client's buffer
+    /// before the work landed. Such a held fence waits here until nothing older is parked; its
+    /// 500 ms ceiling then bounds only the hold, not an older fence the GPU has not finished.
+    fn complete(&mut self, ring: VirtioGpuRing, fence_id: u64) -> Vec<FenceDescriptor> {
+        let held = self
+            .descs
+            .iter()
+            .any(|d| d.ring == ring && d.fence_id == fence_id && d.route == FenceRoute::FlushHold);
+        if held && self.older_parked(ring, fence_id) {
+            debug!("held flush fence {fence_id} waits for an older fence on its ring");
+            self.deferred_holds.push((ring, fence_id));
+            return Vec::new();
+        }
+        let mut retired = self.retire_through(ring, fence_id);
+        self.deferred_holds.sort_by_key(|&(_, id)| id);
+        while let Some(pos) = self
+            .deferred_holds
+            .iter()
+            .position(|&(r, id)| !self.older_parked(r, id))
+        {
+            let (r, id) = self.deferred_holds.remove(pos);
+            retired.extend(self.retire_through(r, id));
+        }
+        retired
+    }
+
+    fn older_parked(&self, ring: VirtioGpuRing, fence_id: u64) -> bool {
+        self.descs
+            .iter()
+            .any(|d| d.ring == ring && d.fence_id < fence_id)
+    }
+
+    fn retire_through(&mut self, ring: VirtioGpuRing, fence_id: u64) -> Vec<FenceDescriptor> {
+        let (retired, parked) = std::mem::take(&mut self.descs)
+            .into_iter()
+            .partition(|d| d.ring == ring && d.fence_id <= fence_id);
+        self.descs = parked;
+        // max(): a completion can arrive out of order (an immediate retire for N+1, then the
+        // timeline's N), and a lower id must not pull the watermark back under N+1.
+        let entry = self.completed_fences.entry(ring).or_insert(0);
+        *entry = (*entry).max(fence_id);
+        retired
+    }
+
     /// Whether no guest fence is parked.
     pub(crate) fn is_idle(&self) -> bool {
         self.descs.is_empty()
@@ -932,32 +984,22 @@ impl VirtioGpu {
 
             let mut queue = control_queue.lock().unwrap();
             let mut fence_state = fence_state.lock().unwrap();
-            let mut i = 0;
 
             let mut retired_any = false;
-            while i < fence_state.descs.len() {
-                debug!("XXX - fence_id: {}", fence_state.descs[i].fence_id);
-                if fence_state.descs[i].ring == ring
-                    && fence_state.descs[i].fence_id <= completed_fence.fence_id
-                {
-                    let completed_desc = fence_state.descs.remove(i);
-                    trace
-                        .fences_retired
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug!(
-                        "XXX - found fence: desc_index={}",
-                        completed_desc.desc_index
-                    );
+            for completed_desc in fence_state.complete(ring, completed_fence.fence_id) {
+                trace
+                    .fences_retired
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug!(
+                    "XXX - found fence: desc_index={}",
+                    completed_desc.desc_index
+                );
 
-                    if let Err(e) =
-                        queue.add_used(&mem, completed_desc.desc_index, completed_desc.len)
-                    {
-                        error!("failed to add used elements to the queue: {e:?}");
-                    }
-                    retired_any = true;
-                } else {
-                    i += 1;
+                if let Err(e) = queue.add_used(&mem, completed_desc.desc_index, completed_desc.len)
+                {
+                    error!("failed to add used elements to the queue: {e:?}");
                 }
+                retired_any = true;
             }
             // One interrupt per completion callback, not per retired descriptor — and with
             // EVENT_IDX negotiated only when the guest's used_event says it's waiting
@@ -988,13 +1030,6 @@ impl VirtioGpu {
                     t.0 = std::time::Instant::now();
                 }
             }
-            // Update the last completed fence for this context.
-            // Use max() to avoid a race where an out-of-order completion
-            // (e.g., immediate-retire for fence N+1 followed by timeline
-            // signal for fence N) would overwrite a higher fence_id with
-            // a lower one, causing fence N+1 to be stuck forever.
-            let entry = fence_state.completed_fences.entry(ring).or_insert(0);
-            *entry = (*entry).max(completed_fence.fence_id);
         })
     }
 
@@ -2264,6 +2299,7 @@ impl VirtioGpu {
             fs.descs.clear();
             fs.completed_fences.clear();
             fs.signalled.clear();
+            fs.deferred_holds.clear();
         }
         if let Some(pf) = self.present_fence.as_mut() {
             // Drop parked frames and held flush fences: their cookies/descriptors belong to the
@@ -4691,6 +4727,7 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 
 #[cfg(test)]
 mod test {
+    use super::{FenceDescriptor, FenceRoute, FenceState, VirtioGpuRing};
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
 
     fn bare_present_fence_state() -> super::PresentFenceState {
@@ -5083,6 +5120,70 @@ mod test {
             (Vec::new(), 0),
             "and none of them again"
         );
+    }
+
+    fn park(fs: &mut FenceState, fence_id: u64, route: FenceRoute) {
+        fs.descs.push(FenceDescriptor {
+            ring: VirtioGpuRing::Global,
+            fence_id,
+            desc_index: fence_id as u16,
+            len: 0,
+            created_at: std::time::Instant::now(),
+            route,
+            reported: false,
+        });
+    }
+
+    fn ids(descs: Vec<FenceDescriptor>) -> Vec<u64> {
+        descs.into_iter().map(|d| d.fence_id).collect()
+    }
+
+    #[test]
+    fn a_held_flush_never_retires_an_older_renderer_fence() {
+        let mut fs = FenceState::default();
+        park(&mut fs, 1, FenceRoute::Renderer);
+        park(&mut fs, 2, FenceRoute::FlushHold);
+
+        assert!(fs.complete(VirtioGpuRing::Global, 2).is_empty());
+        assert_eq!(fs.completed_fences.get(&VirtioGpuRing::Global), None);
+
+        assert_eq!(ids(fs.complete(VirtioGpuRing::Global, 1)), vec![1, 2]);
+        assert!(fs.descs.is_empty());
+        assert_eq!(fs.completed_fences[&VirtioGpuRing::Global], 2);
+    }
+
+    #[test]
+    fn a_held_flush_with_nothing_older_retires_at_once() {
+        let mut fs = FenceState::default();
+        park(&mut fs, 2, FenceRoute::FlushHold);
+        park(&mut fs, 3, FenceRoute::Renderer);
+
+        assert_eq!(ids(fs.complete(VirtioGpuRing::Global, 2)), vec![2]);
+        assert_eq!(ids(std::mem::take(&mut fs.descs)), vec![3]);
+    }
+
+    #[test]
+    fn deferred_holds_retire_in_order_as_what_is_older_retires() {
+        let mut fs = FenceState::default();
+        park(&mut fs, 1, FenceRoute::Renderer);
+        park(&mut fs, 2, FenceRoute::FlushHold);
+        park(&mut fs, 3, FenceRoute::Renderer);
+        park(&mut fs, 4, FenceRoute::FlushHold);
+
+        assert!(fs.complete(VirtioGpuRing::Global, 4).is_empty());
+        assert!(fs.complete(VirtioGpuRing::Global, 2).is_empty());
+        assert_eq!(ids(fs.complete(VirtioGpuRing::Global, 1)), vec![1, 2]);
+        assert_eq!(ids(fs.complete(VirtioGpuRing::Global, 3)), vec![3, 4]);
+        assert!(fs.deferred_holds.is_empty());
+    }
+
+    #[test]
+    fn a_renderer_completion_still_retires_everything_at_or_below_it() {
+        let mut fs = FenceState::default();
+        park(&mut fs, 1, FenceRoute::Renderer);
+        park(&mut fs, 2, FenceRoute::Renderer);
+
+        assert_eq!(ids(fs.complete(VirtioGpuRing::Global, 2)), vec![1, 2]);
     }
 
     #[test]
