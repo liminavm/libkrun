@@ -138,6 +138,9 @@ pub struct VmResources {
     /// of its own, written at `BOOT_LOGO_START`. At most `BOOT_LOGO_SIZE` bytes; the firmware
     /// decides whether it is a logo it can draw.
     pub boot_logo: Option<Vec<u8>>,
+    /// limina, firmware boots: ask the firmware to show its console and the loader's boot menu
+    /// this boot (`/chosen/libkrun,boot-menu`).
+    pub boot_menu: bool,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
@@ -325,6 +328,7 @@ mod tests {
             acpi_spcr: false,
             extra_bootargs: None,
             boot_logo: None,
+            boot_menu: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
             usb: false,

@@ -1721,6 +1721,7 @@ pub fn build_microvm(
         vm_resources.acpi_spcr,
         vm_resources.extra_bootargs.as_deref(),
         vm_resources.boot_logo.as_ref().map(Vec::len),
+        vm_resources.boot_menu,
         &virtio_mmio_devices,
         payload_config.pvh,
     )
