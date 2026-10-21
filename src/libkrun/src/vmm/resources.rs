@@ -134,6 +134,10 @@ pub struct VmResources {
     /// limina, firmware boots: arguments the firmware adds to a Linux kernel's command line as it
     /// starts it, handed over in the device tree's `/chosen/libkrun,extra-bootargs`.
     pub extra_bootargs: Option<String>,
+    /// limina, aarch64 firmware boots: a BMP for the firmware to show as its boot logo in place
+    /// of its own, written at `BOOT_LOGO_START`. At most `BOOT_LOGO_SIZE` bytes; the firmware
+    /// decides whether it is a logo it can draw.
+    pub boot_logo: Option<Vec<u8>>,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
@@ -320,6 +324,7 @@ mod tests {
             acpi_enabled: false,
             acpi_spcr: false,
             extra_bootargs: None,
+            boot_logo: None,
             serial_consoles: Vec::new(),
             kernel_console: None,
             usb: false,

@@ -113,3 +113,12 @@ pub const ACPI_START: u64 = 0x0408_0000;
 
 /// limina: the ACPI window's size, a multiple of the 16 KiB host page.
 pub const ACPI_SIZE: usize = 0x4_0000;
+
+/// limina: where the VMM writes a boot logo (a BMP) for the firmware to show in place of its
+/// own, past the ACPI window, below the GIC. The firmware finds it through the
+/// `libkrun,boot-logo` device-tree node, whose `reg` is the BMP's exact extent.
+pub const BOOT_LOGO_START: u64 = 0x040C_0000;
+
+/// limina: the boot-logo window's size, and so the largest logo: 4 MiB, a 1024x1024 logo at
+/// 32 bits per pixel less its headers. A multiple of the 16 KiB host page.
+pub const BOOT_LOGO_SIZE: usize = 0x40_0000;
