@@ -101,6 +101,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     vcpu_capacities: &[u32],
     extra_bootargs: Option<&str>,
     boot_logo_len: Option<u64>,
+    boot_menu: bool,
 ) -> Result<Vec<u8>> {
     // Alocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -124,7 +125,14 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     create_efi_vars_node(&mut fdt, guest_mem)?;
     create_acpi_tables_node(&mut fdt, guest_mem)?;
     create_boot_logo_node(&mut fdt, guest_mem, boot_logo_len)?;
-    create_chosen_node(&mut fdt, cmdline, initrd, device_info, extra_bootargs)?;
+    create_chosen_node(
+        &mut fdt,
+        cmdline,
+        initrd,
+        device_info,
+        extra_bootargs,
+        boot_menu,
+    )?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
     create_clock_node(&mut fdt)?;
@@ -324,12 +332,17 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
     initrd: &Option<InitrdConfig>,
     dev_info: &HashMap<(DeviceType, String), T>,
     extra_bootargs: Option<&str>,
+    boot_menu: bool,
 ) -> Result<()> {
     let chosen_node = fdt.begin_node("chosen")?;
     fdt.property_string("bootargs", cmdline)?;
     // limina: for a firmware boot, where the kernel's command line is the loader's.
     if let Some(args) = extra_bootargs {
         fdt.property_string("libkrun,extra-bootargs", args)?;
+    }
+    // limina: a firmware that sees this shows its console and the loader's boot menu.
+    if boot_menu {
+        fdt.property_null("libkrun,boot-menu")?;
     }
 
     // If we have a legacy serial device, tell the guest this is the default console.
