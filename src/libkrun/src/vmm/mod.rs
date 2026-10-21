@@ -898,6 +898,7 @@ impl Vmm {
         _acpi_enabled: bool,
         _acpi_spcr: bool,
         _extra_bootargs: Option<&str>,
+        _boot_logo_len: Option<usize>,
         _virtio_mmio_devices: &[(u64, u32)],
         _pvh: bool,
     ) -> Result<()> {
@@ -945,6 +946,7 @@ impl Vmm {
                 initrd,
                 self.mmio_device_manager.vcpu_capacities(),
                 _extra_bootargs,
+                _boot_logo_len.map(|l| l as u64),
             )
             .map_err(Error::SetupFDT)?;
             if _acpi_enabled {

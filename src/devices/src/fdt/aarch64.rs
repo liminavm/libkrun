@@ -13,8 +13,8 @@ use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::gic::GICDevice;
 use arch::aarch64::layout::{
-    ACPI_SIZE, ACPI_START, EFI_VARS_SIZE, EFI_VARS_START, GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC,
-    GTIMER_VIRT,
+    ACPI_SIZE, ACPI_START, BOOT_LOGO_START, EFI_VARS_SIZE, EFI_VARS_START, GTIMER_HYP, GTIMER_PHYS,
+    GTIMER_SEC, GTIMER_VIRT,
 };
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
@@ -100,6 +100,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     initrd: &Option<InitrdConfig>,
     vcpu_capacities: &[u32],
     extra_bootargs: Option<&str>,
+    boot_logo_len: Option<u64>,
 ) -> Result<Vec<u8>> {
     // Alocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -122,6 +123,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_efi_vars_node(&mut fdt, guest_mem)?;
     create_acpi_tables_node(&mut fdt, guest_mem)?;
+    create_boot_logo_node(&mut fdt, guest_mem, boot_logo_len)?;
     create_chosen_node(&mut fdt, cmdline, initrd, device_info, extra_bootargs)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
@@ -289,6 +291,29 @@ fn create_acpi_tables_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> 
     let node = fdt.begin_node(&format!("acpi-tables@{ACPI_START:x}"))?;
     fdt.property_string("compatible", "libkrun,acpi-tables")?;
     fdt.property("reg", &generate_prop64(&[ACPI_START, ACPI_SIZE as u64]))?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
+/// limina: when guest memory holds a boot logo, tell the firmware where it is and how long. Like
+/// the ACPI window it is not RAM; the firmware publishes its own copy of what it draws.
+fn create_boot_logo_node(
+    fdt: &mut FdtWriter,
+    guest_mem: &GuestMemoryMmap,
+    len: Option<u64>,
+) -> Result<()> {
+    let Some(len) = len else {
+        return Ok(());
+    };
+    if guest_mem
+        .find_region(GuestAddress(BOOT_LOGO_START))
+        .is_none()
+    {
+        return Ok(());
+    }
+    let node = fdt.begin_node(&format!("boot-logo@{BOOT_LOGO_START:x}"))?;
+    fdt.property_string("compatible", "libkrun,boot-logo")?;
+    fdt.property("reg", &generate_prop64(&[BOOT_LOGO_START, len]))?;
     fdt.end_node(node)?;
     Ok(())
 }

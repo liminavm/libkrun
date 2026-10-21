@@ -173,6 +173,8 @@ pub enum StartMicrovmError {
     EfiVars(io::Error),
     /// limina: the machine cannot be described with ACPI.
     Acpi(String),
+    /// limina: the boot logo cannot be handed to the firmware.
+    BootLogo(String),
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// The kernel doesn't fit into the microVM memory.
@@ -373,6 +375,7 @@ impl Display for StartMicrovmError {
             TpmState(ref err) => write!(f, "Cannot load the TPM's state: {err}"),
             EfiVars(ref err) => write!(f, "Cannot map the UEFI variable store: {err}"),
             Acpi(ref err) => write!(f, "Cannot describe the machine with ACPI: {err}"),
+            BootLogo(ref err) => write!(f, "Cannot hand over the boot logo: {err}"),
             InvalidKernelBundle(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -873,6 +876,7 @@ pub fn build_microvm(
         vm_resources.firmware_config.as_ref(),
         vm_resources.efi_vars.as_deref(),
         vm_resources.acpi_enabled,
+        vm_resources.boot_logo.as_deref(),
         &fs_shm_sizes,
         gpu_shm_size,
         gpu_ext_sizes,
@@ -1716,6 +1720,7 @@ pub fn build_microvm(
         vm_resources.acpi_enabled,
         vm_resources.acpi_spcr,
         vm_resources.extra_bootargs.as_deref(),
+        vm_resources.boot_logo.as_ref().map(Vec::len),
         &virtio_mmio_devices,
         payload_config.pvh,
     )
@@ -2338,6 +2343,29 @@ fn acpi_region(
     Ok((GuestAddress(ACPI_START), ACPI_SIZE, None))
 }
 
+/// limina: the guest region a boot logo is written to: the whole window, whatever the logo's
+/// size, since untouched pages cost nothing. Only the firmware reads it.
+#[cfg(target_arch = "aarch64")]
+fn boot_logo_region(
+    logo: &[u8],
+    firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    use arch::aarch64::layout::{BOOT_LOGO_SIZE, BOOT_LOGO_START};
+
+    if !firmware {
+        return Err(StartMicrovmError::BootLogo(
+            "only a firmware shows a boot logo".into(),
+        ));
+    }
+    if logo.is_empty() || logo.len() > BOOT_LOGO_SIZE {
+        return Err(StartMicrovmError::BootLogo(format!(
+            "a boot logo is 1 to {BOOT_LOGO_SIZE} bytes, not {}",
+            logo.len()
+        )));
+    }
+    Ok((GuestAddress(BOOT_LOGO_START), BOOT_LOGO_SIZE, None))
+}
+
 #[cfg(not(target_arch = "aarch64"))]
 fn efi_vars_region(
     path: &std::path::Path,
@@ -2365,6 +2393,7 @@ pub fn create_guest_memory(
     firmware_config: Option<&crate::vmm::vmm_config::firmware::FirmwareConfig>,
     efi_vars: Option<&std::path::Path>,
     acpi: bool,
+    boot_logo: Option<&[u8]>,
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
     gpu_ext_sizes: Option<(usize, usize)>,
@@ -2536,6 +2565,10 @@ pub fn create_guest_memory(
         if acpi {
             regions.push(acpi_region(firmware_config.is_some())?);
         }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(logo) = boot_logo {
+            regions.push(boot_logo_region(logo, firmware_config.is_some())?);
+        }
         // Guest memory takes its regions in address order, and the variable store and the ACPI
         // window sit between the firmware and RAM.
         regions.sort_by_key(|&(addr, _, _)| addr);
@@ -2567,6 +2600,12 @@ pub fn create_guest_memory(
         guest_mem
             .write(firmware_data, GuestAddress(arch_mem_info.firmware_addr))
             .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(logo) = boot_logo {
+        guest_mem
+            .write_slice(logo, GuestAddress(arch::aarch64::layout::BOOT_LOGO_START))
+            .map_err(|e| StartMicrovmError::BootLogo(format!("{e:?}")))?;
     }
 
     let payload_config = PayloadConfig {
@@ -3165,6 +3204,7 @@ pub mod tests {
             }),
             Some(&vars),
             false,
+            None,
             &[],
             None,
             None,
@@ -3181,6 +3221,60 @@ pub mod tests {
         assert_eq!(file.len(), EFI_VARS_SIZE);
         assert_eq!(&file[0x100..0x109], b"BootOrder");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A firmware boot with a boot logo has the logo's bytes at the window's start, and the
+    /// window is refused without a firmware, empty, or past its size.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_firmware_boot_finds_its_boot_logo_in_the_window() {
+        use arch::aarch64::layout::{BOOT_LOGO_SIZE, BOOT_LOGO_START};
+
+        let dir = std::env::temp_dir().join(format!("krun-logo-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let firmware = dir.join("fw.fd");
+        std::fs::write(&firmware, vec![0u8; 0x10000]).unwrap();
+        let logo = b"BM a logo".to_vec();
+
+        let (mem, _, _, _) = create_guest_memory(
+            64,
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            Some(&crate::vmm::vmm_config::firmware::FirmwareConfig {
+                path: firmware.clone(),
+            }),
+            None,
+            false,
+            Some(&logo),
+            &[],
+            None,
+            None,
+            false,
+            &Payload::Firmware,
+            #[cfg(feature = "tee")]
+            None,
+        )
+        .unwrap();
+        let mut back = vec![0u8; logo.len()];
+        mem.read_slice(&mut back, GuestAddress(BOOT_LOGO_START))
+            .unwrap();
+        assert_eq!(back, logo);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let refused = |logo: &[u8], firmware| {
+            matches!(
+                boot_logo_region(logo, firmware),
+                Err(StartMicrovmError::BootLogo(_))
+            )
+        };
+        assert!(refused(b"BM", false));
+        assert!(refused(b"", true));
+        assert!(refused(&vec![0u8; BOOT_LOGO_SIZE + 1], true));
+        assert!(!refused(&vec![0u8; BOOT_LOGO_SIZE], true));
     }
 
     /// A new variable store is made the store's size and owner-only; a store already there keeps
@@ -3250,6 +3344,7 @@ pub mod tests {
             None,
             None,
             false,
+            None,
             &[],
             None,
             None,
