@@ -22,6 +22,9 @@ pub struct ArchMemoryInfo {
     pub fdt_addr: u64,
     pub initrd_addr: u64,
     pub firmware_addr: u64,
+    /// limina: virtio-mem's region as `(gpa, size)`, when a device asked for one. Guest memory
+    /// backs it, but it is not RAM the firmware or the kernel is told about.
+    pub hotplug_ram: Option<(u64, u64)>,
     #[cfg(target_os = "macos")]
     pub ipa_size: u32,
 }

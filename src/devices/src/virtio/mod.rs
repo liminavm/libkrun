@@ -32,6 +32,8 @@ pub mod i2c;
 #[cfg(feature = "input")]
 pub mod input;
 pub mod linux_errno;
+#[cfg(not(feature = "tee"))]
+pub mod mem;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
@@ -59,6 +61,8 @@ pub use self::fs::*;
 pub use self::gpu::*;
 #[cfg(not(feature = "tee"))]
 pub use self::i2c::*;
+#[cfg(not(feature = "tee"))]
+pub use self::mem::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;

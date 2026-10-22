@@ -848,6 +848,7 @@ pub fn build_microvm(
     #[cfg(not(feature = "gpu"))]
     let gpu_ext_sizes: Option<(usize, usize)> = None;
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
+    let hotplug_ram = requirements.iter().filter_map(|r| r.hotplug_ram).next();
 
     #[cfg(feature = "tdx")]
     let td_shim_parsed = match &vm_resources.tee_firmware_config {
@@ -887,6 +888,7 @@ pub fn build_microvm(
         gpu_shm_size,
         gpu_ext_sizes,
         use_vhost_user,
+        hotplug_ram,
         #[cfg(target_os = "macos")]
         vm_resources.guest_ram_blocks.as_ref(),
         &payload,
@@ -1517,6 +1519,8 @@ pub fn build_microvm(
         #[cfg(feature = "gpu")]
         gpu_device: None,
         balloon_control_handle: None,
+        #[cfg(not(feature = "tee"))]
+        mem_control_handle: None,
         #[cfg(target_os = "macos")]
         vcpu_list: vcpu_list.clone(),
         #[cfg(target_os = "macos")]
@@ -2400,21 +2404,22 @@ fn efi_vars_region(
 /// Guest memory over `regions`. On macOS, with a block layout, the RAM region (the one at
 /// `ram_start`) is built from owned blocks ([`hvf::guest_ram`]), which bill a page the VMM and the
 /// guest both touch once rather than once per mapping.
+/// Guest memory over `regions`; on macOS, those starting at an address in `owned` are built from
+/// owned memory blocks laid out as it says.
 fn guest_memory_over(
     regions: &[(GuestAddress, usize, Option<FileOffset>)],
-    #[cfg(target_os = "macos")] ram_start: u64,
-    #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
+    #[cfg(target_os = "macos")] owned: &[(u64, hvf::guest_ram::BlockLayout)],
 ) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
     let error = |e: &dyn std::fmt::Debug| StartMicrovmError::GuestMemoryMmap(format!("{e:?}"));
     #[cfg(target_os = "macos")]
-    if let Some(blocks) = guest_ram_blocks {
+    if !owned.is_empty() {
         let regions = regions
             .iter()
             .map(|(addr, size, file)| {
-                if addr.raw_value() != ram_start {
+                let Some((_, blocks)) = owned.iter().find(|(at, _)| *at == addr.raw_value()) else {
                     return GuestRegionMmap::from_range(*addr, *size, file.clone())
                         .map_err(|e| error(&e));
-                }
+                };
                 let host = hvf::guest_ram::allocate(*size as u64, blocks).map_err(|e| error(&e))?;
                 // SAFETY: `allocate` made a readable and writable mapping of `size` bytes that is
                 // never unmapped.
@@ -2428,7 +2433,7 @@ fn guest_memory_over(
                 }
                 .map_err(|e| error(&e))?;
                 info!(
-                    "guest RAM: {} MiB at {:#x} as owned blocks ({blocks:?})",
+                    "guest memory: {} MiB at {:#x} as owned blocks ({blocks:?})",
                     size >> 20,
                     addr.raw_value()
                 );
@@ -2458,6 +2463,7 @@ pub fn create_guest_memory(
     gpu_shm_size: Option<usize>,
     gpu_ext_sizes: Option<(usize, usize)>,
     use_vhost_user: bool,
+    hotplug_ram: Option<usize>,
     #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
     payload: &Payload,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
@@ -2562,6 +2568,25 @@ pub fn create_guest_memory(
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
+    // limina: virtio-mem's region goes above everything else the guest can address, on a 1 GiB
+    // boundary, which Linux's 128 MiB memory blocks divide.
+    let hotplug_ram = hotplug_ram.map(|size| {
+        #[allow(unused_mut)]
+        let mut end = arch_mem_regions
+            .iter()
+            .map(|&(addr, size)| addr.raw_value() + size as u64)
+            .max()
+            .unwrap_or(0);
+        #[cfg(feature = "gpu")]
+        if let Some((doorbells, arenas)) = shm_manager.gpu_ext_regions() {
+            for r in [doorbells, arenas] {
+                end = end.max(r.guest_addr.raw_value() + r.size as u64);
+            }
+        }
+        (end.next_multiple_of(1 << 30), size)
+    });
+    arch_mem_info.hotplug_ram = hotplug_ram.map(|(addr, size)| (addr, size as u64));
+
     let guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
         {
@@ -2630,15 +2655,28 @@ pub fn create_guest_memory(
         if let Some(logo) = boot_logo {
             regions.push(boot_logo_region(logo, firmware_config.is_some())?);
         }
+        if let Some((addr, size)) = hotplug_ram {
+            regions.push((GuestAddress(addr), size, None));
+        }
         // Guest memory takes its regions in address order, and the variable store and the ACPI
         // window sit between the firmware and RAM.
         regions.sort_by_key(|&(addr, _, _)| addr);
+        #[cfg(target_os = "macos")]
+        let owned: Vec<_> = guest_ram_blocks
+            .map(|layout| (arch_mem_info.ram_start_addr, layout.clone()))
+            .into_iter()
+            .chain(hotplug_ram.map(|(addr, _)| {
+                let block = devices::virtio::HOTPLUG_BLOCK_SIZE;
+                (
+                    addr,
+                    hvf::guest_ram::BlockLayout::uniform(block).expect("a valid block"),
+                )
+            }))
+            .collect();
         guest_memory_over(
             &regions,
             #[cfg(target_os = "macos")]
-            arch_mem_info.ram_start_addr,
-            #[cfg(target_os = "macos")]
-            guest_ram_blocks,
+            &owned,
         )?
     };
 
@@ -3275,6 +3313,7 @@ pub mod tests {
             None,
             None,
             false,
+            None,
             #[cfg(target_os = "macos")]
             None,
             &Payload::Firmware,
@@ -3322,6 +3361,7 @@ pub mod tests {
             None,
             None,
             false,
+            None,
             #[cfg(target_os = "macos")]
             None,
             &Payload::Firmware,
@@ -3419,6 +3459,7 @@ pub mod tests {
             None,
             None,
             false,
+            None,
             #[cfg(target_os = "macos")]
             None,
             &Payload::Empty,

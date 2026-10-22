@@ -43,6 +43,8 @@ pub use device_builders::PciDeviceManager;
 pub use device_builders::RngDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
+#[cfg(not(feature = "tee"))]
+pub use device_builders::VirtioMemDevice;
 pub use device_builders::{
     AttachContext, AttachDevice, DeviceManager, DeviceRequirements, MmioDeviceManager,
     ResolvedShmRegion, TsiFlags, VsockDevice,
