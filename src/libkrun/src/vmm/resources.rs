@@ -32,6 +32,8 @@ use kbs_types::Tee;
 
 #[cfg(target_os = "macos")]
 pub use hvf::IpaGranule;
+#[cfg(target_os = "macos")]
+pub use hvf::guest_ram::BlockLayout;
 
 type Result<E> = std::result::Result<(), E>;
 
@@ -121,6 +123,11 @@ pub struct VmResources {
     /// (16 KiB on Apple silicon), which cannot express a 4 KiB-page guest's memory layout.
     #[cfg(target_os = "macos")]
     pub ipa_granule: Option<IpaGranule>,
+    /// limina: build guest RAM from owned memory blocks cut this way (`hvf::guest_ram`), which
+    /// bill a page the VMM and the guest both touch once, and release by whole block. `None`
+    /// keeps an anonymous mapping.
+    #[cfg(target_os = "macos")]
+    pub guest_ram_blocks: Option<BlockLayout>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables. x86_64: when disabled, virtio-mmio devices are discovered
@@ -323,6 +330,8 @@ mod tests {
             nested_enabled: false,
             #[cfg(target_os = "macos")]
             ipa_granule: None,
+            #[cfg(target_os = "macos")]
+            guest_ram_blocks: None,
             split_irqchip: false,
             acpi_enabled: false,
             acpi_spcr: false,
