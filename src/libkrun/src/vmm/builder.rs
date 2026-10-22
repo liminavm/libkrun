@@ -1467,9 +1467,12 @@ pub fn build_microvm(
     let released_ram = {
         use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
         let shm_start = arch_memory_info.shm_start_addr;
+        // virtio-mem's region is not the balloon's: the device gives its blocks back itself.
+        let hotplug = arch_memory_info.hotplug_ram.map(|(gpa, _)| gpa);
         let regions = guest_memory
             .iter()
             .filter(|r| shm_start == 0 || r.start_addr().raw_value() < shm_start)
+            .filter(|r| Some(r.start_addr().raw_value()) != hotplug)
             .map(|r| {
                 let host = guest_memory.get_host_address(r.start_addr()).unwrap() as u64;
                 (r.start_addr().raw_value(), host, r.len())
@@ -1520,7 +1523,7 @@ pub fn build_microvm(
         gpu_device: None,
         balloon_control_handle: None,
         #[cfg(not(feature = "tee"))]
-        mem_control_handle: None,
+        mem_device: None,
         #[cfg(target_os = "macos")]
         vcpu_list: vcpu_list.clone(),
         #[cfg(target_os = "macos")]
@@ -1637,6 +1640,20 @@ pub fn build_microvm(
                 snap.head.layout, expected
             );
             return Err(StartMicrovmError::Internal(crate::vmm::Error::Snapshot));
+        }
+        // limina: the virtio-mem region is part of the layout: the guest onlined its plugged
+        // blocks at these addresses.
+        let saved = snap.head.hotplug.as_ref().map(|m| (m.addr, m.region_size));
+        if saved != vmm.arch_memory_info.hotplug_ram {
+            let why = format!(
+                "restore refused: this VM was suspended with virtio-mem region {saved:x?} and \
+                 has {:x?} now",
+                vmm.arch_memory_info.hotplug_ram
+            );
+            error!("{why}");
+            return Err(StartMicrovmError::Internal(
+                crate::vmm::Error::RestoreRefused(why),
+            ));
         }
         // limina: a guest suspended with a TPM holds keys, sessions and sealed secrets in it, and
         // its driver is bound to the device. Refused by name, before the slots: the TPM's window
@@ -1834,6 +1851,12 @@ pub fn build_microvm(
         #[cfg(feature = "usb")]
         if let Some(usb) = &snap.head.usb {
             vmm.restore_xhci_state(usb);
+        }
+        // limina: the virtio-mem device as the guest left it; its driver reads the plugged size
+        // back on thaw.
+        if let Some(mem) = &snap.head.hotplug {
+            vmm.restore_mem_state(mem)
+                .map_err(StartMicrovmError::Internal)?;
         }
         // limina: the TPM as the guest left it. A VM without one was refused above.
         if let Some(tpm) = &snap.head.tpm {
@@ -2568,15 +2591,15 @@ pub fn create_guest_memory(
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
-    // limina: virtio-mem's region goes above everything else the guest can address, on a 1 GiB
-    // boundary, which Linux's 128 MiB memory blocks divide.
+    // limina: virtio-mem's region goes above everything else the guest can address, the shared
+    // memory window's base included, on a 1 GiB boundary, which Linux's 128 MiB memory blocks
+    // divide.
     let hotplug_ram = hotplug_ram.map(|size| {
         #[allow(unused_mut)]
         let mut end = arch_mem_regions
             .iter()
             .map(|&(addr, size)| addr.raw_value() + size as u64)
-            .max()
-            .unwrap_or(0);
+            .fold(arch_mem_info.shm_start_addr, u64::max);
         #[cfg(feature = "gpu")]
         if let Some((doorbells, arenas)) = shm_manager.gpu_ext_regions() {
             for r in [doorbells, arenas] {
