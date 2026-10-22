@@ -10,6 +10,7 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+pub mod guest_ram;
 pub mod released_ram;
 
 #[macro_use]
