@@ -2017,6 +2017,7 @@ impl NetDevice {
                     mode,
                     bridged_interface: (!bridged_interface.is_empty())
                         .then(|| bridged_interface.to_string()),
+                    subnet: None,
                 }),
                 mac,
                 features,
