@@ -49,6 +49,8 @@ pub use device_builders::RngDevice;
 pub use device_builders::RtcDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
+#[cfg(not(feature = "tee"))]
+pub use device_builders::VirtioMemDevice;
 pub use device_builders::{
     AttachContext, AttachDevice, DeviceManager, DeviceRequirements, MmioDeviceManager,
     ResolvedShmRegion, TsiFlags, VsockDevice,
