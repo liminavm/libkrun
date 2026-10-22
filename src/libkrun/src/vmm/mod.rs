@@ -227,9 +227,9 @@ pub struct Vmm {
     /// when the balloon is attached. `None` if no balloon (e.g. the `tee` build).
     balloon_control_handle: Option<devices::virtio::BalloonControlHandle>,
 
-    /// limina: the handle that sets the live virtio-mem device's requested size, if attached.
+    /// limina: the virtio-mem device, if attached.
     #[cfg(not(feature = "tee"))]
-    mem_control_handle: Option<devices::virtio::MemControlHandle>,
+    mem_device: Option<Arc<Mutex<devices::virtio::Mem>>>,
 
     /// limina (M9 snapshot/suspend): the shared vCPU list, used to kick every vCPU out to the
     /// top of its run loop so it notices a snapshot `Pause`. See [`Self::pause_vcpus`].
@@ -328,12 +328,28 @@ impl Vmm {
     /// limina: the live virtio-mem device's control handle, if one is attached.
     #[cfg(not(feature = "tee"))]
     pub fn mem_control_handle(&self) -> Option<devices::virtio::MemControlHandle> {
-        self.mem_control_handle.clone()
+        self.mem_device
+            .as_ref()
+            .map(|m| m.lock().unwrap().control_handle())
     }
 
     #[cfg(not(feature = "tee"))]
-    pub(crate) fn set_mem_control_handle(&mut self, handle: devices::virtio::MemControlHandle) {
-        self.mem_control_handle = Some(handle);
+    pub(crate) fn set_mem_device(&mut self, device: Arc<Mutex<devices::virtio::Mem>>) {
+        self.mem_device = Some(device);
+    }
+
+    /// limina restore: the virtio-mem device's plugged blocks and requested size, before the
+    /// guest resumes. The builder refuses a snapshot whose region differs before it gets here.
+    #[cfg(all(target_os = "macos", not(feature = "tee")))]
+    pub fn restore_mem_state(&self, state: &devices::virtio::MemState) -> Result<()> {
+        let Some(mem) = &self.mem_device else {
+            error!("restore: the snapshot carries a virtio-mem device and this VM has none");
+            return Err(Error::Snapshot);
+        };
+        mem.lock().unwrap().restore_state(state).map_err(|e| {
+            error!("restore: {e}");
+            Error::Snapshot
+        })
     }
 
     /// Starts the microVM vcpus.
@@ -778,6 +794,12 @@ impl Vmm {
             .tpm
             .as_ref()
             .map(|t| t.lock().unwrap().save_state());
+        // limina: the virtio-mem device. Its plugged blocks are guest RAM like any other, and
+        // the only part of its region that holds anything.
+        let hotplug = self
+            .mem_device
+            .as_ref()
+            .map(|m| m.lock().unwrap().save_state());
         let head = snapshot::SnapshotHead {
             vcpus,
             gic,
@@ -789,6 +811,7 @@ impl Vmm {
             slots: Some(self.mmio_device_manager.device_slots()),
             fingerprints: Some(self.mmio_device_manager.device_fingerprints()),
             tpm,
+            hotplug,
         };
         // v6: stream chunked RAM frames straight out of guest memory (zero-chunk holes + lz4),
         // written by a worker pool — no whole-RAM intermediate copy, no serial multi-GB CRC.
@@ -805,7 +828,8 @@ impl Vmm {
             }
             None => return Err(Error::Snapshot),
         };
-        let regions = self.ram_regions();
+        let mut regions = self.ram_regions();
+        regions.extend(head.hotplug.iter().flat_map(|m| m.plugged.iter().copied()));
         let t0 = std::time::Instant::now();
         let stats = snapshot::write_streaming(&tmp, &head, &self.guest_memory, &regions)
             .map_err(Error::SnapshotIo)?;
@@ -882,12 +906,14 @@ impl Vmm {
     fn ram_regions(&self) -> Vec<(u64, u64)> {
         use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
         let shm_start = self.arch_memory_info.shm_start_addr;
+        let hotplug = self.arch_memory_info.hotplug_ram.map(|(gpa, _)| gpa);
         self.guest_memory
             .iter()
             .filter_map(|region| {
                 let gpa = region.start_addr().raw_value();
-                // GPU/fs SHM window — not part of the RAM snapshot.
-                (gpa < shm_start).then_some((gpa, region.len()))
+                // GPU/fs SHM window — not part of the RAM snapshot. Nor is virtio-mem's region:
+                // the snapshot takes only its plugged blocks.
+                (gpa < shm_start && Some(gpa) != hotplug).then_some((gpa, region.len()))
             })
             .collect()
     }

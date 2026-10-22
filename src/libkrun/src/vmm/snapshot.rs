@@ -19,6 +19,7 @@ use devices::legacy::GpioState;
 use devices::usb_state::{
     XhciEpState, XhciEventRingState, XhciPortState, XhciSlotState, XhciState,
 };
+use devices::virtio::MemState;
 use hvf::{VcpuPower, VcpuState};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -69,7 +70,11 @@ const MAGIC: &[u8; 8] = b"LIMINAS1";
 // (`devices::tpm::TpmTis::save_state`). The guest resumes with no firmware run and no
 // TPM2_Startup, so without it a restored TPM is a fresh one that has not started, and every
 // command the guest sends it fails. A v10 file carries no TPM.
-const VERSION: u32 = 11;
+// v12 appends the virtio-mem device: its region, the requested size and the plugged runs. The
+// plugged runs join the RAM regions; the rest of the region holds nothing, and reading it would
+// give it pages. The guest's driver reads `plugged_size` back on thaw and expects the blocks it
+// plugged, with their contents. A v11 file carries no virtio-mem device.
+const VERSION: u32 = 12;
 const OLDEST_READABLE_VERSION: u32 = 8;
 
 /// v6 RAM chunk size: 4 MiB — large enough to amortize per-frame overhead, small enough to spread
@@ -282,6 +287,8 @@ pub struct SnapshotHead {
     /// v11: the TPM, as `devices::tpm::TpmTis::save_state` saved it. `None` when the VM has no
     /// TPM, and for a file older than v11.
     pub tpm: Option<Vec<u8>>,
+    /// v12: the virtio-mem device. `None` when the VM has none, and for a file older than v12.
+    pub hotplug: Option<MemState>,
 }
 
 /// CRC-32 (IEEE 802.3, reflected): the head's and every RAM frame's integrity check.
@@ -460,6 +467,22 @@ fn encode_head_as(head: &SnapshotHead, version: u32) -> Vec<u8> {
             Some(t) => {
                 v.push(1);
                 put_bytes(&mut v, t);
+            }
+            None => v.push(0),
+        }
+    }
+    if version >= 12 {
+        match &head.hotplug {
+            Some(m) => {
+                v.push(1);
+                put_u64(&mut v, m.addr);
+                put_u64(&mut v, m.region_size);
+                put_u64(&mut v, m.requested_size);
+                put_u32(&mut v, m.plugged.len() as u32);
+                for &(gpa, len) in &m.plugged {
+                    put_u64(&mut v, gpa);
+                    put_u64(&mut v, len);
+                }
             }
             None => v.push(0),
         }
@@ -1254,6 +1277,9 @@ fn decode_bool(r: &mut Reader) -> io::Result<bool> {
 /// Bound a decoded element count before it drives an allocation. The head CRC is only checked
 /// *after* the whole head parses, so a corrupt length must not be trusted this far — and every
 /// count here has a small hard ceiling from the controller's geometry anyway.
+/// A virtio-mem region of 64 GiB in 2 MiB blocks, every other one plugged.
+const MAX_PLUGGED_RUNS: u32 = 1 << 14;
+
 fn bounded_count(r: &mut Reader, max: u32, what: &str) -> io::Result<usize> {
     let n = r.u32()?;
     if n > max {
@@ -1556,6 +1582,30 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
     } else {
         None
     };
+    let hotplug = if version >= 12 {
+        match r.u8()? {
+            0 => None,
+            1 => {
+                let addr = r.u64()?;
+                let region_size = r.u64()?;
+                let requested_size = r.u64()?;
+                let runs = bounded_count(&mut r, MAX_PLUGGED_RUNS, "plugged run")?;
+                let mut plugged = Vec::with_capacity(runs);
+                for _ in 0..runs {
+                    plugged.push((r.u64()?, r.u64()?));
+                }
+                Some(MemState {
+                    addr,
+                    region_size,
+                    requested_size,
+                    plugged,
+                })
+            }
+            _ => return Err(corrupt("bad virtio-mem presence byte")),
+        }
+    } else {
+        None
+    };
     // v6: the head is covered by its own CRC (the RAM frames each carry theirs).
     let head_end = r.pos;
     let stored = r.u32()?;
@@ -1577,6 +1627,7 @@ fn parse(raw: std::sync::Arc<StreamedFile>) -> io::Result<SnapshotFile> {
             slots,
             fingerprints,
             tpm,
+            hotplug,
         },
         raw,
         ram_off,
@@ -1781,6 +1832,12 @@ mod tests {
             slots: Some(windowed_slots()),
             fingerprints: Some(windowed_fingerprints()),
             tpm: Some(b"TIS1 and a backend".to_vec()),
+            hotplug: Some(MemState {
+                addr: 0x2_4000_0000,
+                region_size: 1 << 31,
+                requested_size: 1 << 30,
+                plugged: vec![(0x2_4000_0000, 6 << 20), (0x2_4100_0000, 2 << 20)],
+            }),
         }
     }
 
@@ -1864,6 +1921,18 @@ mod tests {
         let fewer = vec![windowed_fingerprints()[1].clone()];
         assert_eq!(fingerprint_mismatch(&windowed_fingerprints(), &fewer), None);
         assert_eq!(fingerprint_mismatch(&fewer, &windowed_fingerprints()), None);
+    }
+
+    /// A v11 file has a TPM and no virtio-mem device, and reads as exactly that.
+    #[test]
+    fn a_v11_head_reads_without_a_virtio_mem_device() {
+        let mut v = encode_head_as(&sample_head(), 11);
+        let crc = crc32(&v);
+        put_u32(&mut v, crc);
+        put_u32(&mut v, 0); // no RAM regions
+        let file = parse(StreamedFile::landed(v)).expect("a v11 head reads");
+        assert_eq!(file.head.tpm, sample_head().tpm);
+        assert_eq!(file.head.hotplug, None);
     }
 
     /// A v10 file has fingerprints and no TPM, and reads as exactly that.
@@ -1984,6 +2053,7 @@ mod tests {
         assert_eq!(head.slots, want.slots);
         assert_eq!(head.fingerprints, want.fingerprints);
         assert_eq!(head.tpm, want.tpm);
+        assert_eq!(head.hotplug, want.hotplug);
 
         // Restore into memory pre-filled with garbage: data frames AND holes must both overwrite.
         let mem2 = test_mem();
@@ -2014,6 +2084,7 @@ mod tests {
             slots: Some(vec![]),
             fingerprints: Some(vec![]),
             tpm: None,
+            hotplug: None,
         };
         let mem = test_mem();
         let path =
@@ -2096,6 +2167,7 @@ mod tests {
             slots: Some(vec![]),
             fingerprints: Some(vec![]),
             tpm: None,
+            hotplug: None,
         };
         let mut v = encode_head(&head);
         let crc = crc32(&v);
@@ -2133,6 +2205,7 @@ mod tests {
             slots: Some(vec![]),
             fingerprints: Some(vec![]),
             tpm: None,
+            hotplug: None,
         };
         let mut v = encode_head(&head);
         let crc = crc32(&v);

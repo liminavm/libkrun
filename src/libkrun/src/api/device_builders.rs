@@ -1256,8 +1256,8 @@ impl<'a> AttachDevice<'a> for VirtioMemDevice {
             size >> 20,
             devices::virtio::HOTPLUG_BLOCK_SIZE >> 20
         );
-        ctx.vmm.set_mem_control_handle(mem.control_handle());
         let inner = Arc::new(Mutex::new(mem));
+        ctx.vmm.set_mem_device(inner.clone());
         ctx.subscribe_events(inner.clone())?;
         ctx.register("virtio-mem", inner)
     }
