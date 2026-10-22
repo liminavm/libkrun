@@ -100,7 +100,7 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         #[cfg(feature = "gpu")]
         gpu_timing: None,
         #[cfg(not(feature = "tee"))]
-        mem_control_handle: None,
+        mem_device: None,
     };
 
     match control {

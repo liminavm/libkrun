@@ -3,7 +3,7 @@ mod event_handler;
 mod plug;
 
 pub use self::defs::uapi::VIRTIO_ID_MEM as TYPE_MEM;
-pub use self::device::{Mem, MemControlHandle, MemStats};
+pub use self::device::{Mem, MemControlHandle, MemState, MemStats};
 
 /// The device's block size, and the size of the owned blocks its region is built from: an
 /// unplugged block is returned to the host whole.

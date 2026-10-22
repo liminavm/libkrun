@@ -9,7 +9,7 @@
 //! and maps them back.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -31,6 +31,7 @@ pub(crate) const AVAIL_FEATURES: u64 = (1 << VIRTIO_F_VERSION_1 as u64)
 struct Shared {
     requested: AtomicU64,
     plugged: AtomicU64,
+    bound: AtomicBool,
     /// Wakes the device to tell the guest a new requested size.
     requested_evt: EventFd,
 }
@@ -47,12 +48,24 @@ pub struct Mem {
     shared: Arc<Shared>,
 }
 
+/// What a snapshot carries of the device: where its region is, what the host asked for, and
+/// which blocks the guest has plugged, as `(gpa, len)` runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemState {
+    pub addr: u64,
+    pub region_size: u64,
+    pub requested_size: u64,
+    pub plugged: Vec<(u64, u64)>,
+}
+
 /// How big the region is, how much of it the host asks the guest to plug, and how much is.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemStats {
     pub region_size: u64,
     pub requested_size: u64,
     pub plugged_size: u64,
+    /// The guest's driver has activated the device at least once.
+    pub bound: bool,
 }
 
 /// Drives the live device's requested size. Mechanism only: limina decides the size.
@@ -80,6 +93,7 @@ impl MemControlHandle {
             region_size: self.region_size,
             requested_size: self.shared.requested.load(Ordering::Relaxed),
             plugged_size: self.shared.plugged.load(Ordering::Relaxed),
+            bound: self.shared.bound.load(Ordering::Relaxed),
         }
     }
 }
@@ -108,6 +122,7 @@ impl Mem {
             shared: Arc::new(Shared {
                 requested: AtomicU64::new(0),
                 plugged: AtomicU64::new(0),
+                bound: AtomicBool::new(false),
                 requested_evt: EventFd::new(EFD_NONBLOCK).map_err(MemError::EventFd)?,
             }),
         })
@@ -123,6 +138,34 @@ impl Mem {
             region_size: self.region_size,
             block_size: self.block_size,
         }
+    }
+
+    pub fn save_state(&self) -> MemState {
+        MemState {
+            addr: self.addr,
+            region_size: self.region_size,
+            requested_size: self.shared.requested.load(Ordering::Relaxed),
+            plugged: self.plugged.runs(),
+        }
+    }
+
+    /// Take the state a snapshot carries, before the restored guest runs: its driver reads
+    /// `plugged_size` back on thaw and expects the blocks it plugged.
+    pub fn restore_state(&mut self, state: &MemState) -> Result<(), String> {
+        if (state.addr, state.region_size) != (self.addr, self.region_size) {
+            return Err(format!(
+                "the snapshot's virtio-mem region {:#x}+{:#x} is not this one, {:#x}+{:#x}",
+                state.addr, state.region_size, self.addr, self.region_size
+            ));
+        }
+        self.plugged.set_runs(&state.plugged)?;
+        self.shared
+            .requested
+            .store(state.requested_size, Ordering::Relaxed);
+        self.shared
+            .plugged
+            .store(self.plugged.plugged_size(), Ordering::Relaxed);
+        Ok(())
     }
 
     pub(crate) fn queue_event(&self, idx: usize) -> &Arc<EventFd> {
@@ -309,6 +352,7 @@ impl VirtioDevice for Mem {
         }
         self.queues = Some(queues);
         self.device_state = DeviceState::Activated(mem, interrupt);
+        self.shared.bound.store(true, Ordering::Relaxed);
         Ok(())
     }
 
