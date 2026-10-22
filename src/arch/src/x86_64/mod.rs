@@ -202,6 +202,7 @@ pub fn arch_memory_regions(
         page_size,
         initrd_addr: ram_last_addr.min(MMIO_MEM_START) - initrd_size,
         firmware_addr,
+        hotplug_ram: None,
     };
     (info, regions)
 }
@@ -275,6 +276,7 @@ pub fn arch_memory_regions(
         page_size,
         initrd_addr: layout::INITRD_SEV_START,
         firmware_addr: 0,
+        hotplug_ram: None,
     };
     (info, regions)
 }

@@ -60,6 +60,8 @@ pub struct DeviceRequirements {
     pub gpu_ext: Option<(usize, usize)>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
+    /// limina: bytes of guest memory above RAM for a virtio-mem device to plug.
+    pub hotplug_ram: Option<usize>,
 }
 
 /// Context provided to devices during attachment.
@@ -147,6 +149,11 @@ impl<'a> AttachContext<'a> {
     /// The VM's guest memory map.
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.vmm.guest_memory
+    }
+
+    /// limina: the region made for [`DeviceRequirements::hotplug_ram`], as `(gpa, size)`.
+    pub fn hotplug_ram(&self) -> Option<(u64, u64)> {
+        self.vmm.arch_memory_info.hotplug_ram
     }
 
     /// The resolved SHM region for the current device index, if one was
@@ -1211,6 +1218,48 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
         ctx.vmm
             .set_balloon_control_handle(inner.lock().unwrap().balloon_control_handle());
         ctx.register("balloon", inner)
+    }
+}
+
+/// limina: a virtio-mem device over `size` bytes of guest memory above RAM, which the guest plugs
+/// as the host asks through [`devices::virtio::MemControlHandle`]. `size` should be a multiple of
+/// 128 MiB, Linux's memory block on arm64, or the guest cannot use the remainder.
+#[cfg(not(feature = "tee"))]
+pub struct VirtioMemDevice {
+    size: usize,
+}
+
+#[cfg(not(feature = "tee"))]
+impl VirtioMemDevice {
+    pub fn new(size: usize) -> Self {
+        Self { size }
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl<'a> AttachDevice<'a> for VirtioMemDevice {
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            hotplug_ram: Some(self.size),
+            ..Default::default()
+        }
+    }
+
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        let (addr, size) = ctx
+            .hotplug_ram()
+            .ok_or_else(|| VmmError::Internal("virtio-mem: no region was made".into()))?;
+        let mem = devices::virtio::Mem::new(addr, size, devices::virtio::HOTPLUG_BLOCK_SIZE)
+            .map_err(|e| VmmError::Internal(format!("virtio-mem: {e:?}")))?;
+        info!(
+            "virtio-mem: {} MiB at {addr:#x} in blocks of {} MiB",
+            size >> 20,
+            devices::virtio::HOTPLUG_BLOCK_SIZE >> 20
+        );
+        ctx.vmm.set_mem_control_handle(mem.control_handle());
+        let inner = Arc::new(Mutex::new(mem));
+        ctx.subscribe_events(inner.clone())?;
+        ctx.register("virtio-mem", inner)
     }
 }
 

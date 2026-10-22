@@ -227,6 +227,10 @@ pub struct Vmm {
     /// when the balloon is attached. `None` if no balloon (e.g. the `tee` build).
     balloon_control_handle: Option<devices::virtio::BalloonControlHandle>,
 
+    /// limina: the handle that sets the live virtio-mem device's requested size, if attached.
+    #[cfg(not(feature = "tee"))]
+    mem_control_handle: Option<devices::virtio::MemControlHandle>,
+
     /// limina (M9 snapshot/suspend): the shared vCPU list, used to kick every vCPU out to the
     /// top of its run loop so it notices a snapshot `Pause`. See [`Self::pause_vcpus`].
     #[cfg(target_os = "macos")]
@@ -319,6 +323,17 @@ impl Vmm {
     /// [`Self::balloon_control_handle`]).
     pub fn set_balloon_control_handle(&mut self, handle: devices::virtio::BalloonControlHandle) {
         self.balloon_control_handle = Some(handle);
+    }
+
+    /// limina: the live virtio-mem device's control handle, if one is attached.
+    #[cfg(not(feature = "tee"))]
+    pub fn mem_control_handle(&self) -> Option<devices::virtio::MemControlHandle> {
+        self.mem_control_handle.clone()
+    }
+
+    #[cfg(not(feature = "tee"))]
+    pub(crate) fn set_mem_control_handle(&mut self, handle: devices::virtio::MemControlHandle) {
+        self.mem_control_handle = Some(handle);
     }
 
     /// Starts the microVM vcpus.
