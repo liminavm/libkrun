@@ -89,16 +89,22 @@ use vm_memory::Bytes;
 use vm_memory::FileOffset;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemoryRegion;
-#[cfg(all(
-    target_arch = "x86_64",
-    not(feature = "tee"),
-    not(target_os = "windows")
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_arch = "x86_64",
+        not(feature = "tee"),
+        not(target_os = "windows")
+    )
 ))]
 use vm_memory::GuestRegionMmap;
-#[cfg(all(
-    target_arch = "x86_64",
-    not(feature = "tee"),
-    not(target_os = "windows")
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_arch = "x86_64",
+        not(feature = "tee"),
+        not(target_os = "windows")
+    )
 ))]
 use vm_memory::mmap::MmapRegion;
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -798,6 +804,8 @@ pub fn build_microvm(
         gpu_shm_size,
         gpu_ext_sizes,
         use_vhost_user,
+        #[cfg(target_os = "macos")]
+        vm_resources.guest_ram_blocks.as_ref(),
         &payload,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
@@ -1354,7 +1362,15 @@ pub fn build_microvm(
                 (r.start_addr().raw_value(), host, r.len())
             })
             .collect();
-        Arc::new(hvf::ReleasedRam::new(regions))
+        let released_ram = hvf::ReleasedRam::new(regions);
+        Arc::new(match &vm_resources.guest_ram_blocks {
+            Some(layout) => released_ram.with_owned_blocks(
+                arch_memory_info.ram_start_addr,
+                arch_memory_info.ram_last_addr - arch_memory_info.ram_start_addr,
+                layout.clone(),
+            ),
+            None => released_ram,
+        })
     };
 
     let mut vmm = Vmm {
@@ -2265,6 +2281,49 @@ fn efi_vars_region(
     )))
 }
 
+/// Guest memory over `regions`. On macOS, with a block layout, the RAM region (the one at
+/// `ram_start`) is built from owned blocks ([`hvf::guest_ram`]), which bill a page the VMM and the
+/// guest both touch once rather than once per mapping.
+fn guest_memory_over(
+    regions: &[(GuestAddress, usize, Option<FileOffset>)],
+    #[cfg(target_os = "macos")] ram_start: u64,
+    #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    let error = |e: &dyn std::fmt::Debug| StartMicrovmError::GuestMemoryMmap(format!("{e:?}"));
+    #[cfg(target_os = "macos")]
+    if let Some(blocks) = guest_ram_blocks {
+        let regions = regions
+            .iter()
+            .map(|(addr, size, file)| {
+                if addr.raw_value() != ram_start {
+                    return GuestRegionMmap::from_range(*addr, *size, file.clone())
+                        .map_err(|e| error(&e));
+                }
+                let host = hvf::guest_ram::allocate(*size as u64, blocks).map_err(|e| error(&e))?;
+                // SAFETY: `allocate` made a readable and writable mapping of `size` bytes that is
+                // never unmapped.
+                let mapping = unsafe {
+                    MmapRegion::build_raw(
+                        host as *mut u8,
+                        *size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE,
+                    )
+                }
+                .map_err(|e| error(&e))?;
+                info!(
+                    "guest RAM: {} MiB at {:#x} as owned blocks ({blocks:?})",
+                    size >> 20,
+                    addr.raw_value()
+                );
+                GuestRegionMmap::new(mapping, *addr).ok_or_else(|| error(&"RAM region overflows"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return GuestMemoryMmap::from_regions(regions).map_err(|e| error(&e));
+    }
+    GuestMemoryMmap::from_ranges_with_files(regions).map_err(|e| error(&e))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_guest_memory(
     mem_size: usize,
@@ -2283,6 +2342,7 @@ pub fn create_guest_memory(
     gpu_shm_size: Option<usize>,
     gpu_ext_sizes: Option<(usize, usize)>,
     use_vhost_user: bool,
+    #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
     payload: &Payload,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
 ) -> std::result::Result<
@@ -2457,8 +2517,13 @@ pub fn create_guest_memory(
         // Guest memory takes its regions in address order, and the variable store and the ACPI
         // window sit between the firmware and RAM.
         regions.sort_by_key(|&(addr, _, _)| addr);
-        GuestMemoryMmap::from_ranges_with_files(&regions)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+        guest_memory_over(
+            &regions,
+            #[cfg(target_os = "macos")]
+            arch_mem_info.ram_start_addr,
+            #[cfg(target_os = "macos")]
+            guest_ram_blocks,
+        )?
     };
 
     let LoadedPayload {
@@ -3075,6 +3140,8 @@ pub mod tests {
             None,
             None,
             false,
+            #[cfg(target_os = "macos")]
+            None,
             &Payload::Firmware,
             #[cfg(feature = "tee")]
             None,
@@ -3120,6 +3187,8 @@ pub mod tests {
             None,
             None,
             false,
+            #[cfg(target_os = "macos")]
+            None,
             &Payload::Firmware,
             #[cfg(feature = "tee")]
             None,
@@ -3215,6 +3284,8 @@ pub mod tests {
             None,
             None,
             false,
+            #[cfg(target_os = "macos")]
+            None,
             &Payload::Empty,
             #[cfg(feature = "tee")]
             None,
