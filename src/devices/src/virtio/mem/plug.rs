@@ -73,6 +73,36 @@ impl Plugged {
         self.plugged as u64 * self.block_size
     }
 
+    /// The plugged blocks, as `(gpa, len)` runs in address order.
+    pub fn runs(&self) -> Vec<(u64, u64)> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (i, _) in self.blocks.iter().enumerate().filter(|(_, b)| **b) {
+            let gpa = self.addr + i as u64 * self.block_size;
+            match runs.last_mut() {
+                Some((start, len)) if *start + *len == gpa => *len += self.block_size,
+                _ => runs.push((gpa, self.block_size)),
+            }
+        }
+        runs
+    }
+
+    /// Plug exactly `runs`, each a whole number of blocks inside the region.
+    pub fn set_runs(&mut self, runs: &[(u64, u64)]) -> Result<(), String> {
+        let mut blocks = vec![false; self.blocks.len()];
+        for &(gpa, len) in runs {
+            let count = len / self.block_size;
+            let range = u16::try_from(count)
+                .ok()
+                .filter(|_| len.is_multiple_of(self.block_size))
+                .and_then(|nb| self.range(gpa, nb))
+                .ok_or_else(|| format!("plugged run {gpa:#x}+{len:#x} is not in the region"))?;
+            blocks[range].fill(true);
+        }
+        self.plugged = blocks.iter().filter(|&&b| b).count();
+        self.blocks = blocks;
+        Ok(())
+    }
+
     /// Answer `req`, given the size the host currently asks for. The whole region is usable.
     pub fn handle(&mut self, req: Request, requested_size: u64) -> Outcome {
         match req {
@@ -251,6 +281,22 @@ mod tests {
             VIRTIO_MEM_STATE_UNPLUGGED
         );
         assert_eq!(p.plugged_size(), 2 * BLOCK);
+    }
+
+    #[test]
+    fn plugged_runs_round_trip() {
+        let mut p = Plugged::new(BASE, BLOCK, 8);
+        let big = 8 * BLOCK;
+        p.handle(plug(BASE, 2), big);
+        p.handle(plug(BASE + 5 * BLOCK, 3), big);
+        let runs = p.runs();
+        assert_eq!(runs, vec![(BASE, 2 * BLOCK), (BASE + 5 * BLOCK, 3 * BLOCK)]);
+        let mut q = Plugged::new(BASE, BLOCK, 8);
+        q.set_runs(&runs).unwrap();
+        assert_eq!(q.runs(), runs);
+        assert_eq!(q.plugged_size(), 5 * BLOCK);
+        assert!(q.set_runs(&[(BASE + 7 * BLOCK, 2 * BLOCK)]).is_err());
+        assert!(q.set_runs(&[(BASE, BLOCK / 2)]).is_err());
     }
 
     #[test]
