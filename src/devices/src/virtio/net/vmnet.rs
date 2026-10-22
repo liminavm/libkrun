@@ -45,6 +45,18 @@ pub struct VmnetConfig {
     pub mode: VmnetMode,
     /// The host interface a bridged guest joins; ignored in the other modes.
     pub bridged_interface: Option<String>,
+    /// The subnet a shared or host-only interface asks for; vmnet picks one when it is absent.
+    /// Interfaces that ask for the same subnet share one network.
+    pub subnet: Option<VmnetSubnet>,
+}
+
+/// A subnet for vmnet to run: the host takes `gateway`, and its DHCP server leases the addresses
+/// after it up to and including `dhcp_end`. All of them must be private (RFC 1918).
+#[derive(Clone, Copy, Debug)]
+pub struct VmnetSubnet {
+    pub gateway: Ipv4Addr,
+    pub dhcp_end: Ipv4Addr,
+    pub mask: Ipv4Addr,
 }
 
 type XpcObject = *mut c_void;
@@ -76,6 +88,7 @@ unsafe extern "C" {
     static vmnet_read_max_packets_key: *const c_char;
     static vmnet_write_max_packets_key: *const c_char;
     static vmnet_start_address_key: *const c_char;
+    static vmnet_end_address_key: *const c_char;
     static vmnet_subnet_mask_key: *const c_char;
 
     fn vmnet_start_interface(
@@ -230,6 +243,12 @@ impl Vmnet {
             }
             _ => None,
         };
+        let subnet = match (&config.mode, config.subnet) {
+            (VmnetMode::Bridged, _) | (_, None) => None,
+            (_, Some(s)) => {
+                Some([s.gateway, s.dhcp_end, s.mask].map(|a| CString::new(a.to_string()).unwrap()))
+            }
+        };
 
         let io_error = |e: io::Error| ConnectError::Vmnet(format!("wake socket: {e}"));
         let (wake_rx, wake_tx) = UnixDatagram::pair().map_err(io_error)?;
@@ -244,6 +263,11 @@ impl Vmnet {
             xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key, config.mode as u64);
             if let Some(name) = &bridged {
                 xpc_dictionary_set_string(desc, vmnet_shared_interface_name_key, name.as_ptr());
+            }
+            if let Some([gateway, dhcp_end, mask]) = &subnet {
+                xpc_dictionary_set_string(desc, vmnet_start_address_key, gateway.as_ptr());
+                xpc_dictionary_set_string(desc, vmnet_end_address_key, dhcp_end.as_ptr());
+                xpc_dictionary_set_string(desc, vmnet_subnet_mask_key, mask.as_ptr());
             }
             xpc_dictionary_set_bool(desc, vmnet_allocate_mac_address_key, false);
             xpc_dictionary_set_bool(desc, vmnet_enable_virtio_header_key, true);
