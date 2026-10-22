@@ -34,6 +34,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::bindings::*;
+use crate::guest_ram::{self, BlockLayout};
 use crate::host_page_size;
 
 /// ESR xFSC translation-fault range (levels 0-3): the only fault kind a missing stage-2
@@ -102,6 +103,12 @@ pub trait Stage2: Send + Sync {
     unsafe fn discard(&self, host: u64, len: u64, zero: bool) -> std::io::Result<()>;
     /// Mark the host range `MADV_FREE_REUSE`.
     fn reuse(&self, host: u64, len: u64) -> std::io::Result<()>;
+    /// Replace the host range, one whole block of owned guest RAM, with a fresh block.
+    ///
+    /// # Safety
+    ///
+    /// As [`Stage2::discard`]: the block is unmapped from the guest, so nothing else touches it.
+    unsafe fn renew(&self, host: u64, len: u64) -> std::io::Result<()>;
 }
 
 pub struct Hvf;
@@ -133,6 +140,11 @@ impl Stage2 for Hvf {
     fn reuse(&self, host: u64, len: u64) -> std::io::Result<()> {
         madvise(host, len, libc::MADV_FREE_REUSE)
     }
+
+    unsafe fn renew(&self, host: u64, len: u64) -> std::io::Result<()> {
+        // SAFETY: the caller's contract: one block of owned guest RAM, unmapped from the guest.
+        unsafe { guest_ram::place_block(host, len) }
+    }
 }
 
 fn madvise(host: u64, len: u64, advice: libc::c_int) -> std::io::Result<()> {
@@ -143,9 +155,24 @@ fn madvise(host: u64, len: u64, advice: libc::c_int) -> std::io::Result<()> {
     }
 }
 
+/// Guest RAM made of owned blocks ([`guest_ram`]): where it starts and how it is cut.
+struct OwnedBlocks {
+    gpa: u64,
+    size: u64,
+    layout: BlockLayout,
+}
+
+impl OwnedBlocks {
+    fn contains(&self, gpa: u64) -> bool {
+        gpa >= self.gpa && gpa < self.gpa + self.size
+    }
+}
+
 pub struct ReleasedRam<S: Stage2 = Hvf> {
     stage2: S,
     regions: Vec<RamRegion>,
+    /// Owned-block guest RAM, released by renewing whole blocks instead of `MADV_FREE_REUSABLE`.
+    owned: Option<OwnedBlocks>,
     /// Released GPA ranges: start -> len, disjoint, coalesced. Exact by construction: every
     /// byte in here is stage-2 unmapped and only bytes in here are (balloon-released) ones.
     released: Mutex<BTreeMap<u64, u64>>,
@@ -242,6 +269,7 @@ impl<S: Stage2> ReleasedRam<S> {
         Self {
             stage2,
             regions,
+            owned: None,
             released: Mutex::new(BTreeMap::new()),
             chunk,
             heals: AtomicU64::new(0),
@@ -255,6 +283,19 @@ impl<S: Stage2> ReleasedRam<S> {
             sweep_debited_bytes: AtomicU64::new(0),
             sweep_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Treat `[gpa, gpa + size)` as guest RAM made of owned blocks laid out by `layout`
+    /// ([`guest_ram::allocate`]). `MADV_FREE_REUSABLE` does nothing on such memory, so a release
+    /// there renews each block it leaves wholly released, and a partly released block keeps its
+    /// pages until the rest of it follows.
+    pub fn with_owned_blocks(mut self, gpa: u64, size: u64, layout: BlockLayout) -> Self {
+        self.owned = Some(OwnedBlocks { gpa, size, layout });
+        self
+    }
+
+    fn owned_at(&self, gpa: u64) -> Option<&OwnedBlocks> {
+        self.owned.as_ref().filter(|o| o.contains(gpa))
     }
 
     fn region_of(&self, gpa: u64) -> Option<&RamRegion> {
@@ -301,6 +342,11 @@ impl<S: Stage2> ReleasedRam<S> {
             return false;
         }
         insert_range(&mut released, gpa, len);
+        if let Some(owned) = self.owned_at(gpa) {
+            self.renew_released_blocks(&released, owned, region, gpa, len);
+            self.released_bytes.fetch_add(len, Ordering::Relaxed);
+            return true;
+        }
         let host = Self::host_of(region, gpa);
         let zero = match self.zero_on_release {
             ZeroOnRelease::All => true,
@@ -319,6 +365,36 @@ impl<S: Stage2> ReleasedRam<S> {
         }
         self.released_bytes.fetch_add(len, Ordering::Relaxed);
         true
+    }
+
+    /// Renew every block that `[gpa, gpa + len)`, just released, leaves wholly released.
+    fn renew_released_blocks(
+        &self,
+        released: &BTreeMap<u64, u64>,
+        owned: &OwnedBlocks,
+        region: &RamRegion,
+        gpa: u64,
+        len: u64,
+    ) {
+        let (&span, &span_len) = released
+            .range(..=gpa)
+            .next_back()
+            .expect("the range was just inserted");
+        let blocks = owned
+            .layout
+            .blocks(gpa - owned.gpa, gpa + len - owned.gpa, owned.size);
+        for (start, block) in blocks {
+            let block_gpa = owned.gpa + start;
+            if block_gpa < span || block_gpa + block > span + span_len {
+                continue;
+            }
+            let host = Self::host_of(region, block_gpa);
+            // SAFETY: the whole block is in the released set, so unmapped from the guest and
+            // balloon-owned; the released lock keeps a heal from mapping it back meanwhile.
+            if let Err(e) = unsafe { self.stage2.renew(host, block) } {
+                warn!("released-ram: renewing the block at {host:#x} len={block:#x} failed: {e}");
+            }
+        }
     }
 
     /// Take `[gpa, gpa + len)` back for the guest ahead of a known reuse (deflate): every
@@ -445,7 +521,9 @@ impl<S: Stage2> ReleasedRam<S> {
             .region_of(gpa)
             .expect("released range outside every RAM region");
         let host = Self::host_of(region, gpa);
-        if let Err(e) = self.stage2.reuse(host, len) {
+        if self.owned_at(gpa).is_none()
+            && let Err(e) = self.stage2.reuse(host, len)
+        {
             warn!("released-ram: madvise(MADV_FREE_REUSE) at {host:#x} len={len:#x} failed: {e}");
         }
         let ret = self.stage2.map(host, gpa, len);
@@ -500,7 +578,12 @@ impl<S: Stage2> ReleasedRam<S> {
         let started = Instant::now();
         let before = phys_footprint();
         let chunk = sweep_chunk_bytes();
-        for region in &self.regions {
+        // Owned-block RAM bills a page once however many pmaps map it: nothing to settle.
+        for region in self
+            .regions
+            .iter()
+            .filter(|r| self.owned_at(r.gpa).is_none())
+        {
             let region_end = region.gpa + region.len;
             let mut pos = region.gpa;
             while pos < region_end {
@@ -1218,6 +1301,7 @@ mod tests {
 mod every_sequence {
     use super::{FaultOutcome, ReleasedRam, Stage2, ZeroOnRelease, contains_point, hv_return_t};
     use crate::bindings::{HV_ERROR, HV_SUCCESS};
+    use crate::guest_ram::BlockLayout;
     use crate::host_page_size;
     use std::ops::Range;
     use std::sync::Mutex;
@@ -1251,10 +1335,17 @@ mod every_sequence {
         }
     }
 
+    /// Pages per owned block, when region A is owned-block RAM.
+    const BLOCK_PAGES: usize = 2;
+
     #[derive(Default)]
     struct State {
         unmapped: [bool; PAGES],
         reusable: [bool; PAGES],
+        /// Region A is owned-block RAM.
+        owned: bool,
+        /// Renewed since its last unmap.
+        renewed: [bool; PAGES],
         fail_unmap: bool,
         fail_map: bool,
         wrong: Vec<String>,
@@ -1298,6 +1389,7 @@ mod every_sequence {
             }
             for p in Self::pages_of_gpa(&mut s, gpa, len) {
                 s.unmapped[p] = true;
+                s.renewed[p] = false;
             }
             HV_SUCCESS as hv_return_t
         }
@@ -1338,6 +1430,10 @@ mod every_sequence {
                     s.wrong
                         .push(format!("page {p} made reusable while the guest reaches it"));
                 }
+                if s.owned && REGION_A.contains(&p) {
+                    s.wrong
+                        .push(format!("owned page {p} made reusable, which does nothing"));
+                }
                 s.reusable[p] = true;
             }
             Ok(())
@@ -1347,6 +1443,29 @@ mod every_sequence {
             let mut s = self.0.lock().unwrap();
             for p in Self::pages_of_host(&mut s, host, len) {
                 s.reusable[p] = false;
+            }
+            Ok(())
+        }
+
+        unsafe fn renew(&self, host: u64, len: u64) -> std::io::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            let pages = Self::pages_of_host(&mut s, host, len);
+            if pages.len() != BLOCK_PAGES
+                || !(pages[0] - REGION_A.start).is_multiple_of(BLOCK_PAGES)
+            {
+                s.wrong
+                    .push(format!("pages {pages:?} renewed, which is not one block"));
+            }
+            for p in pages {
+                if !s.unmapped[p] {
+                    s.wrong
+                        .push(format!("page {p} renewed while the guest reaches it"));
+                }
+                if !(s.owned && REGION_A.contains(&p)) {
+                    s.wrong
+                        .push(format!("page {p} renewed, which is not owned"));
+                }
+                s.renewed[p] = true;
             }
             Ok(())
         }
@@ -1481,6 +1600,16 @@ mod every_sequence {
         if let Some(w) = s.wrong.first() {
             return Err(w.clone());
         }
+        if s.owned {
+            for block in REGION_A.step_by(BLOCK_PAGES) {
+                let pages = block..block + BLOCK_PAGES;
+                if pages.clone().all(|p| e.released[p]) && !pages.clone().all(|p| s.renewed[p]) {
+                    return Err(format!(
+                        "block {pages:?} is wholly released and was not renewed"
+                    ));
+                }
+            }
+        }
         let set = rr.released.lock().unwrap();
         let not = |b: bool| if b { "" } else { "not " };
         for p in (0..PAGES).filter(|&p| region(p).is_some()) {
@@ -1503,22 +1632,31 @@ mod every_sequence {
         Ok(())
     }
 
-    fn run(seq: &[Op]) -> Result<(), String> {
+    fn run(seq: &[Op], owned: bool) -> Result<(), String> {
         let regions = [REGION_A, REGION_B]
             .into_iter()
             .map(|r| (gpa(r.start), host_of(r.start), r.len() as u64 * page()))
             .collect();
-        let rr = ReleasedRam::with_stage2(
+        let mut rr = ReleasedRam::with_stage2(
             Model::default(),
             regions,
             WINDOW_PAGES * page(),
             ZeroOnRelease::InflateQueue,
         );
+        if owned {
+            let layout = BlockLayout::uniform(BLOCK_PAGES as u64 * page()).unwrap();
+            let size = REGION_A.len() as u64 * page();
+            rr = rr.with_owned_blocks(gpa(REGION_A.start), size, layout);
+            rr.stage2.0.lock().unwrap().owned = true;
+        }
         let mut e = Expect::default();
         for (i, &op) in seq.iter().enumerate() {
             step(&rr, &mut e, op)
                 .and_then(|()| check(&rr, &e))
-                .map_err(|m| format!("{:?}, at step {}: {m}", &seq[..=i], i + 1))?;
+                .map_err(|m| {
+                    let ram = if owned { "owned-block" } else { "anonymous" };
+                    format!("{:?} on {ram} RAM, at step {}: {m}", &seq[..=i], i + 1)
+                })?;
         }
         Ok(())
     }
@@ -1537,8 +1675,10 @@ mod every_sequence {
     }
 
     fn replay(seq: &[Op]) {
-        if let Err(m) = run(seq) {
-            panic!("{m}");
+        for owned in [false, true] {
+            if let Err(m) = run(seq, owned) {
+                panic!("{m}");
+            }
         }
     }
 
@@ -1658,6 +1798,17 @@ mod loom_model {
             let mut s = self.0.lock().unwrap();
             for p in index(host, HOST)..index(host + len, HOST) {
                 s.reusable[p] = false;
+            }
+            Ok(())
+        }
+
+        unsafe fn renew(&self, host: u64, len: u64) -> std::io::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            for p in index(host, HOST)..index(host + len, HOST) {
+                if !s.unmapped[p] {
+                    s.wrong
+                        .push(format!("page {p} renewed while the guest reaches it"));
+                }
             }
             Ok(())
         }
