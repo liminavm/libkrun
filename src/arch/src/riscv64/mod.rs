@@ -45,6 +45,7 @@ pub fn arch_memory_regions(
         page_size,
         initrd_addr: ram_last_addr - layout::FDT_MAX_SIZE as u64 - initrd_size,
         firmware_addr: FIRMWARE_START,
+        hotplug_ram: None,
     };
     let regions = vec![(GuestAddress(layout::DRAM_MEM_START), dram_size)];
 
