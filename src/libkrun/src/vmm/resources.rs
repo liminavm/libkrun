@@ -30,6 +30,11 @@ use crate::vmm::vstate::VcpuConfig;
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
 
+#[cfg(target_os = "macos")]
+pub use hvf::IpaGranule;
+#[cfg(target_os = "macos")]
+pub use hvf::guest_ram::BlockLayout;
+
 type Result<E> = std::result::Result<(), E>;
 
 /// Errors encountered when configuring microVM resources.
@@ -114,15 +119,74 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// Stage-2 translation granule to create the VM with. `None` keeps the host default
+    /// (16 KiB on Apple silicon), which cannot express a 4 KiB-page guest's memory layout.
+    #[cfg(target_os = "macos")]
+    pub ipa_granule: Option<IpaGranule>,
+    /// limina: build guest RAM from owned memory blocks cut this way (`hvf::guest_ram`), which
+    /// bill a page the VMM and the guest both touch once, and release by whole block. `None`
+    /// keeps an anonymous mapping.
+    #[cfg(target_os = "macos")]
+    pub guest_ram_blocks: Option<BlockLayout>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
-    /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
-    /// discovered via the kernel command line and SMP uses the MP table.
+    /// Whether to expose ACPI tables. x86_64: when disabled, virtio-mmio devices are discovered
+    /// via the kernel command line and SMP uses the MP table. aarch64 (limina, firmware boots
+    /// only): the VMM also writes ACPI tables for the firmware to hand the OS in place of the
+    /// device tree.
     pub acpi_enabled: bool,
+    /// aarch64 ACPI only: name the serial port in an SPCR, which makes it the OS's preferred
+    /// console the way the device tree's `stdout-path` does, but as its only console.
+    pub acpi_spcr: bool,
+    /// limina, firmware boots: arguments the firmware adds to a Linux kernel's command line as it
+    /// starts it, handed over in the device tree's `/chosen/libkrun,extra-bootargs`.
+    pub extra_bootargs: Option<String>,
+    /// limina, aarch64 firmware boots: a BMP for the firmware to show as its boot logo in place
+    /// of its own, written at `BOOT_LOGO_START`. At most `BOOT_LOGO_SIZE` bytes; the firmware
+    /// decides whether it is a logo it can draw.
+    pub boot_logo: Option<Vec<u8>>,
+    /// limina, firmware boots: ask the firmware to show its console and the loader's boot menu
+    /// this boot (`/chosen/libkrun,boot-menu`).
+    pub boot_menu: bool,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
+    /// limina: attach the emulated xHCI USB controller (platform `generic-xhci`).
+    /// A plain bool so callers need no `usb`-feature cfg; the builder only acts on
+    /// it when built with the `usb` feature (see devices::usb::xhci). Default off —
+    /// a stock guest without it simply has no USB bus.
+    pub usb: bool,
+    /// limina: expose the virtual cpufreq controller (`qemu,virtual-cpufreq`) to the guest.
+    /// Default off. It carries no interrupt and does not change how fast anything runs; it
+    /// exists so the guest gains cpufreq policies and a frequency-invariance source, which are
+    /// two of the preconditions for Energy Aware Scheduling (see devices::legacy::VirtCpuFreq).
+    pub cpufreq: bool,
+    /// limina: attach a TPM 2.0 (the TIS interface over MMIO, `tcg,tpm-tis-mmio`), backed by the
+    /// janus engine. Default off. Exists only in a build with the `tpm` feature, so a VMM cannot
+    /// ask for a TPM it was built without.
+    #[cfg(feature = "tpm")]
+    pub tpm: bool,
+    /// limina: the file the TPM's NV lives in across runs, made with a new TPM when absent.
+    /// `None` keeps it in memory for the life of the VM.
+    #[cfg(feature = "tpm")]
+    pub tpm_state: Option<std::path::PathBuf>,
+    /// limina: the file a firmware's UEFI variables live in across runs, mapped into the guest
+    /// at `EFI_VARS_START` (aarch64, firmware boot only). Created when absent. `None` leaves the
+    /// firmware's variables in RAM for one run.
+    pub efi_vars: Option<std::path::PathBuf>,
+    /// limina: how many of the vCPUs are "little" — advertised to the guest with a lower
+    /// `capacity-dmips-mhz` and their own perf domain, and backed on the host by a vCPU thread
+    /// at a macOS QoS class that lands it on an efficiency core. The last `little_vcpus` vCPUs
+    /// are the little ones; CPU0 is never one. Ignored unless `cpufreq` is on, since the
+    /// asymmetry is only useful to a guest that also has cpufreq policies. Default 0 —
+    /// a uniform machine.
+    pub little_vcpus: u32,
+    /// limina: software-defined USB devices cold-plugged to the emulated xHCI
+    /// controller's root ports (one per port, in order) before boot. Set by the
+    /// caller (`limina-vmm`); the controller enumerates them once `usb` is on.
+    #[cfg(feature = "usb")]
+    pub usb_devices: Vec<std::sync::Arc<dyn devices::usb::UsbDeviceModel>>,
 }
 
 impl VmResources {
@@ -264,10 +328,28 @@ mod tests {
             external_kernel: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            #[cfg(target_os = "macos")]
+            ipa_granule: None,
+            #[cfg(target_os = "macos")]
+            guest_ram_blocks: None,
             split_irqchip: false,
             acpi_enabled: false,
+            acpi_spcr: false,
+            extra_bootargs: None,
+            boot_logo: None,
+            boot_menu: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
+            usb: false,
+            cpufreq: false,
+            #[cfg(feature = "tpm")]
+            tpm: false,
+            #[cfg(feature = "tpm")]
+            tpm_state: None,
+            efi_vars: None,
+            little_vcpus: 0,
+            #[cfg(feature = "usb")]
+            usb_devices: Vec::new(),
         }
     }
 

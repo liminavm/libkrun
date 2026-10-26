@@ -22,6 +22,7 @@ use std::os::fd::{AsFd, BorrowedFd, FromRawFd};
 use std::os::windows::io::AsHandle;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
@@ -54,6 +55,8 @@ use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
 use devices::virtio::{MmioTransport, VirtioDevice};
+#[cfg(target_os = "macos")]
+use hvf::IpaGranule;
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -83,20 +86,25 @@ use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemoryRegion;
-#[cfg(all(
-    target_arch = "x86_64",
-    not(feature = "tee"),
-    not(target_os = "windows")
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_arch = "x86_64",
+        not(feature = "tee"),
+        not(target_os = "windows")
+    )
 ))]
 use vm_memory::GuestRegionMmap;
-#[cfg(all(
-    target_arch = "x86_64",
-    not(feature = "tee"),
-    not(target_os = "windows")
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_arch = "x86_64",
+        not(feature = "tee"),
+        not(target_os = "windows")
+    )
 ))]
 use vm_memory::mmap::MmapRegion;
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -164,6 +172,15 @@ pub enum StartMicrovmError {
     Internal(Error),
     /// Cannot inject the kernel into the guest memory due to a problem with the bundle.
     InvalidKernelBundle(vm_memory::mmap::MmapRegionError),
+    /// limina: the TPM's state file could not be read, restored or first written.
+    #[cfg(feature = "tpm")]
+    TpmState(io::Error),
+    /// limina: the UEFI variable store's file could not be opened, made or used.
+    EfiVars(io::Error),
+    /// limina: the machine cannot be described with ACPI.
+    Acpi(String),
+    /// limina: the boot logo cannot be handed to the firmware.
+    BootLogo(String),
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// The kernel doesn't fit into the microVM memory.
@@ -360,6 +377,11 @@ impl Display for StartMicrovmError {
             ),
             InitrdRead(ref err) => write!(f, "Cannot load initrd due to an invalid image: {err}"),
             Internal(ref err) => write!(f, "Internal error while starting microVM: {err:?}"),
+            #[cfg(feature = "tpm")]
+            TpmState(ref err) => write!(f, "Cannot load the TPM's state: {err}"),
+            EfiVars(ref err) => write!(f, "Cannot map the UEFI variable store: {err}"),
+            Acpi(ref err) => write!(f, "Cannot describe the machine with ACPI: {err}"),
+            BootLogo(ref err) => write!(f, "Cannot hand over the boot logo: {err}"),
             InvalidKernelBundle(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -756,13 +778,28 @@ fn measure_qboot_regions(
 }
 
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
+///
+/// This is the default build recipe, one could build other microVM flavors by using the
+/// independent functions in this module instead of calling this recipe.
+///
+/// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
+/// is returned.
+#[allow(clippy::too_many_arguments)]
 pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
+    _suspend_efd: Option<EventFd>,
+    _restart_efd: Option<EventFd>,
+    _wake_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     device_manager: Box<dyn crate::api::device_builders::DeviceManager<'_> + '_>,
+    restore_from: Option<PathBuf>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    // M9 suspend/resume is macOS/HVF-only; other targets never restore.
+    #[cfg(not(target_os = "macos"))]
+    let _ = &restore_from;
+
     let payload = choose_payload(vm_resources)?;
 
     #[cfg(all(
@@ -806,7 +843,12 @@ pub fn build_microvm(
     let gpu_shm_size = requirements.iter().filter_map(|r| r.gpu_shm).next();
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
+    #[cfg(feature = "gpu")]
+    let gpu_ext_sizes = requirements.iter().filter_map(|r| r.gpu_ext).next();
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ext_sizes: Option<(usize, usize)> = None;
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
+    let hotplug_ram = requirements.iter().filter_map(|r| r.hotplug_ram).next();
 
     #[cfg(feature = "tdx")]
     let td_shim_parsed = match &vm_resources.tee_firmware_config {
@@ -839,9 +881,16 @@ pub fn build_microvm(
         #[cfg(feature = "tee")]
         vm_resources.initrd_bundle.as_ref(),
         vm_resources.firmware_config.as_ref(),
+        vm_resources.efi_vars.as_deref(),
+        vm_resources.acpi_enabled,
+        vm_resources.boot_logo.as_deref(),
         &fs_shm_sizes,
         gpu_shm_size,
+        gpu_ext_sizes,
         use_vhost_user,
+        hotplug_ram,
+        #[cfg(target_os = "macos")]
+        vm_resources.guest_ram_blocks.as_ref(),
         &payload,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
@@ -917,6 +966,8 @@ pub fn build_microvm(
         &guest_memory,
         &mut arch_memory_info,
         vm_resources.nested_enabled,
+        #[cfg(target_os = "macos")]
+        vm_resources.ipa_granule,
     )?;
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
@@ -1289,7 +1340,14 @@ pub fn build_microvm(
             // userspace implementation.
             let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
-                Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
+                Err(_) => {
+                    // limina wake-probe: only the userspace GIC routes interrupts through
+                    // `set_irq_common` and traps the guest's ICC_IAR1_EL1 acknowledge, so only
+                    // here can the return half of the wake chain be timed. Tell the probe, so
+                    // it says the hop is unavailable instead of just omitting it.
+                    devices::virtio::wake_probe::note_software_gic();
+                    IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone())))
+                }
             };
             Arc::new(Mutex::new(gic))
         };
@@ -1313,7 +1371,61 @@ pub fn build_microvm(
             serial_devices,
             event_manager,
             _shutdown_efd,
+            _suspend_efd,
+            _restart_efd,
+            _wake_efd,
+            vcpu_list.clone(),
         )?;
+
+        // limina: emulated xHCI USB controller (opt-in). Registered after the legacy
+        // devices so their MMIO/IRQ layout is unchanged when USB is off; a stock guest
+        // binds it via its own xhci-plat driver (see devices::usb::xhci).
+        #[cfg(feature = "usb")]
+        if vm_resources.usb {
+            mmio_device_manager
+                .register_mmio_xhci(
+                    &vm,
+                    intc.clone(),
+                    event_manager,
+                    &guest_memory,
+                    vm_resources.usb_devices.clone(),
+                )
+                .map_err(Error::RegisterMMIODevice)
+                .map_err(StartMicrovmError::Internal)?;
+        }
+
+        // limina: virtual cpufreq (opt-in). Registered LAST, after every interrupt-carrying
+        // device, because it takes no IRQ of its own — putting it here means switching it on
+        // cannot shift any other device's interrupt line.
+        if vm_resources.cpufreq {
+            let num_cpus = vm_resources.vm_config().vcpu_count.unwrap_or(1) as usize;
+            let little = vm_resources.little_vcpus.min(num_cpus as u32);
+            let per_cpu = devices::legacy::VcpuPerfDomain::topology(num_cpus, little as usize);
+            // The host half of the asymmetry: the same vCPUs the guest is told are slow get a
+            // QoS class macOS serves on an efficiency core. Without this the capacities are a
+            // fiction and EAS packs work onto CPUs that are not actually cheaper.
+            #[cfg(target_os = "macos")]
+            crate::vmm::macos::vcpu_sched::set_topology(num_cpus as u64, little as u64);
+            mmio_device_manager
+                .register_mmio_cpufreq(per_cpu)
+                .map_err(Error::RegisterMMIODevice)
+                .map_err(StartMicrovmError::Internal)?;
+        }
+
+        // limina: TPM 2.0 (opt-in). No IRQ either, so it goes last for the same reason.
+        #[cfg(feature = "tpm")]
+        if vm_resources.tpm {
+            let backend = match &vm_resources.tpm_state {
+                Some(path) => devices::tpm::JanusBackend::with_state_file(path)
+                    .map_err(StartMicrovmError::TpmState)?,
+                None => devices::tpm::JanusBackend::new(),
+            };
+            let tpm = devices::tpm::TpmTis::new(backend);
+            mmio_device_manager
+                .register_mmio_tpm(tpm)
+                .map_err(Error::RegisterMMIODevice)
+                .map_err(StartMicrovmError::Internal)?;
+        }
     }
 
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
@@ -1348,6 +1460,35 @@ pub fn build_microvm(
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
 
+    // The balloon's stage-2 release/heal tracker, over the RAM regions only: the GPU/fs SHM
+    // window at/above shm_start_addr is managed by blob mappings and must keep its M9.3
+    // unmapped-on-restore fault signature.
+    #[cfg(target_os = "macos")]
+    let released_ram = {
+        use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+        let shm_start = arch_memory_info.shm_start_addr;
+        // virtio-mem's region is not the balloon's: the device gives its blocks back itself.
+        let hotplug = arch_memory_info.hotplug_ram.map(|(gpa, _)| gpa);
+        let regions = guest_memory
+            .iter()
+            .filter(|r| shm_start == 0 || r.start_addr().raw_value() < shm_start)
+            .filter(|r| Some(r.start_addr().raw_value()) != hotplug)
+            .map(|r| {
+                let host = guest_memory.get_host_address(r.start_addr()).unwrap() as u64;
+                (r.start_addr().raw_value(), host, r.len())
+            })
+            .collect();
+        let released_ram = hvf::ReleasedRam::new(regions);
+        Arc::new(match &vm_resources.guest_ram_blocks {
+            Some(layout) => released_ram.with_owned_blocks(
+                arch_memory_info.ram_start_addr,
+                arch_memory_info.ram_last_addr - arch_memory_info.ram_start_addr,
+                layout.clone(),
+            ),
+            None => released_ram,
+        })
+    };
+
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
@@ -1372,6 +1513,21 @@ pub fn build_microvm(
         paused: false,
         #[cfg(target_os = "macos")]
         paused_at: 0,
+        #[cfg(target_os = "macos")]
+        vtimer_offset: 0,
+        #[cfg(feature = "gpu")]
+        gpu_timing: None,
+        #[cfg(feature = "gpu")]
+        gpu_resize_handle: None,
+        #[cfg(feature = "gpu")]
+        gpu_device: None,
+        balloon_control_handle: None,
+        #[cfg(not(feature = "tee"))]
+        mem_device: None,
+        #[cfg(target_os = "macos")]
+        vcpu_list: vcpu_list.clone(),
+        #[cfg(target_os = "macos")]
+        released_ram,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -1443,16 +1599,194 @@ pub fn build_microvm(
         any(target_os = "linux", target_os = "windows")
     )))]
     let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
+    // M9 restore: read + validate the snapshot, hand each vCPU its saved state and the shared
+    // GIC-restore gate, and stash the RAM/GIC for the two steps below (RAM overwrite after
+    // `configure_system`, GIC restore after `start_vcpus`). `vcpus` is consumed and rebuilt so it
+    // stays immutable on the fresh-boot path. `restore_release` is `None` for a normal boot.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    let (vcpus, restore_release): (
+        Vec<Vcpu>,
+        Option<(
+            crate::vmm::snapshot::SnapshotFile,
+            Arc<crate::vmm::vstate::RestoreGate>,
+        )>,
+    ) = if let Some(ref path) = restore_from {
+        let t0 = std::time::Instant::now();
+        let mut snap = crate::vmm::snapshot::read(path)
+            .map_err(|e| StartMicrovmError::Internal(crate::vmm::Error::SnapshotIo(e)))?;
+        info!(
+            "restore: read + validated the snapshot head ({} MiB file; RAM frames stream in \
+             behind it) in {:.1}s",
+            std::fs::metadata(path).map(|m| m.len() >> 20).unwrap_or(0),
+            t0.elapsed().as_secs_f32()
+        );
+        if snap.head.vcpus.len() != vcpus.len() {
+            // Snapshot vCPU count must match this boot's --cpus, or the register state is nonsense.
+            return Err(StartMicrovmError::Internal(crate::vmm::Error::Snapshot));
+        }
+        // M9.3 fail-closed layout identity: the guest's page tables and the device SHM-window mappings
+        // are baked into the snapshotted RAM at these exact addresses, so restoring into a worker with
+        // a different RAM/SHM layout (e.g. a different --ram-mib) is silent corruption, not migration.
+        let expected = crate::vmm::snapshot::LayoutInfo {
+            ram_start: vmm.arch_memory_info.ram_start_addr,
+            ram_last: vmm.arch_memory_info.ram_last_addr,
+            shm_start: vmm.arch_memory_info.shm_start_addr,
+            firmware: vmm.arch_memory_info.ram_start_addr == 0x4000_0000,
+        };
+        if snap.head.layout != expected {
+            error!(
+                "restore: snapshot memory layout {:?} != this worker's {:?} — refusing (fail closed)",
+                snap.head.layout, expected
+            );
+            return Err(StartMicrovmError::Internal(crate::vmm::Error::Snapshot));
+        }
+        // limina: the virtio-mem region is part of the layout: the guest onlined its plugged
+        // blocks at these addresses.
+        let saved = snap.head.hotplug.as_ref().map(|m| (m.addr, m.region_size));
+        if saved != vmm.arch_memory_info.hotplug_ram {
+            let why = format!(
+                "restore refused: this VM was suspended with virtio-mem region {saved:x?} and \
+                 has {:x?} now",
+                vmm.arch_memory_info.hotplug_ram
+            );
+            error!("{why}");
+            return Err(StartMicrovmError::Internal(
+                crate::vmm::Error::RestoreRefused(why),
+            ));
+        }
+        // limina: a guest suspended with a TPM holds keys, sessions and sealed secrets in it, and
+        // its driver is bound to the device. Refused by name, before the slots: the TPM's window
+        // happens to sit below the virtio devices, so they move too, but that is no guarantee.
+        if snap.head.tpm.is_some() && vmm.mmio_device_manager.tpm.is_none() {
+            let why =
+                "restore refused: this VM was suspended with a TPM and has none now".to_string();
+            error!("{why}");
+            return Err(StartMicrovmError::Internal(
+                crate::vmm::Error::RestoreRefused(why),
+            ));
+        }
+        // A guest suspended at EL2 left its hypervisor's state in registers a VM without EL2 does
+        // not have, and a guest that never had EL2 cannot be handed one mid-run.
+        if let Some(saved) = snap.head.vcpus.first().map(|v| v.nested()) {
+            let here = vm_resources.nested_enabled;
+            if saved != Some(here) {
+                let why = match saved {
+                    Some(true) => {
+                        "restore refused: this VM was suspended with nested virtualization on, \
+                         and it is off now"
+                    }
+                    Some(false) => {
+                        "restore refused: this VM was suspended with nested virtualization off, \
+                         and it is on now"
+                    }
+                    None => "restore refused: the snapshot's vCPU registers match no known layout",
+                }
+                .to_string();
+                error!("{why}");
+                return Err(StartMicrovmError::Internal(
+                    crate::vmm::Error::RestoreRefused(why),
+                ));
+            }
+        }
+        // Every device is attached by now, and a guest driver bound to a slot that now holds a
+        // different device spins on it (a vsock driver rings an input device and floods the log
+        // with HdrDescTooSmall). Refused before the RAM is applied, so a refusal costs nothing.
+        match &snap.head.slots {
+            Some(captured) => {
+                let here = vmm.mmio_device_manager.device_slots();
+                if let Some(diff) = crate::vmm::snapshot::slot_mismatch(captured, &here) {
+                    let why = format!(
+                        "restore refused: this VM's devices differ from the ones it was \
+                         suspended with ({diff})"
+                    );
+                    error!("{why}");
+                    return Err(StartMicrovmError::Internal(
+                        crate::vmm::Error::RestoreRefused(why),
+                    ));
+                }
+            }
+            None => warn!("restore: the snapshot predates the device-slot record; not checked"),
+        }
+        // The same devices at the same slots can still offer the guest something else: a build
+        // that adds a console port or a feature bit leaves the guest's driver set up for the old
+        // device. Checked after the slots, so a moved device is reported as moved.
+        match &snap.head.fingerprints {
+            Some(captured) => {
+                let here = vmm.mmio_device_manager.device_fingerprints();
+                if let Some(diff) = crate::vmm::snapshot::fingerprint_mismatch(captured, &here) {
+                    let why = format!(
+                        "restore refused: this VM's devices offer the guest something other than \
+                         what it was suspended with ({diff})"
+                    );
+                    error!("{why}");
+                    return Err(StartMicrovmError::Internal(
+                        crate::vmm::Error::RestoreRefused(why),
+                    ));
+                }
+            }
+            None if snap.head.slots.is_some() => warn!(
+                "restore: the snapshot predates the device fingerprint; device features and \
+                 ports not checked"
+            ),
+            None => {}
+        }
+        let gate = Arc::new(crate::vmm::vstate::RestoreGate::default());
+        let vcpu_states = std::mem::take(&mut snap.head.vcpus);
+        if let Some(first) = vcpu_states.first() {
+            vmm.note_vtimer_offset(first.vtimer_offset);
+        }
+        let vcpus = vcpus
+            .into_iter()
+            .zip(vcpu_states)
+            .map(|(mut v, st)| {
+                v.set_restore(st, gate.clone());
+                v
+            })
+            .collect();
+        (vcpus, Some((snap, gate)))
+    } else {
+        (vcpus, None)
+    };
+
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
         &payload_config.initrd_config,
         &vm_resources.smbios_oem_strings,
         vm_resources.acpi_enabled,
+        vm_resources.acpi_spcr,
+        vm_resources.extra_bootargs.as_deref(),
+        vm_resources.boot_logo.as_ref().map(Vec::len),
+        vm_resources.boot_menu,
         &virtio_mmio_devices,
         payload_config.pvh,
     )
     .map_err(StartMicrovmError::Internal)?;
+
+    // M9 restore: overwrite guest RAM from the snapshot AFTER `configure_system` has written the
+    // fresh FDT. The snapshot RAM already holds the guest's own FDT and full memory image as of
+    // suspend and is authoritative — the guest resumes mid-execution from its saved PC and never
+    // re-reads the FDT. (The GPU/fs SHM window was excluded at save time and is re-established by
+    // the guest, per Strategy A; it is not overwritten here.)
+    #[cfg(target_os = "macos")]
+    if let Some((snap, _)) = &restore_release {
+        let t0 = std::time::Instant::now();
+        let stats = snap.apply_ram(vmm.guest_memory()).map_err(|e| {
+            error!("restore: applying snapshot RAM failed: {e}");
+            StartMicrovmError::Internal(crate::vmm::Error::Snapshot)
+        })?;
+        info!(
+            "restore: applied {} MiB RAM ({} zero / {} data frames) in {:.1}s (pool: {:.1}s \
+             decoding, {:.1}s storing into guest RAM)",
+            stats.ram_bytes >> 20,
+            stats.zero_frames,
+            stats.data_frames,
+            t0.elapsed().as_secs_f32(),
+            stats.decode.as_secs_f32(),
+            stats.store.as_secs_f32()
+        );
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1490,6 +1824,81 @@ pub fn build_microvm(
 
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+
+    // M9 restore: `start_vcpus` returns only once every vCPU has created its HVF vCPU (its
+    // per-vCPU TLS-init handshake fires right after `HvfVcpu::new`, which sets MPIDR) — so all
+    // MPIDRs are set and each restoring vCPU is now parked on the gate. Restore the VM-wide
+    // in-kernel GIC (distributor + redistributor), then open the gate so each vCPU restores its
+    // own register file (including its ICC/CPU-interface regs, on its own thread) and runs.
+    #[cfg(target_os = "macos")]
+    if let Some((snap, gate)) = &restore_release {
+        let gic = &snap.head.gic;
+        let devices = &snap.head.devices;
+        let gpu = &snap.head.gpu;
+        hvf::restore_gic_state(gic)
+            .map_err(|_| StartMicrovmError::Internal(crate::vmm::Error::Snapshot))?;
+        // Restore the PL061 register file into the fresh GPIO device before releasing the vCPUs, so
+        // the wake injected after resume demuxes correctly (GPIOMIS = istate & im).
+        if let Some(gpio) = &snap.head.gpio {
+            vmm.restore_gpio_state(gpio);
+        }
+        // M14: and the xHCI controller's host-side state, so the guest's light resume finds the
+        // controller it saved rather than a blank one (docs/design/usb-xhci-snapshot/). Ordered
+        // AFTER `restore_gic_state` on purpose: restoring can queue a port-change event, and the
+        // worker that eventually posts it pulses an SPI into whatever GIC state exists. The
+        // restore deliberately does NOT kick the worker — the guest's own resume register writes
+        // do that, once its vCPUs are released below.
+        #[cfg(feature = "usb")]
+        if let Some(usb) = &snap.head.usb {
+            vmm.restore_xhci_state(usb);
+        }
+        // limina: the virtio-mem device as the guest left it; its driver reads the plugged size
+        // back on thaw.
+        if let Some(mem) = &snap.head.hotplug {
+            vmm.restore_mem_state(mem)
+                .map_err(StartMicrovmError::Internal)?;
+        }
+        // limina: the TPM as the guest left it. A VM without one was refused above.
+        if let Some(tpm) = &snap.head.tpm {
+            vmm.restore_tpm_state(tpm).map_err(|e| {
+                error!("restore: {e}");
+                StartMicrovmError::Internal(crate::vmm::Error::Snapshot)
+            })?;
+        }
+        // M9.3: validate + log the captured device transports. We do NOT re-drive them: RED-first +
+        // R4 (2026-07-18) proved the guest re-negotiates every virtio device ITSELF on s2idle thaw
+        // (`virtio_device_restore` resets + re-drives DRIVER_OK; the fresh worker activates from the
+        // guest's own writes), so a restore-side negotiation replay is redundant. The GPU is captured
+        // only because it lacks driver PM ops (the sole device left non-INIT at snapshot) but is still
+        // re-negotiated on thaw. This pass fails closed on device-topology drift and logs for
+        // diagnostics; the real venus-resume wedge is lost HOST-side venus context state, handled by
+        // the retain-and-replay work, not here. Runs before the gate opens.
+        if !devices.is_empty() {
+            vmm.mmio_device_manager
+                .validate_transport_states(devices)
+                .map_err(|e| {
+                    error!("restore: virtio transport validation failed: {e}");
+                    StartMicrovmError::Internal(crate::vmm::Error::Snapshot)
+                })?;
+        }
+        // M9.3 venus snapshot-replay: stage the v5 GPU section on the device. The worker
+        // replays it at the guest thaw's re-activation — after the thaw reset (whose
+        // `reset_session` would wipe an earlier replay) and before the first queue command,
+        // whose venus state it re-creates. A failed replay is logged by the worker and the
+        // guest gets the fresh-renderer behavior (session restart), never a wedge.
+        #[cfg(feature = "gpu")]
+        if let Some(data) = gpu
+            && vmm.restore_gpu(data.clone())
+        {
+            info!(
+                "restore: staged {}-byte GPU re-creation payload for replay on thaw",
+                data.len()
+            );
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = gpu;
+        gate.open();
+    }
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
@@ -1916,6 +2325,149 @@ pub struct PayloadConfig {
     pub pvh: bool,
 }
 
+/// limina: the guest region a firmware's UEFI variable store lives in, backed by `path` so every
+/// variable write reaches the file. A missing or empty file is made the store's size, zero-filled,
+/// for the firmware to format; a file of any other size is refused, never truncated, since it is
+/// some other store's variables.
+#[cfg(target_arch = "aarch64")]
+fn efi_vars_region(
+    path: &std::path::Path,
+    firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    use arch::aarch64::layout::{EFI_VARS_SIZE, EFI_VARS_START};
+
+    let refuse = |what: String| {
+        StartMicrovmError::EfiVars(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: {what}", path.display()),
+        ))
+    };
+    if !firmware {
+        return Err(refuse("a variable store needs a firmware boot".into()));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(StartMicrovmError::EfiVars)?;
+    let len = file.metadata().map_err(StartMicrovmError::EfiVars)?.len();
+    if len == 0 {
+        file.set_len(EFI_VARS_SIZE as u64)
+            .map_err(StartMicrovmError::EfiVars)?;
+    } else if len != EFI_VARS_SIZE as u64 {
+        return Err(refuse(format!(
+            "is {len} bytes, and a variable store is {EFI_VARS_SIZE}"
+        )));
+    }
+    Ok((
+        GuestAddress(EFI_VARS_START),
+        EFI_VARS_SIZE,
+        Some(FileOffset::new(file, 0)),
+    ))
+}
+
+/// limina: the guest region the ACPI tables are written to. Only a firmware hands ACPI to an
+/// arm64 OS (through its configuration table), so a direct kernel boot keeps the device tree.
+#[cfg(target_arch = "aarch64")]
+fn acpi_region(
+    firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    use arch::aarch64::layout::{ACPI_SIZE, ACPI_START};
+
+    if !firmware {
+        return Err(StartMicrovmError::Acpi(
+            "an arm64 guest only finds ACPI tables through a firmware".into(),
+        ));
+    }
+    Ok((GuestAddress(ACPI_START), ACPI_SIZE, None))
+}
+
+/// limina: the guest region a boot logo is written to: the whole window, whatever the logo's
+/// size, since untouched pages cost nothing. Only the firmware reads it.
+#[cfg(target_arch = "aarch64")]
+fn boot_logo_region(
+    logo: &[u8],
+    firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    use arch::aarch64::layout::{BOOT_LOGO_SIZE, BOOT_LOGO_START};
+
+    if !firmware {
+        return Err(StartMicrovmError::BootLogo(
+            "only a firmware shows a boot logo".into(),
+        ));
+    }
+    if logo.is_empty() || logo.len() > BOOT_LOGO_SIZE {
+        return Err(StartMicrovmError::BootLogo(format!(
+            "a boot logo is 1 to {BOOT_LOGO_SIZE} bytes, not {}",
+            logo.len()
+        )));
+    }
+    Ok((GuestAddress(BOOT_LOGO_START), BOOT_LOGO_SIZE, None))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn efi_vars_region(
+    path: &std::path::Path,
+    _firmware: bool,
+) -> std::result::Result<(GuestAddress, usize, Option<FileOffset>), StartMicrovmError> {
+    Err(StartMicrovmError::EfiVars(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{}: a file-backed variable store is aarch64-only",
+            path.display()
+        ),
+    )))
+}
+
+/// Guest memory over `regions`. On macOS, with a block layout, the RAM region (the one at
+/// `ram_start`) is built from owned blocks ([`hvf::guest_ram`]), which bill a page the VMM and the
+/// guest both touch once rather than once per mapping.
+/// Guest memory over `regions`; on macOS, those starting at an address in `owned` are built from
+/// owned memory blocks laid out as it says.
+fn guest_memory_over(
+    regions: &[(GuestAddress, usize, Option<FileOffset>)],
+    #[cfg(target_os = "macos")] owned: &[(u64, hvf::guest_ram::BlockLayout)],
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    let error = |e: &dyn std::fmt::Debug| StartMicrovmError::GuestMemoryMmap(format!("{e:?}"));
+    #[cfg(target_os = "macos")]
+    if !owned.is_empty() {
+        let regions = regions
+            .iter()
+            .map(|(addr, size, file)| {
+                let Some((_, blocks)) = owned.iter().find(|(at, _)| *at == addr.raw_value()) else {
+                    return GuestRegionMmap::from_range(*addr, *size, file.clone())
+                        .map_err(|e| error(&e));
+                };
+                let host = hvf::guest_ram::allocate(*size as u64, blocks).map_err(|e| error(&e))?;
+                // SAFETY: `allocate` made a readable and writable mapping of `size` bytes that is
+                // never unmapped.
+                let mapping = unsafe {
+                    MmapRegion::build_raw(
+                        host as *mut u8,
+                        *size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE,
+                    )
+                }
+                .map_err(|e| error(&e))?;
+                info!(
+                    "guest memory: {} MiB at {:#x} as owned blocks ({blocks:?})",
+                    size >> 20,
+                    addr.raw_value()
+                );
+                GuestRegionMmap::new(mapping, *addr).ok_or_else(|| error(&"RAM region overflows"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return GuestMemoryMmap::from_regions(regions).map_err(|e| error(&e));
+    }
+    GuestMemoryMmap::from_ranges_with_files(regions).map_err(|e| error(&e))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_guest_memory(
     mem_size: usize,
@@ -1927,9 +2479,15 @@ pub fn create_guest_memory(
         &crate::vmm::vmm_config::kernel_bundle::InitrdBundle,
     >,
     firmware_config: Option<&crate::vmm::vmm_config::firmware::FirmwareConfig>,
+    efi_vars: Option<&std::path::Path>,
+    acpi: bool,
+    boot_logo: Option<&[u8]>,
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
+    gpu_ext_sizes: Option<(usize, usize)>,
     use_vhost_user: bool,
+    hotplug_ram: Option<usize>,
+    #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
     payload: &Payload,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
 ) -> std::result::Result<
@@ -2019,11 +2577,38 @@ pub fn create_guest_memory(
     }
     #[cfg(not(feature = "gpu"))]
     let _ = gpu_shm_size;
+    #[cfg(feature = "gpu")]
+    if let Some((doorbells, arenas)) = gpu_ext_sizes {
+        shm_manager
+            .create_gpu_ext_regions(doorbells, arenas)
+            .map_err(StartMicrovmError::ShmCreate)?;
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_ext_sizes;
 
     let _ = use_vhost_user;
 
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
+
+    // limina: virtio-mem's region goes above everything else the guest can address, the shared
+    // memory window's base included, on a 1 GiB boundary, which Linux's 128 MiB memory blocks
+    // divide.
+    let hotplug_ram = hotplug_ram.map(|size| {
+        #[allow(unused_mut)]
+        let mut end = arch_mem_regions
+            .iter()
+            .map(|&(addr, size)| addr.raw_value() + size as u64)
+            .fold(arch_mem_info.shm_start_addr, u64::max);
+        #[cfg(feature = "gpu")]
+        if let Some((doorbells, arenas)) = shm_manager.gpu_ext_regions() {
+            for r in [doorbells, arenas] {
+                end = end.max(r.guest_addr.raw_value() + r.size as u64);
+            }
+        }
+        (end.next_multiple_of(1 << 30), size)
+    });
+    arch_mem_info.hotplug_ram = hotplug_ram.map(|(addr, size)| (addr, size as u64));
 
     let guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -2078,8 +2663,44 @@ pub fn create_guest_memory(
         #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
         unreachable!()
     } else {
-        GuestMemoryMmap::from_ranges(&arch_mem_regions)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+        let mut regions: Vec<_> = arch_mem_regions
+            .iter()
+            .map(|&(addr, size)| (addr, size, None))
+            .collect();
+        if let Some(path) = efi_vars {
+            regions.push(efi_vars_region(path, firmware_config.is_some())?);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if acpi {
+            regions.push(acpi_region(firmware_config.is_some())?);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(logo) = boot_logo {
+            regions.push(boot_logo_region(logo, firmware_config.is_some())?);
+        }
+        if let Some((addr, size)) = hotplug_ram {
+            regions.push((GuestAddress(addr), size, None));
+        }
+        // Guest memory takes its regions in address order, and the variable store and the ACPI
+        // window sit between the firmware and RAM.
+        regions.sort_by_key(|&(addr, _, _)| addr);
+        #[cfg(target_os = "macos")]
+        let owned: Vec<_> = guest_ram_blocks
+            .map(|layout| (arch_mem_info.ram_start_addr, layout.clone()))
+            .into_iter()
+            .chain(hotplug_ram.map(|(addr, _)| {
+                let block = devices::virtio::HOTPLUG_BLOCK_SIZE;
+                (
+                    addr,
+                    hvf::guest_ram::BlockLayout::uniform(block).expect("a valid block"),
+                )
+            }))
+            .collect();
+        guest_memory_over(
+            &regions,
+            #[cfg(target_os = "macos")]
+            &owned,
+        )?
     };
 
     let LoadedPayload {
@@ -2107,6 +2728,12 @@ pub fn create_guest_memory(
             .write(firmware_data, GuestAddress(arch_mem_info.firmware_addr))
             .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
     }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(logo) = boot_logo {
+        guest_mem
+            .write_slice(logo, GuestAddress(arch::aarch64::layout::BOOT_LOGO_START))
+            .map_err(|e| StartMicrovmError::BootLogo(format!("{e:?}")))?;
+    }
 
     let payload_config = PayloadConfig {
         entry_addr,
@@ -2116,6 +2743,12 @@ pub fn create_guest_memory(
     };
 
     arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
+    // The GPU extension's windows are not guest memory, but the IPA space must reach them.
+    #[cfg(feature = "gpu")]
+    if let Some((_, arenas)) = shm_manager.gpu_ext_regions() {
+        let end = arenas.guest_addr.raw_value() + arenas.size as u64 - 1;
+        arch_mem_info.guest_last_addr = arch_mem_info.guest_last_addr.max(end);
+    }
 
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
 }
@@ -2207,8 +2840,9 @@ pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     arch_mem_info: &mut ArchMemoryInfo,
     nested_enabled: bool,
+    ipa_granule: Option<IpaGranule>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(arch_mem_info, nested_enabled)
+    let mut vm = Vm::new(arch_mem_info, nested_enabled, ipa_granule)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
@@ -2349,6 +2983,7 @@ fn attach_legacy_devices(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn attach_legacy_devices(
     vm: &Vm,
     mmio_device_manager: &mut MMIODeviceManager,
@@ -2357,6 +2992,10 @@ fn attach_legacy_devices(
     serial: Vec<Arc<Mutex<Serial>>>,
     event_manager: &mut EventManager,
     shutdown_efd: Option<EventFd>,
+    suspend_efd: Option<EventFd>,
+    restart_efd: Option<EventFd>,
+    wake_efd: Option<EventFd>,
+    vcpu_list: Arc<VcpuList>,
 ) -> Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2366,7 +3005,7 @@ fn attach_legacy_devices(
     }
 
     mmio_device_manager
-        .register_mmio_rtc(vm, intc.clone())
+        .register_mmio_rtc(vm, intc.clone(), event_manager)
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 
@@ -2375,9 +3014,32 @@ fn attach_legacy_devices(
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 
+    // The GPIO device carries the poweroff, suspend, and restart buttons. We synthesize the
+    // suspend/restart eventfds when the caller didn't supply them so the buttons always exist
+    // (the guest side is harmless if never pulsed); the poweroff eventfd stays required.
     if let Some(shutdown_efd) = shutdown_efd {
+        let or_new = |efd: Option<EventFd>| -> Result<EventFd, StartMicrovmError> {
+            match efd {
+                Some(efd) => Ok(efd),
+                None => EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                    .map_err(Error::EventFd)
+                    .map_err(StartMicrovmError::Internal),
+            }
+        };
+        let suspend_efd = or_new(suspend_efd)?;
+        let restart_efd = or_new(restart_efd)?;
+        let wake_efd = or_new(wake_efd)?;
         mmio_device_manager
-            .register_mmio_gpio(vm, intc.clone(), event_manager, shutdown_efd)
+            .register_mmio_gpio(
+                vm,
+                intc.clone(),
+                event_manager,
+                shutdown_efd,
+                suspend_efd,
+                restart_efd,
+                wake_efd,
+                vcpu_list,
+            )
             .map_err(Error::RegisterMMIODevice)
             .map_err(StartMicrovmError::Internal)?;
     }
@@ -2486,7 +3148,14 @@ fn create_vcpus_aarch64(
         vcpus.push(vcpu);
     }
 
-    vcpus[0].set_boot_senders(boot_senders);
+    // Every vCPU gets the full boot-sender map (the senders are cheap clones sharing the same
+    // channels). At initial boot only cpu0 issues CPU_ON, but a RUNTIME re-online (CPU hotplug)
+    // issues CPU_ON from whatever CPU runs the hotplug thread — any online vCPU — so each must be
+    // able to route the entry to the target's boot channel. (Was cpu0-only, which dropped a
+    // re-online CPU_ON raised on a secondary with "CpuOn request coming from an unexpected vCPU".)
+    for vcpu in &mut vcpus {
+        vcpu.set_boot_senders(boot_senders.clone());
+    }
 
     Ok(vcpus)
 }
@@ -2524,7 +3193,10 @@ pub(crate) fn attach_mmio_device(
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
-    let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+    #[allow(unused_mut)]
+    let mut mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+    #[cfg(target_os = "macos")]
+    mmio_device.set_power_watch(vmm.vcpu_list.power_watch());
 
     let type_id = mmio_device.locked_device().device_type();
 
@@ -2590,7 +3262,15 @@ pub fn setup_terminal_raw_mode(
                 })));
             }
             Err(e) => {
-                log::error!("Failed to set terminal to raw mode: {e}")
+                // A serial fd that isn't a classic tty — e.g. a pty master, which doesn't
+                // support termios — can't be put in raw mode. That's expected and harmless
+                // (whatever attaches to the other end sets its own mode), so don't surface
+                // it as an error. Real failures still log loudly.
+                if e == nix::errno::Errno::ENOTTY {
+                    log::debug!("serial console fd does not support raw mode (not a tty): {e}")
+                } else {
+                    log::error!("Failed to set terminal to raw mode: {e}")
+                }
             }
         };
     }
@@ -2625,6 +3305,154 @@ pub mod tests {
     use super::*;
     use crate::vmm::vmm_config::kernel_bundle::KernelBundle;
 
+    /// A firmware boot with a variable store has guest memory there, in address order between
+    /// the firmware and RAM, and what the guest writes into it is in the file.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_firmware_boot_maps_its_variable_store_from_the_file() {
+        use arch::aarch64::layout::{EFI_VARS_SIZE, EFI_VARS_START};
+
+        let dir = std::env::temp_dir().join(format!("krun-efi-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let firmware = dir.join("fw.fd");
+        std::fs::write(&firmware, vec![0u8; 0x10000]).unwrap();
+        let vars = dir.join("efi.vars");
+
+        let (mem, _, _, _) = create_guest_memory(
+            64,
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            Some(&crate::vmm::vmm_config::firmware::FirmwareConfig {
+                path: firmware.clone(),
+            }),
+            Some(&vars),
+            false,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+            #[cfg(target_os = "macos")]
+            None,
+            &Payload::Firmware,
+            #[cfg(feature = "tee")]
+            None,
+        )
+        .unwrap();
+
+        let at = GuestAddress(EFI_VARS_START + 0x100);
+        mem.write_slice(b"BootOrder", at).unwrap();
+        let file = std::fs::read(&vars).unwrap();
+        assert_eq!(file.len(), EFI_VARS_SIZE);
+        assert_eq!(&file[0x100..0x109], b"BootOrder");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A firmware boot with a boot logo has the logo's bytes at the window's start, and the
+    /// window is refused without a firmware, empty, or past its size.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_firmware_boot_finds_its_boot_logo_in_the_window() {
+        use arch::aarch64::layout::{BOOT_LOGO_SIZE, BOOT_LOGO_START};
+
+        let dir = std::env::temp_dir().join(format!("krun-logo-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let firmware = dir.join("fw.fd");
+        std::fs::write(&firmware, vec![0u8; 0x10000]).unwrap();
+        let logo = b"BM a logo".to_vec();
+
+        let (mem, _, _, _) = create_guest_memory(
+            64,
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            #[cfg(feature = "tee")]
+            None,
+            Some(&crate::vmm::vmm_config::firmware::FirmwareConfig {
+                path: firmware.clone(),
+            }),
+            None,
+            false,
+            Some(&logo),
+            &[],
+            None,
+            None,
+            false,
+            None,
+            #[cfg(target_os = "macos")]
+            None,
+            &Payload::Firmware,
+            #[cfg(feature = "tee")]
+            None,
+        )
+        .unwrap();
+        let mut back = vec![0u8; logo.len()];
+        mem.read_slice(&mut back, GuestAddress(BOOT_LOGO_START))
+            .unwrap();
+        assert_eq!(back, logo);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let refused = |logo: &[u8], firmware| {
+            matches!(
+                boot_logo_region(logo, firmware),
+                Err(StartMicrovmError::BootLogo(_))
+            )
+        };
+        assert!(refused(b"BM", false));
+        assert!(refused(b"", true));
+        assert!(refused(&vec![0u8; BOOT_LOGO_SIZE + 1], true));
+        assert!(!refused(&vec![0u8; BOOT_LOGO_SIZE], true));
+    }
+
+    /// A new variable store is made the store's size and owner-only; a store already there keeps
+    /// its bytes; one of another size is refused and left alone; and without a firmware there is
+    /// nothing to give it to.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn efi_vars_region_makes_keeps_or_refuses_a_store() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use arch::aarch64::layout::{EFI_VARS_SIZE, EFI_VARS_START};
+
+        let dir = std::env::temp_dir().join(format!("krun-efi-vars-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("efi.vars");
+
+        let (addr, size, file) = efi_vars_region(&path, true).unwrap();
+        assert_eq!((addr, size), (GuestAddress(EFI_VARS_START), EFI_VARS_SIZE));
+        assert!(file.is_some());
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), EFI_VARS_SIZE as u64);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        let mut kept = vec![0u8; EFI_VARS_SIZE];
+        kept[..4].copy_from_slice(b"vars");
+        std::fs::write(&path, &kept).unwrap();
+        efi_vars_region(&path, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), kept);
+
+        std::fs::write(&path, b"short").unwrap();
+        assert!(matches!(
+            efi_vars_region(&path, true),
+            Err(StartMicrovmError::EfiVars(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+
+        assert!(matches!(
+            efi_vars_region(&dir.join("other.vars"), false),
+            Err(StartMicrovmError::EfiVars(_))
+        ));
+        assert!(!dir.join("other.vars").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[allow(unused)]
     fn default_guest_memory(
         mem_size_mib: usize,
@@ -2647,9 +3475,16 @@ pub mod tests {
             #[cfg(feature = "tee")]
             None,
             None,
-            &[],
             None,
             false,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+            #[cfg(target_os = "macos")]
+            None,
             &Payload::Empty,
             #[cfg(feature = "tee")]
             None,

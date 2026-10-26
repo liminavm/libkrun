@@ -19,14 +19,21 @@ pub mod block;
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
+pub mod dump_gate;
 pub mod file_traits;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(any(feature = "gpu", fuzzing, test))]
+pub mod gpu_snapshot;
+#[cfg(not(feature = "tee"))]
+pub mod i2c;
 #[cfg(feature = "input")]
 pub mod input;
 pub mod linux_errno;
+#[cfg(not(feature = "tee"))]
+pub mod mem;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
@@ -34,9 +41,12 @@ mod pci;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
+#[cfg(feature = "snd")]
+pub mod snd;
 #[cfg(feature = "vhost-user")]
 pub mod vhost_user;
 pub mod vsock;
+pub mod wake_probe;
 
 #[cfg(not(feature = "tee"))]
 pub use self::balloon::*;
@@ -44,10 +54,15 @@ pub use self::balloon::*;
 pub use self::block::{Block, CacheType};
 pub use self::console::*;
 pub use self::device::*;
+pub use self::dump_gate::{DumpGate, DumpSection};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
+#[cfg(not(feature = "tee"))]
+pub use self::i2c::*;
+#[cfg(not(feature = "tee"))]
+pub use self::mem::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
@@ -55,9 +70,24 @@ pub use self::pci::*;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
+#[cfg(feature = "snd")]
+pub use self::snd::*;
 #[cfg(feature = "vhost-user")]
 pub use self::vhost_user::VhostUserDevice;
 pub use self::vsock::*;
+
+/// Drain an eventfd (read its 8-byte counter) so a level-triggered "spurious" event on an inactive
+/// device doesn't immediately re-fire and busy-spin the worker's event loop. Used by the event
+/// handlers' not-yet-activated branch: after a device reset (suspend/resume) the queue/kick eventfds
+/// stay registered while the device is Inactive, and anything that writes one (a stale queue kick, or
+/// the host balloon policy kicking its target eventfd) would otherwise spin the loop at 100% CPU for
+/// the whole suspended interval. Nonblocking, so a spurious wakeup with nothing to read is harmless.
+pub(crate) fn drain_eventfd(fd: std::os::unix::io::RawFd) {
+    let mut buf = [0u8; 8];
+    // SAFETY: `fd` is a valid, nonblocking eventfd owned by the calling device; the read cannot
+    // block and writes only into our local buffer.
+    let _ = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+}
 
 /// When the driver initializes the device, it lets the device know about the
 /// completed stages using the Device Status Field.

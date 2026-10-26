@@ -1,0 +1,59 @@
+# libkrun's cargo-fuzz targets on the limina fork (limina's docs/design/in-crate-checkers.md). Its
+# own workspace, so `cargo fuzz` builds it with its own flags and the libkrun build never sees
+# libFuzzer.
+#
+#   cargo +nightly fuzz run <target> -- -max_total_time=<seconds>
+[package]
+name = "krun-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+devices = { package = "krun-devices", path = "../src/devices", features = ["usb"] }
+libfuzzer-sys = "0.4"
+utils = { package = "krun-utils", path = "../src/utils" }
+krun = { package = "libkrun", path = "../src/libkrun", features = ["usb"] }
+vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "xhci_guest"
+path = "fuzz_targets/xhci_guest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_head"
+path = "fuzz_targets/snapshot_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_ram"
+path = "fuzz_targets/snapshot_ram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gpu_snapshot"
+path = "fuzz_targets/gpu_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tpm_tis"
+path = "fuzz_targets/tpm_tis.rs"
+test = false
+doc = false
+bench = false

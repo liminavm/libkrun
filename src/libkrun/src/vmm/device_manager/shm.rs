@@ -25,6 +25,10 @@ pub struct ShmManager {
     page_size: usize,
     fs_regions: BTreeMap<usize, ShmRegion>,
     gpu_region: Option<ShmRegion>,
+    /// limina: the GPU extension's doorbell and arena windows. Not guest memory: the doorbell
+    /// window must trap, and arenas are mapped into theirs one by one.
+    #[cfg(feature = "gpu")]
+    gpu_ext: Option<(ShmRegion, ShmRegion)>,
     #[cfg(feature = "vhost-user")]
     vhost_user_regions: BTreeMap<usize, ShmRegion>,
 }
@@ -36,6 +40,8 @@ impl ShmManager {
             page_size: info.page_size,
             fs_regions: BTreeMap::new(),
             gpu_region: None,
+            #[cfg(feature = "gpu")]
+            gpu_ext: None,
             #[cfg(feature = "vhost-user")]
             vhost_user_regions: BTreeMap::new(),
         }
@@ -95,6 +101,25 @@ impl ShmManager {
             self.gpu_region = Some(self.create_region(size)?);
             Ok(())
         }
+    }
+
+    /// limina: the GPU extension's windows, placed after everything allocated so far (so a VM
+    /// without the extension keeps the layout it always had).
+    #[cfg(feature = "gpu")]
+    pub fn create_gpu_ext_regions(&mut self, doorbells: usize, arenas: usize) -> Result<(), Error> {
+        if self.gpu_ext.is_some() {
+            return Err(Error::DuplicatedGpuRegion);
+        }
+        let d = self.create_region(doorbells)?;
+        let a = self.create_region(arenas)?;
+        self.gpu_ext = Some((d, a));
+        Ok(())
+    }
+
+    /// The GPU extension's (doorbell, arena) windows, if allocated.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_ext_regions(&self) -> Option<&(ShmRegion, ShmRegion)> {
+        self.gpu_ext.as_ref()
     }
 
     #[cfg(not(feature = "tee"))]

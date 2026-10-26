@@ -76,6 +76,7 @@ pub fn arch_memory_regions(
         fdt_addr,
         initrd_addr: fdt_addr - initrd_size,
         firmware_addr: FIRMWARE_START,
+        hotplug_ram: None,
         #[cfg(target_os = "macos")]
         ipa_size: 0,
     };

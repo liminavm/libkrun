@@ -23,6 +23,11 @@ macro_rules! into_rust_result {
         match $expr {
             $($pat $(if $pat_guard)? => $pat_expr,)+
             -1 => Err(DisplayBackendError::InternalError),
+            // -2 = KRUN_DISPLAY_ERR_METHOD_UNSUPPORTED. Without this arm a backend that returns
+            // MethodNotSupported (e.g. the headless capture sink, which has no zero-copy
+            // present_surface) falls through to the catch-all and is misreported as InternalError,
+            // so callers that branch on MethodNotSupported to take a readback fallback never do.
+            -2 => Err(DisplayBackendError::MethodNotSupported),
             -3 => Err(DisplayBackendError::InvalidScanoutId),
             -4 => Err(DisplayBackendError::InvalidParam),
             code @ i32::MIN.. => {
@@ -127,6 +132,92 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
         into_rust_result! {
             method_call!{
                 self.present_frame(scanout_id, frame_id, rect.map(|r| r as *const _).unwrap_or(null()))
+            }
+        }
+    }
+
+    fn set_cursor(
+        &mut self,
+        scanout_id: u32,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        format: ResourceFormat,
+        buffer: &[u8],
+    ) -> Result<(), DisplayBackendError> {
+        // method_call! short-circuits to MethodNotSupported if the backend left the pointer
+        // NULL (e.g. the headless capture backend or a stock GTK backend) — no cursor, fine.
+        into_rust_result! {
+            method_call!{
+                self.set_cursor(scanout_id, width, height, hot_x, hot_y, format as u32, buffer.as_ptr(), buffer.len())
+            }
+        }
+    }
+
+    fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.move_cursor(scanout_id, x, y)
+            }
+        }
+    }
+
+    fn present_surface(
+        &mut self,
+        scanout_id: u32,
+        iosurface_id: u32,
+        rect: Option<&Rect>,
+    ) -> Result<(), DisplayBackendError> {
+        // method_call! short-circuits to MethodNotSupported if the backend left the pointer
+        // NULL (e.g. the headless capture backend) — the device falls back to readback then.
+        into_rust_result! {
+            method_call!{
+                self.present_surface(scanout_id, iosurface_id, rect.map(|r| r as *const _).unwrap_or(null()))
+            }
+        }
+    }
+
+    fn release_surface(&mut self, iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.release_surface(iosurface_id)
+            }
+        }
+    }
+
+    fn republish_surface(&mut self, iosurface_id: u32) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.republish_surface(iosurface_id)
+            }
+        }
+    }
+
+    fn guest_driver_ready(&mut self) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.guest_driver_ready()
+            }
+        }
+    }
+
+    fn scanout_held(&mut self, scanout_id: u32, held: bool) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.scanout_held(scanout_id, u32::from(held))
+            }
+        }
+    }
+
+    fn frame_resource(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+    ) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.frame_resource(scanout_id, resource_id)
             }
         }
     }

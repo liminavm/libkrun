@@ -12,15 +12,20 @@ use std::io;
 use std::result;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REBOOT};
+use super::vcpu_sched;
+use super::wfi_latency::{self, Wake};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
+use crossbeam_channel::{Receiver, RecvError, Select, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{
+    HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuPower, VcpuState, Vcpus,
+    vcpu_request_exit,
+};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -101,8 +106,13 @@ pub struct Vm {
 
 impl Vm {
     /// Constructs a new `Vm` using the given `Kvm` instance.
-    pub fn new(arch_mem_info: &mut ArchMemoryInfo, nested_enabled: bool) -> Result<Self> {
-        let hvf_vm = HvfVm::new(arch_mem_info, nested_enabled).map_err(Error::VmSetup)?;
+    pub fn new(
+        arch_mem_info: &mut ArchMemoryInfo,
+        nested_enabled: bool,
+        ipa_granule: Option<IpaGranule>,
+    ) -> Result<Self> {
+        let hvf_vm =
+            HvfVm::new(arch_mem_info, nested_enabled, ipa_granule).map_err(Error::VmSetup)?;
 
         Ok(Vm { hvf_vm })
     }
@@ -228,6 +238,42 @@ pub struct VcpuConfig {
 // Using this for easier explicit type-casting to help IDEs interpret the code.
 type VcpuCell = Cell<Option<*const Vcpu>>;
 
+/// One-shot barrier that holds every restoring vCPU thread after it has created its HVF vCPU
+/// (so MPIDR is set) but *before* it restores its register file, until the main thread has
+/// restored the VM-wide in-kernel GIC (M9 restore). The ordering is load-bearing: `hv_gic_set_state`
+/// requires the vCPUs to already exist with their MPIDRs, and each vCPU's per-CPU-interface (ICC)
+/// registers — restored inside [`HvfVcpu::restore_state`] on the vCPU's own thread — must be applied
+/// *after* the distributor/redistributor state, or interrupts won't deliver post-restore. Opened once.
+pub struct RestoreGate {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Default for RestoreGate {
+    fn default() -> Self {
+        Self {
+            open: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+impl RestoreGate {
+    /// Block until [`open`](Self::open) is called (returns immediately if already open).
+    pub fn wait(&self) {
+        let mut opened = self.open.lock().unwrap();
+        while !*opened {
+            opened = self.cv.wait(opened).unwrap();
+        }
+    }
+
+    /// Release every waiting vCPU. Called once, after the GIC has been restored.
+    pub fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     id: u8,
@@ -237,6 +283,13 @@ pub struct Vcpu {
     boot_senders: Option<HashMap<u64, Sender<u64>>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
+    /// limina M9.3 floor-spike oracle: base of the GPU/fs host-shared SHM window. A guest MMIO exit
+    /// at or above this is a touch into a region the *fresh restore worker* has no `hv_vm_map` for
+    /// (venus ring / `VkDeviceMemory` HOST3D blobs live here and are SKIPPED by `dump_ram`) — the
+    /// unambiguous "GPU state gone on restore" fault. 0 = unset (no flagging).
+    shm_start: u64,
+    /// One-shot latch so the SHM-window fault is logged loudly once per vCPU, not per (flooding) access.
+    shm_fault_logged: bool,
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
     exit_evt: EventFd,
 
@@ -253,6 +306,18 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+
+    /// M9 restore: this vCPU's saved architectural state. When `Some`, `run` restores it (via
+    /// [`HvfVcpu::restore_state`]) instead of calling `set_initial_state`, and skips the PSCI
+    /// `CPU_ON` boot-wait (a restored guest already onlined its secondaries and never re-sends it).
+    restore_state: Option<VcpuState>,
+    /// M9 restore: the shared gate this vCPU waits on (after creating its HVF vCPU, before
+    /// restoring) until the main thread has restored the in-kernel GIC. `None` on a fresh boot.
+    restore_gate: Option<Arc<RestoreGate>>,
+
+    /// Balloon-released guest RAM (shared with the balloon device), handed to the HVF vCPU at
+    /// thread start so stage-2 faults on released ranges are healed instead of stopping the VM.
+    released_ram: Option<Arc<ReleasedRam>>,
 }
 
 impl Vcpu {
@@ -340,6 +405,8 @@ impl Vcpu {
             boot_senders: None,
             fdt_addr: 0,
             mmio_bus: None,
+            shm_start: 0,
+            shm_fault_logged: false,
             exit_evt,
             mpidr: id as u64,
             event_receiver,
@@ -348,6 +415,9 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            restore_state: None,
+            restore_gate: None,
+            released_ram: None,
         })
     }
 
@@ -356,14 +426,55 @@ impl Vcpu {
         self.id
     }
 
+    /// M9 restore: hand this vCPU its saved state and the shared GIC-restore gate. `run` will then
+    /// wait on the gate (until the GIC is restored) and `restore_state` instead of a fresh boot.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_restore(&mut self, state: VcpuState, gate: Arc<RestoreGate>) {
+        self.restore_state = Some(state);
+        self.restore_gate = Some(gate);
+    }
+
     /// Gets the MPIDR register value.
     pub fn get_mpidr(&self) -> u64 {
         self.mpidr
     }
 
+    /// limina M9.3: tell this vCPU the SHM-window base so an MMIO exit into it (a fresh-worker
+    /// restore touching unmapped GPU/venus blob memory) is flagged as the "GPU gone on restore" fault.
+    pub fn set_shm_start(&mut self, shm_start: u64) {
+        self.shm_start = shm_start;
+    }
+
+    /// limina M9.3 floor-spike oracle. An MMIO exit at/above `shm_start` means the guest touched the
+    /// GPU/fs host-shared window — which is `hv_vm_map`'d in a live worker (so it never traps there),
+    /// but UNMAPPED in a fresh `--restore` worker until the guest re-establishes its blobs. venus'
+    /// ring + every mappable `VkDeviceMemory` are HOST3D blobs in this window and are SKIPPED by
+    /// `dump_ram`, so this exit is the unambiguous signature of "GPU/venus state is gone on restore."
+    /// Only an exit no device claims counts: the virtio-gpu extension's doorbells live up there and
+    /// trap by design. Logged loudly once per vCPU (the access would otherwise flood).
+    fn flag_shm_window_fault(&mut self, vcpuid: u64, addr: u64, write: bool) {
+        if self.shm_start != 0 && addr >= self.shm_start && !self.shm_fault_logged {
+            self.shm_fault_logged = true;
+            warn!(
+                "M9.3 SHM-WINDOW FAULT: vCPU {vcpuid} MMIO {} 0x{addr:x} (>= shm_start 0x{:x}) — the \
+                 guest touched GPU/venus blob memory the fresh restore worker has no mapping for \
+                 (offset +0x{:x} into the window). This is the 'GPU state gone on restore' fault.",
+                if write { "write" } else { "read" },
+                self.shm_start,
+                addr - self.shm_start,
+            );
+        }
+    }
+
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
         self.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Wire up the balloon-released RAM tracker (see [`ReleasedRam`]); forwarded to the HVF vCPU
+    /// when its thread starts.
+    pub fn set_released_ram(&mut self, released_ram: Arc<ReleasedRam>) {
+        self.released_ram = Some(released_ram);
     }
 
     pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
@@ -440,21 +551,38 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    if let Some(ref mmio_bus) = self.mmio_bus {
+                    let handled = self.mmio_bus.as_ref().is_some_and(|mmio_bus| {
                         debug!("vCPU {vcpuid} MMIO read 0x{addr:x}");
-                        mmio_bus.read(vcpuid, addr, data);
+                        mmio_bus.read(vcpuid, addr, data)
+                    });
+                    if !handled {
+                        self.flag_shm_window_fault(vcpuid, addr, false);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    if let Some(ref mmio_bus) = self.mmio_bus {
-                        mmio_bus.write(vcpuid, addr, data);
+                    let handled = self
+                        .mmio_bus
+                        .as_ref()
+                        .is_some_and(|mmio_bus| mmio_bus.write(vcpuid, addr, data));
+                    if !handled {
+                        self.flag_shm_window_fault(vcpuid, addr, true);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::PsciHandled => {
                     debug!("vCPU {vcpuid} PSCI");
                     Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::CpuOff => {
+                    debug!("vCPU {vcpuid} PSCI CPU_OFF (offlining)");
+                    Ok(VcpuEmulation::CpuOff)
+                }
+                VcpuExit::SystemSuspend { entry, context_id } => {
+                    info!(
+                        "vCPU {vcpuid} PSCI SYSTEM_SUSPEND (suspend-to-RAM); resume entry 0x{entry:x}"
+                    );
+                    Ok(VcpuEmulation::SystemSuspend { entry, context_id })
                 }
                 VcpuExit::SecureMonitorCall => {
                     debug!("vCPU {vcpuid} SMC");
@@ -463,6 +591,14 @@ impl Vcpu {
                 VcpuExit::Shutdown => {
                     info!("vCPU {vcpuid} received shutdown signal");
                     Ok(VcpuEmulation::Stopped)
+                }
+                VcpuExit::Reset => {
+                    info!("vCPU {vcpuid} received reboot (PSCI SYSTEM_RESET)");
+                    Ok(VcpuEmulation::Rebooted)
+                }
+                VcpuExit::StageTwoHealed => {
+                    debug!("vCPU {vcpuid} stage-2 fault on balloon-released RAM healed");
+                    Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::SystemRegister => {
                     debug!("vCPU {vcpuid} accessed a system register");
@@ -486,15 +622,39 @@ impl Vcpu {
                     Ok(VcpuEmulation::WaitForEventTimeout(duration))
                 }
             },
-            Err(e) => panic!("Error running HVF vCPU: {e:?}"),
+            // A vCPU run error is no longer fatal to the worker process: log it and report an
+            // emulation error so the run loop tears the VM down cleanly (FC_EXIT_CODE_GENERIC_ERROR)
+            // instead of `panic!`ing. A stock guest that trips an unmodeled trap then degrades to a
+            // clean stop the supervisor can report, not a crashed VMM.
+            Err(e) => {
+                error!("vCPU {vcpuid}: unrecoverable run error: {e}; stopping the VM");
+                Err(Error::VcpuRun)
+            }
         }
     }
 
     /// Main loop of the vCPU thread.
     pub fn run(&mut self, init_tls_sender: Sender<u64>) {
+        // On this thread, before it ever enters the guest: the band applies to mach_thread_self().
+        // The guard it hands back is this thread's own way out of the band — see `BandGuard`.
+        vcpu_sched::set_latency_qos(self.id as u64);
+        let band_guard = vcpu_sched::set_realtime_band(self.id as u64);
         let mut hvf_vcpu =
             HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
+        if let Some(released_ram) = self.released_ram.take() {
+            hvf_vcpu.set_released_ram(released_ram);
+        }
         let hvf_vcpuid = hvf_vcpu.id();
+        // A vCPU restored into its SYSTEM_SUSPEND park is the wake target from the moment the
+        // restore returns, which is before this thread can reach the park; recorded ahead of
+        // the handshake below, which `start_vcpus` waits on.
+        if let Some(VcpuState {
+            power: VcpuPower::SystemSuspended { .. },
+            ..
+        }) = &self.restore_state
+        {
+            self.vcpu_list.set_system_suspended(hvf_vcpuid);
+        }
 
         // Report the HVF-assigned vCPU id (creation order is not deterministic)
         // so the coordinator can break this vCPU out of HVF to pause it.
@@ -505,39 +665,174 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
-        } else {
-            self.boot_entry_addr
-        };
+        // A guest that saturates this vCPU may never leave the guest on its own, so the loop below
+        // would never get to park and the real-time band's fail-safe would demote us. This kick
+        // forces the exit; the loop decides whether a park is actually due.
+        let heartbeat = Arc::new(vcpu_sched::Heartbeat::new());
+        let hb_interval = vcpu_sched::heartbeat_interval();
+        // The kick is needed for either job, and for opposite reasons: the heartbeat forces an
+        // exit so the thread can *park* and keep the band, the band guard so it can *give the
+        // band back*. Both are checks in the loop below, and a guest that never leaves on its own
+        // reaches neither without this.
+        let kick_interval = hb_interval.or_else(|| {
+            band_guard
+                .as_ref()
+                .map(vcpu_sched::BandGuard::kick_interval)
+        });
+        if let Some(interval) = kick_interval {
+            let heartbeat = Arc::clone(&heartbeat);
+            thread::Builder::new()
+                .name(format!("vcpu{}-hb", self.id))
+                .spawn(move || {
+                    loop {
+                        thread::sleep(interval / 2);
+                        if heartbeat.is_stale(interval) {
+                            let _ = vcpu_request_exit(hvf_vcpuid);
+                        }
+                    }
+                })
+                .ok();
+        }
 
-        hvf_vcpu
-            .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        if let Some(state) = self.restore_state.take() {
+            // M9 restore: the HVF vCPU now exists with its MPIDR set (a precondition for
+            // `hv_gic_set_state`). Wait on the shared gate until the main thread has restored the
+            // in-kernel GIC, then restore this vCPU's register file (which restores its ICC regs on
+            // this thread, after the distributor/redistributor). We do NOT wait on the PSCI
+            // `CPU_ON` boot channel — a restored guest already onlined its secondaries and never
+            // re-sends it, so a secondary would otherwise park here forever.
+            if let Some(gate) = self.restore_gate.take() {
+                gate.wait();
+            }
+            // Test aid (LIMINA_TEST_RESTORE_VCPU_DELAY_MS): hold this vCPU back after the gate,
+            // so the host's post-restore wake lands before the vCPU is back in its park.
+            if let Some(delay) = std::env::var("LIMINA_TEST_RESTORE_VCPU_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                thread::sleep(Duration::from_millis(delay));
+            }
+            hvf_vcpu
+                .restore_state(&state)
+                .unwrap_or_else(|e| panic!("Can't restore HVF vCPU {hvf_vcpuid} state: {e}"));
+            // The fresh worker has loaded this vCPU's saved register file into a live HVF vCPU
+            // (behind the already-restored in-kernel GIC); it will resume executing at exactly the
+            // guest PC captured at snapshot time. Emitting the PC makes the resume observable to an
+            // operator (and to the M9.1 acceptance test) without needing the guest to reach any
+            // device — device state is not restored until M9.2.
+            info!(
+                "vCPU {hvf_vcpuid} resumed from snapshot at pc={:#x}",
+                state.pc
+            );
+            // Put a vCPU that was PARKED back into its park. Its saved PC is the instruction
+            // after a PSCI call that does not return on success, so letting it run would make a
+            // secondary return from CPU_OFF (which Linux treats as a BUG) and the boot CPU return
+            // from a SYSTEM_SUSPEND it never took — the guest then executes nothing at all, which
+            // is exactly what a restored deep-suspended guest did before this. Re-parking here
+            // means the restore-path wake finds the same shape it would have found in the
+            // original worker: cpu0 waiting to be re-armed, secondaries waiting for CPU_ON.
+            match state.power {
+                VcpuPower::Running => {}
+                VcpuPower::Offline => {
+                    self.vcpu_list.set_online(hvf_vcpuid, false);
+                    band_powered_off(&band_guard, true);
+                    self.handle_offline(&mut hvf_vcpu);
+                    band_powered_off(&band_guard, false);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                }
+                VcpuPower::SystemSuspended { entry, context_id } => {
+                    self.handle_system_suspend(&mut hvf_vcpu, &wfe_receiver, entry, context_id);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                }
+            }
+        } else {
+            let entry_addr = if self.boot_receiver.is_some() {
+                band_powered_off(&band_guard, true);
+                let entry = self.wait_for_boot_entry(&mut hvf_vcpu);
+                band_powered_off(&band_guard, false);
+                match entry {
+                    Some(entry) => {
+                        // Onlined: executing again from here until the next WFx wait.
+                        self.vcpu_list.set_parked(hvf_vcpu.id(), false);
+                        entry
+                    }
+                    None => return, // channels dropped: process tearing down
+                }
+            } else {
+                self.boot_entry_addr
+            };
+
+            hvf_vcpu
+                .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
+                .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        }
 
         loop {
             // An out-of-band pause request breaks the vCPU out of HVF via
             // `vcpu_request_exit` (-> Canceled), so we observe it here between
             // guest runs and freeze on this thread, where the HvfVcpu lives.
-            if let Ok(VcpuEvent::Pause) = self.event_receiver.try_recv() {
-                self.pause_and_park(&hvf_vcpu);
+            // A `Snapshot` saves this vCPU's state on its own thread (HVF register
+            // affinity) and then parks the same way.
+            if let Some(interval) = hb_interval {
+                heartbeat.beat(interval);
+            }
+            // Before anything that could block: a vCPU which has stopped parking must give the
+            // band back itself, because by then nothing else on the host may be getting a core
+            // to do it for us.
+            if let Some(guard) = &band_guard {
+                guard.check();
+            }
+            if let Ok(ev) = self.event_receiver.try_recv() {
+                self.service(&mut hvf_vcpu, ParkSite::RunLoop, Ok(ev));
             }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
                 // Emulation was interrupted by a breakpoint.
                 Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
+                // The guest offlined this vCPU (PSCI CPU_OFF). Park the thread cleanly until a
+                // matching CPU_ON re-onlines it — zero host CPU/wakeups, vs the busy-spin + VM
+                // wedge of leaving CPU_OFF unmodeled.
+                Ok(VcpuEmulation::CpuOff) => {
+                    band_powered_off(&band_guard, true);
+                    self.handle_offline(&mut hvf_vcpu);
+                    band_powered_off(&band_guard, false);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                }
+                // The guest suspended the whole system (PSCI SYSTEM_SUSPEND). Park exactly as
+                // for CPU_OFF, but wake on the host's `SystemWake` instead of a guest CPU_ON —
+                // a system-suspended guest has no other vCPU left to issue one.
+                Ok(VcpuEmulation::SystemSuspend { entry, context_id }) => {
+                    self.handle_system_suspend(&mut hvf_vcpu, &wfe_receiver, entry, context_id);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                }
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu)
+                    // Parked around the wait, not just "quiet": the host-sleep bracket needs
+                    // to tell a guest that has finished entering s2idle (every vCPU in WFx)
+                    // from one still executing, and a busy vCPU takes no vmexits either.
+                    self.vcpu_list.set_parked(hvf_vcpuid, true);
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &mut hvf_vcpu);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                    heartbeat.observed_block();
                 }
-                Ok(VcpuEmulation::WaitForEventExpired) => (),
+                Ok(VcpuEmulation::WaitForEventExpired) => wfi_latency::record_expired(),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
+                    self.vcpu_list.set_parked(hvf_vcpuid, true);
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &mut hvf_vcpu);
+                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                    heartbeat.observed_block();
                 }
-                // The guest was rebooted or halted.
+                // The guest halted / powered off (PSCI SYSTEM_OFF).
                 Ok(VcpuEmulation::Stopped) => {
                     self.exit(FC_EXIT_CODE_OK);
+                    break;
+                }
+                // The guest asked to reboot (PSCI SYSTEM_RESET). libkrun is single-shot, so we
+                // still tear the worker down — but with a distinct exit code so the supervisor
+                // can relaunch us (a fresh boot) instead of treating it as a clean power-off.
+                Ok(VcpuEmulation::Rebooted) => {
+                    self.exit(FC_EXIT_CODE_REBOOT);
                     break;
                 }
                 // Emulation errors lead to vCPU exit.
@@ -559,25 +854,272 @@ impl Vcpu {
         hvf_vcpuid: u64,
         receiver: &Receiver<u32>,
         timeout: Option<Duration>,
-        hvf_vcpu: &HvfVcpu,
+        hvf_vcpu: &mut HvfVcpu,
     ) {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
+            wfi_latency::record_no_wait();
             return;
         }
-        let paused = if let Some(timeout) = timeout {
+        // Which arm won matters beyond the pause check: a park cut short by an IRQ is early on
+        // purpose, and counting it as punctual would report a healthy timer for a broken one.
+        let measure = wfi_latency::enabled();
+        let started = measure.then(Instant::now);
+        let mut event = None;
+        let wake = if let Some(timeout) = timeout {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
-                recv(after(timeout)) -> _ => false,
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); Wake::Irq }
+                recv(self.event_receiver) -> ev => { event = Some(ev); Wake::Pause }
+                recv(after(timeout)) -> _ => Wake::Deadline,
             }
         } else {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); Wake::Irq }
+                recv(self.event_receiver) -> ev => { event = Some(ev); Wake::Pause }
             }
         };
-        if paused {
-            self.pause_and_park(hvf_vcpu);
+        if let (Some(timeout), Some(started)) = (timeout, started) {
+            wfi_latency::record(wake, timeout, started.elapsed());
+        }
+        // Taken off the channel, so it is this site's to service: nothing else will see it.
+        if let Some(ev) = event {
+            self.service(hvf_vcpu, ParkSite::WfxWait, ev);
+        }
+    }
+
+    /// Wait for this secondary vCPU's first PSCI CPU_ON entry. Like [`Self::handle_offline`],
+    /// the wait must service out-of-band Pause/Snapshot events: a live pause or an M9 suspend
+    /// can arrive while the guest has not yet — or will never (`maxcpus=`, early-boot suspend)
+    /// — onlined this vCPU. A bare `recv` here deadlocked the whole VM: `pause`/
+    /// `snapshot_vcpus` wait for every vCPU's response while the event loop holds the vmm
+    /// lock, and this vCPU never saw the event, so Resume could not even be processed.
+    /// Returns `None` when the channels drop (process teardown).
+    ///
+    /// A never-onlined vCPU snapshotted here saves its reset-default register file; restore
+    /// fidelity for not-currently-online vCPUs is the documented task #41 limitation (see
+    /// `handle_offline`) — this wait only guarantees the save side completes.
+    fn wait_for_boot_entry(&mut self, hvf_vcpu: &mut HvfVcpu) -> Option<u64> {
+        // A vCPU the guest has not onlined yet (maxcpus=, or a suspend before SMP bring-up)
+        // executes nothing, so it counts as parked — otherwise `all_parked` could never be
+        // true on such a guest and the host-sleep bracket would always take its backstop.
+        self.vcpu_list.set_parked(hvf_vcpu.id(), true);
+        // Clones so the select does not borrow `self` across the pause_and_park/handle_snapshot
+        // calls (same shape as handle_offline).
+        let boot = self.boot_receiver.clone().unwrap();
+        let events = self.event_receiver.clone();
+        loop {
+            let mut sel = Select::new();
+            let boot_idx = sel.recv(&boot);
+            let evt_idx = sel.recv(&events);
+            let op = sel.select();
+            let picked = op.index();
+            if picked == boot_idx {
+                return op.recv(&boot).ok();
+            }
+            debug_assert_eq!(picked, evt_idx);
+            if self.service(hvf_vcpu, ParkSite::BootEntry, op.recv(&events)) == Serviced::Closed {
+                return None; // channel dropped: process tearing down
+            }
+        }
+    }
+
+    /// The guest offlined this vCPU (PSCI CPU_OFF). Park the thread cleanly — blocked in a channel
+    /// `recv`, consuming no host CPU or wakeups — until the guest re-onlines it, then re-arm the
+    /// vCPU for a fresh secondary entry and return to the run loop. This is the whole point of
+    /// modeling CPU_OFF: leaving it unmodeled makes the guest busy-spin in `cpu_die` (the VMM hit
+    /// ~546% CPU) and wedge.
+    ///
+    /// Re-online reuses the DURABLE secondary boot channel (`boot_receiver`): the same channel that
+    /// delivers the initial CPU_ON entry at boot delivers every subsequent re-online entry, sent by
+    /// cpu0's `CpuOn` handler (`boot_senders`). We select on it AND the event channel so an M9
+    /// snapshot `Pause`/`Snapshot` arriving while offlined is still serviced (otherwise `pause_vcpus`
+    /// would hang waiting for this vCPU). `set_initial_state` (via `reonline`) runs here, on the
+    /// vCPU's own thread, because HVF register access is thread-bound.
+    ///
+    /// A vCPU with no boot channel (cpu0 — Linux never offlines the boot CPU) parks on events only,
+    /// with no re-online path; parking still beats spinning in the pathological case.
+    ///
+    /// KNOWN LIMITATION (snapshot + offline, task #41): the guest-visible online state lives in
+    /// `VcpuList` and is not part of the M9 snapshot. If a snapshot is taken while a vCPU is
+    /// offline-parked here, the restored worker resumes that vCPU's saved register file (PC just
+    /// past its CPU_OFF HVC) rather than re-parking it, so the offline/online bookkeeping diverges:
+    /// a later re-online of that CPU fails to bring it up (the guest's bounded CPU-bringup wait
+    /// times out — no VMM wedge). Full fidelity needs the online state snapshotted and offlined
+    /// vCPUs routed back into this park on restore.
+    fn handle_offline(&mut self, hvf_vcpu: &mut HvfVcpu) {
+        let hvf_vcpuid = hvf_vcpu.id();
+        debug!("vCPU {hvf_vcpuid} parked (offlined via PSCI CPU_OFF)");
+        self.vcpu_list.set_parked(hvf_vcpuid, true);
+        hvf_vcpu.set_power(VcpuPower::Offline);
+        // Clones so the select does not borrow `self` across the pause_and_park/handle_snapshot calls.
+        let boot = self.boot_receiver.clone();
+        let events = self.event_receiver.clone();
+        loop {
+            let mut sel = Select::new();
+            let boot_idx = boot.as_ref().map(|r| sel.recv(r));
+            let evt_idx = sel.recv(&events);
+            let op = sel.select();
+            let picked = op.index();
+            if Some(picked) == boot_idx {
+                let entry = match op.recv(boot.as_ref().unwrap()) {
+                    Ok(entry) => entry,
+                    Err(_) => return, // channel dropped: process tearing down
+                };
+                hvf_vcpu
+                    .reonline(self.ipa_size, entry, self.fdt_addr)
+                    .unwrap_or_else(|e| panic!("re-online of vCPU {hvf_vcpuid} failed: {e:?}"));
+                hvf_vcpu.set_power(VcpuPower::Running);
+                debug!("vCPU {hvf_vcpuid} re-onlined (PSCI CPU_ON) at entry 0x{entry:x}");
+                return;
+            }
+            debug_assert_eq!(picked, evt_idx);
+            // A snapshot Pause/Snapshot while offlined is serviced, then this keeps parking.
+            if self.service(hvf_vcpu, ParkSite::Offline, op.recv(&events)) == Serviced::Closed {
+                return; // channel dropped: process tearing down
+            }
+        }
+    }
+
+    /// The guest asked firmware to suspend the whole system (PSCI `SYSTEM_SUSPEND`). Park this
+    /// vCPU — the last one still running — until the host sends [`VcpuEvent::SystemWake`], then
+    /// re-arm it at the resume entry point the guest handed us and return to the run loop.
+    ///
+    /// Two things wake it: the host's explicit [`VcpuEvent::SystemWake`], and the `KEY_WAKEUP`
+    /// GPIO, whose device wakes this vCPU through [`VcpuList::wake_system_suspended`] before it
+    /// raises the line. The line itself cannot: on the in-kernel GIC an SPI is injected inside
+    /// HVF and never reaches this thread, which is parked outside `hv_vcpu_run`. A wake that
+    /// arrives before the park is waiting is held for it, so none is lost to the order.
+    ///
+    /// The re-arm is the CPU_ON reset shape ([`HvfVcpu::reonline`]): entry is a PHYSICAL address
+    /// with the MMU and caches off, which is exactly the contract arm64's `cpu_resume` expects
+    /// (it runs `init_kernel_el` → `__cpu_setup` → `__enable_mmu` before touching anything).
+    /// `context_id` goes in X0 per the PSCI spec even though `cpu_resume` immediately zeroes it.
+    ///
+    /// Pause/Snapshot arriving while system-suspended are serviced in place, as in
+    /// [`Self::handle_offline`], so the M9 bracket never hangs waiting for this vCPU.
+    fn handle_system_suspend(
+        &mut self,
+        hvf_vcpu: &mut HvfVcpu,
+        wfe_receiver: &Receiver<u32>,
+        entry: u64,
+        context_id: u64,
+    ) {
+        let hvf_vcpuid = hvf_vcpu.id();
+        debug!("vCPU {hvf_vcpuid} parked (PSCI SYSTEM_SUSPEND), resume entry 0x{entry:x}");
+        self.vcpu_list.set_parked(hvf_vcpuid, true);
+        self.vcpu_list.set_system_suspended(hvf_vcpuid);
+        hvf_vcpu.set_power(VcpuPower::SystemSuspended { entry, context_id });
+        // Clone so the select does not borrow `self` across pause_and_park/handle_snapshot.
+        let events = self.event_receiver.clone();
+        loop {
+            // Mark this vCPU waiting so a wake arrives over the wfe channel: it is parked in a
+            // `recv`, not in `hv_vcpu_run`, so the `hv_vcpus_exit` kick a running vCPU gets
+            // would reach nobody. False means a wake (or, on the userspace GIC, an IRQ) beat us
+            // here, so resume immediately.
+            let wake = if !self.vcpu_list.should_wait_system_suspended(hvf_vcpuid) {
+                true
+            } else {
+                select! {
+                    recv(wfe_receiver) -> r => {
+                        r.expect("WFE channel closed unexpectedly");
+                        true
+                    }
+                    recv(events) -> ev => match self.service(hvf_vcpu, ParkSite::SystemSuspended, ev) {
+                        Serviced::SystemWake => true,
+                        Serviced::Closed => return, // channel dropped: tearing down
+                        Serviced::Continue | Serviced::Resumed => false,
+                    },
+                }
+            };
+            if !wake {
+                continue;
+            }
+            hvf_vcpu
+                .resume_from_system_suspend(self.ipa_size, entry, self.fdt_addr, context_id)
+                .unwrap_or_else(|e| {
+                    panic!("system-suspend resume of vCPU {hvf_vcpuid} failed: {e:?}")
+                });
+            self.vcpu_list.end_system_suspend(hvf_vcpuid);
+            hvf_vcpu.set_power(VcpuPower::Running);
+            info!("vCPU {hvf_vcpuid} resumed from PSCI SYSTEM_SUSPEND at 0x{entry:x}");
+            return;
+        }
+    }
+
+    /// Act on an event that reached this vCPU at `site`, as [`event_action`] says. Every place the
+    /// thread waits for events hands them here, so what each site does with each event is written
+    /// once, in a table that can be checked without a vCPU.
+    fn service(
+        &mut self,
+        hvf_vcpu: &mut HvfVcpu,
+        site: ParkSite,
+        ev: result::Result<VcpuEvent, RecvError>,
+    ) -> Serviced {
+        match (event_action(site, &ev), ev) {
+            (EventAction::Pause, _) => {
+                self.pause_and_park(hvf_vcpu);
+                Serviced::Continue
+            }
+            (EventAction::SnapshotAndPark, Ok(VcpuEvent::Snapshot(reply))) => {
+                self.save_and_reply(hvf_vcpu, reply);
+                self.park_until_resume(hvf_vcpu);
+                Serviced::Continue
+            }
+            (EventAction::Snapshot, Ok(VcpuEvent::Snapshot(reply))) => {
+                self.save_and_reply(hvf_vcpu, reply);
+                Serviced::Continue
+            }
+            (EventAction::Resume, Ok(VcpuEvent::Resume(paused_ticks))) => {
+                hvf_vcpu
+                    .advance_vtimer_offset(paused_ticks)
+                    .unwrap_or_else(|e| panic!("vCPU {} vtimer advance failed: {e:?}", self.id));
+                self.response_sender
+                    .send(VcpuResponse::Resumed)
+                    .expect("failed to send Resumed status");
+                Serviced::Resumed
+            }
+            (EventAction::SystemWake, _) => Serviced::SystemWake,
+            (EventAction::Closed, _) => Serviced::Closed,
+            (EventAction::Ignore, _) => Serviced::Continue,
+            (action, _) => unreachable!("{action:?} for an event it does not describe"),
+        }
+    }
+
+    /// Snapshot this vCPU (M9): save its full architectural state on this thread and send it
+    /// back. Runs where a `Snapshot` is serviced, a clean boundary between `hv_vcpu_run` calls, so
+    /// the captured register file is consistent.
+    fn save_and_reply(&mut self, hvf_vcpu: &mut HvfVcpu, reply: Sender<Box<VcpuState>>) {
+        // Test aid (LIMINA_TEST_FAIL_VCPU_SAVE=<vcpu id>): fail this vCPU's save, as a host that
+        // refuses one of the reads would.
+        let injected = std::env::var("LIMINA_TEST_FAIL_VCPU_SAVE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            == Some(hvf_vcpu.id());
+        let saved = if injected {
+            Err(hvf::Error::VcpuSnapshot)
+        } else {
+            hvf_vcpu.save_state()
+        };
+        match saved {
+            Ok(state) => {
+                // If the collector is gone the whole snapshot is being aborted; just park.
+                let _ = reply.send(Box::new(state));
+            }
+            Err(e) => {
+                error!("vCPU {} snapshot save failed: {e}", hvf_vcpu.id());
+                // Dropping `reply` without sending signals the collector that this vCPU failed.
+            }
+        }
+    }
+
+    /// Block until `Resume` (or the process tears down), servicing what arrives meanwhile as
+    /// [`ParkSite::Parked`].
+    fn park_until_resume(&mut self, hvf_vcpu: &mut HvfVcpu) {
+        loop {
+            let ev = self.event_receiver.recv();
+            match self.service(hvf_vcpu, ParkSite::Parked, ev) {
+                Serviced::Resumed | Serviced::Closed => return,
+                Serviced::Continue | Serviced::SystemWake => {}
+            }
         }
     }
 
@@ -588,27 +1130,11 @@ impl Vcpu {
     /// keeps the guest's CNTVCT continuous so armed timers don't fire en masse
     /// to catch up the gap. The coordinator computes the tick count once for the
     /// whole VM, so multi-vCPU offsets stay in lockstep.
-    fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) {
+    fn pause_and_park(&mut self, hvf_vcpu: &mut HvfVcpu) {
         self.response_sender
             .send(VcpuResponse::Paused)
             .expect("failed to send Paused status");
-        loop {
-            match self.event_receiver.recv() {
-                Ok(VcpuEvent::Resume(paused_ticks)) => {
-                    hvf_vcpu
-                        .advance_vtimer_offset(paused_ticks)
-                        .unwrap_or_else(|e| {
-                            panic!("vCPU {} vtimer advance failed: {e:?}", self.id)
-                        });
-                    self.response_sender
-                        .send(VcpuResponse::Resumed)
-                        .expect("failed to send Resumed status");
-                    return;
-                }
-                Ok(_) => {}
-                Err(_) => return,
-            }
-        }
+        self.park_until_resume(hvf_vcpu);
     }
 
     fn exit(&mut self, exit_code: u8) {
@@ -628,6 +1154,92 @@ impl Drop for Vcpu {
     }
 }
 
+/// Where a vCPU thread is when an event reaches it. Every place the thread waits for one is here,
+/// and each hands what it takes off the channel to [`Vcpu::service`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkSite {
+    /// The top of the run loop, between two guest runs.
+    RunLoop,
+    /// Blocked in a WFx wait ([`Vcpu::wait_for_event`]).
+    WfxWait,
+    /// A secondary waiting for its first `CPU_ON`.
+    BootEntry,
+    /// Offlined by PSCI `CPU_OFF`.
+    Offline,
+    /// Parked in PSCI `SYSTEM_SUSPEND`.
+    SystemSuspended,
+    /// Paused or snapshotted, until `Resume`.
+    Parked,
+}
+
+impl ParkSite {
+    #[cfg(test)]
+    const ALL: [ParkSite; 6] = [
+        ParkSite::RunLoop,
+        ParkSite::WfxWait,
+        ParkSite::BootEntry,
+        ParkSite::Offline,
+        ParkSite::SystemSuspended,
+        ParkSite::Parked,
+    ];
+}
+
+/// What a park site does with an event ([`event_action`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventAction {
+    /// Report `Paused` and park until `Resume`.
+    Pause,
+    /// Save this vCPU's state, send it back, and park until `Resume`.
+    SnapshotAndPark,
+    /// Save this vCPU's state and send it back. The vCPU is already parked.
+    Snapshot,
+    /// Leave the park: advance the vtimer by the paused ticks and report `Resumed`.
+    Resume,
+    /// Leave PSCI `SYSTEM_SUSPEND`.
+    SystemWake,
+    /// Nothing to do: a stale event, or one this site has no use for.
+    Ignore,
+    /// The channel is gone: the process is tearing down.
+    Closed,
+}
+
+/// What [`Vcpu::service`] tells the site it was called from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Serviced {
+    Continue,
+    Resumed,
+    SystemWake,
+    Closed,
+}
+
+/// What `site` does with `ev`. The whole contract between the coordinator and a vCPU thread's
+/// waits, in one place: [`Vmm::pause`](crate::Vmm) and `snapshot_vcpus` each wait for every
+/// vCPU's answer while holding the VMM lock, so an event a site drops hangs or fails them.
+fn event_action(site: ParkSite, ev: &result::Result<VcpuEvent, RecvError>) -> EventAction {
+    use EventAction as A;
+    use ParkSite as P;
+    let Ok(ev) = ev else {
+        return A::Closed;
+    };
+    match (ev, site) {
+        // Already parked: the coordinator does not pause a paused VM.
+        (VcpuEvent::Pause, P::Parked) => A::Ignore,
+        (VcpuEvent::Pause, _) => A::Pause,
+        // Already parked: answer, and stay parked for the one `Resume` that is coming. Ignored
+        // here, a snapshot of a paused VM failed the moment its reply channel dropped.
+        (VcpuEvent::Snapshot(_), P::Parked) => A::Snapshot,
+        // Every other site, a WFx wait included: that one once treated a `Snapshot` as an IRQ
+        // wake, dropping it and its reply channel with it, which fails `snapshot_vcpus` at once.
+        (VcpuEvent::Snapshot(_), _) => A::SnapshotAndPark,
+        (VcpuEvent::Resume(_), P::Parked) => A::Resume,
+        // A stale resume with no pause.
+        (VcpuEvent::Resume(_), _) => A::Ignore,
+        (VcpuEvent::SystemWake, P::SystemSuspended) => A::SystemWake,
+        // A system-wake for a vCPU that is not system-suspended.
+        (VcpuEvent::SystemWake, _) => A::Ignore,
+    }
+}
+
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
@@ -637,6 +1249,14 @@ pub enum VcpuEvent {
     /// (the wall-clock time the VM spent paused). The coordinator sends the
     /// same value to every vCPU so their counters stay synchronized.
     Resume(u64),
+    /// Snapshot this vCPU's full architectural state and send it back over the channel, then
+    /// park (as for `Pause`) until `Resume`. The save runs on the vCPU's own thread because HVF
+    /// binds register access there. Used by the M9 snapshot path.
+    Snapshot(Sender<Box<VcpuState>>),
+    /// Wake a vCPU parked in PSCI `SYSTEM_SUSPEND` (suspend-to-RAM). Delivered to the one vCPU
+    /// that issued the call; it re-arms itself at the guest's recorded resume entry point and
+    /// returns to the run loop. Harmless (ignored) for a vCPU that is not system-suspended.
+    SystemWake,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -692,9 +1312,26 @@ enum VcpuEmulation {
     Handled,
     Interrupted,
     Stopped,
+    Rebooted,
+    /// The guest offlined this vCPU (PSCI CPU_OFF) — park it until re-online.
+    CpuOff,
+    /// The guest asked firmware to suspend the whole system (PSCI `SYSTEM_SUSPEND`) — park this
+    /// vCPU until the host wakes it, then re-arm at `entry`.
+    SystemSuspend {
+        entry: u64,
+        context_id: u64,
+    },
     WaitForEvent,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
+}
+
+/// Tell the band this vCPU is parked powered off, or running again (see
+/// [`vcpu_sched::BandGuard::powered_off`]).
+fn band_powered_off(guard: &Option<vcpu_sched::BandGuard>, off: bool) {
+    if let Some(guard) = guard {
+        guard.powered_off(off);
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +1347,59 @@ mod tests {
     use devices::legacy::VcpuList;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
+    /// The coordinator's side of every park site, event by event. `Vmm::pause` and
+    /// `snapshot_vcpus` each wait on every vCPU's answer with the VMM lock held, so a site that
+    /// drops a `Pause` or a `Snapshot` hangs or fails them, and one that parks twice for one
+    /// request needs a `Resume` nobody sends.
+    #[test]
+    fn every_park_site_answers_the_coordinator() {
+        let snapshot = || Ok(VcpuEvent::Snapshot(unbounded().0));
+        for site in ParkSite::ALL {
+            let parked = site == ParkSite::Parked;
+            assert_eq!(
+                event_action(site, &snapshot()),
+                if parked {
+                    EventAction::Snapshot
+                } else {
+                    EventAction::SnapshotAndPark
+                },
+                "a Snapshot at {site:?} must be saved and answered, and park only a running vCPU"
+            );
+            assert_eq!(
+                event_action(site, &Ok(VcpuEvent::Pause)),
+                if parked {
+                    EventAction::Ignore
+                } else {
+                    EventAction::Pause
+                },
+                "a Pause at {site:?}"
+            );
+            assert_eq!(
+                event_action(site, &Ok(VcpuEvent::Resume(7))),
+                if parked {
+                    EventAction::Resume
+                } else {
+                    EventAction::Ignore
+                },
+                "a Resume at {site:?}"
+            );
+            assert_eq!(
+                event_action(site, &Ok(VcpuEvent::SystemWake)),
+                if site == ParkSite::SystemSuspended {
+                    EventAction::SystemWake
+                } else {
+                    EventAction::Ignore
+                },
+                "a SystemWake at {site:?}"
+            );
+            assert_eq!(
+                event_action(site, &Err(RecvError)),
+                EventAction::Closed,
+                "a closed channel at {site:?}"
+            );
+        }
+    }
+
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods
     // work without one, keeping tests free from the one-VM-per-process limit.
@@ -717,7 +1407,8 @@ mod tests {
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
         let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
         let vcpu_list = Arc::new(VcpuList::new(1));
-        let vcpu = Vcpu::new_aarch64(1, GuestAddress(0), None, exit_evt, vcpu_list, false).unwrap();
+        let vcpu =
+            Vcpu::new_aarch64(1, 36, GuestAddress(0), None, exit_evt, vcpu_list, false).unwrap();
         (vcpu, gm)
     }
 
@@ -731,7 +1422,8 @@ mod tests {
 
     #[test]
     fn test_vm_memory_init() {
-        let mut vm = Vm::new(false).expect("Cannot create new vm");
+        let mut vm = Vm::new(&mut arch::ArchMemoryInfo::default(), false, None)
+            .expect("Cannot create new vm");
 
         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
         let gm = GuestMemoryMmap::from_ranges(&[(
@@ -751,6 +1443,7 @@ mod tests {
         let vcpu_list = Arc::new(VcpuList::new(1));
         let mut vcpu = Vcpu::new_aarch64(
             0,
+            36,
             GuestAddress(0),
             None,
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
@@ -764,6 +1457,7 @@ mod tests {
         let vcpu_list = Arc::new(VcpuList::new(2));
         let mut vcpu = Vcpu::new_aarch64(
             1,
+            36,
             GuestAddress(0),
             None,
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
