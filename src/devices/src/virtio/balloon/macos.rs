@@ -714,8 +714,13 @@ mod tests {
         }
     }
 
+    /// limina: the default mode never madvise()s a reported page itself. It releases through
+    /// `hvf::ReleasedRam`, which unmaps the range from the guest before handing the pages back:
+    /// a page marked reusable must never stay reachable through a live stage-2 mapping. The
+    /// test balloon's ledger holds no guest memory, so the pages stay as the guest wrote them,
+    /// and the report is still completed.
     #[test]
-    fn test_default_mode_marks_reported_pages_as_free() {
+    fn test_default_mode_leaves_reported_pages_to_released_ram() {
         // A multiple of the page size of every host.
         const PAGE: usize = 64 << 10;
         const FIRST: usize = 1 << 20;
@@ -736,16 +741,12 @@ mod tests {
             .collect();
         dev.report(&report);
         assert!(dev.balloon.process_frq());
+        assert_eq!(dev.used(), 1);
 
-        // MADV_FREE clears the modified state of the pages without marking them as reusable,
-        // which MADV_FREE_REUSABLE does. MADV_DONTNEED doesn't touch it.
         let pages = page_query::pages(host_addr, PAGES * PAGE);
         for (block, pages) in pages.chunks(pages.len() / PAGES).enumerate() {
-            let is_released = released
-                .iter()
-                .any(|&(first, blocks)| (first..first + blocks).contains(&block));
             for &(modified, reusable) in pages {
-                assert_eq!((modified, reusable), (!is_released, false), "page {block}");
+                assert_eq!((modified, reusable), (true, false), "page {block}");
             }
         }
     }
