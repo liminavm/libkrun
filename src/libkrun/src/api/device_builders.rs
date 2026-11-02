@@ -1381,6 +1381,11 @@ impl BalloonDevice {
     /// memory instead, which does release them. This costs a few system calls per report, and
     /// the guest's next access to each page faults it in again. Other platforms don't implement
     /// [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+    ///
+    /// limina: on macOS the default mode already releases written pages, through the
+    /// stage-2-unmap ledger (`hvf::ReleasedRam`), and attaching a balloon in
+    /// [`FreePageReportingMode::Replace`] fails: its remap behind the ledger leaves ranges mapped
+    /// that the ledger holds as released, and the next heal or deflate stops the VM.
     pub fn set_free_page_reporting_mode(&mut self, mode: FreePageReportingMode) {
         self.free_page_reporting_mode = mode;
     }
@@ -1420,6 +1425,10 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
         .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         #[cfg(target_os = "macos")]
         {
+            if self.free_page_reporting_mode == FreePageReportingMode::Replace {
+                log::error!("balloon: free page reporting mode Replace conflicts with ReleasedRam");
+                return Err(VmmError::InvalidParam());
+            }
             balloon.set_free_page_reporting_mode(self.free_page_reporting_mode);
             balloon
                 .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
