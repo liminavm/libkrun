@@ -1472,8 +1472,14 @@ impl<'a> AttachDevice<'a> for VirtioMemDevice {
         let (addr, size) = ctx
             .hotplug_ram()
             .ok_or_else(|| VmmError::Internal("virtio-mem: no region was made".into()))?;
-        let mem = devices::virtio::Mem::new(addr, size, devices::virtio::HOTPLUG_BLOCK_SIZE)
-            .map_err(|e| VmmError::Internal(format!("virtio-mem: {e:?}")))?;
+        let mem = devices::virtio::Mem::new(
+            addr,
+            size,
+            devices::virtio::HOTPLUG_BLOCK_SIZE,
+            #[cfg(target_os = "macos")]
+            ctx.vmm.released_ram.clone(),
+        )
+        .map_err(|e| VmmError::Internal(format!("virtio-mem: {e:?}")))?;
         info!(
             "virtio-mem: {} MiB at {addr:#x} in blocks of {} MiB",
             size >> 20,

@@ -1472,31 +1472,39 @@ pub fn build_microvm(
 
     // The balloon's stage-2 release/heal tracker, over the RAM regions only: the GPU/fs SHM
     // window at/above shm_start_addr is managed by blob mappings and must keep its M9.3
-    // unmapped-on-restore fault signature.
+    // unmapped-on-restore fault signature. virtio-mem's region, above that window, is RAM: free
+    // page reporting releases its plugged blocks' free pages, and the device unplugs through the
+    // tracker.
     #[cfg(target_os = "macos")]
     let released_ram = {
         use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
         let shm_start = arch_memory_info.shm_start_addr;
-        // virtio-mem's region is not the balloon's: the device gives its blocks back itself.
-        let hotplug = arch_memory_info.hotplug_ram.map(|(gpa, _)| gpa);
+        let hotplug = arch_memory_info.hotplug_ram;
         let regions = guest_memory
             .iter()
-            .filter(|r| shm_start == 0 || r.start_addr().raw_value() < shm_start)
-            .filter(|r| Some(r.start_addr().raw_value()) != hotplug)
+            .filter(|r| {
+                let gpa = r.start_addr().raw_value();
+                shm_start == 0 || gpa < shm_start || hotplug.is_some_and(|(h, _)| h == gpa)
+            })
             .map(|r| {
                 let host = guest_memory.get_host_address(r.start_addr()).unwrap() as u64;
                 (r.start_addr().raw_value(), host, r.len())
             })
             .collect();
-        let released_ram = hvf::ReleasedRam::new(regions);
-        Arc::new(match &vm_resources.guest_ram_blocks {
-            Some(layout) => released_ram.with_owned_blocks(
+        let mut released_ram = hvf::ReleasedRam::new(regions);
+        if let Some(layout) = &vm_resources.guest_ram_blocks {
+            released_ram = released_ram.with_owned_blocks(
                 arch_memory_info.ram_start_addr,
                 arch_memory_info.ram_last_addr - arch_memory_info.ram_start_addr,
                 layout.clone(),
-            ),
-            None => released_ram,
-        })
+            );
+        }
+        if let Some((gpa, size)) = hotplug {
+            let layout = hvf::guest_ram::BlockLayout::uniform(devices::virtio::HOTPLUG_BLOCK_SIZE)
+                .expect("a valid block");
+            released_ram = released_ram.with_owned_blocks(gpa, size, layout);
+        }
+        Arc::new(released_ram)
     };
 
     let mut vmm = Vmm {

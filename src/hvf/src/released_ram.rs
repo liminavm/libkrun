@@ -172,7 +172,7 @@ pub struct ReleasedRam<S: Stage2 = Hvf> {
     stage2: S,
     regions: Vec<RamRegion>,
     /// Owned-block guest RAM, released by renewing whole blocks instead of `MADV_FREE_REUSABLE`.
-    owned: Option<OwnedBlocks>,
+    owned: Vec<OwnedBlocks>,
     /// Released GPA ranges: start -> len, disjoint, coalesced. Exact by construction: every
     /// byte in here is stage-2 unmapped and only bytes in here are (balloon-released) ones.
     released: Mutex<BTreeMap<u64, u64>>,
@@ -269,7 +269,7 @@ impl<S: Stage2> ReleasedRam<S> {
         Self {
             stage2,
             regions,
-            owned: None,
+            owned: Vec::new(),
             released: Mutex::new(BTreeMap::new()),
             chunk,
             heals: AtomicU64::new(0),
@@ -288,14 +288,14 @@ impl<S: Stage2> ReleasedRam<S> {
     /// Treat `[gpa, gpa + size)` as guest RAM made of owned blocks laid out by `layout`
     /// ([`guest_ram::allocate`]). `MADV_FREE_REUSABLE` does nothing on such memory, so a release
     /// there renews each block it leaves wholly released, and a partly released block keeps its
-    /// pages until the rest of it follows.
+    /// pages until the rest of it follows. May be called once per span of owned RAM.
     pub fn with_owned_blocks(mut self, gpa: u64, size: u64, layout: BlockLayout) -> Self {
-        self.owned = Some(OwnedBlocks { gpa, size, layout });
+        self.owned.push(OwnedBlocks { gpa, size, layout });
         self
     }
 
     fn owned_at(&self, gpa: u64) -> Option<&OwnedBlocks> {
-        self.owned.as_ref().filter(|o| o.contains(gpa))
+        self.owned.iter().find(|o| o.contains(gpa))
     }
 
     fn region_of(&self, gpa: u64) -> Option<&RamRegion> {
@@ -405,6 +405,66 @@ impl<S: Stage2> ReleasedRam<S> {
         let mut released = self.released.lock().unwrap();
         let ranges = remove_overlaps(&mut released, gpa, gpa + len);
         self.reuse_and_map_all(&mut released, &ranges)
+    }
+
+    /// Give the host back `[gpa, gpa + len)`, whole owned blocks the guest has unplugged
+    /// (virtio-mem): unmap them, renew each, and map them back, all under the released-set lock.
+    /// Released ranges inside are forgotten, since the range ends up mapped whole. Returns false
+    /// if the range is not whole owned blocks of one region or a stage-2 call failed; a failed
+    /// map leaves the range in the released set, so a guest touch heals it.
+    pub fn unplug(&self, gpa: u64, len: u64) -> bool {
+        let (Some(region), Some(owned)) = (self.region_of(gpa), self.owned_at(gpa)) else {
+            error!("released-ram: unplug outside owned guest RAM: gpa={gpa:#x} len={len:#x}");
+            return false;
+        };
+        let end = gpa + len;
+        let blocks: Vec<(u64, u64)> = owned
+            .layout
+            .blocks(gpa - owned.gpa, end - owned.gpa, owned.size)
+            .map(|(start, block)| (owned.gpa + start, block))
+            .collect();
+        let whole = blocks.first().is_some_and(|&(first, _)| first == gpa)
+            && blocks
+                .last()
+                .is_some_and(|&(last, block)| last + block == end)
+            && end <= region.gpa + region.len
+            && end <= owned.gpa + owned.size;
+        if len == 0 || !whole {
+            error!("released-ram: unplug of partial blocks: gpa={gpa:#x} len={len:#x}");
+            return false;
+        }
+
+        let mut released = self.released.lock().unwrap();
+        let ret = self.stage2.unmap(gpa, len);
+        if ret != HV_SUCCESS {
+            error!("released-ram: hv_vm_unmap(gpa={gpa:#x}, len={len:#x}) failed: {ret:#x}");
+            return false;
+        }
+        let forgotten: u64 = remove_overlaps(&mut released, gpa, end)
+            .iter()
+            .map(|&(_, l)| l)
+            .sum();
+        self.remapped_bytes.fetch_add(forgotten, Ordering::Relaxed);
+        for (block_gpa, block) in blocks {
+            let host = Self::host_of(region, block_gpa);
+            // SAFETY: the block is unplugged and was just unmapped from the guest, under the
+            // lock, so no heal maps it back meanwhile.
+            if let Err(e) = unsafe { self.stage2.renew(host, block) } {
+                warn!("released-ram: renewing the block at {host:#x} len={block:#x} failed: {e}");
+            }
+        }
+        let host = Self::host_of(region, gpa);
+        let ret = self.stage2.map(host, gpa, len);
+        if ret != HV_SUCCESS {
+            error!(
+                "released-ram: hv_vm_map(host={host:#x}, gpa={gpa:#x}, len={len:#x}) failed: \
+                 {ret:#x}"
+            );
+            insert_range(&mut released, gpa, len);
+            self.released_bytes.fetch_add(len, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     /// Heal a stage-2 fault at `pa` (data or instruction abort with translation-fault
@@ -1480,6 +1540,8 @@ mod every_sequence {
         /// A stage-2 fault reported whatever the page's state, as when another vCPU's heal
         /// raced it.
         Fault(usize),
+        /// virtio-mem gives back `n` pages from page `f`.
+        Unplug(usize, usize),
         FailUnmap,
         FailMap,
     }
@@ -1499,6 +1561,7 @@ mod every_sequence {
         ]);
         ops.extend((0..PAGES - 1).map(Op::Touch));
         ops.extend((0..PAGES).map(Op::Fault));
+        ops.extend([Op::Unplug(0, 2), Op::Unplug(2, 2), Op::Unplug(1, 2)]);
         ops.extend([Op::FailUnmap, Op::FailMap]);
         ops
     }
@@ -1515,6 +1578,7 @@ mod every_sequence {
 
     #[derive(Default)]
     struct Expect {
+        owned: bool,
         released: [bool; PAGES],
         fail_unmap: bool,
         fail_map: bool,
@@ -1576,6 +1640,20 @@ mod every_sequence {
                     Some(_) => "Retry",
                 };
                 let got = outcome(rr.handle_fault(gpa(p), TRANSLATION_FAULT));
+                (got.to_string(), want.to_string())
+            }
+            Op::Unplug(f, n) => {
+                let whole = REGION_A.contains(&f)
+                    && REGION_A.contains(&(f + n - 1))
+                    && (f - REGION_A.start).is_multiple_of(BLOCK_PAGES)
+                    && n.is_multiple_of(BLOCK_PAGES);
+                let want = e.owned && whole && !std::mem::take(&mut e.fail_unmap);
+                if want {
+                    let mapped = !std::mem::take(&mut e.fail_map);
+                    (f..f + n).for_each(|p| e.released[p] = !mapped);
+                }
+                let want = want && !(f..f + n).any(|p| e.released[p]);
+                let got = rr.unplug(gpa(f), n as u64 * page());
                 (got.to_string(), want.to_string())
             }
             Op::FailUnmap => {
@@ -1649,7 +1727,10 @@ mod every_sequence {
             rr = rr.with_owned_blocks(gpa(REGION_A.start), size, layout);
             rr.stage2.0.lock().unwrap().owned = true;
         }
-        let mut e = Expect::default();
+        let mut e = Expect {
+            owned,
+            ..Expect::default()
+        };
         for (i, &op) in seq.iter().enumerate() {
             step(&rr, &mut e, op)
                 .and_then(|()| check(&rr, &e))
@@ -1680,6 +1761,29 @@ mod every_sequence {
                 panic!("{m}");
             }
         }
+    }
+
+    /// An unplug of a partly released block maps it back whole and forgets the released part;
+    /// a later fault there is a heal race, not a heal.
+    #[test]
+    fn an_unplug_forgets_the_ranges_released_inside_it() {
+        replay(&[
+            Op::Release(1, 1),
+            Op::Unplug(0, 2),
+            Op::Fault(1),
+            Op::Touch(1),
+        ]);
+    }
+
+    /// An unplug whose map back fails leaves the blocks released, so a touch heals them.
+    #[test]
+    fn a_failed_unplug_leaves_its_blocks_to_heal() {
+        replay(&[
+            Op::Release(0, 1),
+            Op::FailMap,
+            Op::Unplug(0, 2),
+            Op::Touch(1),
+        ]);
     }
 
     /// A release that repeats an earlier one, whose unmap then fails, must leave the earlier
