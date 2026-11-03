@@ -6,13 +6,17 @@
 //! (`hvf::guest_ram`) and is stage-2 mapped whole from boot: the guest never touches a block it
 //! has not plugged (`VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`), so a mapped, unplugged block costs
 //! nothing. Unplugging unmaps the blocks, replaces each with a fresh one, which frees its pages,
-//! and maps them back.
+//! and maps them back. The balloon's free page reporting releases pages of plugged blocks too, so
+//! the unplug goes through the same released-RAM tracker (`hvf::ReleasedRam::unplug`), which
+//! forgets what it had released there.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(target_os = "macos")]
+use hvf::ReleasedRam;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
@@ -46,6 +50,8 @@ pub struct Mem {
     block_size: u64,
     plugged: Plugged,
     shared: Arc<Shared>,
+    #[cfg(target_os = "macos")]
+    released_ram: Arc<ReleasedRam>,
 }
 
 /// What a snapshot carries of the device: where its region is, what the host asked for, and
@@ -101,7 +107,12 @@ impl MemControlHandle {
 impl Mem {
     /// A device over `[addr, addr + region_size)` in blocks of `block_size`, which must be a
     /// power of two dividing both.
-    pub fn new(addr: u64, region_size: u64, block_size: u64) -> super::Result<Mem> {
+    pub fn new(
+        addr: u64,
+        region_size: u64,
+        block_size: u64,
+        #[cfg(target_os = "macos")] released_ram: Arc<ReleasedRam>,
+    ) -> super::Result<Mem> {
         if !block_size.is_power_of_two()
             || !addr.is_multiple_of(block_size)
             || !region_size.is_multiple_of(block_size)
@@ -125,6 +136,8 @@ impl Mem {
                 bound: AtomicBool::new(false),
                 requested_evt: EventFd::new(EFD_NONBLOCK).map_err(MemError::EventFd)?,
             }),
+            #[cfg(target_os = "macos")]
+            released_ram,
         })
     }
 
@@ -232,36 +245,9 @@ impl Mem {
 
     /// Give the host back the pages of `[gpa, gpa + len)`, which the guest just unplugged.
     #[cfg(target_os = "macos")]
-    fn release(&self, mem: &GuestMemoryMmap, gpa: u64, len: u64) {
-        use hvf::bindings::HV_SUCCESS;
-        use hvf::released_ram::{Hvf, Stage2};
-        use vm_memory::GuestMemoryBackend;
-
-        let host = match mem.get_host_address(GuestAddress(gpa)) {
-            Ok(host) => host as u64,
-            Err(e) => {
-                error!("virtio-mem: unplugged range {gpa:#x}+{len:#x} is not guest memory: {e:?}");
-                return;
-            }
-        };
-        let ret = Hvf.unmap(gpa, len);
-        if ret != HV_SUCCESS as _ {
-            error!("virtio-mem: hv_vm_unmap({gpa:#x}, {len:#x}) failed: {ret:#x}");
-            return;
-        }
-        for offset in (0..len).step_by(self.block_size as usize) {
-            // SAFETY: one block of the region's owned memory, unmapped from the guest just above,
-            // and unplugged, so no device holds a buffer in it.
-            if let Err(e) = unsafe { Hvf.renew(host + offset, self.block_size) } {
-                warn!(
-                    "virtio-mem: renewing the block at {:#x} failed: {e}",
-                    gpa + offset
-                );
-            }
-        }
-        let ret = Hvf.map(host, gpa, len);
-        if ret != HV_SUCCESS as _ {
-            error!("virtio-mem: hv_vm_map({gpa:#x}, {len:#x}) failed: {ret:#x}");
+    fn release(&self, _mem: &GuestMemoryMmap, gpa: u64, len: u64) {
+        if !self.released_ram.unplug(gpa, len) {
+            warn!("virtio-mem: the unplugged range {gpa:#x}+{len:#x} keeps its pages");
         }
     }
 
