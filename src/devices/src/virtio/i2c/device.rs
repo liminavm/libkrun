@@ -56,6 +56,9 @@ const BATTERY_DISCHARGING: u16 = 0x40;
 const BATTERY_FULL_CHARGED: u16 = 0x20;
 const BATTERY_FULL_DISCHARGED: u16 = 0x10;
 
+/// The SBS value of a time estimate that does not apply in the current state.
+const NOT_APPLICABLE: u16 = 0xffff;
+
 /// The emulated SBS smart battery: a register file addressed by an SMBus command
 /// byte. SMBus word/block reads arrive as a command-byte write followed by a read
 /// (two chained virtio requests), so the last written command is sticky state.
@@ -147,24 +150,22 @@ impl SbsBattery {
             0x0f => word((DESIGN_CAPACITY_MAH * percent / 100) as u16),
             // FullChargeCapacity.
             0x10 => word(DESIGN_CAPACITY_MAH as u16),
-            // RunTimeToEmpty / AverageTimeToEmpty (min): only meaningful while
-            // discharging; NAK when unknown so the property reads as absent
-            // rather than a bogus number.
-            0x11 | 0x12 => {
-                if discharging {
-                    state.time_to_empty_min.and_then(word)
-                } else {
-                    None
-                }
-            }
+            // RunTimeToEmpty / AverageTimeToEmpty (min). The SBS spec answers 0xffff
+            // when no estimate applies; a NAK instead fails sbs-battery's read, and
+            // with it every power_supply uevent the guest sends.
+            0x11 | 0x12 => word(
+                state
+                    .time_to_empty_min
+                    .filter(|_| discharging)
+                    .unwrap_or(NOT_APPLICABLE),
+            ),
             // AverageTimeToFull (min).
-            0x13 => {
-                if state.charging {
-                    state.time_to_full_min.and_then(word)
-                } else {
-                    None
-                }
-            }
+            0x13 => word(
+                state
+                    .time_to_full_min
+                    .filter(|_| state.charging)
+                    .unwrap_or(NOT_APPLICABLE),
+            ),
             // ChargingCurrent / ChargingVoltage maxima.
             0x14 => word(2000),
             0x15 => word(12600),
@@ -528,7 +529,9 @@ mod tests {
     }
 
     #[test]
-    fn time_estimates_nak_when_unknown_or_inapplicable() {
+    fn time_estimates_read_not_applicable_rather_than_nak() {
+        // A NAK fails the whole power_supply uevent in the guest, so every time register
+        // must answer; 0xffff is the SBS "not applicable" value.
         let mut bat = battery(BatteryState {
             percent: 50,
             charging: false,
@@ -536,12 +539,10 @@ mod tests {
             time_to_empty_min: Some(123),
             ..Default::default()
         });
+        assert_eq!(read_word(&mut bat, 0x11).unwrap(), 123);
         assert_eq!(read_word(&mut bat, 0x12).unwrap(), 123);
-        // Time-to-full while discharging: NAK.
-        assert!(bat.write(&[0x13]));
-        assert!(bat.read(2).is_none());
+        assert_eq!(read_word(&mut bat, 0x13).unwrap(), 0xffff);
 
-        // Unknown estimate: NAK instead of a bogus number.
         let mut bat = battery(BatteryState {
             percent: 50,
             charging: false,
@@ -549,8 +550,33 @@ mod tests {
             time_to_empty_min: None,
             ..Default::default()
         });
-        assert!(bat.write(&[0x12]));
-        assert!(bat.read(2).is_none());
+        assert_eq!(read_word(&mut bat, 0x12).unwrap(), 0xffff);
+
+        let mut bat = battery(BatteryState {
+            percent: 80,
+            charging: false,
+            ac_online: true,
+            time_to_empty_min: Some(123),
+            time_to_full_min: Some(45),
+            ..Default::default()
+        });
+        for reg in [0x11, 0x12, 0x13] {
+            assert_eq!(
+                read_word(&mut bat, reg).unwrap(),
+                0xffff,
+                "register {reg:#x}"
+            );
+        }
+
+        let mut bat = battery(BatteryState {
+            percent: 80,
+            charging: true,
+            ac_online: true,
+            time_to_full_min: Some(45),
+            ..Default::default()
+        });
+        assert_eq!(read_word(&mut bat, 0x12).unwrap(), 0xffff);
+        assert_eq!(read_word(&mut bat, 0x13).unwrap(), 45);
     }
 
     #[test]
