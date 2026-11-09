@@ -145,11 +145,14 @@ impl Subscriber for Vsock {
                 }
                 _ => warn!("Unexpected vsock event received: {source:?}"),
             }
-            if raise_irq {
+            if raise_irq && self.needs_interrupt() {
                 debug!("raising IRQ");
                 self.device_state.signal_used_queue();
             }
         } else {
+            // Drain to avoid a level-triggered spurious event busy-spinning the loop while inactive
+            // (e.g. across suspend/resume). See `crate::virtio::drain_eventfd`.
+            crate::virtio::drain_eventfd(source);
             warn!("The device is not yet activated. Spurious event received: {source:?}");
         }
     }

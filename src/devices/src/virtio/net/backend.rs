@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(unix)]
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -32,6 +34,11 @@ pub enum ConnectError {
     TunSetVnetHdrSz(io::Error),
     #[cfg(not(target_os = "windows"))]
     TunSetOffload(io::Error),
+    #[cfg(target_os = "macos")]
+    Vmnet(String),
+    /// An [`ExternalBackend`] could not be built.
+    #[cfg(unix)]
+    External(String),
 }
 
 #[allow(dead_code)]
@@ -57,10 +64,24 @@ pub enum WriteError {
     NothingWritten,
     /// Part of the buffer was written, the write has to be finished using try_finish_write
     PartialWrite,
-    /// Passt doesnt seem to be running (received EPIPE)
+    /// The proxy is gone (EPIPE, or a reset or unconnected datagram socket). The frame is lost;
+    /// a backend that can be reconnected says so through [`NetBackend::reconnect`].
     ProcessNotRunning,
     /// Another internal error occurred
     Internal(SysError),
+}
+
+/// What came of an attempt to reconnect a backend whose proxy went away.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum Reconnect {
+    /// The backend talks to the proxy again, on the same descriptor or a new one.
+    Done,
+    /// The proxy is not back yet; try again later.
+    NotYet(SysError),
+    /// This backend cannot reconnect: it was handed over as a descriptor and has nothing to
+    /// connect to.
+    Unsupported,
 }
 
 #[cfg(unix)]
@@ -71,6 +92,21 @@ pub trait NetBackend {
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
     fn raw_socket_fd(&self) -> RawFd;
 
+    /// Descriptors besides [`raw_socket_fd`](Self::raw_socket_fd) whose readiness means frames may
+    /// be waiting, for a backend that gathers several sources. The worker watches them for reads
+    /// and hang-ups only, and takes the set again after every pass, so it may change with any call
+    /// into the backend; a descriptor replaced by another of the same number is taken up again
+    /// only after a reconnect.
+    fn extra_fds(&self) -> Vec<RawFd> {
+        Vec::new()
+    }
+
+    /// Whether `read_frame` writes a blank virtio-net header in front of the frame. A backend
+    /// that relays one (a tap, from the host kernel) returns false, so the header is left alone.
+    fn synthesizes_vnet_hdr(&self) -> bool {
+        true
+    }
+
     /// Delay in microseconds before retrying after NothingWritten.
     /// Returns 0 if no delay-based retry is needed (e.g. on Linux where
     /// EAGAIN + EPOLLET handles retries via writable events).
@@ -78,7 +114,21 @@ pub trait NetBackend {
     fn write_retry_delay_us(&self) -> u64 {
         0
     }
+
+    /// Connect to the proxy again after it went away. Called by the worker with a backoff
+    /// between attempts, once a write reported [`WriteError::ProcessNotRunning`] or the socket
+    /// hung up.
+    fn reconnect(&mut self) -> Reconnect {
+        Reconnect::Unsupported
+    }
 }
+
+/// Builds a backend the embedder implements, once the guest has acked its virtio-net features
+/// (the argument), so offloads can follow what the guest took. Called on the device's first
+/// activation; the backend then survives resets like the built-in ones.
+#[cfg(unix)]
+pub type ExternalBackend =
+    Arc<dyn Fn(u64) -> Result<Box<dyn NetBackend + Send>, ConnectError> + Send + Sync>;
 
 #[cfg(windows)]
 #[derive(Debug, PartialEq, Eq)]

@@ -3,6 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(target_os = "macos")]
+use hvf::ReleasedRam;
+
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -27,6 +30,17 @@ impl InterruptHandler for UsedQueueSignal {
     }
 }
 
+/// A balloon that advertises free page reporting, as upstream's tests expect.
+pub(super) fn new_balloon() -> Balloon {
+    Balloon::new(
+        true,
+        false,
+        #[cfg(target_os = "macos")]
+        Arc::new(ReleasedRam::new(Vec::new())),
+    )
+    .unwrap()
+}
+
 pub(super) struct TestDevice<'a> {
     pub(super) balloon: Balloon,
     pub(super) frq: VirtQueue<'a>,
@@ -36,7 +50,7 @@ pub(super) struct TestDevice<'a> {
 impl<'a> TestDevice<'a> {
     /// Attaches and activates a balloon whose free page reporting queue is at the start of `mem`.
     pub(super) fn new(mem: &'a GuestMemoryMmap) -> Self {
-        Self::with_balloon(mem, Balloon::new().unwrap())
+        Self::with_balloon(mem, new_balloon())
     }
 
     pub(super) fn with_balloon(mem: &'a GuestMemoryMmap, mut balloon: Balloon) -> Self {

@@ -7,13 +7,15 @@
 
 use std::fmt::{Display, Formatter};
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::device::{InterruptHandler, InterruptType, VirtioTransportState};
 use super::*;
 use crate::bus::BusDevice;
-use crate::legacy::IrqChip;
+use crate::legacy::{GuestPowerWatch, IrqChip};
 use utils::{byte_order, eventfd::EventFd};
+use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
@@ -59,6 +61,56 @@ pub struct MmioTransport {
     shm_region_select: u32,
     interrupt: MmioInterrupt,
     device_interrupt: InterruptTransport,
+    // M9.3 snapshot: the negotiated per-queue register file, stashed at `activate()` just before the
+    // live `Queue`s move into the device worker (after which `self.queues` is `None`). This lets
+    // `transport_state()` report the queue GPAs for a snapshot of an already-activated device.
+    activated_queue_regs: Vec<QueueRegs>,
+    // limina M9.3 diagnostics (LIMINA_MMIO_TRACE=1): log every salient transport register write
+    // (status / queue geometry — NOT the per-notification firehose) at warn with the device name.
+    // Answers "did the guest re-program this device's queues on s2idle thaw?" by direct observation.
+    mmio_trace: bool,
+    trace_name: String,
+    // limina M9.3 (no-PM-ops s2idle leniency): did the driver write any queue-geometry register
+    // (QueueNum/Ready/Desc/Avail/Used) since the last reset? A driver whose virtio_driver has no
+    // .freeze/.restore ops resumes from s2idle via the bus fallback (virtio.c
+    // virtio_device_restore_priv): reset → features → DRIVER_OK, with NO queue re-programming —
+    // virtio-gpu is the one such driver in practice (verified absent through v7.1.2). Reset wipes
+    // our queue registers, so that sequence would activate the device on dead queues and every
+    // guest command would wait forever (the M9.3 restore wedge, and equally an in-place s2idle).
+    // When this is false at DRIVER_OK, `activate()` re-arms from `activated_queue_regs`.
+    queues_programmed: bool,
+    // limina: notified whenever `device_status` changes, so the VMM can follow the guest into and
+    // out of suspend without polling (see `GuestPowerWatch`). `None` until the VMM installs it.
+    power_watch: Option<Arc<GuestPowerWatch>>,
+    // limina: the power-watch generation of this device's last status change (0 = none yet). It
+    // orders status changes across devices, which is what tells a guest releasing its devices
+    // (suspending) from one taking them back (resuming) when a snapshot shows both kinds.
+    status_changed_at: u64,
+}
+
+/// A virtqueue's negotiated register file (guest-physical ring addresses + size/ready), as the driver
+/// programmed it. Stashed at activation so a snapshot of an activated device can report its queue GPAs
+/// (used by the save-side drain, and carried in the snapshot for diagnostics). `next_avail`/`next_used`
+/// are not here — they ride the guest RAM snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct QueueRegs {
+    pub size: u16,
+    pub ready: bool,
+    pub desc: u64,
+    pub avail: u64,
+    pub used: u64,
+}
+
+/// Transport-level state a snapshot captures for a device that is DRIVER_OK at snapshot time (M9.3).
+/// Captured for diagnostics + the save-side drain (queue GPAs) + a future feature-drift fail-closed
+/// check. NOT replayed on restore: the guest re-negotiates every virtio device itself on s2idle thaw
+/// (`virtio_device_restore`), so a restore-side negotiation replay is redundant and was removed.
+pub struct TransportState {
+    pub device_status: u32,
+    pub acked_features: u64,
+    pub config_generation: u32,
+    pub isr: u32,
+    pub queues: Vec<QueueRegs>,
 }
 
 struct MmioInterruptInner {
@@ -187,6 +239,7 @@ impl MmioTransport {
             .device_name()
             .to_string();
         let debug_log_target = format!("{}[{device_name}]", module_path!());
+        let mmio_trace = std::env::var("LIMINA_MMIO_TRACE").map(|v| v == "1") == Ok(true);
         let state = VirtioTransportState::new(mem, device)
             .map_err(CreateMmioTransportError::CreateInterruptEventFd)?;
         let interrupt = MmioInterrupt::new(intc, debug_log_target)?;
@@ -197,7 +250,27 @@ impl MmioTransport {
             interrupt,
             device_interrupt,
             shm_region_select: 0,
+            activated_queue_regs: Vec::new(),
+            mmio_trace,
+            trace_name: device_name,
+            queues_programmed: false,
+            power_watch: None,
+            status_changed_at: 0,
         })
+    }
+
+    /// limina: install the VM's guest power-state change counter; every `device_status` change
+    /// notifies it from then on.
+    pub fn set_power_watch(&mut self, watch: Arc<GuestPowerWatch>) {
+        self.power_watch = Some(watch);
+    }
+
+    /// limina M9.3 restore: seed the previous-activation queue register file on a FRESH transport
+    /// from the snapshot's captured transport state. The guest re-negotiates the device itself on
+    /// s2idle thaw, but a driver with no PM ops (virtio-gpu) never re-programs its queues — the
+    /// seeded file is what `activate()`'s no-queues-programmed re-arm then falls back to.
+    pub fn seed_queue_regs(&mut self, regs: Vec<QueueRegs>) {
+        self.activated_queue_regs = regs;
     }
 
     /// Set the irq line for the device.
@@ -208,6 +281,21 @@ impl MmioTransport {
 
     pub fn interrupt_evt(&self) -> &EventFd {
         self.interrupt.event()
+    }
+
+    /// The current virtio device-status register (`ACKNOWLEDGE|DRIVER|FEATURES_OK|DRIVER_OK`
+    /// bits). limina M9.2 reads this at snapshot time: a quiesced (s2idle-suspended) device has
+    /// been reset by its driver's `.suspend` callback, so status returns to `INIT` (0). virtio-gpu
+    /// is the known exception (no PM ops, stays `DRIVER_OK`). Used by the quiesce oracle / the
+    /// INIT-invariant assert on the host-side snapshot path.
+    pub fn device_status(&self) -> u32 {
+        self.state.device_status
+    }
+
+    /// limina: the power-watch generation of the last `device_status` change, 0 if none has been
+    /// recorded (no watch installed, or the driver never touched the device).
+    pub fn status_changed_at(&self) -> u64 {
+        self.status_changed_at
     }
 
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
@@ -229,19 +317,186 @@ impl MmioTransport {
         self.state.device_status & (set | clr) == set
     }
 
+    /// A queue notification activates a device that asks for it
+    /// (`VirtioDevice::activates_before_driver_ok`) once the driver has accepted the features and
+    /// made every queue ready; DRIVER_OK then finds it active.
+    fn activates_on_this_notify(&self) -> bool {
+        self.state.device_status
+            == (device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK)
+            && self
+                .state
+                .queues
+                .as_ref()
+                .is_some_and(|qs| qs.iter().all(|q| q.ready))
+            && {
+                let device = self.locked_device();
+                device.activates_before_driver_ok() && !device.is_activated()
+            }
+    }
+
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&mut self, f: F) -> bool {
         self.state.with_queue_mut(self.state.queue_select, f)
     }
 
     fn update_queue_field<F: FnOnce(&mut Queue)>(&mut self, f: F) {
         if self.check_device_status(device_status::FEATURES_OK, device_status::FAILED) {
+            // limina M9.3: any queue-geometry write marks this negotiation cycle as having
+            // programmed queues — the no-PM-ops resume re-arm must then stay out of the way.
+            self.queues_programmed = true;
             // FIXME: check if activated!
             self.with_queue_mut(f);
         } else {
             warn!(
-                "update virtio queue in invalid state 0x{:x}",
-                self.state.device_status
+                "update virtio queue in invalid state 0x{:x} (device {})",
+                self.state.device_status,
+                self.locked_device().device_name()
             );
+        }
+    }
+
+    /// limina M9.3 (no-PM-ops s2idle leniency): the driver reached DRIVER_OK without programming
+    /// any queue this negotiation cycle (bus-fallback resume, see `queues_programmed`). Re-arm the
+    /// transport queues from the previous activation's register file — the rings still live in
+    /// guest RAM (in-place resume) or restored RAM (snapshot restore, where the file was seeded
+    /// from the capture). Ring cursors resume at used.idx as read from RAM: everything the device
+    /// completed stays completed, and any entries the guest queued past that are (re)processed.
+    /// A queue that fails validation is left un-ready (logged) — no worse than the dead queue the
+    /// spec-faithful behavior would have produced.
+    ///
+    /// Returns whether a re-armed queue holds completions the driver has not been told about:
+    /// under EVENT_IDX, a `used_event` other than `used.idx`. That happens when the device
+    /// completed entries while the guest was suspended (the snapshot's fence drain does exactly
+    /// this) — the interrupt that announced them is gone, because the guest's own reset in
+    /// `virtio_device_restore` cleared the ISR. No later completion can make up for it:
+    /// `used_event` now trails `next_used`, so `needs_notification` stays false until the 16-bit
+    /// index wraps, and the driver never looks at the queue again. The caller interrupts once.
+    fn rearm_queues_from_stash(&mut self, event_idx: bool) -> bool {
+        use vm_memory::Bytes;
+        let mem = self.state.mem().clone();
+        let regs = self.activated_queue_regs.clone();
+        let Some(queues) = self.state.queues.as_mut() else {
+            return false;
+        };
+        if queues.len() != regs.len() {
+            warn!(
+                "{}: queue re-arm skipped: stash has {} queue(s), transport {}",
+                self.trace_name,
+                regs.len(),
+                queues.len()
+            );
+            return false;
+        }
+        let mut unannounced = false;
+        for (i, (q, r)) in queues.iter_mut().zip(regs.iter()).enumerate() {
+            if !r.ready {
+                continue;
+            }
+            q.size = r.size;
+            q.ready = true;
+            q.desc_table = GuestAddress(r.desc);
+            q.avail_ring = GuestAddress(r.avail);
+            q.used_ring = GuestAddress(r.used);
+            // used.idx is the u16 at used_ring + 2 (after the flags field).
+            let used_idx = match mem.read_obj::<u16>(GuestAddress(r.used + 2)) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "{}: queue {i} re-arm: used.idx read failed ({e:?}); leaving queue un-ready",
+                        self.trace_name
+                    );
+                    q.ready = false;
+                    continue;
+                }
+            };
+            q.next_avail = std::num::Wrapping(used_idx);
+            q.next_used = std::num::Wrapping(used_idx);
+            if !q.is_valid(&mem) {
+                warn!(
+                    "{}: queue {i} re-arm: ring invalid against guest memory; leaving queue un-ready",
+                    self.trace_name
+                );
+                q.ready = false;
+                continue;
+            }
+            // avail.idx is the u16 at avail_ring + 2; used_event follows the avail ring's
+            // `size` entries.
+            let avail_idx = mem.read_obj::<u16>(GuestAddress(r.avail + 2)).ok();
+            let used_event = mem
+                .read_obj::<u16>(GuestAddress(r.avail + 4 + 2 * u64::from(r.size)))
+                .ok();
+            info!(
+                "{}: queue {i} re-armed at used.idx {used_idx} (avail.idx {avail_idx:?}, \
+                 used_event {used_event:?})",
+                self.trace_name
+            );
+            if event_idx && used_event.is_some_and(|e| e != used_idx) {
+                warn!(
+                    "{}: queue {i} holds completions the driver was never told about \
+                     (used_event {used_event:?} behind used.idx {used_idx}); interrupting once",
+                    self.trace_name
+                );
+                unannounced = true;
+            }
+        }
+        warn!(
+            "{}: DRIVER_OK with no queues programmed this cycle (no-PM-ops driver resume); \
+             re-armed queue register file from the previous activation",
+            self.trace_name
+        );
+        unannounced
+    }
+
+    /// Activates the device through the shared transport state, first stashing the negotiated
+    /// queue register file (M9.3 snapshot) so `transport_state()` can report the queue GPAs of an
+    /// already-activated device after the live `Queue`s have moved into the device worker.
+    fn activate(&mut self) {
+        // limina M9.3: bus-fallback resume detection — see `rearm_queues_from_stash`.
+        // The verdict doubles as the thaw classification handed to the device below
+        // (host-sleep s2idle defer-and-classify): a re-armed activation is a thaw, a
+        // queue-programming one is a real re-init.
+        let rearmed = !self.queues_programmed
+            && self
+                .state
+                .queues
+                .as_ref()
+                .is_some_and(|qs| qs.iter().all(|q| !q.ready))
+            && self.activated_queue_regs.iter().any(|r| r.ready);
+        let event_idx =
+            (self.locked_device().acked_features() & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+        let unannounced = rearmed && self.rearm_queues_from_stash(event_idx);
+
+        let Some(queues) = self.state.queues.as_ref() else {
+            return;
+        };
+
+        self.activated_queue_regs = queues
+            .iter()
+            .map(|q| QueueRegs {
+                size: q.size,
+                ready: q.ready,
+                desc: q.desc_table.0,
+                avail: q.avail_ring.0,
+                used: q.used_ring.0,
+            })
+            .collect();
+
+        self.locked_device().set_thaw_activation(rearmed);
+        self.state.activate(self.device_interrupt.clone());
+        if unannounced {
+            self.device_interrupt.signal_used_queue();
+        }
+    }
+
+    /// M9.3 snapshot: the transport state a restore needs to re-activate this device. Meaningful for
+    /// an activated device (the queue register file was stashed at `activate()`); reports the current
+    /// status/features/ISR plus that stashed per-queue register file.
+    pub fn transport_state(&self) -> TransportState {
+        TransportState {
+            device_status: self.state.device_status,
+            acked_features: self.locked_device().acked_features(),
+            config_generation: self.state.config_generation,
+            isr: self.interrupt.status() as u32,
+            queues: self.activated_queue_regs.clone(),
         }
     }
 
@@ -253,11 +508,36 @@ impl MmioTransport {
     /// a device status bit. If the driver sets the FAILED bit, the driver MUST later reset
     /// the device before attempting to re-initialize.
     fn set_device_status(&mut self, status: u32) {
+        debug!(
+            "device {} status transition 0x{:x} -> 0x{:x}",
+            self.locked_device().device_name(),
+            self.state.device_status,
+            status
+        );
+        let before = self.state.device_status;
+        let had_driver_ok = self.check_device_status(device_status::DRIVER_OK, 0);
+        // The shared state machine doesn't activate the device here: `activate()` does, so that
+        // the MMIO-only bookkeeping around activation (the M9.3 queue register stash) runs.
         if self
             .state
-            .set_device_status(status, self.device_interrupt.clone(), true)
+            .set_device_status(status, self.device_interrupt.clone(), false)
         {
             self.interrupt.reset_status();
+            // limina M9.3: a new negotiation cycle begins; `activated_queue_regs` deliberately
+            // SURVIVES the reset — it is the fallback for a no-PM-ops driver's bus-fallback resume
+            // (reset → features → DRIVER_OK with no queue writes), see `rearm_queues_from_stash`.
+            self.queues_programmed = false;
+        }
+        if !had_driver_ok
+            && self.check_device_status(device_status::DRIVER_OK, 0)
+            && !self.locked_device().is_activated()
+        {
+            self.activate();
+        }
+        if self.state.device_status != before
+            && let Some(watch) = &self.power_watch
+        {
+            self.status_changed_at = watch.notify();
         }
     }
 }
@@ -289,13 +569,12 @@ impl BusDevice for MmioTransport {
                     0xfc => self.state.config_generation,
                     0xb0..=0xbc => {
                         // For no SHM region or invalid region the kernel looks for length of -1
-                        let (shm_base, shm_len) = if self.shm_region_select > 1 {
-                            (0, !0)
-                        } else {
-                            match self.locked_device().shm_region() {
-                                Some(region) => (region.guest_addr, region.size as u64),
-                                None => (0, !0),
-                            }
+                        let (shm_base, shm_len) = match self
+                            .locked_device()
+                            .shm_region_by_id(self.shm_region_select)
+                        {
+                            Some(region) => (region.guest_addr, region.size as u64),
+                            None => (0, !0),
                         };
                         match offset {
                             0xb0 => shm_len as u32,
@@ -338,6 +617,31 @@ impl BusDevice for MmioTransport {
         match offset {
             0x00..=0xff if data.len() == 4 => {
                 let v = byte_order::read_le_u32(data);
+                // limina M9.3 diagnostics: trace the negotiation-relevant writes (skip the
+                // per-notification 0x50 and interrupt-ack 0x64 firehoses).
+                if self.mmio_trace && offset != 0x50 && offset != 0x64 {
+                    let reg = match offset {
+                        0x14 => "DeviceFeaturesSel",
+                        0x20 => "DriverFeatures",
+                        0x24 => "DriverFeaturesSel",
+                        0x30 => "QueueSel",
+                        0x38 => "QueueNum",
+                        0x44 => "QueueReady",
+                        0x70 => "Status",
+                        0x80 => "QueueDescLow",
+                        0x84 => "QueueDescHigh",
+                        0x90 => "QueueAvailLow",
+                        0x94 => "QueueAvailHigh",
+                        0xa0 => "QueueUsedLow",
+                        0xa4 => "QueueUsedHigh",
+                        0xac => "SHMSel",
+                        _ => "?",
+                    };
+                    warn!(
+                        "[MMIOTRACE] {} write 0x{offset:02x} {reg} = 0x{v:x} (qsel={})",
+                        self.trace_name, self.state.queue_select
+                    );
+                }
                 match offset {
                     0x14 => self.state.features_select = v,
                     0x20 => {
@@ -357,17 +661,51 @@ impl BusDevice for MmioTransport {
                     0x24 => self.state.acked_features_select = v,
                     0x30 => self.state.queue_select = v,
                     0x38 => self.update_queue_field(|q| q.size = v as u16),
-                    0x44 => self.update_queue_field(|q| q.ready = v == 1),
+                    0x44 => self.update_queue_field(|q| {
+                        q.ready = v == 1;
+                        // limina: QEMU-compatible leniency. A driver must program QueueNum
+                        // (reg 0x38) before marking the queue ready, but EDK2's VirtioGpuDxe
+                        // over virtio-mmio leaves it at 0 (its mmio path is normally unused;
+                        // virtio-gpu is almost always virtio-pci). QEMU tolerates this because
+                        // its vring.num defaults to the maximum; we init size to 0, so without
+                        // this the queue's actual_size() stays 0 and pop() ignores the avail
+                        // ring entirely. The driver sized its ring to QueueNumMax, so snapping
+                        // a ready-but-unsized queue to max_size matches the ring it allocated.
+                        if q.ready && q.size == 0 {
+                            warn!("virtio queue marked ready with QueueNum=0; defaulting to max_size={}", q.max_size);
+                            q.size = q.max_size;
+                        }
+                    }),
                     0x50 => {
-                        // Queue notification - write to the eventfd for the specified queue.
-                        if let Some(eventfd) = self.state.queue_evts().get(v as usize) {
+                        if self.activates_on_this_notify() {
+                            self.activate();
+                        }
+                        // A device may service the notification right here, on this vCPU; see
+                        // `VirtioDevice::notify_inline`. Only once the driver is running: before
+                        // that there are no queues to service.
+                        let inline = self.check_device_status(device_status::DRIVER_OK, 0)
+                            && self.locked_device().notify_inline(v);
+                        if inline {
+                            // Handled; nothing to wake.
+                        } else if let Some(eventfd) = self.state.queue_evts().get(v as usize) {
+                            // limina wake-probe: stamp the doorbell BEFORE the eventfd write, so
+                            // the worker's `kick -> wake` covers the wake itself. No-op (one
+                            // never-matching relaxed load) unless LIMINA_WAKE_PROBE=1.
+                            super::wake_probe::kick(eventfd.as_raw_fd());
                             eventfd.write(1).unwrap();
                         } else {
                             warn!("invalid queue index for notification: {v}");
                         }
                     }
                     0x64 => {
-                        if self.check_device_status(device_status::DRIVER_OK, 0)
+                        // limina wake-probe: the guest's virtio ISR handler acking. This is the
+                        // end of the return path, and unlike the GIC acknowledge it traps to us
+                        // even with Apple's in-kernel GIC.
+                        if let Some(evt) = self.state.queue_evts().first() {
+                            super::wake_probe::irq_acked_transport(evt.as_raw_fd());
+                        }
+                        if (self.check_device_status(device_status::DRIVER_OK, 0)
+                            || self.locked_device().is_activated())
                             && let Err(e) = self.interrupt.on_ack(v)
                         {
                             warn!("Failed to clear irq line on ack: {e:?}");
@@ -430,6 +768,12 @@ pub(crate) mod tests {
         avail_features: u64,
         device_activated: bool,
         config_bytes: [u8; 0xeff],
+        /// The queue `notify_inline` services, if any; every notification it saw.
+        inline_queue: Option<u32>,
+        inline_notified: Vec<u32>,
+        /// Whether a guest reset deactivates it, as a real device's `reset` does.
+        resettable: bool,
+        early: bool,
     }
 
     impl DummyDevice {
@@ -439,6 +783,10 @@ pub(crate) mod tests {
                 avail_features: 0,
                 device_activated: false,
                 config_bytes: [0; 0xeff],
+                inline_queue: None,
+                inline_notified: Vec::new(),
+                resettable: false,
+                early: false,
             }
         }
 
@@ -494,6 +842,22 @@ pub(crate) mod tests {
 
         fn is_activated(&self) -> bool {
             self.device_activated
+        }
+
+        fn reset(&mut self) -> bool {
+            if self.resettable {
+                self.device_activated = false;
+            }
+            self.resettable
+        }
+
+        fn notify_inline(&mut self, queue: u32) -> bool {
+            self.inline_notified.push(queue);
+            self.inline_queue == Some(queue)
+        }
+
+        fn activates_before_driver_ok(&self) -> bool {
+            self.early
         }
     }
 
@@ -890,6 +1254,115 @@ pub(crate) mod tests {
         assert!(d.locked_device().is_activated());
     }
 
+    /// Ring layout for the re-arm tests: queue 0 (16 entries) and queue 1 (16 of its 32), each
+    /// with its descriptor table, avail ring and used ring inside the 0x1000 test memory.
+    const REARM_RINGS: [(u64, u64, u64); 2] = [(0x000, 0x200, 0x400), (0x600, 0x800, 0xa00)];
+
+    /// `used_event` lives after the avail ring's 16 entries: flags(2) + idx(2) + 16 * 2.
+    const REARM_USED_EVENT_OFF: u64 = 4 + 16 * 2;
+
+    /// Negotiate EVENT_IDX and program both queues at `REARM_RINGS`, then DRIVER_OK.
+    fn negotiate_event_idx(d: &mut MmioTransport, program_queues: bool) {
+        let mut buf = [0; 4];
+        set_device_status(d, device_status::ACKNOWLEDGE);
+        set_device_status(d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+        write_le_u32(&mut buf[..], 0);
+        d.write(0, 0x24, &buf[..]);
+        write_le_u32(&mut buf[..], 1 << VIRTIO_RING_F_EVENT_IDX);
+        d.write(0, 0x20, &buf[..]);
+        set_device_status(
+            d,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        );
+        if program_queues {
+            for (q, (desc, avail, used)) in REARM_RINGS.iter().enumerate() {
+                d.state.queue_select = q as u32;
+                for (reg, v) in [
+                    (0x38, 16),
+                    (0x80, *desc as u32),
+                    (0x90, *avail as u32),
+                    (0xa0, *used as u32),
+                    (0x44, 1),
+                ] {
+                    write_le_u32(&mut buf[..], v);
+                    d.write(0, reg, &buf[..]);
+                }
+            }
+        }
+        set_device_status(
+            d,
+            device_status::ACKNOWLEDGE
+                | device_status::DRIVER
+                | device_status::FEATURES_OK
+                | device_status::DRIVER_OK,
+        );
+    }
+
+    /// Set queue 0's `used.idx` and the driver's `used_event` in guest memory.
+    fn set_ring_indices(m: &GuestMemoryMmap, used_idx: u16, used_event: u16) {
+        use vm_memory::Bytes;
+        let (_, avail, used) = REARM_RINGS[0];
+        m.write_obj(used_idx, GuestAddress(used + 2)).unwrap();
+        m.write_obj(used_event, GuestAddress(avail + REARM_USED_EVENT_OFF))
+            .unwrap();
+    }
+
+    /// A no-PM-ops driver's resume (reset, features, DRIVER_OK with no queue writes) re-arms the
+    /// queues at `used.idx`. If the device completed entries the driver never consumed — the
+    /// snapshot's fence drain completes commands after the guest suspended, and the guest's own
+    /// reset at `virtio_device_restore` wipes the ISR that announced them — the driver's
+    /// `used_event` is behind `used.idx`. Under EVENT_IDX no later completion can then interrupt
+    /// (`used_event` is never between the old and new `next_used` again until the 16-bit index
+    /// wraps), so the driver never consumes the queue again. The re-arm must interrupt once.
+    #[test]
+    fn test_rearm_interrupts_for_completions_the_driver_never_consumed() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_avail_features(1 << VIRTIO_RING_F_EVENT_IDX);
+        dummy.resettable = true;
+        let mut d = MmioTransport::new(
+            m.clone(),
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+        )
+        .unwrap();
+        negotiate_event_idx(&mut d, true);
+        assert!(d.locked_device().is_activated());
+
+        // The device completed through used.idx 9; the driver asked to hear about entry 4 and
+        // never did.
+        set_ring_indices(&m, 9, 3);
+        set_device_status(&mut d, 0);
+        assert_eq!(d.interrupt.status(), 0);
+
+        negotiate_event_idx(&mut d, false);
+        assert_eq!(
+            d.interrupt.status() & VIRTIO_MMIO_INT_VRING as usize,
+            VIRTIO_MMIO_INT_VRING as usize,
+            "re-armed queue holds completions the driver never saw; no interrupt announced them"
+        );
+    }
+
+    /// The same resume with nothing outstanding (`used_event == used.idx`) raises nothing.
+    #[test]
+    fn test_rearm_is_quiet_when_the_driver_consumed_everything() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_avail_features(1 << VIRTIO_RING_F_EVENT_IDX);
+        dummy.resettable = true;
+        let mut d = MmioTransport::new(
+            m.clone(),
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+        )
+        .unwrap();
+        negotiate_event_idx(&mut d, true);
+        set_ring_indices(&m, 9, 9);
+        set_device_status(&mut d, 0);
+        negotiate_event_idx(&mut d, false);
+        assert_eq!(d.interrupt.status(), 0);
+    }
+
     fn activate_device(d: &mut MmioTransport) {
         set_device_status(d, device_status::ACKNOWLEDGE);
         set_device_status(d, device_status::ACKNOWLEDGE | device_status::DRIVER);
@@ -926,6 +1399,120 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK
         );
         assert!(d.locked_device().is_activated());
+    }
+
+    #[test]
+    fn test_notify_inline_skips_the_queue_eventfd() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.inline_queue = Some(1);
+        let dummy = Arc::new(Mutex::new(dummy));
+        let mut d = MmioTransport::new(m, DummyIrqChip::new().into(), dummy.clone()).unwrap();
+        let notify = |d: &mut MmioTransport, queue: u32| {
+            let mut buf = [0; 4];
+            write_le_u32(&mut buf[..], queue);
+            d.write(0, 0x50, &buf[..]);
+        };
+
+        // Before DRIVER_OK the device is not asked; the eventfd carries the kick.
+        notify(&mut d, 1);
+        assert!(dummy.lock().unwrap().inline_notified.is_empty());
+        assert_eq!(d.queue_evts()[1].read().unwrap(), 1);
+
+        activate_device(&mut d);
+
+        // The device services queue 1 itself: no eventfd write, so no thread is woken.
+        notify(&mut d, 1);
+        assert!(d.queue_evts()[1].read().is_err());
+
+        // It declines queue 0, which is kicked through its eventfd as before.
+        notify(&mut d, 0);
+        assert_eq!(d.queue_evts()[0].read().unwrap(), 1);
+
+        assert_eq!(dummy.lock().unwrap().inline_notified, vec![1, 0]);
+    }
+
+    #[test]
+    fn a_notify_before_driver_ok_activates_a_device_that_asks_for_it() {
+        for early in [false, true] {
+            let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+            let mut dummy = DummyDevice::new();
+            dummy.early = early;
+            let dummy = Arc::new(Mutex::new(dummy));
+            let mut d = MmioTransport::new(m, DummyIrqChip::new().into(), dummy.clone()).unwrap();
+            let mut buf = [0; 4];
+            let features_ok =
+                device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK;
+            set_device_status(&mut d, device_status::ACKNOWLEDGE);
+            set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+            set_device_status(&mut d, features_ok);
+            for q in 0..2 {
+                d.state.queue_select = q;
+                write_le_u32(&mut buf[..], 16);
+                d.write(0, 0x38, &buf[..]);
+                // A notification while a queue is still not ready activates nothing.
+                if q == 0 {
+                    write_le_u32(&mut buf[..], 0);
+                    d.write(0, 0x50, &buf[..]);
+                    assert!(!dummy.lock().unwrap().is_activated());
+                }
+                write_le_u32(&mut buf[..], 1);
+                d.write(0, 0x44, &buf[..]);
+            }
+
+            write_le_u32(&mut buf[..], 0);
+            d.write(0, 0x50, &buf[..]);
+            assert_eq!(dummy.lock().unwrap().is_activated(), early);
+            // The kick still reaches the queue, for the now-running device to find.
+            assert!(d.queue_evts()[0].read().is_ok());
+
+            set_device_status(&mut d, features_ok | device_status::DRIVER_OK);
+            assert_eq!(
+                d.state.device_status,
+                features_ok | device_status::DRIVER_OK
+            );
+            assert!(dummy.lock().unwrap().is_activated());
+        }
+    }
+
+    #[test]
+    fn test_queue_ready_without_queuenum_defaults_to_max() {
+        // limina regression: EDK2's VirtioGpuDxe over virtio-mmio marks the control queue
+        // ready (reg 0x44) WITHOUT ever programming QueueNum (reg 0x38), leaving size=0.
+        // QEMU tolerates this (its vring.num defaults to the maximum); we must too, or the
+        // queue's actual_size() stays 0 and pop() never sees the descriptors the driver
+        // queued -- which deadlocked the GOP firmware boot. A ready-but-unsized queue must
+        // snap to max_size (the ring size the driver actually allocated from QueueNumMax).
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+        let mut buf = [0; 4];
+
+        set_device_status(&mut d, device_status::ACKNOWLEDGE);
+        set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
+        set_device_status(
+            &mut d,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        );
+
+        // Select queue 0 (max_size 16) and mark it ready WITHOUT writing QueueNum (0x38).
+        write_le_u32(&mut buf[..], 0);
+        d.write(0, 0x30, &buf[..]);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].size, 0);
+
+        write_le_u32(&mut buf[..], 1);
+        d.write(0, 0x44, &buf[..]);
+
+        assert!(d.state.queues.as_ref().unwrap()[0].ready);
+        assert_eq!(
+            d.state.queues.as_ref().unwrap()[0].size,
+            16,
+            "queue marked ready with QueueNum=0 must default to max_size"
+        );
     }
 
     #[test]

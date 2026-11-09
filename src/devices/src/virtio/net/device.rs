@@ -5,16 +5,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::Error as DeviceError;
-use crate::virtio::net::Result;
+use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    TYPE_NET, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, DumpGate, InterruptTransport,
+    QueueConfig, TYPE_NET, VirtioDevice,
 };
 
+#[cfg(not(windows))]
+use super::backend::NetBackend;
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
+#[cfg(not(windows))]
+use super::worker::connect_backend;
 
 #[cfg(windows)]
 use super::unixstream::Unixstream;
@@ -26,7 +30,15 @@ use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::{AsSocket, BorrowedSocket, OwnedSocket, RawSocket};
 use std::path::PathBuf;
-use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+#[cfg(not(windows))]
+use std::thread::JoinHandle;
+#[cfg(not(windows))]
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
+use virtio_bindings::virtio_net::{
+    VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_MAC, VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP,
+};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
@@ -78,6 +90,48 @@ pub enum VirtioNetBackend {
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
+    #[cfg(target_os = "macos")]
+    Vmnet(super::vmnet::VmnetConfig),
+    #[cfg(unix)]
+    External(super::backend::ExternalBackend),
+}
+
+/// The NIC's carrier, which the embedder can take away and give back while the guest runs: a
+/// guest's network manager takes the link down with it, and on its return asks for a fresh lease,
+/// as on a cable pulled and plugged back in.
+#[derive(Default)]
+pub struct NetLink {
+    down: AtomicBool,
+    /// The running device's interrupt, from activation to reset.
+    interrupt: Mutex<Option<InterruptTransport>>,
+}
+
+impl NetLink {
+    /// Raises or drops the carrier, and tells a running guest when it changes.
+    pub fn set_up(&self, up: bool) {
+        if self.down.swap(!up, Ordering::SeqCst) == up {
+            let interrupt = self.interrupt.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(interrupt) = interrupt.as_ref() {
+                interrupt.signal_config_change();
+            }
+        }
+    }
+
+    pub fn is_up(&self) -> bool {
+        !self.down.load(Ordering::SeqCst)
+    }
+
+    fn set_interrupt(&self, interrupt: Option<InterruptTransport>) {
+        *self.interrupt.lock().unwrap_or_else(|p| p.into_inner()) = interrupt;
+    }
+
+    fn status(&self) -> u16 {
+        if self.is_up() {
+            VIRTIO_NET_S_LINK_UP as u16
+        } else {
+            0
+        }
+    }
 }
 
 pub struct Net {
@@ -90,11 +144,29 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+    link: Arc<NetLink>,
+    // The backend's frames already carry correct checksums; see `rx_data_valid`.
+    rx_csum_valid: bool,
 
     #[cfg(windows)]
     worker_socket: Option<OwnedSocket>,
     #[cfg(windows)]
     worker: Option<NetWorker>,
+    // Suspend/resume: the running worker's handle + the eventfd that stops it, so `reset` (the
+    // virtio reset the guest issues on resume) can tear the old worker down cleanly before the
+    // device is re-activated with fresh queues. The join handle yields the backend connection back
+    // so it survives the reset (see [`Net::reset`] and `worker::connect_backend`).
+    #[cfg(not(windows))]
+    worker_thread: Option<JoinHandle<Box<dyn NetBackend + Send>>>,
+    #[cfg(not(windows))]
+    worker_stopfd: EventFd,
+    // The gateway connection (e.g. gvproxy socket), preserved across suspend/resume. `Some` while
+    // the device is inactive/idle; taken by `activate` (moved into the worker) and handed back by
+    // `reset`. Lazily opened on first activate.
+    #[cfg(not(windows))]
+    backend: Option<Box<dyn NetBackend + Send>>,
+    /// Held closed by a snapshot while it copies guest RAM; every worker passes through it.
+    dump_gate: Arc<DumpGate>,
 }
 
 impl Net {
@@ -104,9 +176,11 @@ impl Net {
         cfg_backend: VirtioNetBackend,
         mac: [u8; 6],
         features: u32,
+        rx_csum_valid: bool,
     ) -> Result<Self> {
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
+            | (1 << VIRTIO_NET_F_STATUS)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
 
@@ -125,10 +199,19 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+            link: Arc::default(),
+            rx_csum_valid,
             #[cfg(windows)]
             worker_socket: None,
             #[cfg(windows)]
             worker: None,
+            #[cfg(not(windows))]
+            worker_thread: None,
+            #[cfg(not(windows))]
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?,
+            #[cfg(not(windows))]
+            backend: None,
+            dump_gate: Arc::default(),
         })
     }
 
@@ -140,6 +223,11 @@ impl Net {
     /// Provides the virtio-net backend of this net device.
     pub fn backend(&self) -> &VirtioNetBackend {
         &self.cfg_backend
+    }
+
+    /// The device's carrier, to drop and raise while the guest runs.
+    pub fn link(&self) -> Arc<NetLink> {
+        self.link.clone()
     }
 }
 
@@ -173,7 +261,11 @@ impl VirtioDevice for Net {
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
-        let config_slice = self.config.as_slice();
+        let config = VirtioNetConfig {
+            status: self.link.status().to_le(),
+            ..self.config
+        };
+        let config_slice = config.as_slice();
         let config_len = config_slice.len() as u64;
         if offset >= config_len {
             error!("Failed to read config space");
@@ -242,27 +334,61 @@ impl VirtioDevice for Net {
 
         #[cfg(not(windows))]
         {
-            match NetWorker::new(
+            // Drain any leftover stop signal before arming a new worker: if a previous worker
+            // panicked (instead of exiting via `reset`) it never read the pipe, and a residual byte
+            // would make the new worker see its stop event immediately and exit — a silently dead
+            // NIC. Nonblocking.
+            let _ = self.worker_stopfd.read();
+
+            let stop_fd = match self.worker_stopfd.try_clone() {
+                Ok(fd) => fd,
+                Err(err) => {
+                    error!(
+                        "Cannot clone virtio-net ({}) stop eventfd: {err:?}",
+                        self.id()
+                    );
+                    return Err(ActivateError::BadActivate);
+                }
+            };
+
+            // Reuse the existing gateway connection across a suspend/resume cycle; open it only the
+            // first time (or if a previous worker failed to hand it back).
+            let backend = match self.backend.take() {
+                Some(backend) => backend,
+                None => match connect_backend(self.cfg_backend.clone(), self.acked_features) {
+                    Ok(backend) => backend,
+                    Err(err) => {
+                        error!(
+                            "Error connecting virtio-net ({}) backend: {err:?}",
+                            self.id()
+                        );
+                        return Err(ActivateError::BadActivate);
+                    }
+                },
+            };
+
+            let reused = self.backend.is_none(); // took Some above -> reused if we didn't reconnect
+            debug!(
+                "virtio-net ({}): activate; reused_preserved_backend={}",
+                self.id(),
+                reused
+            );
+            let rx_data_valid = rx_data_valid(self.rx_csum_valid, self.acked_features);
+            let worker = NetWorker::new(
                 rx_q,
                 tx_q,
                 interrupt.clone(),
                 mem.clone(),
-                self.acked_features,
-                self.cfg_backend.clone(),
-            ) {
-                Ok(worker) => {
-                    worker.run();
-                    self.device_state = DeviceState::Activated(mem, interrupt);
-                    Ok(())
-                }
-                Err(err) => {
-                    error!(
-                        "Error activating virtio-net ({}) backend: {err:?}",
-                        self.id()
-                    );
-                    Err(ActivateError::BadActivate)
-                }
-            }
+                backend,
+                stop_fd,
+                rx_data_valid,
+            );
+            #[cfg(unix)]
+            let worker = worker.with_dump_gate(self.dump_gate.clone());
+            self.worker_thread = Some(worker.run());
+            self.link.set_interrupt(Some(interrupt.clone()));
+            self.device_state = DeviceState::Activated(mem, interrupt);
+            Ok(())
         }
     }
 
@@ -270,6 +396,11 @@ impl VirtioDevice for Net {
         self.device_state.is_activated()
     }
 
+    /// Deactivate on the virtio reset the guest issues when re-initialising the device — notably
+    /// on resume from suspend-to-idle. Stop the worker thread (so a fresh `activate` doesn't race a
+    /// stale one on the same queues) and go Inactive; the transport then recreates the queues and
+    /// re-activates. Returning `false` here (the trait default) would leave the transport marking
+    /// the device FAILED, so the guest's re-init writes get dropped and networking never comes back.
     fn reset(&mut self) -> bool {
         #[cfg(windows)]
         {
@@ -281,6 +412,113 @@ impl VirtioDevice for Net {
             true
         }
         #[cfg(not(windows))]
-        false
+        {
+            debug!("virtio-net ({}): reset (suspend/resume)", self.id());
+            if let Some(worker) = self.worker_thread.take() {
+                let _ = self.worker_stopfd.write(1);
+                match worker.join() {
+                    // Preserve the gateway connection so the next activate reuses it (don't reconnect,
+                    // which would drop gvproxy).
+                    Ok(backend) => self.backend = Some(backend),
+                    Err(e) => error!(
+                        "error waiting for virtio-net ({}) worker thread: {e:?}",
+                        self.id()
+                    ),
+                }
+            }
+            self.link.set_interrupt(None);
+            self.device_state = DeviceState::Inactive;
+            true
+        }
+    }
+
+    #[cfg(unix)]
+    fn dump_gate(&self) -> Option<Arc<DumpGate>> {
+        Some(self.dump_gate.clone())
+    }
+}
+
+/// Whether RX frames reach the guest marked `VIRTIO_NET_HDR_F_DATA_VALID`. Only the user can
+/// vouch that a backend's frames carry correct checksums (a proxy building them in its own stack
+/// does; one relaying a wire does not), and only a guest that negotiated GUEST_CSUM may be told.
+fn rx_data_valid(rx_csum_valid: bool, acked_features: u64) -> bool {
+    rx_csum_valid && acked_features & (1 << VIRTIO_NET_F_GUEST_CSUM) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUEST_CSUM: u64 = 1 << VIRTIO_NET_F_GUEST_CSUM;
+
+    fn status(net: &Net) -> u16 {
+        let mut b = [0u8; 2];
+        net.read_config(6, &mut b);
+        u16::from_le_bytes(b)
+    }
+
+    /// The carrier is up from the start, and a drop and a return each tell a running guest once.
+    #[test]
+    fn the_link_drops_and_returns_with_a_config_interrupt_each_way() {
+        use crate::virtio::device::{InterruptHandler, InterruptType};
+
+        /// Records whether the device signaled a config change since the last look.
+        #[derive(Default)]
+        struct ConfigChanges(AtomicBool);
+
+        impl InterruptHandler for ConfigChanges {
+            fn try_signal(
+                &self,
+                interrupt: InterruptType,
+            ) -> std::result::Result<(), crate::Error> {
+                if let InterruptType::ConfigChange = interrupt {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        let net = Net::new(
+            "net-test".into(),
+            VirtioNetBackend::UnixstreamPath(PathBuf::new()),
+            [0; 6],
+            0,
+            false,
+        )
+        .unwrap();
+        assert_ne!(net.avail_features() & (1 << VIRTIO_NET_F_STATUS), 0);
+        assert_eq!(status(&net), VIRTIO_NET_S_LINK_UP as u16);
+
+        let changes = Arc::new(ConfigChanges::default());
+        let interrupt = InterruptTransport::from_handler(changes.clone());
+        let config_signalled = || changes.0.swap(false, Ordering::SeqCst);
+        let link = net.link();
+        link.set_interrupt(Some(interrupt.clone()));
+
+        link.set_up(false);
+        assert_eq!(status(&net), 0);
+        assert!(config_signalled(), "the guest is told the link went down");
+        link.set_up(false);
+        assert!(!config_signalled(), "and only once");
+        link.set_up(true);
+        assert_eq!(status(&net), VIRTIO_NET_S_LINK_UP as u16);
+        assert!(config_signalled(), "the guest is told the link is back");
+    }
+
+    #[test]
+    fn a_vouched_backend_marks_frames_valid_for_a_csum_guest() {
+        assert!(rx_data_valid(true, GUEST_CSUM));
+    }
+
+    #[test]
+    fn a_backend_nobody_vouched_for_never_marks_frames_valid() {
+        // A relay of LAN frames over the same socket type must not have the guest skip its
+        // checksum check.
+        assert!(!rx_data_valid(false, GUEST_CSUM));
+    }
+
+    #[test]
+    fn a_guest_without_guest_csum_is_never_told() {
+        assert!(!rx_data_valid(true, 0));
     }
 }

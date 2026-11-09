@@ -9,7 +9,7 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{ActivateResult, Queue, device_status};
+use super::{ActivateResult, DumpGate, Queue, device_status};
 use crate::virtio::AsAny;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -145,6 +145,10 @@ impl VirtioTransportState {
         self.device.clone()
     }
 
+    pub(crate) fn mem(&self) -> &GuestMemoryMmap {
+        &self.mem
+    }
+
     pub(crate) fn queue_evts(&self) -> &[Arc<EventFd>] {
         &self.queue_evts
     }
@@ -194,6 +198,12 @@ impl VirtioTransportState {
     pub(crate) fn reset(&mut self) {
         self.features_select = 0;
         self.acked_features_select = 0;
+        // Clear the device's negotiated features. Per virtio 1.0 §2.1.1 a reset returns the device
+        // to the state it was in just after power-on, which includes un-negotiated features. Since
+        // `ack_features_by_page` OR-accumulates into the device (see `DeviceQueue`/`set_acked_...`),
+        // not clearing here let a driver that re-acks a *smaller* set after resume keep stale bits
+        // (e.g. EVENT_IDX), diverging queue-notification semantics. Same-kernel resume masks it.
+        self.locked_device().set_acked_features(0);
         self.queue_select = 0;
         self.device_status = device_status::INIT;
         // Keep config_generation monotonic and reuse queue eventfds across reset.
@@ -261,6 +271,10 @@ impl VirtioTransportState {
                     debug!("reset device while it's still in active state");
                 }
                 if device_activated && !self.locked_device().reset() {
+                    warn!(
+                        "device {} does not support reset; marking FAILED",
+                        self.locked_device().device_name()
+                    );
                     self.device_status |= FAILED;
                 }
 
@@ -295,6 +309,17 @@ impl DeviceState {
                 warn!("DeviceState::signal_used_queue() called, but device is not activated")
             }
             Self::Activated(_, interrupt) => interrupt.signal_used_queue(),
+        }
+    }
+
+    /// Raise a config-change interrupt so the guest re-reads device config (e.g. the balloon
+    /// `num_pages` target). Mirrors [`Self::signal_used_queue`].
+    pub fn signal_config_change(&self) {
+        match self {
+            Self::Inactive => {
+                warn!("DeviceState::signal_config_change() called, but device is not activated")
+            }
+            Self::Activated(_, interrupt) => interrupt.signal_config_change(),
         }
     }
 }
@@ -401,6 +426,35 @@ pub trait VirtioDevice: AsAny + Send {
     /// Checks if the resources of this device are activated.
     fn is_activated(&self) -> bool;
 
+    /// limina (host-sleep s2idle): called by the transport just before [`activate`] with
+    /// `thaw = true` when this activation's queues were RE-ARMED from the previous
+    /// activation's register file — the signature of a no-PM-ops driver's bus-fallback
+    /// s2idle thaw (reset → renegotiate → DRIVER_OK with no queue writes; see
+    /// `MmioTransport::rearm_queues_from_stash`). A driver that re-initializes for real
+    /// always programs its queues, so `thaw = false` there. Devices that defer session
+    /// teardown across a reset (virtio-gpu) use this to classify the activation; the
+    /// default implementation ignores it.
+    fn set_thaw_activation(&mut self, _thaw: bool) {}
+
+    /// limina: service a queue notification on the vCPU that wrote it, instead of waking the
+    /// device's thread through the queue eventfd. Returns `true` when the device handled it,
+    /// in which case the transport does not write the eventfd.
+    ///
+    /// For a device whose requests are cheap and whose driver is latency-sensitive in a way the
+    /// eventfd path makes worse. The work runs with the vCPU stopped in an MMIO exit and the
+    /// device locked, so it must not block. The default declines.
+    fn notify_inline(&mut self, _queue: u32) -> bool {
+        false
+    }
+
+    /// limina: activate on the first queue notification once the driver has accepted the
+    /// features and made every queue ready, instead of waiting for DRIVER_OK. For a device whose
+    /// stock Linux driver submits requests from its own probe, before the virtio core sets
+    /// DRIVER_OK, and waits for them without a timeout. The default waits for DRIVER_OK.
+    fn activates_before_driver_ok(&self) -> bool {
+        false
+    }
+
     /// Optionally deactivates this device. The device should drop its queues.
     /// After reset, the transport will recreate queues from queue_config().
     fn reset(&mut self) -> bool {
@@ -410,6 +464,32 @@ pub trait VirtioDevice: AsAny + Send {
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
+    }
+
+    /// limina: the config fields that decide what the guest's driver builds around this device,
+    /// by name -- a console's port count, a GPU's scanouts. A snapshot records them beside the
+    /// offered features and the queue count, and a restore whose device reports different values
+    /// is refused: the guest's driver set itself up for the old ones. Only fields fixed when the
+    /// device is built belong here; anything that changes while the VM runs would refuse a
+    /// restore on the same build. The default reports none.
+    fn snapshot_topology(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
+
+    /// limina: the gate this device's own threads pass through to write guest RAM, so a snapshot
+    /// can hold them off while it copies guest RAM. The default `None` leaves the device's
+    /// threads running through the copy.
+    fn dump_gate(&self) -> Option<Arc<DumpGate>> {
+        None
+    }
+
+    /// The SHM region the driver selected by `id`. Devices with one region answer it for ids 0
+    /// and 1, as the transport always did; devices with more override this.
+    fn shm_region_by_id(&self, id: u32) -> Option<VirtioShmRegion> {
+        if id > 1 {
+            return None;
+        }
+        self.shm_region().cloned()
     }
 }
 

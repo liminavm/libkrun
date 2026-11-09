@@ -9,26 +9,115 @@ pub const MAX_DISPLAYS: usize = VIRTIO_GPU_MAX_SCANOUTS as usize;
 
 use super::edid::EdidInfo;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdidParams {
     pub refresh_rate: u32,
+    /// limina: the preferred mode's exact refresh rate, in millihertz (59950 for a 59.95 Hz
+    /// panel). When set it alone sets that mode's pixel clock, to the encoding's full 10 kHz
+    /// precision, so a guest whose vblank timer runs off the mode ticks at the host display's
+    /// rate rather than beating against it; `refresh_rate` still names the mode everywhere a
+    /// whole number of Hz is wanted. `None` keeps the historical clock, byte for byte.
+    pub refresh_millihertz: Option<u32>,
     pub physical_size: PhysicalSize,
-    pub manufacturer: [u8; 3],
-    pub display_name: String,
+    /// The *stable identity* half of the EDID: the fields a guest compositor uses to recognize
+    /// this monitor across mode changes and reboots (and to key its remembered per-monitor
+    /// configuration). `None` keeps the historical anonymous identity (`RHT`, product 1,
+    /// serial 1, name `krun-display`), which is what a caller that never sets one gets.
+    pub identity: Option<EdidIdentity>,
+    /// Monitor range limits (descriptor tag `0xFD`). When set, the EDID also declares itself a
+    /// continuous-frequency display, so the guest may infer modes within the range.
+    pub range: Option<RefreshRange>,
+    /// Replaces the built-in standard-timing list with caller-supplied modes. These are
+    /// advertised *non-preferred* — only the detailed timing built from the display's current
+    /// size is preferred (and the guest prunes any other preferred mode; see
+    /// `docs/design/stable-edid-hotplug.md`).
+    pub standard_timings: Option<StandardTimings>,
+    /// An additional detailed timing (e.g. the same size at the panel's other refresh rate),
+    /// emitted as the second detailed descriptor and therefore non-preferred.
+    pub alt_mode: Option<DetailedMode>,
 }
+
+/// Density the default EDID claims, and therefore what a guest that is never given a real
+/// identity computes its scale from.
+///
+/// A desktop density, because the physical size tracks the mode: at 300 the generator described
+/// a 2560x1440 display as 8.5 x 4.8 inches — a ~10" retina panel that does not exist — and every
+/// guest compositor that trusts the EDID picked a HiDPI scale for it. A window-driven boot never
+/// saw this, because the supervisor replaces the identity with the host screen's on the first
+/// poll after a frame; a boot with no window keeps it for the life of the VM, which is how a
+/// seated 2560x1440 desktop ended up laid out at scale 2 on a phantom 10" monitor.
+///
+/// 96 is the density a monitor of unknown size is conventionally assumed to have, and it is what
+/// limina's own pushed identities use to mean "an ordinary desktop panel".
+const DEFAULT_DPI: u32 = 96;
 
 impl Default for EdidParams {
     fn default() -> Self {
         EdidParams {
             refresh_rate: 60,
-            physical_size: PhysicalSize::Dpi(300),
-            manufacturer: *b"RHT",
-            display_name: "krun-display".to_string(),
+            refresh_millihertz: None,
+            physical_size: PhysicalSize::Dpi(DEFAULT_DPI),
+            identity: None,
+            range: None,
+            standard_timings: None,
+            alt_mode: None,
         }
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+/// The identity fields of a generated EDID. Deliberately `Copy` and fixed-size so `EdidParams`
+/// stays `Copy` and can be pushed at runtime without allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdidIdentity {
+    /// Three upper-case letters, PNP-style (bytes 8-9, five bits per letter).
+    pub manufacturer: [u8; 3],
+    /// Manufacturer product code (bytes 10-11).
+    pub product_id: u16,
+    /// Serial number (bytes 12-15). Non-zero, unique per physical display.
+    pub serial: u32,
+    /// Display product name, ASCII, `0x0A`-terminated and space-padded to 13 bytes
+    /// (descriptor tag `0xFC`).
+    pub product_name: [u8; 13],
+    /// Optional display product serial *string* (descriptor tag `0xFF`), same padding rule.
+    pub serial_string: Option<[u8; 13]>,
+}
+
+/// Vertical/horizontal limits for the monitor-range-limits descriptor (tag `0xFD`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshRange {
+    pub min_vertical_hz: u8,
+    pub max_vertical_hz: u8,
+    /// Horizontal rates in kHz. Wider than the descriptor's byte on purpose: EDID 1.4
+    /// carries a +255 kHz offset flag per bound, and a 4K panel at 120 Hz needs it.
+    pub min_horizontal_khz: u16,
+    pub max_horizontal_khz: u16,
+    /// Maximum pixel clock in MHz; stored in the descriptor rounded up to a 10 MHz step.
+    pub max_pixel_clock_mhz: u32,
+}
+
+/// One entry of the standard-timing list (bytes 38-53). The encoding only admits four aspect
+/// ratios, widths that are a multiple of 8 in `256..=2288`, and refresh rates in `60..=123`;
+/// entries that don't fit are dropped by the generator rather than mis-encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandardTiming {
+    pub width: u16,
+    pub height: u16,
+    pub refresh_hz: u16,
+}
+
+/// The eight standard-timing slots.
+pub type StandardTimings = [Option<StandardTiming>; 8];
+
+/// A full detailed timing: everything else about it (blanking, porches) uses the generator's
+/// defaults, as the built-in preferred timing does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailedMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PhysicalSize {
     Dpi(u32),
     DimensionsMillimeters(u16, u16),
@@ -40,7 +129,19 @@ pub enum PhysicalSize {
 pub struct DisplayInfo {
     pub width: u32,
     pub height: u32,
+    /// limina (arrangement relay): where this display sits in the guest's desktop, in the
+    /// coordinates the guest compositor lays monitors out in (mutter consumes the DRM
+    /// `suggested X`/`suggested Y` connector properties as *logical* coordinates, verbatim).
+    /// Reported through `GET_DISPLAY_INFO` as the scanout rect's `r.x`/`r.y`, which the
+    /// stock guest driver already stores and ignores — a position-aware driver turns it
+    /// into the suggested-offset properties. (0, 0) when the host has no arrangement to
+    /// suggest.
+    pub position: (u32, u32),
     pub edid: DisplayInfoEdid,
+    /// limina: whether the guest sees this scanout as a *connected* display. Reported through
+    /// `GET_DISPLAY_INFO`, where the guest driver turns it straight into connector status
+    /// (`virtio_gpu_conn_detect`), so clearing it is a genuine unplug. Displays start connected.
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +155,9 @@ impl DisplayInfo {
         Self {
             width,
             height,
+            position: (0, 0),
             edid: DisplayInfoEdid::Generated(EdidParams::default()),
+            connected: true,
         }
     }
 
