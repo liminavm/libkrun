@@ -1,0 +1,2091 @@
+  1:  393b1973 !   1:  1a94f08b limina: keep the in-tree rutabaga_gfx
+    @@ Cargo.toml: members = [
+          "src/aws_nitro",
+     +    "src/rutabaga_gfx",
+          "src/whp",
+    -     "bindings/libkrun-via-cdylib-weak",
+      ]
+    + exclude = [
+     
+      ## src/devices/Cargo.toml ##
+     @@ src/devices/Cargo.toml: krun_input = { package = "krun-input", version = "0.1.0", path = "../input", fea
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: use krun_display::{
+      #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+     -use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_SHM;
+     +use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
+    ++use rutabaga_gfx::RutabagaResult;
+      #[cfg(target_os = "linux")]
+      use rutabaga_gfx::{
+     -    RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+                          shm_region.guest_addr,
+                          offset,
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: mod test {
+    -         assert!(!scanouts.has_any_enabled());
+    +             Transfer3D,
+    +         };
+    + 
+    +-        let mut rutabaga = RutabagaBuilder::new(0, RutabagaFenceHandler::new(|_| {}))
+    +-            .set_default_component(RutabagaComponentType::Rutabaga2D)
+    +-            .build()
+    ++        let mut rutabaga = RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0, 0)
+    ++            .build(RutabagaFenceHandler::new(|_| {}), None)
+    +             .unwrap();
+    +         let (width, height) = (4, 2);
+    +         rutabaga
+    +@@ src/devices/src/virtio/gpu/virtio_gpu.rs: mod test {
+    +             )
+    +             .unwrap();
+    +         rutabaga
+    +-            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height, 0), None)
+    ++            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height))
+    +             .unwrap();
+    + 
+    +         let resource = VirtioGpuResource::new(1, width, height, None, 0);
+    +@@ src/devices/src/virtio/gpu/virtio_gpu.rs: mod test {
+    +         assert_eq!(frame[2 * 4..], *row(1));
+          }
+      }
+     -
+  2:  f93020aa =   2:  771a98f4 limina: expose the vmm module to embedders
+  3:  a8aa5bc6 !   3:  f2293788 limina: software 2D virtio-gpu scanout for GL-less hosts (no renderer init)
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: pub struct FenceState {
+      struct AssociatedScanouts(u32);
+      
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: pub struct VirtioGpuScanout {
+    -     resource_id: u32,
+    +     height: u32,
+      }
+      
+     +/// A host-side software 2D resource (limina patch).
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+          }
+      
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    - 
+    -         for scanout_id in resource.scanouts.iter_enabled() {
+    +                 continue;
+    +             };
+                  let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
+    --            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
+    +-            let read = Self::read_2d_resource(&mut self.rutabaga, resource, scanout, buffer);
+    +-            // Present the frame even if the read failed: the display API has no
+    +-            // way to release it, and a backend may not hand out another one.
+    +-            self.display_backend
+    +-                .present_frame(scanout_id, frame_id, Some(&rect))?;
+    +-            if let Err(e) = read {
+     -                log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
+     +            // limina software 2D: the pixels already live in the host buffer; copy them out.
+     +            // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+     +                let n = buffer.len().min(sw.host.len());
+     +                buffer[..n].copy_from_slice(&sw.host[..n]);
+     +            } else if let Some(rutabaga) = self.rutabaga.as_mut() {
+    -+                if let Err(e) = Self::read_2d_resource(rutabaga, resource, buffer) {
+    ++                let read = Self::read_2d_resource(rutabaga, resource, scanout, buffer);
+    ++                // Present the frame even if the read failed: the display API has no
+    ++                // way to release it, and a backend may not hand out another one.
+    ++                self.display_backend
+    ++                    .present_frame(scanout_id, frame_id, Some(&rect))?;
+    ++                if let Err(e) = read {
+     +                    log::error!(
+     +                        "Failed to read resource {resource_id} for scanout {scanout_id}: {e}"
+     +                    );
+     +                    return Err(ErrUnspec);
+     +                }
+    ++                continue;
+     +            } else {
+     +                // No software-2D buffer and no renderer: nothing to present.
+                      return Err(ErrUnspec);
+                  }
+    -             self.display_backend
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    ++            self.display_backend
+    ++                .present_frame(scanout_id, frame_id, Some(&rect))?;
+              }
+      
+              #[cfg(windows)]
+  4:  3d229db9 =   4:  f0e7d927 limina: PL011 drops serial output on WouldBlock instead of erroring
+  5:  a971ec9d =   5:  5e324dd2 limina: virtio-console ConsoleInOut port + quiet raw-mode ENOTTY
+  6:  c7197a40 <   -:  -------- limina: HVF support 16-bit (halfword) MMIO writes
+  7:  8cbcf1ce <   -:  -------- limina: FDT mark PL011 serial node as arm,primecell (real ttyAMA0 tty)
+  8:  ddf7f874 =   6:  b7042809 limina: virtio-mmio default ready queue to max_size when QueueNum unset
+  9:  e156d5d1 =   7:  a8ff3042 limina: virtio-gpu stop the worker thread on device reset
+ 10:  d9e254a1 =   8:  06780340 limina: virtio-gpu hardware cursor (service the cursor queue)
+ 11:  38545fe6 =   9:  e4b99d34 limina: log renderer-init failure instead of swallowing it
+ 12:  dc90fdd8 =  10:  85647f27 limina: virtio-gpu coexist — route fences by ring + graceful renderer fallback
+ 13:  025b5f0f =  11:  373c5d77 limina: log hv_vm_map failures with alignment breakdown
+ 14:  7bc7bb6f =  12:  8f9d5d90 limina: virtio-gpu map blob via map_ptr for upstream virglrenderer 1.3.0
+ 15:  3b8d0fd5 !  13:  c0a27e45 gpu(macos): implement SET_SCANOUT_BLOB as zero-copy IOSurface present
+    @@ Commit message
+         Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+     
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpuResource {
+    - 
+    - pub struct VirtioGpuScanout {
+    +@@ src/devices/src/virtio/gpu/virtio_gpu.rs: pub struct VirtioGpuScanout {
+          resource_id: u32,
+    +     width: u32,
+    +     height: u32,
+     +    /// limina tier-2: if `Some`, this scanout's resource is backed by a global IOSurface
+     +    /// (venus SET_SCANOUT_BLOB) and `flush_resource` presents it zero-copy via
+     +    /// `present_surface` instead of the readback + `present_frame` path.
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpuResource {
+      
+      /// A host-side software 2D resource (limina patch).
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    -             format,
+    -         )?;
+    - 
+    --        *scanout = Some(VirtioGpuScanout { resource_id });
+    -+        *scanout = Some(VirtioGpuScanout {
+    -+            resource_id,
+    +             resource_id,
+    +             width,
+    +             height,
+     +            #[cfg(target_os = "macos")]
+     +            iosurface_id: None,
+     +        });
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+     +
+     +        *scanout = Some(VirtioGpuScanout {
+     +            resource_id,
+    ++            width,
+    ++            height,
+     +            iosurface_id,
+    -+        });
+    +         });
+              Ok(OkNoData)
+          }
+    - 
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+                  .ok_or(ErrInvalidResourceId)?;
+      
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+     +                }
+     +            }
+     +
+    -             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
+    -             // limina software 2D: the pixels already live in the host buffer; copy them out.
+    -             // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
+    +             let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize) else {
+    +                 continue;
+    +             };
+     
+      ## src/devices/src/virtio/gpu/worker.rs ##
+     @@ src/devices/src/virtio/gpu/worker.rs: impl Worker {
+ 16:  0818ba89 <   -:  -------- limina #30: don't panic the GPU worker on scanout readback failure
+ 17:  6c7d62c4 =  14:  32ae7c19 limina: virtio-gpu [FLUSHDBG] scanout flush diagnostics
+ 18:  e21e567e =  15:  f6541640 gpu: log context lifecycle and error responses at visible levels
+ 19:  cac35ef8 !  16:  f6d36949 limina: fence-accurate scanout presents (LIMINA_FENCE_PRESENT, #8/#31)
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpuResource {
+     +
+      pub struct VirtioGpuScanout {
+          resource_id: u32,
+    -     /// limina tier-2: if `Some`, this scanout's resource is backed by a global IOSurface
+    +     width: u32,
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: pub struct VirtioGpu {
+          scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
+          displays: Box<[DisplayInfo]>,
+ 20:  938d6cef =  17:  695fdf08 limina: hold guest flush fences until present + latch (#8 half 2 host side)
+ 21:  21c9840e =  18:  92b54539 limina: complete held flush fences on supervisor shown-acks (#8 latency collapse)
+ 22:  da1e71c4 =  19:  4d90ddfb limina: virtio-gpu persist the renderer across device reset (singleton fix)
+ 23:  eef9d637 !  20:  699712d0 limina: distinguish guest reboot (PSCI SYSTEM_RESET) from power-off
+    @@ Commit message
+     
+         Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+     
+    - ## src/hvf/src/lib.rs ##
+    -@@ src/hvf/src/lib.rs: pub enum VcpuExit<'a> {
+    -     PsciHandled,
+    -     SecureMonitorCall,
+    -     Shutdown,
+    -+    /// PSCI `SYSTEM_RESET` — the guest asked to reboot (vs `Shutdown` = power off). (limina addition.)
+    -+    Reset,
+    -     SystemRegister,
+    -     VtimerActivated,
+    -     WaitForEvent,
+    -@@ src/hvf/src/lib.rs: impl HvfVcpu<'_> {
+    -                 Ok(VcpuExit::Shutdown)
+    -             },
+    -             0x8400_0009 /* QEMU_PSCI_0_2_FN_SYSTEM_RESET */ => {
+    --                Ok(VcpuExit::Shutdown)
+    -+                Ok(VcpuExit::Reset)
+    -             },
+    -             0xc400_0003 /* QEMU_PSCI_0_2_FN64_CPU_ON */ => {
+    -                 let mpidr = self.read_reg(hv_reg_t_HV_REG_X1)?;
+    -
+      ## src/libkrun/src/vmm/macos/vstate.rs ##
+    -@@ src/libkrun/src/vmm/macos/vstate.rs: use std::sync::Arc;
+    - use std::thread;
+    - use std::time::Duration;
+    - 
+    --use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+    -+use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REBOOT};
+    - use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
+    - 
+    - use arch::ArchMemoryInfo;
+    -@@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+    -                     info!("vCPU {vcpuid} received shutdown signal");
+    -                     Ok(VcpuEmulation::Stopped)
+    -                 }
+    -+                VcpuExit::Reset => {
+    -+                    info!("vCPU {vcpuid} received reboot (PSCI SYSTEM_RESET)");
+    -+                    Ok(VcpuEmulation::Rebooted)
+    -+                }
+    -                 VcpuExit::SystemRegister => {
+    -                     debug!("vCPU {vcpuid} accessed a system register");
+    -                     Ok(VcpuEmulation::Handled)
+     @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+                      Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
+                          self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
+                      }
+    --                // The guest was rebooted or halted.
+    ++                // The guest asked to reboot (PSCI SYSTEM_RESET). libkrun is single-shot, so we
+    ++                // still tear the worker down, and the VMM picks an exit code the supervisor can
+    ++                // tell apart from a clean power-off (`DEFAULT_RESET_EXIT_CODE`).
+    +                 Ok(VcpuEmulation::Reset) => {
+    +                     self.exit(VcpuResponse::Reset);
+    +                     break;
+    +                 }
+    +-                // The guest was halted.
+     +                // The guest halted / powered off (PSCI SYSTEM_OFF).
+                      Ok(VcpuEmulation::Stopped) => {
+    -                     self.exit(FC_EXIT_CODE_OK);
+    +                     self.exit(VcpuResponse::Exited(FC_EXIT_CODE_OK));
+                          break;
+    -                 }
+    -+                // The guest asked to reboot (PSCI SYSTEM_RESET). libkrun is single-shot, so we
+    -+                // still tear the worker down — but with a distinct exit code so the supervisor
+    -+                // can relaunch us (a fresh boot) instead of treating it as a clean power-off.
+    -+                Ok(VcpuEmulation::Rebooted) => {
+    -+                    self.exit(FC_EXIT_CODE_REBOOT);
+    -+                    break;
+    -+                }
+    -                 // Emulation errors lead to vCPU exit.
+    -                 Err(_) => {
+    -                     self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+    -@@ src/libkrun/src/vmm/macos/vstate.rs: enum VcpuEmulation {
+    -     Handled,
+    -     Interrupted,
+    -     Stopped,
+    -+    Rebooted,
+    -     WaitForEvent,
+    -     WaitForEventExpired,
+    -     WaitForEventTimeout(Duration),
+     
+      ## src/libkrun/src/vmm/mod.rs ##
+     @@ src/libkrun/src/vmm/mod.rs: pub const FC_EXIT_CODE_GENERIC_ERROR: u8 = 1;
+    @@ src/libkrun/src/vmm/mod.rs: pub const FC_EXIT_CODE_GENERIC_ERROR: u8 = 1;
+     +/// worker process down — this code lets the supervisor tell a reboot apart from a clean
+     +/// power-off and relaunch the worker (limina patch: VMM-as-child reboot). (limina addition.)
+     +pub const FC_EXIT_CODE_REBOOT: u8 = 125;
+    ++/// The exit code of a guest reset when the builder sets no `reset_exit_code`. On HVF that is
+    ++/// [`FC_EXIT_CODE_REBOOT`], which the limina supervisor relaunches on; elsewhere it stays
+    ++/// upstream's `FC_EXIT_CODE_OK`. (limina addition.)
+    ++#[cfg(target_os = "macos")]
+    ++const DEFAULT_RESET_EXIT_CODE: u8 = FC_EXIT_CODE_REBOOT;
+    ++#[cfg(not(target_os = "macos"))]
+    ++const DEFAULT_RESET_EXIT_CODE: u8 = FC_EXIT_CODE_OK;
+     +
+      /// Errors associated with the VMM internal logic. These errors cannot be generated by direct user
+      /// input, but can result from bad configuration of the host (for example if Firecracker doesn't
+      /// have permissions to open the KVM fd).
+    +@@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+    +             match h.response_receiver().recv() {
+    +                 Ok(VcpuResponse::Paused) => {}
+    +                 Ok(VcpuResponse::Reset) => {
+    +-                    self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+    ++                    self.stop_guest(self.reset_exit_code.unwrap_or(DEFAULT_RESET_EXIT_CODE));
+    +                 }
+    +                 Ok(VcpuResponse::Exited(code)) => self.stop_guest(code),
+    +                 Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
+    +@@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+    +             match h.response_receiver().recv() {
+    +                 Ok(VcpuResponse::Resumed) => {}
+    +                 Ok(VcpuResponse::Reset) => {
+    +-                    self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+    ++                    self.stop_guest(self.reset_exit_code.unwrap_or(DEFAULT_RESET_EXIT_CODE));
+    +                 }
+    +                 Ok(VcpuResponse::Exited(code)) => self.stop_guest(code),
+    +                 Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
+    +@@ src/libkrun/src/vmm/mod.rs: impl Subscriber for Vmm {
+    +         if source == self.reset_evt.as_raw_fd() && event_set == EventSet::IN {
+    +             let _ = self.reset_evt.read();
+    +             info!("i8042 reset");
+    +-            self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+    ++            self.stop_guest(self.reset_exit_code.unwrap_or(DEFAULT_RESET_EXIT_CODE));
+    +         }
+    + 
+    +         if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
+    +@@ src/libkrun/src/vmm/mod.rs: impl Subscriber for Vmm {
+    +                 .find_map(|handle| match handle.response_receiver().try_recv() {
+    +                     Ok(VcpuResponse::Exited(exit_code)) => Some(exit_code),
+    +                     Ok(VcpuResponse::Reset) => {
+    +-                        Some(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK))
+    ++                        Some(self.reset_exit_code.unwrap_or(DEFAULT_RESET_EXIT_CODE))
+    +                     }
+    +                     _ => None,
+    +                 })
+ 24:  798b5def !  21:  5f167920 limina: implement virtio-gpu transfer_read (TRANSFER_FROM_HOST_3D)
+    @@ Commit message
+     
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    -     ///    2) To the host resource's attached iovecs
+    -     ///
+    -     /// Can also be used to invalidate caches.
+    -+    ///
+    -+    /// limina: this is the virgl/vrend copy-model readback path (`TRANSFER_FROM_HOST_3D`).
+    -+    /// venus (zero-copy, host-visible blobs) never needs it, so upstream left it a `panic!` —
+    -+    /// but a stock 4 KiB guest on the coexist device drives vrend, and any GL readback
+    -+    /// (`glReadPixels`, `glxinfo`, WebGL) issues `TRANSFER_FROM_HOST_3D`. Panicking here killed
+    -+    /// the GPU worker thread and wedged the whole guest (every later command blocks on a fence
+    -+    /// that never completes). Delegate to rutabaga like `transfer_write` does, and never panic.
+    -     pub fn transfer_read(
+    -         &mut self,
+    --        _ctx_id: u32,
+    --        _resource_id: u32,
+    --        _transfer: Transfer3D,
+    --        _buf: Option<VolatileSlice>,
+    -+        ctx_id: u32,
+    -+        resource_id: u32,
+    -+        transfer: Transfer3D,
+    -+        buf: Option<VolatileSlice>,
+    +         resource_id: u32,
+    +         transfer: Transfer3D,
+          ) -> VirtioGpuResult {
+    --        panic!("virtio_gpu: transfer_read unimplemented");
+    +-        self.rutabaga
+    +-            .transfer_read(ctx_id, resource_id, transfer, None)?;
+     +        // limina software 2D: the guest backing already mirrors our host buffer (we copy it on
+     +        // write/flush), so a host->guest readback is a no-op for these resources.
+     +        if self.sw2d.contains_key(&resource_id) {
+     +            return Ok(OkNoData);
+     +        }
+    -+        // The common `TRANSFER_FROM_HOST_3D` path passes `buf = None`: rutabaga copies from the
+    -+        // host resource into the resource's attached guest iovecs. When a destination slice is
+    -+        // given instead, hand it to rutabaga as an `IoSliceMut`.
+    -+        // SAFETY: `s` is a writable guest-memory slice the descriptor chain keeps valid for the
+    -+        // duration of this command; `IoSliceMut` only borrows it (same pattern as line ~62/968).
+    -+        let mut dst = buf.map(|s| unsafe {
+    -+            IoSliceMut::new(std::slice::from_raw_parts_mut(
+    -+                s.ptr_guard_mut().as_ptr(),
+    -+                s.len(),
+    -+            ))
+    -+        });
+    -+        self.rutabaga
+    -+            .as_mut()
+    -+            .ok_or(ErrUnspec)?
+    -+            .transfer_read(ctx_id, resource_id, transfer, dst.take())?;
+    -+        Ok(OkNoData)
+    ++        self.rutabaga.as_mut().ok_or(ErrUnspec)?.transfer_read(
+    ++            ctx_id,
+    ++            resource_id,
+    ++            transfer,
+    ++            None,
+    ++        )?;
+    +         Ok(OkNoData)
+          }
+      
+    -     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
+ 25:  21fa0204 !  22:  ff821794 limina: virtio-gpu runtime display resize (config-change mechanism)
+    @@ src/devices/src/virtio/gpu/device.rs: impl VirtioDevice for Gpu {
+     
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    +                 continue;
+    +             };
+    +             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
+    ++            let mut read_failed = false;
+    +             // limina software 2D: the pixels already live in the host buffer; copy them out.
+    +             // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
+    +             if let Some(sw) = self.sw2d.get(&resource_id) {
+                      let n = buffer.len().min(sw.host.len());
+                      buffer[..n].copy_from_slice(&sw.host[..n]);
+                  } else if let Some(rutabaga) = self.rutabaga.as_mut() {
+    +-                let read = Self::read_2d_resource(rutabaga, resource, scanout, buffer);
+    +-                // Present the frame even if the read failed: the display API has no
+    +-                // way to release it, and a backend may not hand out another one.
+    +-                self.display_backend
+    +-                    .present_frame(scanout_id, frame_id, Some(&rect))?;
+    +-                if let Err(e) = read {
+     +                // limina DIAG (flicker hunt): tunable pre-readback delay. `echo N >
+     +                // /tmp/limina-readback-delay` sleeps N ms before transfer_read, giving the
+     +                // host GPU time to finish rendering this buffer. If the incomplete-frame
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+     +                        }
+     +                    }
+     +                }
+    -                 if let Err(e) = Self::read_2d_resource(rutabaga, resource, buffer) {
+    ++                if let Err(e) = Self::read_2d_resource(rutabaga, resource, scanout, buffer) {
+                          log::error!(
+                              "Failed to read resource {resource_id} for scanout {scanout_id}: {e}"
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    +                     );
+    +-                    return Err(ErrUnspec);
+    ++                    read_failed = true;
+    +                 }
+    +-                continue;
+    +             } else {
+                      // No software-2D buffer and no renderer: nothing to present.
+                      return Err(ErrUnspec);
+                  }
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+     +                    let _ = std::fs::write(format!("/tmp/limina-staging-{n:03}.raw"), &buffer[..]);
+     +                }
+     +            }
+    ++            // Present the frame even if the read failed: the display API has no
+    ++            // way to release it, and a backend may not hand out another one.
+                  self.display_backend
+    -                 .present_frame(scanout_id, frame_id, Some(&rect))?
+    +                 .present_frame(scanout_id, frame_id, Some(&rect))?;
+    ++            if read_failed {
+    ++                return Err(ErrUnspec);
+    ++            }
+              }
+    + 
+    +         #[cfg(windows)]
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+              Ok(OkEdid(display.edid_bytes()))
+          }
+ 26:  27a90221 !  23:  2fce9bde limina: expose the GPU DisplayResizeHandle to the host VMM
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for GpuDevice
+     
+      ## src/libkrun/src/vmm/builder.rs ##
+     @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+    -         paused: false,
+    -         #[cfg(target_os = "macos")]
+              paused_at: 0,
+    +         #[cfg(target_os = "macos")]
+    +         ram_in_blocks: payload_config.ram_in_blocks,
+     +        #[cfg(feature = "gpu")]
+     +        gpu_resize_handle: None,
+          };
+    @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+     
+      ## src/libkrun/src/vmm/mod.rs ##
+     @@ src/libkrun/src/vmm/mod.rs: pub struct Vmm {
+    -     pub(crate) paused: bool,
+    +     /// Whether guest RAM is mapped in blocks, see `map_guest_ram_in_blocks()`.
+          #[cfg(target_os = "macos")]
+    -     pub(crate) paused_at: u64,
+    +     pub(crate) ram_in_blocks: bool,
+     +    /// limina: a handle for pushing runtime display resizes into the live virtio-gpu device,
+     +    /// captured when the GPU device is attached. `None` if no display/GPU is configured.
+     +    #[cfg(feature = "gpu")]
+    @@ src/libkrun/src/vmm/mod.rs: pub enum VmCtl {
+          /// Starts the microVM vcpus.
+          pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+              let vcpu_count = vcpus.len();
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         paused: resume,
+    +         paused_at: unsafe { hvf::mach_absolute_time() },
+    +         ram_in_blocks: false,
+    ++        #[cfg(feature = "gpu")]
+    ++        gpu_resize_handle: None,
+    +     };
+    + 
+    +     match control {
+ 27:  8adbdd74 !  24:  6adefd9a limina: virtio-gpu present the scanout rect at the resource's stride (de-shear)
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: const LIMINA_PRESENT_RING: u8 = 63;
+     +    /// backing *resource* can be LARGER (mutter pads its framebuffer, e.g. a 1000×708 mode
+     +    /// backed by a 1024×768 resource), so the 2D readback must extract this rect at the
+     +    /// resource's own stride — a flat copy shears. See `flush_resource`.
+    -+    width: u32,
+    -+    height: u32,
+    +     width: u32,
+    +     height: u32,
+          /// limina tier-2: if `Some`, this scanout's resource is backed by a global IOSurface
+    -     /// (venus SET_SCANOUT_BLOB) and `flush_resource` presents it zero-copy via
+    -     /// `present_surface` instead of the readback + `present_frame` path.
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl Sw2dResource {
+          }
+      }
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl Sw2dResource {
+          /// The host 3D renderer. `None` in limina software-2D-only mode, where the device serves
+          /// only the 2D scanout path (see [`Sw2dResource`]) and never initializes
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    - 
+    -         *scanout = Some(VirtioGpuScanout {
+    -             resource_id,
+    -+            width,
+    -+            height,
+    -             #[cfg(target_os = "macos")]
+    -             iosurface_id: None,
+    -         });
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    - 
+    -         *scanout = Some(VirtioGpuScanout {
+    -             resource_id,
+    -+            width,
+    -+            height,
+    -             iosurface_id,
+    -         });
+    -         Ok(OkNoData)
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+          fn read_2d_resource(
+              rutabaga: &mut Rutabaga,
+              resource: VirtioGpuResource,
+    +-        scanout: &VirtioGpuScanout,
+     +        width: u32,
+     +        height: u32,
+              output: &mut [u8],
+    -     ) -> VirtioGpuResult {
+    +     ) -> RutabagaResult<()> {
+     +        // limina: read the top-left `width`×`height` rect (the scanout's visible region) into a
+     +        // TIGHTLY packed `width*4`-stride output — the host staging buffer. The backing resource
+     +        // may be wider (mutter pads its framebuffer), but the box read extracts just the rect, so
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+                  x: 0,
+                  y: 0,
+                  z: 0,
+    --            w: resource.width,
+    --            h: resource.height,
+    -+            w: width,
+    -+            h: height,
+    +-            w: scanout.width.min(resource.width),
+    +-            h: scanout.height.min(resource.height),
+    ++            w: width.min(resource.width),
+    ++            h: height.min(resource.height),
+                  d: 1,
+                  level: 0,
+    --            stride: resource.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+    +-            stride: scanout.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+     +            stride: width * ResourceFormat::BYTES_PER_PIXEL as u32,
+                  layer_stride: 0,
+                  offset: 0,
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+                      }
+                  }
+      
+    +-            let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize) else {
+    +-                continue;
+    +-            };
+     +            // limina: the scanout's visible rect = the staging-buffer size (`configure_scanout`
+     +            // was called with it). The backing resource may be LARGER — mutter pads its
+     +            // framebuffer (e.g. a 1000×708 mode backed by a 1024×768 resource) — so we must
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+     +            let src_stride = resource.width as usize * bpp;
+     +
+                  let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
+    +             let mut read_failed = false;
+                  // limina software 2D: the pixels already live in the host buffer; copy them out.
+                  // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
+                  if let Some(sw) = self.sw2d.get(&resource_id) {
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+                              }
+                          }
+                      }
+    --                if let Err(e) = Self::read_2d_resource(rutabaga, resource, buffer) {
+    +-                if let Err(e) = Self::read_2d_resource(rutabaga, resource, scanout, buffer) {
+     +                if let Err(e) = Self::read_2d_resource(rutabaga, resource, scan_w, scan_h, buffer) {
+                          log::error!(
+                              "Failed to read resource {resource_id} for scanout {scanout_id}: {e}"
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: fn checked_blob_map_addr(base: u64, of
+          // Software-2D mode (rutabaga == None) has no async fence handler. A fence the
+          // guest requests on a 2D command must be retired synchronously, otherwise the
+          // response is parked forever and the guest hangs (observed: GTK4/nautilus on
+    +@@ src/devices/src/virtio/gpu/virtio_gpu.rs: mod test {
+    + 
+    +     #[test]
+    +     fn test_read_2d_resource_larger_than_scanout() {
+    +-        use super::{VirtioGpu, VirtioGpuResource, VirtioGpuScanout};
+    ++        use super::{VirtioGpu, VirtioGpuResource};
+    +         use rutabaga_gfx::{
+    +             RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
+    +             RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler, RutabagaIovec,
+    +@@ src/devices/src/virtio/gpu/virtio_gpu.rs: mod test {
+    +             .unwrap();
+    + 
+    +         let resource = VirtioGpuResource::new(1, width, height, None, 0);
+    +-        let scanout = VirtioGpuScanout {
+    +-            resource_id: 1,
+    +-            width: 2,
+    +-            height: 2,
+    +-        };
+    +         let mut frame = [0u8; 2 * 2 * 4];
+    +-        VirtioGpu::read_2d_resource(&mut rutabaga, resource, &scanout, &mut frame).unwrap();
+    ++        VirtioGpu::read_2d_resource(&mut rutabaga, resource, 2, 2, &mut frame).unwrap();
+    + 
+    +         let row = |y: usize| &guest[y * 4 * 4..][..2 * 4];
+    +         assert_eq!(frame[..2 * 4], *row(0));
+ 28:  756e1aa9 =  25:  3cc51e81 limina: HVF — don't panic the worker on unhandled guest traps
+ 29:  271f6bf3 =  26:  c08709a0 limina: virtio-gpu advertise only the capsets the renderer backs
+ 30:  bce1b5dd =  27:  150f16a8 limina: map KRUN_DISPLAY_ERR_METHOD_UNSUPPORTED (-2) in into_rust_result!
+ 31:  ee06d8d8 !  28:  1129afe2 limina: virtio-gpu read the venus scanout IOSurface for the headless capture sink
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+     +            let scan_iosurface_id: Option<u32> = None;
+     +
+                  let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
+    +             let mut read_failed = false;
+                  // limina software 2D: the pixels already live in the host buffer; copy them out.
+                  // Otherwise fall back to the rutabaga readback path (3D/Venus resources).
+                  if let Some(sw) = self.sw2d.get(&resource_id) {
+ 32:  af473f1a =  29:  9953e8a9 limina: balloon — reclaim free pages with MADV_FREE_REUSABLE + 16 KiB-safe coalescing
+ 33:  7608a640 !  30:  c872e041 limina: balloon — inflate/deflate, target/actual, DEFLATE_ON_OOM, BalloonControlHandle
+    @@ src/devices/src/virtio/device.rs: impl DeviceState {
+     
+      ## src/libkrun/src/api/device_builders.rs ##
+     @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for BalloonDevice {
+    -             .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+    -             .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+    +                 .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+    +         }
+              ctx.subscribe_events(self.inner.clone())?;
+     +        // limina: capture the balloon control handle before the device is moved into the bus, so
+     +        // limina-vmm can drive the dynamic-memory target on the live device (M6).
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for BalloonDev
+     
+      ## src/libkrun/src/vmm/builder.rs ##
+     @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+    -         paused_at: 0,
+    +         ram_in_blocks: payload_config.ram_in_blocks,
+              #[cfg(feature = "gpu")]
+              gpu_resize_handle: None,
+     +        balloon_control_handle: None,
+    @@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+          /// Starts the microVM vcpus.
+          pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+              let vcpu_count = vcpus.len();
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         ram_in_blocks: false,
+    +         #[cfg(feature = "gpu")]
+    +         gpu_resize_handle: None,
+    ++        balloon_control_handle: None,
+    +     };
+    + 
+    +     match control {
+ 34:  82d8f12d =  31:  6f715905 limina: virtio-gpu — demote per-frame present DIAGs (FLUSH2/FENCEPRESENT) to trace
+ 35:  b2f3896e =  32:  70e7f4a9 limina: virtio-input — return to Inactive on reset() so the device can re-activate
+ 36:  189a2c9a =  33:  62ffbe68 limina: virtio-input worker blocks (epoll -1) instead of a pointless 1s timeout
+ 37:  bc73a470 =  34:  de2d4839 limina: hvf vtimer — multiply before dividing so the WFI timeout isn't ~1.6% short
+ 38:  be9d7a82 =  35:  0dfeb96c rutabaga: balance the eager macOS blob map on unref_resource
+ 39:  14203a20 =  36:  e2291b69 virtio-i2c: new device with an emulated SBS smart battery slave
+ 40:  d4b8bd38 =  37:  6f205293 limina: hvf — round map/unmap sizes up to the host page granule
+ 41:  f51010ff =  38:  c0a5b8e4 rutabaga_gfx: route virgl logs through the level-aware callback
+ 42:  05f2ff8b =  39:  1a3e1787 virtio/snd: add native in-VMM virtio-snd device (playback enumeration)
+ 43:  83a2c594 =  40:  e3dd874c virtio/snd: CoreAudio output sink with completion pacing
+ 44:  a169e48a =  41:  3965f81a virtio/snd: mic capture — opt-in input stream (macOS CoreAudio)
+ 45:  cfe8f172 !  42:  488812b1 limina: real vCPU pause/quiesce mechanism (macOS/HVF) for M9 snapshots
+    @@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+          /// Configures the system for boot.
+          #[allow(clippy::too_many_arguments)]
+          pub fn configure_system(
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         #[cfg(feature = "gpu")]
+    +         gpu_resize_handle: None,
+    +         balloon_control_handle: None,
+    ++        #[cfg(target_os = "macos")]
+    ++        vcpu_list: Arc::new(devices::legacy::VcpuList::new(1)),
+    +     };
+    + 
+    +     match control {
+ 46:  7326ec6b !  43:  7508603e limina: per-vCPU save/restore + snapshot collection (macOS/HVF) for M9
+    @@ src/libkrun/src/vmm/macos/vstate.rs: use crate::vmm::vmm_config::machine_config:
+     -use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+     +use hvf::{HvfVcpu, HvfVm, VcpuExit, VcpuState, Vcpus};
+      use utils::eventfd::EventFd;
+    + use utils::worker_message::RECLAIM_BLOCK_SIZE;
+      use vm_memory::{
+    -     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+     @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+                  // An out-of-band pause request breaks the vCPU out of HVF via
+                  // `vcpu_request_exit` (-> Canceled), so we observe it here between
+ 47:  e1b1a441 !  44:  954b6409 limina: GIC state + RAM dump + snapshot file format (macOS/HVF) for M9
+    @@ src/libkrun/src/vmm/mod.rs: mod linux;
+     +#[cfg(target_os = "macos")]
+     +pub mod snapshot;
+      mod terminal;
+    - pub mod worker;
+    - 
+    + #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    + mod tests;
+     @@ src/libkrun/src/vmm/mod.rs: pub enum Error {
+          VcpuResume,
+          /// vCPU pause failed (a vCPU did not report `Paused` in time). Used by the M9 snapshot path.
+ 48:  b0c685dd =  45:  9bb77fdb limina: --restore reloads a snapshot into a fresh microVM (macOS/HVF) for M9
+ 49:  77e2e2be =  46:  ea997d0b limina: PL031 RTC alarm — deliver the match interrupt (macOS/HVF)
+ 50:  9a4bdd08 =  47:  e6634a3b limina: virtio-net implements reset (suspend/resume thaw), preserving the backend
+ 51:  f5844f04 =  48:  6618ffcf virtio: implement reset() for balloon + vsock (suspend/resume thaw)
+ 52:  3a68b7e5 =  49:  8023119e virtio: debug logging for suspend/resume device re-init
+ 53:  afb1d6d7 =  50:  5110faca virtio: drain inactive eventfds + un-negotiate features on transport reset
+ 54:  404b624c !  51:  1ff416ab virtio-balloon: gate VIRTIO_BALLOON_F_REPORTING (mask by default) + clear reset state
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for ConsoleDev
+     +    free_page_reporting_mode: FreePageReportingMode,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
+      #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
+      impl BalloonDevice {
+          pub fn new() -> Result<Self, VmmError> {
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for ConsoleDev
+          }
+      
+     @@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+    -     /// the guest's next access to each page faults it in again. Other platforms don't implement
+    -     /// [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+    +     /// Other platforms don't implement [`FreePageReportingMode::Replace`], and use
+    +     /// [`FreePageReportingMode::Default`] instead.
+          pub fn set_free_page_reporting_mode(&mut self, mode: FreePageReportingMode) {
+     -        #[cfg(target_os = "macos")]
+     -        self.inner
+    @@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+          }
+      }
+      
+    -@@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+    - impl<'a> AttachDevice<'a> for BalloonDevice {
+    +@@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for BalloonDevice {
+    +     fn requirements(&self) -> DeviceRequirements {
+    +         DeviceRequirements {
+    +             #[cfg(target_os = "macos")]
+    +-            replaces_guest_ram: self.inner.lock().unwrap().free_page_reporting_mode()
+    +-                == FreePageReportingMode::Replace,
+    ++            replaces_guest_ram: self.free_page_reporting_mode == FreePageReportingMode::Replace,
+    +             ..Default::default()
+    +         }
+    +     }
+    + 
+          #[cfg_attr(feature = "ffi", ffier(skip))]
+          fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+    --        #[cfg(target_os = "macos")]
+    --        self.inner
+    --            .lock()
+    --            .unwrap()
+    --            .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+     +        let mut balloon = devices::virtio::Balloon::new(self.free_page_reporting)
+    -             .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+    --        ctx.subscribe_events(self.inner.clone())?;
+    -+        #[cfg(target_os = "macos")]
+    -+        {
+    ++            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+    +         #[cfg(target_os = "macos")]
+    +         {
+    +-            let mut balloon = self.inner.lock().unwrap();
+     +            balloon.set_free_page_reporting_mode(self.free_page_reporting_mode);
+    -+            balloon
+    -+                .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+    -+                .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+    -+        }
+    +             balloon.set_guest_ram_in_blocks(ctx.guest_ram_in_blocks());
+    +             balloon
+    +                 .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+    +                 .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+    +         }
+    +-        ctx.subscribe_events(self.inner.clone())?;
+     +        let inner = Arc::new(Mutex::new(balloon));
+     +        ctx.subscribe_events(inner.clone())?;
+              // limina: capture the balloon control handle before the device is moved into the bus, so
+ 55:  65fea216 =  52:  d3caa5ad gpio: add a KEY_SLEEP suspend button (host-driven, no guest agent)
+ 56:  380c8879 =  53:  bb31e086 gpio: split into poweroff (KEY_POWER), suspend (KEY_SLEEP), restart (KEY_RESTART)
+ 57:  629506ce =  54:  335a8b36 gpio: add a wakeup-source KEY_WAKEUP button (M9 restore wake)
+ 58:  28a8ac6e =  55:  7b6eda88 snapshot: serialize the PL061 GPIO register file (M9.2 restore wake)
+ 59:  3adc8188 =  56:  bea4f6c1 vmm: add resume_parked_vcpus for the M9 snapshot abort path (macOS)
+ 60:  81abd3bf =  57:  26262e67 vmm: virtio quiesce oracle for the M9.2 suspend bracket (macOS)
+ 61:  95e9d2c3 =  58:  80fbe27d vmm: M9.3 SHM-window-fault oracle on the HVF MMIO path (macOS)
+ 62:  57e91089 =  59:  9512afde vmm: M9 snapshot byte-section length must be u64, not u32 (macOS)
+ 63:  5f8b121e =  60:  1b073025 vmm: M9.3 snapshot v4 format — layout-identity header + device-transport section
+ 64:  795a0638 =  61:  c673551d vmm: M9.3 capture device transports + restore validation (macOS)
+ 65:  c339d1ec !  62:  c32ac4e9 limina(0071): M9.3 GPU probes — stale-ctx/resource counters, fence ledger, renderer dump
+    @@ src/devices/src/virtio/gpu/trace.rs (new)
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: use rutabaga_gfx::{
+      use utils::worker_message::WorkerMessage;
+    - use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
+    + use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+      
+     +use super::trace::GpuTraceStats;
+      use super::{GpuError, Result};
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+              }
+          }
+      
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    -                 s.len(),
+    -             ))
+    -         });
+    --        self.rutabaga
+    --            .as_mut()
+    --            .ok_or(ErrUnspec)?
+    --            .transfer_read(ctx_id, resource_id, transfer, dst.take())?;
+    -+        self.rutabaga.as_mut().ok_or(ErrUnspec)?.transfer_read(
+    -+            ctx_id,
+    -+            resource_id,
+    -+            transfer,
+    -+            dst.take(),
+    -+        )?;
+    -         Ok(OkNoData)
+    -     }
+    - 
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+              rutabaga_fence: RutabagaFence,
+              is_flush: bool,
+    @@ src/devices/src/virtio/gpu/worker.rs: impl Worker {
+                                  return InnerExit::Shutdown
+                              }
+     @@ src/devices/src/virtio/gpu/worker.rs: impl Worker {
+    -                 virtio_gpu.transfer_read(ctx_id, resource_id, transfer, None)
+    +                 virtio_gpu.transfer_read(ctx_id, resource_id, transfer)
+                  }
+                  GpuCommand::CmdSubmit3d(info) => {
+     +                // limina M9.3 trace: total submissions, the denominator for unknown_ctx.
+ 66:  4c17f9cf =  63:  86183bda limina(0072): sticky queue re-arm — survive the no-PM-ops bus-fallback s2idle resume
+ 67:  5894e2c5 !  64:  d6f6ab8d limina(0073): rutabaga-layer snapshot-replay journal (M9.3 P0)
+    @@ src/devices/src/virtio/gpu/trace.rs: pub fn maybe_spawn_reporter(stats: Arc<GpuT
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: use rutabaga_gfx::{
+      use utils::worker_message::WorkerMessage;
+    - use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
+    + use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+      
+     +use super::journal::GpuJournal;
+      use super::trace::GpuTraceStats;
+ 68:  082cbeb6 !  65:  b8157cf6 limina(0074): v5 GPU snapshot section + venus replay engine (M9.3 P1)
+    @@ src/devices/src/virtio/gpu/journal.rs: impl GpuJournal {
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: use rutabaga_gfx::{
+      use utils::worker_message::WorkerMessage;
+    - use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
+    + use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+      
+     -use super::journal::GpuJournal;
+     +use super::journal::{GpuJournal, GpuJournalOp};
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for GpuDevice
+     
+      ## src/libkrun/src/vmm/builder.rs ##
+     @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+    -         paused_at: 0,
+    +         ram_in_blocks: payload_config.ram_in_blocks,
+              #[cfg(feature = "gpu")]
+              gpu_resize_handle: None,
+     +        #[cfg(feature = "gpu")]
+    @@ src/libkrun/src/vmm/snapshot.rs: mod tests {
+              };
+              let path =
+     
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         balloon_control_handle: None,
+    +         #[cfg(target_os = "macos")]
+    +         vcpu_list: Arc::new(devices::legacy::VcpuList::new(1)),
+    ++        #[cfg(feature = "gpu")]
+    ++        gpu_device: None,
+    +     };
+    + 
+    +     match control {
+    +
+      ## src/rutabaga_gfx/src/rutabaga_core.rs ##
+     @@ src/rutabaga_gfx/src/rutabaga_core.rs: pub trait RutabagaComponent {
+          /// called on the renderer thread.
+ 69:  c3610712 =  66:  f02461af limina(0076): classify replay wire-entry drops by journal class (M9.3 diagnostics)
+ 70:  71860ec2 =  67:  a0794090 limina(0079): full VkDeviceMemory content capture in the GPU snapshot (M9.3 P2)
+ 71:  4ca6d1c2 =  68:  e6d1c43e limina(0080): sync-state section in the GPU snapshot (M9.3 P2.1)
+ 72:  be38c94d =  69:  5af07365 vmm: v6 chunked-frame snapshot format — parallel lz4 + zero-page holes (limina M9.4 snapshot speed)
+ 73:  1b97e326 =  70:  be539450 vmm: lz4 the GPU re-creation section in the snapshot head (limina M9.3 P3)
+ 74:  cdc5b374 =  71:  a8a2d84e gpu: carry the cursor overlay across snapshot restore (limina M9.3 P3)
+ 75:  6c7107f0 =  72:  571a00c7 vmm: publish the snapshot atomically (stream to .tmp, rename on success)
+ 76:  cd1d9f8c =  73:  6a1ae9d1 vmm: fast lz4 (default-features off) + snapshot phase timing
+ 77:  a6aeeab4 !  74:  66d86ab1 balloon: stop advertising DEFLATE_ON_OOM by default (per-VM re-advertise knob)
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for ConsoleDev
+     +    deflate_on_oom: bool,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
+     @@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+              Ok(Self {
+                  free_page_reporting: false,
+    @@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+      }
+      
+      #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+    -@@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+    - impl<'a> AttachDevice<'a> for BalloonDevice {
+    +@@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for BalloonDevice {
+    + 
+          #[cfg_attr(feature = "ffi", ffier(skip))]
+          fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+     -        let mut balloon = devices::virtio::Balloon::new(self.free_page_reporting)
+ 78:  0dc56b15 =  75:  3030e426 rtc_pl031: anchor reads to the host wallclock, not a monotonic Instant
+ 79:  1ceeeca3 =  76:  e1fc4381 gpu: defer-and-classify the session reset — park across a bus-fallback thaw
+ 80:  7adfac3f =  77:  a9554dbb gpu: negotiate EVENT_IDX and coalesce used-buffer interrupts
+ 81:  a5465d6d =  78:  fe62115c polly/gpu: env-gated wake-rate tracing (LIMINA_WAKE_TRACE)
+ 82:  74199082 =  79:  0e8d810e vsock timesync: saturate elapsed-time arithmetic against backward clock steps
+ 83:  8239e271 !  80:  67ce1f64 hvf/vmm: model PSCI CPU_OFF + AFFINITY_INFO and re-deliverable CPU_ON (guest vCPU hotplug)
+    @@ src/libkrun/src/vmm/builder.rs: fn create_vcpus_aarch64(
+      }
+     
+      ## src/libkrun/src/vmm/macos/vstate.rs ##
+    -@@ src/libkrun/src/vmm/macos/vstate.rs: use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REB
+    +@@ src/libkrun/src/vmm/macos/vstate.rs: use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+      use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
+      
+      use arch::ArchMemoryInfo;
+    @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+          /// a clean boundary between `hv_vcpu_run` calls, so the captured register file is consistent.
+     @@ src/libkrun/src/vmm/macos/vstate.rs: enum VcpuEmulation {
+          Interrupted,
+    +     Reset,
+          Stopped,
+    -     Rebooted,
+     +    /// The guest offlined this vCPU (PSCI CPU_OFF) — park it until re-online.
+     +    CpuOff,
+          WaitForEvent,
+ 84:  94ee0b03 =  81:  4b3611df usb/xhci: emulated xHCI controller bring-up (register file, stub data path)
+ 85:  4b836a92 =  82:  3f6a2784 usb/xhci: Stage B1 — rings, command set, EP0 control transfers, gadgets
+ 86:  832862f8 =  83:  7673119f usb/xhci: Stage B2 — non-EP0 data flow + mock HID echo gadget
+ 87:  384dd2b7 =  84:  a1ee9018 usb/xhci: generic HID report-pipe gadget (Stage C mechanism)
+ 88:  7cdf356d =  85:  f85310f0 usb/xhci: generic bulk-pipe gadget (MOC fingerprint mechanism)
+ 89:  ce43216a =  86:  6acf64ac usb/xhci: handle Immediate Data (IDT) on Normal TRBs
+ 90:  345d1ed7 =  87:  f3b44364 usb/xhci: bound work TRBs per data TD (hostile-ring DoS guard)
+ 91:  21fefde2 =  88:  1d44abef usb/xhci: PM-correct register semantics (suspend/resume)
+ 92:  a825661a =  89:  bfdec8cb usb/xhci: carry controller state across a VM snapshot
+ 93:  dfa55605 =  90:  2db8ff8c usb/xhci: trace the PM register writes (suspend/resume oracle)
+ 94:  a5aea091 =  91:  9aa38392 virtio: LIMINA_WAKE_PROBE — time the VMM half of the venus wake chain
+ 95:  70bb1734 =  92:  47a5db3f virtio: close the wake chain's return half via the virtio ISR ack
+ 96:  992f181b =  93:  7495d495 virtio: attribute control-queue drains that overrun a frame
+ 97:  32423cf5 =  94:  f2204d6a virtio: stamp every wake-probe line with CLOCK_REALTIME, not just the outliers
+ 98:  3dfa5002 =  95:  bdbc6ede virtio-gpu: default fence-accurate presents ON when the shown-ack channel exists
+ 99:  3e6b1f4d =  96:  01799d26 virtio-gpu: readback fallback for deferred presents on sinks without zero-copy
+100:  d0c9fc1c =  97:  cc7b6c2a virtio-gpu: swap the fence-present runtime marker to a force-OFF
+101:  33f4efee =  98:  3ee2b8f9 virtio-gpu: log fence-present engagement once at INFO
+102:  6cb96adb =  99:  c94603d4 virtio-gpu: resolve + present vrend IOSurface scanouts on plain SET_SCANOUT
+103:  172f0b30 = 100:  214fb966 virtio-gpu: honest Global-ring fences for vrend sessions
+104:  de27c0a7 = 101:  46503726 virtio-gpu: retire-as-lost for refused context fences (the §22 KMS wedge)
+105:  99f28187 = 102:  9d572038 virtio-gpu: stable EDID identity, real mode list and monitor range limits
+106:  b84c6513 ! 103:  6fccf47b virtio-gpu: runtime display updates carry EDID and connection state
+    @@ src/devices/src/virtio/gpu/device.rs: mod tests {
+      }
+     
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice
+    +@@ src/devices/src/virtio/gpu/virtio_gpu.rs: use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+      use super::journal::{GpuJournal, GpuJournalOp};
+      use super::trace::GpuTraceStats;
+      use super::{GpuError, Result};
+107:  8d552368 = 104:  6564d562 virtio-gpu: log when descriptor slots overflow the base EDID block
+108:  4bfae3f3 = 105:  b0a4cfac virtio-gpu: declare the generated EDID digital, not analog
+109:  9588dd71 = 106:  20cfbf41 virtio-gpu: carry over-ceiling modes in a DisplayID type VII extension block
+110:  ce59e6f6 = 107:  2a77e1a0 virtio-gpu: carry a range descriptor's horizontal rate past 255 kHz
+111:  1f512269 = 108:  eb1ae64b virtio-console: return a port's queues on close so it can be reopened
+112:  ba973646 = 109:  e625052b usb: tell a gadget when the guest cancels an endpoint's transfer
+113:  7ea36030 = 110:  4575399b virtio-gpu: snapshot the classic (vrend) world — journal ops + two-phase replay
+114:  45d1dcc9 = 111:  c7bce93f virtio-gpu: carry classic host-side resource contents in the snapshot (P2)
+115:  dec307fb = 112:  350f2c0a virtio-gpu: ledger the display path's scanout resources
+116:  39ef44b0 = 113:  6e2f606a virtio/gpu: tell the display backend when a scanout resource is unref'd
+117:  6a937682 = 114:  1ad33b1d virtio/gpu: don't count stranded present bookkeeping against quiescence
+118:  54091ffa = 115:  40bbfa8e virtio/gpu: warn when a park discards a deep awaiting-shown backlog
+119:  de24fa12 ! 116:  b8ab57df hvf: heal stage-2 faults on balloon-released guest RAM
+    @@ src/hvf/src/lib.rs: impl Display for Error {
+                      f,
+                      "Nested virtualization was requested but it's not support in this system"
+     @@ src/hvf/src/lib.rs: pub enum VcpuExit<'a> {
+    -     Shutdown,
+    -     /// PSCI `SYSTEM_RESET` — the guest asked to reboot (vs `Shutdown` = power off). (limina addition.)
+          Reset,
+    +     SecureMonitorCall,
+    +     Shutdown,
+     +    /// A stage-2 fault on balloon-released guest RAM was healed (the range was re-validated and
+     +    /// re-mapped). The PC was deliberately NOT advanced: re-running the vCPU retries the faulting
+     +    /// access against the restored mapping. (limina addition — the FRQ/balloon unmap fix.)
+    @@ src/hvf/src/released_ram.rs (new)
+     
+      ## src/libkrun/src/vmm/macos/vstate.rs ##
+     @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+    -                     info!("vCPU {vcpuid} received reboot (PSCI SYSTEM_RESET)");
+    -                     Ok(VcpuEmulation::Rebooted)
+    +                     info!("vCPU {vcpuid} received shutdown signal");
+    +                     Ok(VcpuEmulation::Stopped)
+                      }
+     +                VcpuExit::StageTwoHealed => {
+     +                    debug!("vCPU {vcpuid} stage-2 fault on balloon-released RAM healed");
+120:  21adc666 ! 117:  59033e77 virtio/balloon: unmap released pages from the guest
+    @@ src/hvf/src/released_ram.rs: mod tests {
+          }
+     
+      ## src/libkrun/src/api/device_builders.rs ##
+    -@@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+    - impl<'a> AttachDevice<'a> for BalloonDevice {
+    +@@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for BalloonDevice {
+    + 
+          #[cfg_attr(feature = "ffi", ffier(skip))]
+          fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+     -        let mut balloon = devices::virtio::Balloon::new(self.free_page_reporting, self.deflate_on_oom)
+    @@ src/libkrun/src/vmm/macos/vstate.rs: use crate::vmm::vmm_config::machine_config:
+     -use hvf::{HvfVcpu, HvfVm, VcpuExit, VcpuState, Vcpus};
+     +use hvf::{HvfVcpu, HvfVm, ReleasedRam, VcpuExit, VcpuState, Vcpus};
+      use utils::eventfd::EventFd;
+    + use utils::worker_message::RECLAIM_BLOCK_SIZE;
+      use vm_memory::{
+    -     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+     @@ src/libkrun/src/vmm/macos/vstate.rs: pub struct Vcpu {
+          /// M9 restore: the shared gate this vCPU waits on (after creating its HVF vCPU, before
+          /// restoring) until the main thread has restored the in-kernel GIC. `None` on a fresh boot.
+    @@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+      
+                  self.vcpus_handles
+                      .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         vcpu_list: Arc::new(devices::legacy::VcpuList::new(1)),
+    +         #[cfg(feature = "gpu")]
+    +         gpu_device: None,
+    ++        #[cfg(target_os = "macos")]
+    ++        released_ram: Arc::new(hvf::ReleasedRam::new(Vec::new())),
+    +     };
+    + 
+    +     match control {
+121:  027d7f47 = 118:  ed7382e1 hvf: bound the heal-window scan to the overlapping ranges
+122:  3ad10ee2 = 119:  d72c1cfe virtio/balloon: surface released-RAM counters in BalloonStats
+123:  1a4b57a1 = 120:  d0e720f7 hvf: retry stray stage-2 faults instead of MMIO-decoding guest RAM
+124:  e89ab490 = 121:  6ba7c65c hvf/balloon: per-path zero-on-release gate (LIMINA_BALLOON_RELEASE_MEMSET)
+125:  36f0e835 = 122:  f7562713 hvf: default balloon release zeroing to the inflate queue
+126:  3f18e3c2 = 123:  6857d227 devices: retry transient EFAULT at syscalls addressing guest RAM
+127:  666dda6a = 124:  141c6589 hvf: add a task-pmap ledger settle sweep to ReleasedRam
+128:  43010c06 = 125:  d8b06e41 virtio/balloon: expose the ledger settle sweep on the control handle
+129:  2104ccb4 = 126:  b215895c hvf: count sweep-fielded faults and never chain guest-region faults
+130:  5bda5ae8 = 127:  79ed78fc virtio/gpu: trace iov backings behind an env var
+131:  6f8aa1b2 <   -:  -------- hvf: mask SME on every vcpu, not only the nested ones
+132:  24f285bf = 128:  d8f75929 gpu: answer the supervisor's "resurface <id>" by re-publishing the surface
+133:  7c3ea38f = 129:  201e4fcf smbios: lead product_name with a recognized hypervisor name
+134:  a305a0cf = 130:  c1dffc0c smbios: identify the machine as Limina
+135:  c927b438 = 131:  95aa3b3f virtio/gpu: bind a resource to a scanout only after the backend accepts
+136:  93f98130 = 132:  216df6c0 virtio/gpu: tell the display backend when the OS driver takes over
+137:  400577a2 = 133:  a4be3c69 display: tell the backend which scanout a cursor belongs to
+138:  5dfaa5c4 = 134:  06f16955 gpu: carry each scanout's desktop position through display info
+139:  34c8e67c = 135:  fc42110f gpu: never lose a display config-change event
+140:  eb8249fc = 136:  8e4886bf gpu: trace the 3D submit, transfer and command stream
+141:  fac5a3b9 = 137:  2632ca54 gpu: trace guest blob creation under LIMINA_TRACE_BLOB
+142:  6176ef86 = 138:  f22723bc usb: a HID pipe shaped for an input device
+143:  792ab2e9 = 139:  7035e0c2 vmm: a device no driver ever took is not a quiesce holdout
+144:  a34b56f3 = 140:  c2c425c5 gpu: pump virgl_renderer_poll() when vrend has no sync thread
+145:  6cb80903 = 141:  704e0905 display: let the consumer ask for a backend-owned surface back
+146:  67d8eb51 = 142:  2b420aa0 gpu: ask the renderer for a resource's IOSurface id instead of remembering it
+147:  de975c0b = 143:  c14b388f gpu: release the IOSurface we published, not the one backing the resource
+148:  bfa8ad37 ! 144:  7f02c735 hvf: let the embedder choose the stage-2 IPA granule
+    @@ src/hvf/src/lib.rs: static HVF: LazyLock<libloading::Library> = LazyLock::new(||
+              if nested_enabled {
+                  let set_el2_enabled: libloading::Symbol<
+                      'static,
+    -@@ src/hvf/src/lib.rs: impl HvfVcpu<'_> {
+    -             if ret != HV_SUCCESS {
+    -                 return Err(Error::VcpuInitialRegisters);
+    -             }
+    --
+    -         } else {
+    -             let ret = unsafe {
+    -                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
+     @@ src/hvf/src/lib.rs: impl HvfVcpu<'_> {
+                      if let Some(released_ram) = &self.released_ram {
+                          match released_ram.handle_fault(pa, syndrome & 0x3f) {
+    @@ src/libkrun/src/vmm/macos/vstate.rs: use crate::vmm::vmm_config::machine_config:
+     -use hvf::{HvfVcpu, HvfVm, ReleasedRam, VcpuExit, VcpuState, Vcpus};
+     +use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus};
+      use utils::eventfd::EventFd;
+    + use utils::worker_message::RECLAIM_BLOCK_SIZE;
+      use vm_memory::{
+    -     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+     @@ src/libkrun/src/vmm/macos/vstate.rs: pub struct Vm {
+      
+      impl Vm {
+    @@ src/libkrun/src/vmm/macos/vstate.rs: pub struct Vm {
+              Ok(Vm { hvf_vm })
+          }
+     @@ src/libkrun/src/vmm/macos/vstate.rs: mod tests {
+    - 
+    -     #[test]
+    -     fn test_vm_memory_init() {
+    --        let mut vm =
+    --            Vm::new(&mut arch::ArchMemoryInfo::default(), false).expect("Cannot create new vm");
+    -+        let mut vm = Vm::new(&mut arch::ArchMemoryInfo::default(), false, None)
+    -+            .expect("Cannot create new vm");
+    - 
+    -         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
+    -         let gm = GuestMemoryMmap::from_ranges(&[(
+    +     fn test_vm() -> MutexGuard<'static, Vm> {
+    +         static VM: LazyLock<Mutex<Vm>> = LazyLock::new(|| {
+    +             Mutex::new(
+    +-                Vm::new(&mut arch::ArchMemoryInfo::default(), false).expect("Cannot create new vm"),
+    ++                Vm::new(&mut arch::ArchMemoryInfo::default(), false, None)
+    ++                    .expect("Cannot create new vm"),
+    +             )
+    +         });
+    +         VM.lock().unwrap_or_else(|e| e.into_inner())
+     
+      ## src/libkrun/src/vmm/resources.rs ##
+     @@ src/libkrun/src/vmm/resources.rs: use crate::vmm::vstate::VcpuConfig;
+    @@ src/libkrun/src/vmm/resources.rs: use crate::vmm::vstate::VcpuConfig;
+      
+      /// Errors encountered when configuring microVM resources.
+     @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+    -     pub smbios_oem_strings: Option<Vec<String>>,
+    -     /// Whether to enable nested virtualization.
+          pub nested_enabled: bool,
+    +     /// The process exit code when the guest resets instead of powering off.
+    +     pub reset_exit_code: Option<u8>,
+     +    /// Stage-2 translation granule to create the VM with. `None` keeps the host default
+     +    /// (16 KiB on Apple silicon), which cannot express a 4 KiB-page guest's memory layout.
+     +    #[cfg(target_os = "macos")]
+     +    pub ipa_granule: Option<IpaGranule>,
+          /// Whether to enable split irqchip
+          pub split_irqchip: bool,
+    -     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
+    +     /// Whether to ask for transparent huge pages for guest memory (Linux).
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+    -             external_kernel: None,
+                  smbios_oem_strings: None,
+                  nested_enabled: false,
+    +             reset_exit_code: None,
+     +            #[cfg(target_os = "macos")]
+     +            ipa_granule: None,
+                  split_irqchip: false,
+    -             acpi_enabled: false,
+    -             serial_consoles: Vec::new(),
+    +             #[cfg(target_os = "linux")]
+    +             transparent_huge_pages: false,
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         cases.into_iter().nth(case.parse().unwrap()).unwrap();
+    + 
+    +     let mut arch_memory_info = ArchMemoryInfo::default();
+    +-    let vm = Vm::new(&mut arch_memory_info, false).unwrap();
+    ++    let vm = Vm::new(&mut arch_memory_info, false, None).unwrap();
+    +     let (event_sender, event_receiver) = unbounded();
+    +     let (response_sender, response_receiver) = unbounded();
+    +     let (id_sender, id_receiver) = unbounded();
+149:  c7627ac5 = 145:  7a559b7c hvf: round map sizes to the granule the VM was created with, not the host page
+150:  623a0b43 ! 146:  237cedbc vmm: record how late the host serves a guest's WFI deadline
+    @@ Commit message
+     
+      ## src/libkrun/src/vmm/macos/mod.rs ##
+     @@
+    + #[cfg(test)]
+    + pub(crate) mod vm_map;
+      pub mod vstate;
+     +pub mod wfi_latency;
+     
+      ## src/libkrun/src/vmm/macos/vstate.rs ##
+    -@@ src/libkrun/src/vmm/macos/vstate.rs: use std::io;
+    +@@ src/libkrun/src/vmm/macos/vstate.rs: use std::ops::Range;
+      use std::result;
+      use std::sync::Arc;
+      use std::thread;
+     -use std::time::Duration;
+     +use std::time::{Duration, Instant};
+      
+    - use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REBOOT};
+    + use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+     +use super::wfi_latency::{self, Wake};
+      use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
+      
+151:  b31f6aee = 147:  26260d08 vmm: count the WFI parks that never happen
+152:  7afe21cc ! 148:  bc275bfd vmm: let the embedder put vCPU threads in the real-time band
+    @@ Commit message
+      ## src/libkrun/src/vmm/macos/mod.rs ##
+     @@
+     +pub mod vcpu_sched;
+    + #[cfg(test)]
+    + pub(crate) mod vm_map;
+      pub mod vstate;
+    - pub mod wfi_latency;
+     
+      ## src/libkrun/src/vmm/macos/vcpu_sched.rs (new) ##
+     @@
+    @@ src/libkrun/src/vmm/macos/vstate.rs
+     @@ src/libkrun/src/vmm/macos/vstate.rs: use std::thread;
+      use std::time::{Duration, Instant};
+      
+    - use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_REBOOT};
+    + use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+     +use super::vcpu_sched;
+      use super::wfi_latency::{self, Wake};
+      use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
+153:  d752984c ! 149:  f4c87ba4 macos/vcpu: keep a banded vCPU out of xnu's real-time fail-safe
+    @@ src/libkrun/src/vmm/macos/vstate.rs: use crate::vmm::vmm_config::machine_config:
+     -use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus};
+     +use hvf::{HvfVcpu, HvfVm, IpaGranule, ReleasedRam, VcpuExit, VcpuState, Vcpus, vcpu_request_exit};
+      use utils::eventfd::EventFd;
+    + use utils::worker_message::RECLAIM_BLOCK_SIZE;
+      use vm_memory::{
+    -     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+     @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+              let (wfe_sender, wfe_receiver) = unbounded();
+              self.vcpu_list.register(hvf_vcpuid, wfe_sender);
+    @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+     +                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu);
+     +                    heartbeat.observed_block();
+                      }
+    -                 // The guest halted / powered off (PSCI SYSTEM_OFF).
+    -                 Ok(VcpuEmulation::Stopped) => {
+    +                 // The guest asked to reboot (PSCI SYSTEM_RESET). libkrun is single-shot, so we
+    +                 // still tear the worker down, and the VMM picks an exit code the supervisor can
+154:  b0347f45 = 150:  1fd8cf11 macos/vcpu: make the band's reach and its heartbeat observable
+155:  185b4be5 = 151:  bba4fb2e macos/vcpu: arm the real-time band per vCPU, from that thread's own CPU share
+156:  778d9626 ! 152:  05f6d089 macos/vcpu: expose whether every vCPU is parked, and a resume that keeps the counter
+    @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+     +                    self.vcpu_list.set_parked(hvf_vcpuid, false);
+                          heartbeat.observed_block();
+                      }
+    -                 // The guest halted / powered off (PSCI SYSTEM_OFF).
+    +                 // The guest asked to reboot (PSCI SYSTEM_RESET). libkrun is single-shot, so we
+     @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+          /// fidelity for not-currently-online vCPUs is the documented task #41 limitation (see
+          /// `handle_offline`) — this wait only guarantees the save side completes.
+157:  2a4a4078 ! 153:  2619ff60 psci: implement SYSTEM_SUSPEND, the exact quiesce signal we were approximating
+    @@ src/libkrun/src/vmm/macos/vstate.rs: pub enum VcpuEvent {
+      
+      #[derive(Debug, Eq, PartialEq)]
+     @@ src/libkrun/src/vmm/macos/vstate.rs: enum VcpuEmulation {
+    -     Rebooted,
+    +     Stopped,
+          /// The guest offlined this vCPU (PSCI CPU_OFF) — park it until re-online.
+          CpuOff,
+     +    /// The guest asked firmware to suspend the whole system (PSCI `SYSTEM_SUSPEND`) — park this
+158:  4c290380 = 154:  f0f5cb78 psci: gate SYSTEM_SUSPEND behind LIMINA_PSCI_SYSTEM_SUSPEND, default on
+159:  ea9bfb8b = 155:  d447a466 macos/sysreg: answer the OS-lock register reads the suspend path makes
+160:  55193e92 = 156:  84e03356 gpio: let the wake button resume a guest that is suspended to RAM
+161:  61910b05 ! 157:  5d5e8ef5 snapshot: carry each vCPU's PSCI power state (v8), and restore into it
+    @@ src/libkrun/src/vmm/macos/vstate.rs: use crate::vmm::vmm_config::machine_config:
+     +    vcpu_request_exit,
+     +};
+      use utils::eventfd::EventFd;
+    + use utils::worker_message::RECLAIM_BLOCK_SIZE;
+      use vm_memory::{
+    -     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+     @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+                      "vCPU {hvf_vcpuid} resumed from snapshot at pc={:#x}",
+                      state.pc
+162:  1460e82d = 158:  98900109 virtio/gpu: arm the renderer dump on any command error, not just a lost context
+163:  fee760a9 = 159:  7870458a gpu snapshot: carry the display configuration across restore
+164:  3fac812d = 160:  521cdc88 gpu restore: add LIMINA_RESTORE_SKIP_DISPLAYS, a RED lever for the display carry-over
+165:  a4c44d03 = 161:  7674ba34 gpu restore: count the classic content re-uploads that vrend refuses
+166:  d2b85509 = 162:  1a863103 gpu snapshot: carry the presented scanout frame across a restore (payload v8)
+167:  f29249c8 = 163:  34db681d gpu restore: LIMINA_RESTORE_SKIP_SCANOUT, a RED lever for the saved frame
+168:  3a72954e = 164:  f90907d2 gpu restore: re-bind the scanouts without presenting a stale console
+169:  613a44f1 = 165:  fa947430 gpu restore: drop the guest-shadow re-upload, keep P2 as the account
+170:  2e5fba3c = 166:  ca200960 gpu snapshot/restore: count the ink in the saved scanout frame
+171:  fbe56220 = 167:  bdf6dfc9 snd: report PCM stream lifecycle to an embedder hook
+172:  319626c6 = 168:  d9ccca8b snd: report when the playback stream goes silent, not just when it ends
+173:  4d45e504 = 169:  9aaf37a8 devices: a virtual cpufreq controller, so the guest can see frequency
+174:  175a62e2 = 170:  10846936 vcpu: little vCPUs, made true by the QoS class their thread runs at
+175:  363479b0 = 171:  967a68ea snd: tell the guest how much audio the host still owes
+176:  d8fab0a1 = 172:  9e04ca4d snd: a switch to force the old zero-latency reporting
+177:  088ed9e1 = 173:  207cfe13 gpu: hold the renderer's journal opaque, and let it say what it lost
+178:  f1ee3446 = 174:  7af9580f gpu: consume virglrenderer as a Rust crate, not through its C ABI
+179:  edc4481a = 175:  7bd92b65 gpu: mark the C-ABI helpers as gfxstream's alone
+180:  69086cd8 = 176:  a150d32c gpu: rustfmt virgl_renderer.rs to this tree's settings
+181:  b42bd710 = 177:  b0aa80e7 gpu: take virglrs from limina's third_party, not a sibling checkout
+182:  57f69583 = 178:  ccbfd38a rustfmt: pin the style edition, and make the tree match it
+183:  e24c65c8 = 179:  5c4ee38d gpu: make the iosurface sync fallback a state, not a one-shot warning
+184:  39be156b = 180:  38d59326 display: the default EDID should describe a monitor that could exist
+185:  d845e838 = 181:  126a5823 rutabaga: give the renderer the context a fence is for
+186:  09a9a900 = 182:  0ac9ac56 rutabaga: follow virglrs's Renderer API through the Linux port
+187:  d0c2f6a0 = 183:  d2fbae25 gpu: park a vrend scanout's present on a fence instead of blocking for it
+188:  f39f5a63 = 184:  6682e1e0 gpu: present retired vrend frames from inside a long control-queue drain
+189:  dabceafd = 185:  3bf4514e gpu: say when a scanout presents an older frame over a newer one
+190:  415fdeaf = 186:  d6c0140c gpu: say when a scanout flush leaves nothing holding the guest's buffers
+191:  49e9878a = 187:  4a55735f display: tell the backend whether the guest is held off a scanout's buffers
+192:  784741bd = 188:  3b087e00 gpu: report a scanout presented at once as not held
+193:  50876396 = 189:  ee1cf84b gpu: move the pointer from inside a long control-queue drain
+194:  7b4a4267 = 190:  d97eda1f gpu: service the cursor queue mid-drain only once the guest has kicked it
+195:  bab3caa7 ! 191:  131a6375 vsock: let the embedder turn the timesync datagram off
+    @@ src/libkrun/src/api/device_builders.rs: pub struct VsockDevice {
+     +    timesync: bool,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export)]
+    + #[cfg_attr(feature = "ffi", ffier::export(send))]
+     @@ src/libkrun/src/api/device_builders.rs: impl VsockDevice {
+                  tsi_flags,
+                  host_port_map: HashMap::new(),
+196:  d9a0399f = 192:  5a15b588 vsock: reset a connection whose proxy socket cannot be created
+197:  51d67c8b = 193:  ebee54f9 vsock: suppress doorbells and interrupts with EVENT_IDX
+198:  f3a3f1e0 = 194:  b7e1572b vsock: give a unix proxy socket a 1 MiB send buffer on macOS
+199:  9b0df993 = 195:  7d2b3fd5 vmm: refuse to restore a snapshot into a machine whose devices moved
+200:  c76a93fe = 196:  bf25930c virtio/net: stop interrupting a polling guest, mark proxy frames checksum-valid
+201:  dea7d400 = 197:  ab32b14c virtio/net: mark RX frames checksum-valid only for a vouched backend
+202:  6b5d6a39 = 198:  16e61a4e rutabaga: follow virglrs's surface, RingId and journal signatures
+203:  fa4a3184 = 199:  cc4d5679 rutabaga: run a suspended driver wait outside the renderer lock
+204:  3bdb69f5 = 200:  8c2d0090 rutabaga: follow virglrs's unified journal and replay entry points
+205:  4f080f1b = 201:  7ee1e578 rutabaga: follow virglrs's typed transfer direction
+206:  11dfcec4 = 202:  a88deb6a gpu: ask the renderer to fence a present, not a reserved ring
+207:  0582b6ac = 203:  11d55318 vcpu_sched: let a vCPU leave the real-time band without being told
+208:  81475643 = 204:  9778b081 vcpu_sched: spend the disarm budget in CPU time, not wall time
+209:  b381cb07 = 205:  b62d24f0 vcpu_sched: judge the band by the RATE a vCPU burns CPU, not the total
+210:  c407a9dd = 206:  ad913af8 vmm: let the VMM wait on guest power-state transitions
+211:  338af594 = 207:  32d4b48a rutabaga: answer a republish from virglrs's surface registry
+212:  cbf93fac = 208:  c69ca72a virtio: read an unreadable avail ring as empty instead of panicking
+213:  075eeb5d = 209:  dfe196bd vmm: report which way the guest last moved a virtio device
+214:  c085a2f6 = 210:  6ef7a893 vmm/macos: say why a little vCPU never takes the band
+215:  64b19f7f = 211:  f98044e7 virtio/gpu: keep a detached resource's attach record for restore
+216:  1cf6c9cc = 212:  29c31c37 virtio/snd: service the queues on a thread of the device's own
+217:  a152d28a = 213:  038b802d virtio: let a device service a queue notification on the kicking vCPU
+218:  cd6268c9 = 214:  490880ca gpu: bring hardware decodes to rest before a snapshot
+219:  32818a86 = 215:  efb82978 rutabaga: name the context that pays for a host-minted blob
+220:  b252244b = 216:  80973a3c snapshot: guard the CRC-32 format and bench the RAM path on a real snapshot
+221:  fd8228d4 = 217:  bb2c69ee snapshot: compute the CRC-32 with the ARMv8 CRC instructions
+222:  9e1d2200 = 218:  c795f31b snapshot: let the RAM bench write to /dev/null
+223:  d522b3ad = 219:  7587c45b snapshot: size the RAM pool by cores, not a cap of 8
+224:  d372433b = 220:  2f419949 snapshot: map the snapshot file for restore instead of reading it
+225:  d7cc4bd5 = 221:  7c0f3553 snapshot: log where the RAM save and apply spend their time
+226:  46c255e2 = 222:  d74cc370 snapshot: read the snapshot file again instead of mapping it
+227:  b2d1c6e0 = 223:  97082979 snapshot: stream the file in behind the restore instead of reading it first
+228:  c097d118 = 224:  58f32fa0 builder: say the restore's first timing covers the head, not the file
+229:  7ed563cc = 225:  182e086d balloon: prove the reclaim coalescer's page arithmetic with Kani
+230:  a75c48ac = 226:  6f634bf5 xhci: refuse Address Device on a slot the guest never enabled
+231:  0fe07fea = 227:  cdd1cc7c fuzz: drive the xHCI controller the way a guest can
+232:  cfe37da5 = 228:  0c14dff0 xhci: refuse an event ring segment past the top of the address space
+233:  de436525 = 229:  0e3c3e66 xhci: prove the ring walker's step with Kani
+234:  f4c9e2cc = 230:  c0c723e1 xhci: walk every slot command sequence to depth four against a model
+235:  718ce91c = 231:  04fbb69f hvf: put released RAM's stage-2 and madvise calls behind a seam
+236:  103594de = 232:  c184e655 hvf: walk every release and heal sequence against a model, and fix what it found
+237:  5a21e4bd = 233:  66d5179f hvf: model release, heal and reclaim racing one another with loom
+238:  7f0a3399 = 234:  b16a6ccc hvf: bound the sweep fault handler test by time, not by 50 sweeps
+239:  fb200af5 = 235:  0f26da60 balloon: walk every sequence of reported runs through the coalescer
+240:  1f9a16a8 = 236:  5d6ceabb vmm: let the snapshot reader parse bytes already in memory, for fuzzing
+241:  930da55f = 237:  88c58754 vmm: refuse a corrupt snapshot before it sizes an allocation or overflows
+242:  99f49df1 = 238:  f0b68918 fuzz: read snapshot heads and apply snapshot RAM, seeded from a real snapshot
+243:  d3669c51 = 239:  5572cbeb vmm: make the head corruption test reach the head CRC
+244:  bcb96ef1 = 240:  dbb8d8a4 vcpu_sched: a band move is claimed before it is made
+245:  f4e591e8 = 241:  dbb6e671 power_watch: a loom model of the waiter protocol
+246:  292ca46f ! 242:  310e9fd8 vstate: every park site answers a Snapshot
+    @@ src/libkrun/src/vmm/macos/vstate.rs: impl Vcpu {
+     +        self.park_until_resume(hvf_vcpu);
+          }
+      
+    -     fn exit(&mut self, exit_code: u8) {
+    +     fn exit(&mut self, response: VcpuResponse) {
+     @@ src/libkrun/src/vmm/macos/vstate.rs: impl Drop for Vcpu {
+          }
+      }
+247:  55e91fa4 = 243:  f9113984 Cargo.lock: record krun-devices' loom dev-dependency
+248:  684d7f1e = 244:  b651226a usb/xhci: post a control TD's Status event only when the guest asks
+249:  6204f18c = 245:  6388697c hvf/released_ram: cast the fault handler through a pointer
+250:  026bd311 = 246:  46b431b9 virtio/gpu: move the snapshot payload codec out of the journal, and fuzz it
+251:  1748627b = 247:  09586492 virtio/gpu: bound a snapshot payload's counts and lengths by its bytes
+252:  a5504652 = 248:  f44b9716 virtio/gpu: build the snapshot payload codec in every test build
+253:  558daafd = 249:  e745f3b6 treewide: clean clippy on the workspace limina builds
+254:  a8395e52 = 250:  39afc0c5 virtio/gpu: present an unfenced venus scanout as an ordered copy
+255:  cb9e424d = 251:  0a2142a1 virtio/gpu: drop a frame rather than show a scanout the guest can reach
+256:  6b855745 = 252:  3c71044a gpu: name the scanout a venus present copy is taken for
+257:  3d52d926 ! 253:  ad28cf08 treewide: clean clippy, fmt and the tests after the rebase onto upstream
+    @@ Cargo.lock: dependencies = [
+     + "syn 2.0.117",
+      ]
+      
+    - [[package]]
+    -@@ Cargo.lock: dependencies = [
+    -  "proc-macro2",
+    -  "quote",
+    -  "serde_json",
+    -- "syn",
+    -+ "syn 2.0.117",
+    - ]
+    - 
+      [[package]]
+     @@ Cargo.lock: version = "0.2.0"
+      source = "registry+https://github.com/rust-lang/crates.io-index"
+    @@ Cargo.lock: dependencies = [
+     + "crc32fast",
+       "crossbeam-channel",
+       "env_logger",
+    -  "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
+    +  "ffier",
+     @@ Cargo.lock: dependencies = [
+       "libloading",
+       "linux-loader",
+258:  97e31b30 = 254:  244537fe api: typed constructors for a Rust embedder of the display and input devices
+259:  1fd4d1a2 = 255:  78f43441 api: register each input device under its own id
+260:  b8d4aed1 = 256:  106b93e6 rutabaga: take the renderer's defaults for config the flags do not carry
+261:  ae879f2f = 257:  7fe3d740 virtio-gpu: report guest fences that stay parked, and where they stuck
+262:  6933a34f = 258:  d701f8b7 rutabaga: pump virglrs's poll descriptor so waited-on GL queries finish
+263:  79b171ee = 259:  f990ef7b vmm/macos: put vCPU threads in a latency-QoS tier on request
+264:  b10a793a = 260:  d40dce61 hvf: chain a guest-address fault no settle sweep explains
+265:  adf71749 = 261:  2c536685 hvf: hold a sweep window open until the fault-handler test touches it
+266:  f9d6759b = 262:  2839d2e2 rutabaga: survive a virglrs panic with 3D off instead of aborting
+267:  346cf563 = 263:  d9c65d59 vmm: refuse a restore whose devices offer the guest something else
+268:  45323951 = 264:  bcbe73a0 virtio/net: reconnect to a network proxy that went away
+269:  083b8efd = 265:  3ded6888 virtio/net: remove the datagram backend's socket file on the way out
+270:  1f11ce5b = 266:  ada5975b vmm: hold device threads off guest RAM while a snapshot dumps it
+271:  68a796c7 = 267:  ff6ba751 virtio/gpu: a test knob that holds back each control-queue drain
+272:  0b147d96 = 268:  b39ef1e9 virtio/mmio: interrupt once when a re-armed queue holds unseen completions
+273:  89528a0e = 269:  0b2cc290 vmm: a test knob that holds a restoring vCPU back, and say what a wake found
+274:  40601a16 = 270:  1714648d vmm: hold a SYSTEM_SUSPEND wake that arrives before the park waits
+275:  1267bb1b = 271:  ec16e18c fuzz: build against the VMM in the libkrun crate
+276:  3e93f6f4 = 272:  996fc8e4 devices/tpm: add a TPM 2.0 behind the TIS MMIO interface
+277:  411ef2f7 = 273:  15f16f43 devices/tpm: check a non-active locality leaves the transaction alone
+278:  606a5766 = 274:  84b384e8 devices/tpm: give janus the host's monotonic clock
+279:  07c225dc = 275:  e9e41ca2 devices/tpm: keep the TPM's state in a file across runs
+280:  071369c4 = 276:  6d43994e devices/tpm: trace each command and its response code
+281:  40d1af95 ! 277:  563f1f67 vmm: map a firmware's UEFI variable store from a file
+    @@ src/devices/src/fdt/aarch64.rs: fn create_memory_node(
+          cmdline: &str,
+     
+      ## src/libkrun/src/vmm/builder.rs ##
+    -@@ src/libkrun/src/vmm/builder.rs: use polly::event_manager::{Error as EventManagerError, EventManager};
+    - use utils::eventfd::EventFd;
+    +@@ src/libkrun/src/vmm/builder.rs: use utils::eventfd::EventFd;
+    + use utils::worker_message::RECLAIM_BLOCK_SIZE;
+      use utils::worker_message::WorkerMessage;
+      use vm_memory::Bytes;
+     -#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+      use vm_memory::FileOffset;
+    - #[cfg(feature = "tdx")]
+    + #[cfg(any(feature = "tdx", target_os = "linux"))]
+      use vm_memory::GuestMemoryRegion;
+     @@ src/libkrun/src/vmm/builder.rs: pub enum StartMicrovmError {
+          /// limina: the TPM's state file could not be read, restored or first written.
+    @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+              &fs_shm_sizes,
+              gpu_shm_size,
+              use_vhost_user,
+    -@@ src/libkrun/src/vmm/builder.rs: pub struct PayloadConfig {
+    -     pub pvh: bool,
+    +@@ src/libkrun/src/vmm/builder.rs: fn map_ram_in_blocks(
+    +     }
+      }
+      
+     +/// limina: the guest region a firmware's UEFI variable store lives in, backed by `path` so every
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            None,
+     +            false,
+     +            &Payload::Firmware,
+    ++            #[cfg(target_os = "macos")]
+    ++            false,
+    ++            #[cfg(target_os = "linux")]
+    ++            false,
+     +            #[cfg(feature = "tee")]
+     +            None,
+     +        )
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  &[],
+                  None,
+                  false,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +     #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    +     fn test_create_guest_memory_advises_huge_pages_only_when_asked() {
+    +         for thp in [true, false] {
+    +-            let (guest_memory, _info, _shm_manager, _payload_config) =
+    +-                create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, thp)
+    +-                    .unwrap();
+    ++            let (guest_memory, _info, _shm_manager, _payload_config) = create_guest_memory(
+    ++                64,
+    ++                None,
+    ++                None,
+    ++                None,
+    ++                &[],
+    ++                None,
+    ++                false,
+    ++                &Payload::Empty,
+    ++                thp,
+    ++            )
+    ++            .unwrap();
+    +             let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    +             for region in guest_memory.iter() {
+    +                 let start = format!("{:x}-", region.as_ptr() as usize);
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 64,
+    +                 None,
+    +                 None,
+    ++                None,
+    +                 &[],
+    +                 None,
+    +                 false,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +     #[test]
+    +     #[cfg(target_os = "macos")]
+    +     fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
+    +-        let (guest_memory, info, _shm_manager, _payload_config) =
+    +-            create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, false).unwrap();
+    ++        let (guest_memory, info, _shm_manager, _payload_config) = create_guest_memory(
+    ++            64,
+    ++            None,
+    ++            None,
+    ++            None,
+    ++            &[],
+    ++            None,
+    ++            false,
+    ++            &Payload::Empty,
+    ++            false,
+    ++        )
+    ++        .unwrap();
+    + 
+    +         let mut asked = None;
+    +         let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
+     
+      ## src/libkrun/src/vmm/resources.rs ##
+     @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+282:  75d06f43 = 278:  b5679b2e vmm: carry the TPM through a snapshot
+283:  31209765 = 279:  257163f0 vmm: write snapshots readable by their owner only
+284:  63b86d2d = 280:  b5187cec fuzz: restore the TPM device mid-sequence and compare
+285:  722b2757 = 281:  2c5f2ed0 vmm: refuse by name a resume into a VM without its TPM
+286:  af2ea884 ! 282:  429ca412 gpu: carry a pipeline-cache key to the renderer
+    @@ src/libkrun/src/api/device_builders.rs: pub struct GpuDevice {
+     +    pipeline_cache_key: Option<devices::virtio::PipelineCacheKey>,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"gpu\""))]
+     @@ src/libkrun/src/api/device_builders.rs: impl GpuDevice {
+                  software_2d: false,
+                  backend,
+287:  e26c9f1b ! 283:  3caab084 display: name the guest resource each present shows
+    @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+                              scanout_id,
+                              iosurface_id,
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+    -                     let _ = std::fs::write(format!("/tmp/limina-staging-{n:03}.raw"), &buffer[..]);
+    -                 }
+                  }
+    +             // Present the frame even if the read failed: the display API has no
+    +             // way to release it, and a backend may not hand out another one.
+     +            self.name_frame_resource(scanout_id, resource_id);
+                  self.display_backend
+    -                 .present_frame(scanout_id, frame_id, Some(&rect))?
+    -         }
+    +                 .present_frame(scanout_id, frame_id, Some(&rect))?;
+    +             if read_failed {
+     @@ src/devices/src/virtio/gpu/virtio_gpu.rs: impl VirtioGpu {
+              true
+          }
+288:  dc4e1deb = 284:  d3211b32 hvf: give MDCR_EL2 its real register id
+289:  74087b11 = 285:  d35fe586 hvf/vmm: carry a nested guest's EL2 state through a snapshot
+290:  5151404e = 286:  d4387380 hvf: name the system register a read failed on
+291:  a8cbad8c ! 287:  f2c68043 virtio-gpu: an extension for a guest-driven native GPU context
+    @@ src/libkrun/src/api/device_builders.rs: pub struct GpuDevice {
+     +    ext: Option<(Arc<dyn GpuExtension>, usize)>,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"gpu\""))]
+     @@ src/libkrun/src/api/device_builders.rs: impl GpuDevice {
+                  backend,
+                  shm_size: Self::DEFAULT_SHM_SIZE,
+    @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+     +    #[cfg(not(feature = "gpu"))]
+     +    let gpu_ext_sizes: Option<(usize, usize)> = None;
+          let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
+    - 
+    -     #[cfg(feature = "tdx")]
+    +     #[cfg(target_os = "macos")]
+    +     let ram_in_blocks = requirements.iter().any(|r| r.replaces_guest_ram);
+     @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+              vm_resources.efi_vars.as_deref(),
+              &fs_shm_sizes,
+    @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+     +        gpu_ext_sizes,
+              use_vhost_user,
+              &payload,
+    -         #[cfg(feature = "tee")]
+    +         #[cfg(target_os = "macos")]
+     @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+          efi_vars: Option<&std::path::Path>,
+          fs_shm_sizes: &[Option<usize>],
+    @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+     +    gpu_ext_sizes: Option<(usize, usize)>,
+          use_vhost_user: bool,
+          payload: &Payload,
+    -     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
+    +     #[cfg(target_os = "macos")] ram_in_blocks: bool,
+     @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+          }
+          #[cfg(not(feature = "gpu"))]
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            None,
+                  false,
+                  &Payload::Empty,
+    -             #[cfg(feature = "tee")]
+    +             #[cfg(target_os = "macos")]
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 &[],
+    +                 None,
+    ++                None,
+    +                 false,
+    +                 &Payload::Empty,
+    +                 thp,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 &[],
+    +                 None,
+    ++                None,
+    +                 false,
+    +                 &Payload::Empty,
+    +                 ram_in_blocks,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +             None,
+    +             &[],
+    +             None,
+    ++            None,
+    +             false,
+    +             &Payload::Empty,
+    +             false,
+     
+      ## src/libkrun/src/vmm/device_manager/shm.rs ##
+     @@ src/libkrun/src/vmm/device_manager/shm.rs: pub struct ShmManager {
+292:  703f089d = 288:  e079a9fa virtio-gpu: share extension arenas as blob resources
+293:  d539e7dd = 289:  3018e105 vmm/macos: an MMIO exit a device claims is no shm-window fault
+294:  9be326fa = 290:  708125f0 virtio-gpu: fences for extension contexts
+295:  bb5f2061 ! 291:  0cd5eacf virtio-gpu: surfaces for extension contexts, shared with every renderer
+    @@ src/devices/src/virtio/gpu/protocol.rs: impl GpuCommand {
+      
+     
+      ## src/devices/src/virtio/gpu/virtio_gpu.rs ##
+    -@@ src/devices/src/virtio/gpu/virtio_gpu.rs: use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
+    - use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
+    +@@ src/devices/src/virtio/gpu/virtio_gpu.rs: use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
+      #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+      use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
+    + use rutabaga_gfx::RutabagaResult;
+     +#[cfg(target_os = "macos")]
+     +use rutabaga_gfx::SurfaceDesc;
+      #[cfg(target_os = "linux")]
+296:  cdba4ade = 292:  26b13278 virtio/gpu: let an extension context import a resource's surface
+297:  979a609d = 293:  791f74d7 rutabaga: name R8 and RG8 surfaces by their DRM fourcc
+298:  4d0bcf44 = 294:  0f8794f5 rutabaga: pass a SurfaceShape to resource_create_surface
+299:  30f5059f = 295:  912bb33e virtio-gpu: fail a restore whose replay dropped commands
+300:  1946ca46 = 296:  d30220c7 virtio-gpu: carry the native-context extension across a snapshot
+301:  9b7467a8 = 297:  c6d35416 virtio-gpu: encode extension surface shapes field by field
+302:  565c1e21 = 298:  f3272f80 virtio-gpu: log the extension's surface ids across a snapshot
+303:  7790e2da = 299:  a5eaa25a virtio-gpu: say what protocol the extension's embedder speaks
+304:  90f85e74 = 300:  089db453 virtio-gpu: answer an extension surface import again
+305:  2825cda3 = 301:  51c45595 virtio-gpu: hold a fenced flush of an extension surface until it leaves glass
+306:  9d50c905 = 302:  9674047c limina ext: never free an arena the hypervisor would not unmap
+307:  de0ab96f = 303:  f5c3b70d virtio-gpu: an unref keeps the extension's holds until it succeeds, and a blob that would not unmap
+308:  690cdd24 = 304:  0f9d71fd limina ext: snapshot embedder surfaces by resource, not by the context that made them
+309:  4f02618d = 305:  6ef12733 virtio-gpu: say when a copied scanout's guest starts fencing
+310:  c469d099 = 306:  dabbf550 display: time the preferred mode at the host panel's exact rate
+311:  ca83464e = 307:  ed46373b hvf: a restore records the vtimer offset it writes
+312:  6706f600 ! 308:  a01f8e34 gpu: a timing page in the extension, in guest counter time
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for GpuDevice
+     
+      ## src/libkrun/src/vmm/builder.rs ##
+     @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+    -         paused: false,
+    -         #[cfg(target_os = "macos")]
+              paused_at: 0,
+    +         #[cfg(target_os = "macos")]
+    +         ram_in_blocks: payload_config.ram_in_blocks,
+     +        #[cfg(target_os = "macos")]
+     +        vtimer_offset: 0,
+     +        #[cfg(feature = "gpu")]
+    @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+     
+      ## src/libkrun/src/vmm/mod.rs ##
+     @@ src/libkrun/src/vmm/mod.rs: pub struct Vmm {
+    -     pub(crate) paused: bool,
+    +     /// Whether guest RAM is mapped in blocks, see `map_guest_ram_in_blocks()`.
+          #[cfg(target_os = "macos")]
+    -     pub(crate) paused_at: u64,
+    +     pub(crate) ram_in_blocks: bool,
+     +    /// limina: the vtimer offset every vCPU carries — the guest's counter is
+     +    /// `mach_absolute_time()` minus it. Moved by a live pause that hides its interval and set by a
+     +    /// restore; whoever states host times in guest counter time needs it.
+    @@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+              Ok(())
+          }
+      
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         gpu_device: None,
+    +         #[cfg(target_os = "macos")]
+    +         released_ram: Arc::new(hvf::ReleasedRam::new(Vec::new())),
+    ++        #[cfg(target_os = "macos")]
+    ++        vtimer_offset: 0,
+    ++        #[cfg(feature = "gpu")]
+    ++        gpu_timing: None,
+    +     };
+    + 
+    +     match control {
+313:  b32047a1 = 309:  2e395c5a vmm: move the timing page to the new counter time before resuming
+314:  5cd15c2f = 310:  ac821845 virtio-gpu: present transport surfaces as copies, held only for the copy
+315:  bf72647d = 311:  e9d2d9a4 virtio-gpu: a fenced scanout is reported held by its fence, copied or not
+316:  f48f3b5f = 312:  18ccf906 vmm: resume the vCPUs of a snapshot whose vCPU save failed
+317:  f1e81369 = 313:  0c46cbc3 hvf: snapshot a vCPU whose pending interrupt lines HVF refuses
+318:  00f9172a = 314:  c93d863a virtio-gpu: an arena a restore cannot place loses only its contexts
+319:  18ca541c = 315:  c185aade virtio-gpu: a limina fence names where its completed value is
+320:  1a061bc0 ! 316:  c15a64ee aarch64: describe the machine with ACPI for a firmware boot
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+                  None,
+    ++            false,
+    +             &[],
+    +             None,
+    +             None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 None,
+    ++                false,
+    +                 &[],
+    +                 None,
+    +                 None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 None,
+    ++                false,
+    +                 &[],
+    +                 None,
+    +                 None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +             None,
+    +             None,
+    +             None,
+     +            false,
+                  &[],
+                  None,
+    @@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+     
+      ## src/libkrun/src/vmm/resources.rs ##
+     @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+    -     pub ipa_granule: Option<IpaGranule>,
+    -     /// Whether to enable split irqchip
+    -     pub split_irqchip: bool,
+    +     /// Whether to ask for transparent huge pages for guest memory (Linux).
+    +     #[cfg(target_os = "linux")]
+    +     pub transparent_huge_pages: bool,
+     -    /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
+     -    /// discovered via the kernel command line and SMP uses the MP table.
+     +    /// Whether to expose ACPI tables. x86_64: when disabled, virtio-mmio devices are discovered
+321:  b9d40b3f = 317:  726b3a45 aarch64: ACPI power, sleep and wake buttons on the PL061
+322:  6c2e512a = 318:  58bf8316 aarch64: describe the TPM under ACPI
+323:  c6c5837e = 319:  14243bd5 virtio/i2c: activate on a notification before DRIVER_OK
+324:  ab78bd39 = 320:  16671743 aarch64: describe the SBS battery under ACPI
+325:  efb8a4f7 = 321:  4948f8e6 hvf: sign-extend trapped MMIO loads as the instruction asks
+326:  06930d49 = 322:  fe591666 virtio/blk: report the bytes written to the guest as the used length
+327:  cacf4d77 ! 323:  113626f8 virtio/net: add a vmnet backend for macOS
+    @@ src/libkrun/src/api/device_builders.rs: impl NetDevice {
+     +        }
+     +    }
+     +
+    -     // FIXME: use #[cfg(target_os = "linux")] on the method once ffier supports
+    -     // per-method cfg inside #[cfg_attr(feature = "ffi", ffier::export)] impl blocks.
+    -     pub fn new_tap(id: &str, tap_name: &str, mac: &[u8], features: u32) -> Result<Self, VmmError> {
+    +     // FIXME: use #[cfg(target_os = "linux")] on the method once the TAP test
+    +     // backend is Linux-gated too; it still calls this on macOS and relies on
+    +     // the runtime stub below.
+328:  21e82fbd = 324:  c8dabc55 virtio/net: let the embedder supply the backend
+329:  bddc2aba = 325:  6f38b349 virtio/net: ask the guest for RX buffers after using the ones in hand
+330:  936af1c4 = 326:  40d6d81a virtio/net: let a backend gather several descriptors
+331:  55e06a9e = 327:  bbc484aa virtio/net: report link status and let the embedder flap it
+332:  78737d69 = 328:  4de8429d virtio/net: report a vmnet interface's subnet
+333:  71abb1cb = 329:  efb3556b virtio/net: name the vmnet status a start fails with
+334:  c37d0267 = 330:  01092405 devices/acpi: declare every device's DMA coherent
+335:  4d29fb33 ! 331:  413440d6 devices/acpi: name the serial console in an SPCR on request
+    @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+          pub kernel_console: Option<String>,
+          /// Serial consoles to attach to the guest
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+    -             ipa_granule: None,
+    -             split_irqchip: false,
+    +             #[cfg(target_os = "linux")]
+    +             transparent_huge_pages: false,
+                  acpi_enabled: false,
+     +            acpi_spcr: false,
+                  serial_consoles: Vec::new(),
+336:  073223c2 ! 332:  08bb6099 fdt: hand the firmware arguments for a Linux kernel's command line
+    @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+          pub kernel_console: Option<String>,
+          /// Serial consoles to attach to the guest
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+    -             split_irqchip: false,
+    +             transparent_huge_pages: false,
+                  acpi_enabled: false,
+                  acpi_spcr: false,
+     +            extra_bootargs: None,
+337:  e7106e24 = 333:  ff85e233 devices/acpi: describe little vCPUs to an ACPI guest with CPPC
+338:  a5e74d9c ! 334:  13def9df vmm: pass the GPU extension sizes in the variable-store test
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            None,
+                  false,
+                  &Payload::Firmware,
+    -             #[cfg(feature = "tee")]
+    +             #[cfg(target_os = "macos")]
+339:  83792180 = 335:  ed2b6ffd vcpu_sched: a powered-off vCPU gives the band back
+340:  6b8a8847 = 336:  a2cec2f2 virtio/gpu: never retire a guest fence ahead of an older one on its ring
+341:  67f4c071 ! 337:  ad4328b9 vmm: hand the firmware a boot logo of the VMM's choosing
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            None,
+     +            false,
+     +            &Payload::Firmware,
+    ++            #[cfg(target_os = "macos")]
+    ++            false,
+    ++            #[cfg(target_os = "linux")]
+    ++            false,
+     +            #[cfg(feature = "tee")]
+     +            None,
+     +        )
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+                  false,
+    ++            None,
+    +             &[],
+    +             None,
+    +             None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 false,
+    ++                None,
+    +                 &[],
+    +                 None,
+    +                 None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 false,
+    ++                None,
+    +                 &[],
+    +                 None,
+    +                 None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +             None,
+    +             None,
+    +             false,
+     +            None,
+                  &[],
+                  None,
+342:  59a22963 = 338:  48e212c8 fdt: let the VMM ask the firmware for the boot menu
+343:  72b6d675 ! 339:  a4d7223c hvf: build guest RAM from owned memory blocks
+    @@ src/hvf/src/released_ram.rs: mod loom_model {
+      ## src/libkrun/src/vmm/builder.rs ##
+     @@ src/libkrun/src/vmm/builder.rs: use vm_memory::Bytes;
+      use vm_memory::FileOffset;
+    - #[cfg(feature = "tdx")]
+    + #[cfg(any(feature = "tdx", target_os = "linux"))]
+      use vm_memory::GuestMemoryRegion;
+     -#[cfg(all(
+     -    target_arch = "x86_64",
+    @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+     +        #[cfg(target_os = "macos")]
+     +        vm_resources.guest_ram_blocks.as_ref(),
+              &payload,
+    -         #[cfg(feature = "tee")]
+    -         fw_range_for_mem,
+    +         #[cfg(target_os = "macos")]
+    +         ram_in_blocks,
+     @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+                      (r.start_addr().raw_value(), host, r.len())
+                  })
+    @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+          use_vhost_user: bool,
+     +    #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
+          payload: &Payload,
+    -     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
+    - ) -> std::result::Result<
+    +     #[cfg(target_os = "macos")] ram_in_blocks: bool,
+    +     #[cfg(target_os = "linux")] transparent_huge_pages: bool,
+     @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+              // Guest memory takes its regions in address order, and the variable store and the ACPI
+              // window sit between the firmware and RAM.
+    @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+     +        )?
+          };
+      
+    -     let LoadedPayload {
+    +     #[cfg(target_os = "linux")]
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            #[cfg(target_os = "macos")]
+     +            None,
+                  &Payload::Firmware,
+    -             #[cfg(feature = "tee")]
+    -             None,
+    +             #[cfg(target_os = "macos")]
+    +             false,
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            #[cfg(target_os = "macos")]
+     +            None,
+                  &Payload::Firmware,
+    -             #[cfg(feature = "tee")]
+    -             None,
+    +             #[cfg(target_os = "macos")]
+    +             false,
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            #[cfg(target_os = "macos")]
+     +            None,
+                  &Payload::Empty,
+    -             #[cfg(feature = "tee")]
+    +             #[cfg(target_os = "macos")]
+    +             false,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 false,
+    ++                None,
+    +                 &Payload::Empty,
+    +                 ram_in_blocks,
+    +             )
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+    +             None,
+    +             false,
+    ++            None,
+    +             &Payload::Empty,
+    +             false,
+    +         )
+     
+      ## src/libkrun/src/vmm/resources.rs ##
+     @@ src/libkrun/src/vmm/resources.rs: use kbs_types::Tee;
+    @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+     +    pub guest_ram_blocks: Option<BlockLayout>,
+          /// Whether to enable split irqchip
+          pub split_irqchip: bool,
+    -     /// Whether to expose ACPI tables. x86_64: when disabled, virtio-mmio devices are discovered
+    +     /// Whether to ask for transparent huge pages for guest memory (Linux).
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+    -             nested_enabled: false,
+    +             reset_exit_code: None,
+                  #[cfg(target_os = "macos")]
+                  ipa_granule: None,
+     +            #[cfg(target_os = "macos")]
+     +            guest_ram_blocks: None,
+                  split_irqchip: false,
+    -             acpi_enabled: false,
+    -             acpi_spcr: false,
+    +             #[cfg(target_os = "linux")]
+    +             transparent_huge_pages: false,
+344:  8fdd68bb ! 340:  b61201cb virtio/mem: add a virtio-mem device over owned memory blocks
+    @@ src/devices/src/virtio/mod.rs: pub use self::fs::*;
+     
+      ## src/libkrun/src/api/device_builders.rs ##
+     @@ src/libkrun/src/api/device_builders.rs: pub struct DeviceRequirements {
+    -     pub process_shareable_memory: bool,
+    -     /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
+    -     pub replaces_legacy_rtc: bool,
+    +     /// VMM then does.
+    +     #[cfg(target_os = "macos")]
+    +     pub replaces_guest_ram: bool,
+     +    /// limina: bytes of guest memory above RAM for a virtio-mem device to plug.
+     +    pub hotplug_ram: Option<usize>,
+      }
+    @@ src/libkrun/src/api/mod.rs: pub use device_builders::RngDevice;
+     
+      ## src/libkrun/src/vmm/builder.rs ##
+     @@ src/libkrun/src/vmm/builder.rs: pub fn build_microvm(
+    -     #[cfg(not(feature = "gpu"))]
+    -     let gpu_ext_sizes: Option<(usize, usize)> = None;
+          let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
+    +     #[cfg(target_os = "macos")]
+    +     let ram_in_blocks = requirements.iter().any(|r| r.replaces_guest_ram);
+     +    let hotplug_ram = requirements.iter().filter_map(|r| r.hotplug_ram).next();
+      
+          #[cfg(feature = "tdx")]
+    @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+     +    hotplug_ram: Option<usize>,
+          #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
+          payload: &Payload,
+    -     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
+    +     #[cfg(target_os = "macos")] ram_in_blocks: bool,
+     @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+          // Add SHM regions before creating guest memory
+          arch_mem_regions.extend(shm_manager.regions());
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  #[cfg(target_os = "macos")]
+                  None,
+                  &Payload::Empty,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 false,
+    ++                None,
+    +                 &Payload::Empty,
+    +                 thp,
+    +             )
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 false,
+    +                 None,
+    ++                None,
+    +                 &Payload::Empty,
+    +                 ram_in_blocks,
+    +             )
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +             None,
+    +             false,
+    +             None,
+    ++            None,
+    +             &Payload::Empty,
+    +             false,
+    +         )
+     
+      ## src/libkrun/src/vmm/mod.rs ##
+     @@ src/libkrun/src/vmm/mod.rs: pub struct Vmm {
+    @@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+          /// Starts the microVM vcpus.
+          pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+              let vcpu_count = vcpus.len();
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         vtimer_offset: 0,
+    +         #[cfg(feature = "gpu")]
+    +         gpu_timing: None,
+    ++        #[cfg(not(feature = "tee"))]
+    ++        mem_control_handle: None,
+    +     };
+    + 
+    +     match control {
+345:  eefeb961 ! 341:  8afc8ef4 vmm: carry virtio-mem's plugged blocks across a snapshot
+    @@ src/libkrun/src/vmm/snapshot.rs: mod tests {
+              };
+              let mut v = encode_head(&head);
+              let crc = crc32(&v);
+    +
+    + ## src/libkrun/src/vmm/tests.rs ##
+    +@@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+    +         #[cfg(feature = "gpu")]
+    +         gpu_timing: None,
+    +         #[cfg(not(feature = "tee"))]
+    +-        mem_control_handle: None,
+    ++        mem_device: None,
+    +     };
+    + 
+    +     match control {
+346:  88ceea1d = 342:  7ff817c6 virtio/net: let a vmnet interface ask for its subnet
+347:  b3195ea1 ! 343:  4982c595 balloon: refuse the Replace reporting mode next to ReleasedRam on macOS
+    @@ src/devices/src/virtio/balloon/macos.rs: mod tests {
+     
+      ## src/libkrun/src/api/device_builders.rs ##
+     @@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+    -     /// memory instead, which does release them. This costs a few system calls per report, and
+    -     /// the guest's next access to each page faults it in again. Other platforms don't implement
+    -     /// [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+    +     /// map RAM like that, the VM starts anyway and uses [`FreePageReportingMode::Default`].
+    +     /// Other platforms don't implement [`FreePageReportingMode::Replace`], and use
+    +     /// [`FreePageReportingMode::Default`] instead.
+     +    ///
+     +    /// limina: on macOS the default mode already releases written pages, through the
+     +    /// stage-2-unmap ledger (`hvf::ReleasedRam`), and attaching a balloon in
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for BalloonDev
+     +                return Err(VmmError::InvalidParam());
+     +            }
+                  balloon.set_free_page_reporting_mode(self.free_page_reporting_mode);
+    +             balloon.set_guest_ram_in_blocks(ctx.guest_ram_in_blocks());
+                  balloon
+    -                 .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+348:  259764f0 = 344:  7c945acd hvf: release free pages of virtio-mem's plugged blocks
+349:  586668e3 = 345:  9d40ded1 virtio/i2c: answer the SBS battery's time registers in every state

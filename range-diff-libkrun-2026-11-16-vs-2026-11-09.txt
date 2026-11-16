@@ -1,0 +1,648 @@
+  1:  90278b82 !   1:  1a94f08b limina: keep the in-tree rutabaga_gfx
+    @@ Cargo.toml: members = [
+          "src/aws_nitro",
+     +    "src/rutabaga_gfx",
+          "src/whp",
+    -     "bindings/libkrun-via-cdylib-weak",
+      ]
+    + exclude = [
+     
+      ## src/devices/Cargo.toml ##
+     @@ src/devices/Cargo.toml: krun_input = { package = "krun-input", version = "0.1.0", path = "../input", fea
+  2:  91213ce3 =   2:  771a98f4 limina: expose the vmm module to embedders
+  3:  1a26a889 =   3:  f2293788 limina: software 2D virtio-gpu scanout for GL-less hosts (no renderer init)
+  4:  bd055c68 =   4:  f0e7d927 limina: PL011 drops serial output on WouldBlock instead of erroring
+  5:  45ac7fd6 =   5:  5e324dd2 limina: virtio-console ConsoleInOut port + quiet raw-mode ENOTTY
+  6:  c5d107db =   6:  b7042809 limina: virtio-mmio default ready queue to max_size when QueueNum unset
+  7:  fc54830f =   7:  a8ff3042 limina: virtio-gpu stop the worker thread on device reset
+  8:  7c701aab =   8:  06780340 limina: virtio-gpu hardware cursor (service the cursor queue)
+  9:  81a57f8e =   9:  e4b99d34 limina: log renderer-init failure instead of swallowing it
+ 10:  f5671d8e =  10:  85647f27 limina: virtio-gpu coexist — route fences by ring + graceful renderer fallback
+ 11:  d5929122 =  11:  373c5d77 limina: log hv_vm_map failures with alignment breakdown
+ 12:  1a6c7bcd =  12:  8f9d5d90 limina: virtio-gpu map blob via map_ptr for upstream virglrenderer 1.3.0
+ 13:  b3413c30 =  13:  c0a27e45 gpu(macos): implement SET_SCANOUT_BLOB as zero-copy IOSurface present
+ 14:  6f181a5c =  14:  32ae7c19 limina: virtio-gpu [FLUSHDBG] scanout flush diagnostics
+ 15:  e35ec7f0 =  15:  f6541640 gpu: log context lifecycle and error responses at visible levels
+ 16:  1eb5fdfb =  16:  f6d36949 limina: fence-accurate scanout presents (LIMINA_FENCE_PRESENT, #8/#31)
+ 17:  e2fc26ad =  17:  695fdf08 limina: hold guest flush fences until present + latch (#8 half 2 host side)
+ 18:  3d832887 =  18:  92b54539 limina: complete held flush fences on supervisor shown-acks (#8 latency collapse)
+ 19:  399527b5 =  19:  4d90ddfb limina: virtio-gpu persist the renderer across device reset (singleton fix)
+ 20:  a88bded9 =  20:  699712d0 limina: distinguish guest reboot (PSCI SYSTEM_RESET) from power-off
+ 21:  5b921d24 =  21:  5f167920 limina: implement virtio-gpu transfer_read (TRANSFER_FROM_HOST_3D)
+ 22:  ae7c3ac0 =  22:  ff821794 limina: virtio-gpu runtime display resize (config-change mechanism)
+ 23:  d57a8afd =  23:  2fce9bde limina: expose the GPU DisplayResizeHandle to the host VMM
+ 24:  7950acf6 =  24:  6adefd9a limina: virtio-gpu present the scanout rect at the resource's stride (de-shear)
+ 25:  39e5f08a =  25:  3cc51e81 limina: HVF — don't panic the worker on unhandled guest traps
+ 26:  21ff8122 =  26:  c08709a0 limina: virtio-gpu advertise only the capsets the renderer backs
+ 27:  c14fbc76 =  27:  150f16a8 limina: map KRUN_DISPLAY_ERR_METHOD_UNSUPPORTED (-2) in into_rust_result!
+ 28:  6f33ac3e =  28:  1129afe2 limina: virtio-gpu read the venus scanout IOSurface for the headless capture sink
+ 29:  f719925d =  29:  9953e8a9 limina: balloon — reclaim free pages with MADV_FREE_REUSABLE + 16 KiB-safe coalescing
+ 30:  c1cf644d =  30:  c872e041 limina: balloon — inflate/deflate, target/actual, DEFLATE_ON_OOM, BalloonControlHandle
+ 31:  4247e4aa =  31:  6f715905 limina: virtio-gpu — demote per-frame present DIAGs (FLUSH2/FENCEPRESENT) to trace
+ 32:  518a11a1 =  32:  70e7f4a9 limina: virtio-input — return to Inactive on reset() so the device can re-activate
+ 33:  0328e1ff =  33:  62ffbe68 limina: virtio-input worker blocks (epoll -1) instead of a pointless 1s timeout
+ 34:  7a1b373f =  34:  de2d4839 limina: hvf vtimer — multiply before dividing so the WFI timeout isn't ~1.6% short
+ 35:  6805892d =  35:  0dfeb96c rutabaga: balance the eager macOS blob map on unref_resource
+ 36:  7938f4db =  36:  e2291b69 virtio-i2c: new device with an emulated SBS smart battery slave
+ 37:  e27f9f01 =  37:  6f205293 limina: hvf — round map/unmap sizes up to the host page granule
+ 38:  de2db690 =  38:  c0a5b8e4 rutabaga_gfx: route virgl logs through the level-aware callback
+ 39:  ce18d12e =  39:  1a3e1787 virtio/snd: add native in-VMM virtio-snd device (playback enumeration)
+ 40:  d177d102 =  40:  e3dd874c virtio/snd: CoreAudio output sink with completion pacing
+ 41:  d80b8797 =  41:  3965f81a virtio/snd: mic capture — opt-in input stream (macOS CoreAudio)
+ 42:  0fa39373 =  42:  488812b1 limina: real vCPU pause/quiesce mechanism (macOS/HVF) for M9 snapshots
+ 43:  76d99d1d =  43:  7508603e limina: per-vCPU save/restore + snapshot collection (macOS/HVF) for M9
+ 44:  a886d5b1 =  44:  954b6409 limina: GIC state + RAM dump + snapshot file format (macOS/HVF) for M9
+ 45:  790f465b =  45:  9bb77fdb limina: --restore reloads a snapshot into a fresh microVM (macOS/HVF) for M9
+ 46:  0cc2de83 =  46:  ea997d0b limina: PL031 RTC alarm — deliver the match interrupt (macOS/HVF)
+ 47:  41d0f54c =  47:  e6634a3b limina: virtio-net implements reset (suspend/resume thaw), preserving the backend
+ 48:  59b964f3 =  48:  6618ffcf virtio: implement reset() for balloon + vsock (suspend/resume thaw)
+ 49:  ca097ebd =  49:  8023119e virtio: debug logging for suspend/resume device re-init
+ 50:  07b3cdd6 =  50:  5110faca virtio: drain inactive eventfds + un-negotiate features on transport reset
+ 51:  f8e85f27 !  51:  1ff416ab virtio-balloon: gate VIRTIO_BALLOON_F_REPORTING (mask by default) + clear reset state
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for ConsoleDev
+     +    free_page_reporting_mode: FreePageReportingMode,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
+      #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
+      impl BalloonDevice {
+          pub fn new() -> Result<Self, VmmError> {
+ 52:  d51ef0cb =  52:  d3caa5ad gpio: add a KEY_SLEEP suspend button (host-driven, no guest agent)
+ 53:  1879ce9a =  53:  bb31e086 gpio: split into poweroff (KEY_POWER), suspend (KEY_SLEEP), restart (KEY_RESTART)
+ 54:  95f948f2 =  54:  335a8b36 gpio: add a wakeup-source KEY_WAKEUP button (M9 restore wake)
+ 55:  15be62e1 =  55:  7b6eda88 snapshot: serialize the PL061 GPIO register file (M9.2 restore wake)
+ 56:  e7aa8724 =  56:  bea4f6c1 vmm: add resume_parked_vcpus for the M9 snapshot abort path (macOS)
+ 57:  360f1c17 =  57:  26262e67 vmm: virtio quiesce oracle for the M9.2 suspend bracket (macOS)
+ 58:  e5be60c3 =  58:  80fbe27d vmm: M9.3 SHM-window-fault oracle on the HVF MMIO path (macOS)
+ 59:  f1f66023 =  59:  9512afde vmm: M9 snapshot byte-section length must be u64, not u32 (macOS)
+ 60:  46340f37 =  60:  1b073025 vmm: M9.3 snapshot v4 format — layout-identity header + device-transport section
+ 61:  b25cee62 =  61:  c673551d vmm: M9.3 capture device transports + restore validation (macOS)
+ 62:  de42587e =  62:  c32ac4e9 limina(0071): M9.3 GPU probes — stale-ctx/resource counters, fence ledger, renderer dump
+ 63:  6c7521d6 =  63:  86183bda limina(0072): sticky queue re-arm — survive the no-PM-ops bus-fallback s2idle resume
+ 64:  936ff731 =  64:  d6f6ab8d limina(0073): rutabaga-layer snapshot-replay journal (M9.3 P0)
+ 65:  c48e543a =  65:  b8157cf6 limina(0074): v5 GPU snapshot section + venus replay engine (M9.3 P1)
+ 66:  80b4d1d4 =  66:  f02461af limina(0076): classify replay wire-entry drops by journal class (M9.3 diagnostics)
+ 67:  75fe775f =  67:  a0794090 limina(0079): full VkDeviceMemory content capture in the GPU snapshot (M9.3 P2)
+ 68:  1dc01b64 =  68:  e6d1c43e limina(0080): sync-state section in the GPU snapshot (M9.3 P2.1)
+ 69:  612bb7d2 =  69:  5af07365 vmm: v6 chunked-frame snapshot format — parallel lz4 + zero-page holes (limina M9.4 snapshot speed)
+ 70:  a33a7e15 =  70:  be539450 vmm: lz4 the GPU re-creation section in the snapshot head (limina M9.3 P3)
+ 71:  97aaf56d =  71:  a8a2d84e gpu: carry the cursor overlay across snapshot restore (limina M9.3 P3)
+ 72:  a084ab6c =  72:  571a00c7 vmm: publish the snapshot atomically (stream to .tmp, rename on success)
+ 73:  97711df8 =  73:  6a1ae9d1 vmm: fast lz4 (default-features off) + snapshot phase timing
+ 74:  1787917d !  74:  66d86ab1 balloon: stop advertising DEFLATE_ON_OOM by default (per-VM re-advertise knob)
+    @@ src/libkrun/src/api/device_builders.rs: impl<'a> AttachDevice<'a> for ConsoleDev
+     +    deflate_on_oom: bool,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
+     @@ src/libkrun/src/api/device_builders.rs: impl BalloonDevice {
+              Ok(Self {
+                  free_page_reporting: false,
+ 75:  127ce77d =  75:  3030e426 rtc_pl031: anchor reads to the host wallclock, not a monotonic Instant
+ 76:  fde64c66 =  76:  e1fc4381 gpu: defer-and-classify the session reset — park across a bus-fallback thaw
+ 77:  06fd5999 =  77:  a9554dbb gpu: negotiate EVENT_IDX and coalesce used-buffer interrupts
+ 78:  7bc3485a =  78:  fe62115c polly/gpu: env-gated wake-rate tracing (LIMINA_WAKE_TRACE)
+ 79:  80681881 =  79:  0e8d810e vsock timesync: saturate elapsed-time arithmetic against backward clock steps
+ 80:  8cec10a3 =  80:  67ce1f64 hvf/vmm: model PSCI CPU_OFF + AFFINITY_INFO and re-deliverable CPU_ON (guest vCPU hotplug)
+ 81:  a8f1b714 =  81:  4b3611df usb/xhci: emulated xHCI controller bring-up (register file, stub data path)
+ 82:  1629b175 =  82:  3f6a2784 usb/xhci: Stage B1 — rings, command set, EP0 control transfers, gadgets
+ 83:  61e8e75c =  83:  7673119f usb/xhci: Stage B2 — non-EP0 data flow + mock HID echo gadget
+ 84:  b47b822d =  84:  a1ee9018 usb/xhci: generic HID report-pipe gadget (Stage C mechanism)
+ 85:  6b4080f1 =  85:  f85310f0 usb/xhci: generic bulk-pipe gadget (MOC fingerprint mechanism)
+ 86:  c240bd74 =  86:  6acf64ac usb/xhci: handle Immediate Data (IDT) on Normal TRBs
+ 87:  ce0f48fe =  87:  f3b44364 usb/xhci: bound work TRBs per data TD (hostile-ring DoS guard)
+ 88:  eb25032c =  88:  1d44abef usb/xhci: PM-correct register semantics (suspend/resume)
+ 89:  95c52fec =  89:  bfdec8cb usb/xhci: carry controller state across a VM snapshot
+ 90:  b614cbae =  90:  2db8ff8c usb/xhci: trace the PM register writes (suspend/resume oracle)
+ 91:  2fd3cb39 =  91:  9aa38392 virtio: LIMINA_WAKE_PROBE — time the VMM half of the venus wake chain
+ 92:  0fbe134e =  92:  47a5db3f virtio: close the wake chain's return half via the virtio ISR ack
+ 93:  ae8e1136 =  93:  7495d495 virtio: attribute control-queue drains that overrun a frame
+ 94:  ced32f2c =  94:  f2204d6a virtio: stamp every wake-probe line with CLOCK_REALTIME, not just the outliers
+ 95:  cdf97d8c =  95:  bdbc6ede virtio-gpu: default fence-accurate presents ON when the shown-ack channel exists
+ 96:  e232b579 =  96:  01799d26 virtio-gpu: readback fallback for deferred presents on sinks without zero-copy
+ 97:  ab89bb9a =  97:  cc7b6c2a virtio-gpu: swap the fence-present runtime marker to a force-OFF
+ 98:  c9ea62aa =  98:  3ee2b8f9 virtio-gpu: log fence-present engagement once at INFO
+ 99:  deaa61bc =  99:  c94603d4 virtio-gpu: resolve + present vrend IOSurface scanouts on plain SET_SCANOUT
+100:  d786c023 = 100:  214fb966 virtio-gpu: honest Global-ring fences for vrend sessions
+101:  34e853fe = 101:  46503726 virtio-gpu: retire-as-lost for refused context fences (the §22 KMS wedge)
+102:  858cf85d = 102:  9d572038 virtio-gpu: stable EDID identity, real mode list and monitor range limits
+103:  855792ca = 103:  6fccf47b virtio-gpu: runtime display updates carry EDID and connection state
+104:  a162a84a = 104:  6564d562 virtio-gpu: log when descriptor slots overflow the base EDID block
+105:  f7a2e1b6 = 105:  b0a4cfac virtio-gpu: declare the generated EDID digital, not analog
+106:  8577b4d1 = 106:  20cfbf41 virtio-gpu: carry over-ceiling modes in a DisplayID type VII extension block
+107:  c4c17f83 = 107:  2a77e1a0 virtio-gpu: carry a range descriptor's horizontal rate past 255 kHz
+108:  4228ff7c = 108:  eb1ae64b virtio-console: return a port's queues on close so it can be reopened
+109:  c6be10ce = 109:  e625052b usb: tell a gadget when the guest cancels an endpoint's transfer
+110:  1e7904df = 110:  4575399b virtio-gpu: snapshot the classic (vrend) world — journal ops + two-phase replay
+111:  84b25f0b = 111:  c7bce93f virtio-gpu: carry classic host-side resource contents in the snapshot (P2)
+112:  18588866 = 112:  350f2c0a virtio-gpu: ledger the display path's scanout resources
+113:  04c8cc47 = 113:  6e2f606a virtio/gpu: tell the display backend when a scanout resource is unref'd
+114:  ab16580a = 114:  1ad33b1d virtio/gpu: don't count stranded present bookkeeping against quiescence
+115:  0d389fd9 = 115:  40bbfa8e virtio/gpu: warn when a park discards a deep awaiting-shown backlog
+116:  7cf83865 = 116:  b8ab57df hvf: heal stage-2 faults on balloon-released guest RAM
+117:  23e2ccf5 = 117:  59033e77 virtio/balloon: unmap released pages from the guest
+118:  a914fa3c = 118:  ed7382e1 hvf: bound the heal-window scan to the overlapping ranges
+119:  5b04eb36 = 119:  d72c1cfe virtio/balloon: surface released-RAM counters in BalloonStats
+120:  3397cf21 = 120:  d0e720f7 hvf: retry stray stage-2 faults instead of MMIO-decoding guest RAM
+121:  2decdee8 = 121:  6ba7c65c hvf/balloon: per-path zero-on-release gate (LIMINA_BALLOON_RELEASE_MEMSET)
+122:  07cb07a2 = 122:  f7562713 hvf: default balloon release zeroing to the inflate queue
+123:  8bd6c8dc = 123:  6857d227 devices: retry transient EFAULT at syscalls addressing guest RAM
+124:  2a72c53c = 124:  141c6589 hvf: add a task-pmap ledger settle sweep to ReleasedRam
+125:  efa06eed = 125:  d8b06e41 virtio/balloon: expose the ledger settle sweep on the control handle
+126:  96075f61 = 126:  b215895c hvf: count sweep-fielded faults and never chain guest-region faults
+127:  cfc86940 = 127:  79ed78fc virtio/gpu: trace iov backings behind an env var
+128:  c1524825 = 128:  d8f75929 gpu: answer the supervisor's "resurface <id>" by re-publishing the surface
+129:  3f03dd11 = 129:  201e4fcf smbios: lead product_name with a recognized hypervisor name
+130:  d588f1af = 130:  c1dffc0c smbios: identify the machine as Limina
+131:  35db3be3 = 131:  95aa3b3f virtio/gpu: bind a resource to a scanout only after the backend accepts
+132:  778738a7 = 132:  216df6c0 virtio/gpu: tell the display backend when the OS driver takes over
+133:  3b8124c2 = 133:  a4be3c69 display: tell the backend which scanout a cursor belongs to
+134:  fab7c789 = 134:  06f16955 gpu: carry each scanout's desktop position through display info
+135:  0956801d = 135:  fc42110f gpu: never lose a display config-change event
+136:  1d0c4ce5 = 136:  8e4886bf gpu: trace the 3D submit, transfer and command stream
+137:  bf23cefd = 137:  2632ca54 gpu: trace guest blob creation under LIMINA_TRACE_BLOB
+138:  ea335a1c = 138:  f22723bc usb: a HID pipe shaped for an input device
+139:  c27294d0 = 139:  7035e0c2 vmm: a device no driver ever took is not a quiesce holdout
+140:  74b18978 = 140:  c2c425c5 gpu: pump virgl_renderer_poll() when vrend has no sync thread
+141:  048804af = 141:  704e0905 display: let the consumer ask for a backend-owned surface back
+142:  353ffab8 = 142:  2b420aa0 gpu: ask the renderer for a resource's IOSurface id instead of remembering it
+143:  bfe683a9 = 143:  c14b388f gpu: release the IOSurface we published, not the one backing the resource
+144:  72a21696 ! 144:  7f02c735 hvf: let the embedder choose the stage-2 IPA granule
+    @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+     +    pub ipa_granule: Option<IpaGranule>,
+          /// Whether to enable split irqchip
+          pub split_irqchip: bool,
+    -     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
+    +     /// Whether to ask for transparent huge pages for guest memory (Linux).
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+                  smbios_oem_strings: None,
+                  nested_enabled: false,
+    @@ src/libkrun/src/vmm/resources.rs: mod tests {
+     +            #[cfg(target_os = "macos")]
+     +            ipa_granule: None,
+                  split_irqchip: false,
+    -             acpi_enabled: false,
+    -             serial_consoles: Vec::new(),
+    +             #[cfg(target_os = "linux")]
+    +             transparent_huge_pages: false,
+     
+      ## src/libkrun/src/vmm/tests.rs ##
+     @@ src/libkrun/src/vmm/tests.rs: fn check_terminal_responses(test_name: &str, control: VmCtl) {
+145:  b7c03293 = 145:  7a559b7c hvf: round map sizes to the granule the VM was created with, not the host page
+146:  015984a5 = 146:  237cedbc vmm: record how late the host serves a guest's WFI deadline
+147:  b92de629 = 147:  26260d08 vmm: count the WFI parks that never happen
+148:  7696bbca = 148:  bc275bfd vmm: let the embedder put vCPU threads in the real-time band
+149:  a9c289e9 = 149:  f4c87ba4 macos/vcpu: keep a banded vCPU out of xnu's real-time fail-safe
+150:  2dc165c2 = 150:  1fd8cf11 macos/vcpu: make the band's reach and its heartbeat observable
+151:  c3a5878d = 151:  bba4fb2e macos/vcpu: arm the real-time band per vCPU, from that thread's own CPU share
+152:  4971f440 = 152:  05f6d089 macos/vcpu: expose whether every vCPU is parked, and a resume that keeps the counter
+153:  6b7308c5 = 153:  2619ff60 psci: implement SYSTEM_SUSPEND, the exact quiesce signal we were approximating
+154:  4720a790 = 154:  f0f5cb78 psci: gate SYSTEM_SUSPEND behind LIMINA_PSCI_SYSTEM_SUSPEND, default on
+155:  c4f30e4e = 155:  d447a466 macos/sysreg: answer the OS-lock register reads the suspend path makes
+156:  4b50fbc8 = 156:  84e03356 gpio: let the wake button resume a guest that is suspended to RAM
+157:  0bbd9040 = 157:  5d5e8ef5 snapshot: carry each vCPU's PSCI power state (v8), and restore into it
+158:  ce36f681 = 158:  98900109 virtio/gpu: arm the renderer dump on any command error, not just a lost context
+159:  1227ed9f = 159:  7870458a gpu snapshot: carry the display configuration across restore
+160:  7aabccf0 = 160:  521cdc88 gpu restore: add LIMINA_RESTORE_SKIP_DISPLAYS, a RED lever for the display carry-over
+161:  f6b0054f = 161:  7674ba34 gpu restore: count the classic content re-uploads that vrend refuses
+162:  3e555542 = 162:  1a863103 gpu snapshot: carry the presented scanout frame across a restore (payload v8)
+163:  933e004a = 163:  34db681d gpu restore: LIMINA_RESTORE_SKIP_SCANOUT, a RED lever for the saved frame
+164:  29ad1c18 = 164:  f90907d2 gpu restore: re-bind the scanouts without presenting a stale console
+165:  78bb584d = 165:  fa947430 gpu restore: drop the guest-shadow re-upload, keep P2 as the account
+166:  40c70078 = 166:  ca200960 gpu snapshot/restore: count the ink in the saved scanout frame
+167:  1ebca632 = 167:  bdf6dfc9 snd: report PCM stream lifecycle to an embedder hook
+168:  17966800 = 168:  d9ccca8b snd: report when the playback stream goes silent, not just when it ends
+169:  46c02a47 = 169:  9aaf37a8 devices: a virtual cpufreq controller, so the guest can see frequency
+170:  4b3ca6b2 = 170:  10846936 vcpu: little vCPUs, made true by the QoS class their thread runs at
+171:  aea988a4 = 171:  967a68ea snd: tell the guest how much audio the host still owes
+172:  81373fad = 172:  9e04ca4d snd: a switch to force the old zero-latency reporting
+173:  3a75a4a5 = 173:  207cfe13 gpu: hold the renderer's journal opaque, and let it say what it lost
+174:  08c51b2c = 174:  7af9580f gpu: consume virglrenderer as a Rust crate, not through its C ABI
+175:  fb3d3098 = 175:  7bd92b65 gpu: mark the C-ABI helpers as gfxstream's alone
+176:  80e271a0 = 176:  a150d32c gpu: rustfmt virgl_renderer.rs to this tree's settings
+177:  df213926 = 177:  b0aa80e7 gpu: take virglrs from limina's third_party, not a sibling checkout
+178:  a422427a = 178:  ccbfd38a rustfmt: pin the style edition, and make the tree match it
+179:  3ac355c0 = 179:  5c4ee38d gpu: make the iosurface sync fallback a state, not a one-shot warning
+180:  016c5070 = 180:  38d59326 display: the default EDID should describe a monitor that could exist
+181:  0ca46731 = 181:  126a5823 rutabaga: give the renderer the context a fence is for
+182:  6bbebeaf = 182:  0ac9ac56 rutabaga: follow virglrs's Renderer API through the Linux port
+183:  ccf36558 = 183:  d2fbae25 gpu: park a vrend scanout's present on a fence instead of blocking for it
+184:  1703064b = 184:  6682e1e0 gpu: present retired vrend frames from inside a long control-queue drain
+185:  79cf6d26 = 185:  3bf4514e gpu: say when a scanout presents an older frame over a newer one
+186:  d586f173 = 186:  d6c0140c gpu: say when a scanout flush leaves nothing holding the guest's buffers
+187:  05892850 = 187:  4a55735f display: tell the backend whether the guest is held off a scanout's buffers
+188:  c85e3ba4 = 188:  3b087e00 gpu: report a scanout presented at once as not held
+189:  6ef649a4 = 189:  ee1cf84b gpu: move the pointer from inside a long control-queue drain
+190:  89c8d171 = 190:  d97eda1f gpu: service the cursor queue mid-drain only once the guest has kicked it
+191:  da457afa ! 191:  131a6375 vsock: let the embedder turn the timesync datagram off
+    @@ src/libkrun/src/api/device_builders.rs: pub struct VsockDevice {
+     +    timesync: bool,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export)]
+    + #[cfg_attr(feature = "ffi", ffier::export(send))]
+     @@ src/libkrun/src/api/device_builders.rs: impl VsockDevice {
+                  tsi_flags,
+                  host_port_map: HashMap::new(),
+192:  e000f81f = 192:  5a15b588 vsock: reset a connection whose proxy socket cannot be created
+193:  40e16a0a = 193:  ebee54f9 vsock: suppress doorbells and interrupts with EVENT_IDX
+194:  52c1d142 = 194:  b7e1572b vsock: give a unix proxy socket a 1 MiB send buffer on macOS
+195:  fff6610a = 195:  7d2b3fd5 vmm: refuse to restore a snapshot into a machine whose devices moved
+196:  46f60048 = 196:  bf25930c virtio/net: stop interrupting a polling guest, mark proxy frames checksum-valid
+197:  7ead4197 = 197:  ab32b14c virtio/net: mark RX frames checksum-valid only for a vouched backend
+198:  19fc4cd3 = 198:  16e61a4e rutabaga: follow virglrs's surface, RingId and journal signatures
+199:  c7881a29 = 199:  cc4d5679 rutabaga: run a suspended driver wait outside the renderer lock
+200:  c496261e = 200:  8c2d0090 rutabaga: follow virglrs's unified journal and replay entry points
+201:  c9c882d4 = 201:  7ee1e578 rutabaga: follow virglrs's typed transfer direction
+202:  b2a06cd4 = 202:  a88deb6a gpu: ask the renderer to fence a present, not a reserved ring
+203:  573089d7 = 203:  11d55318 vcpu_sched: let a vCPU leave the real-time band without being told
+204:  8261158f = 204:  9778b081 vcpu_sched: spend the disarm budget in CPU time, not wall time
+205:  a702d935 = 205:  b62d24f0 vcpu_sched: judge the band by the RATE a vCPU burns CPU, not the total
+206:  6c95956e = 206:  ad913af8 vmm: let the VMM wait on guest power-state transitions
+207:  897c39a9 = 207:  32d4b48a rutabaga: answer a republish from virglrs's surface registry
+208:  5a5b86f2 = 208:  c69ca72a virtio: read an unreadable avail ring as empty instead of panicking
+209:  34826cf4 = 209:  dfe196bd vmm: report which way the guest last moved a virtio device
+210:  0303966b = 210:  6ef7a893 vmm/macos: say why a little vCPU never takes the band
+211:  23445701 = 211:  f98044e7 virtio/gpu: keep a detached resource's attach record for restore
+212:  c55b0c92 = 212:  29c31c37 virtio/snd: service the queues on a thread of the device's own
+213:  c9f71135 = 213:  038b802d virtio: let a device service a queue notification on the kicking vCPU
+214:  2cc2d8c5 = 214:  490880ca gpu: bring hardware decodes to rest before a snapshot
+215:  6d14645a = 215:  efb82978 rutabaga: name the context that pays for a host-minted blob
+216:  22cbe29f = 216:  80973a3c snapshot: guard the CRC-32 format and bench the RAM path on a real snapshot
+217:  fa090a61 = 217:  bb2c69ee snapshot: compute the CRC-32 with the ARMv8 CRC instructions
+218:  b3e5d33a = 218:  c795f31b snapshot: let the RAM bench write to /dev/null
+219:  895f33a9 = 219:  7587c45b snapshot: size the RAM pool by cores, not a cap of 8
+220:  eefb87a1 = 220:  2f419949 snapshot: map the snapshot file for restore instead of reading it
+221:  db0c63e9 = 221:  7c0f3553 snapshot: log where the RAM save and apply spend their time
+222:  b091d5dd = 222:  d74cc370 snapshot: read the snapshot file again instead of mapping it
+223:  a913ef4a = 223:  97082979 snapshot: stream the file in behind the restore instead of reading it first
+224:  9c5270f0 = 224:  58f32fa0 builder: say the restore's first timing covers the head, not the file
+225:  640caadf = 225:  182e086d balloon: prove the reclaim coalescer's page arithmetic with Kani
+226:  f2a6409b = 226:  6f634bf5 xhci: refuse Address Device on a slot the guest never enabled
+227:  3dd6b9ec = 227:  cdd1cc7c fuzz: drive the xHCI controller the way a guest can
+228:  cfaa2a21 = 228:  0c14dff0 xhci: refuse an event ring segment past the top of the address space
+229:  497023e8 = 229:  0e3c3e66 xhci: prove the ring walker's step with Kani
+230:  9fca4bfa = 230:  c0c723e1 xhci: walk every slot command sequence to depth four against a model
+231:  e75e2622 = 231:  04fbb69f hvf: put released RAM's stage-2 and madvise calls behind a seam
+232:  59c4c848 = 232:  c184e655 hvf: walk every release and heal sequence against a model, and fix what it found
+233:  0946a4f2 = 233:  66d5179f hvf: model release, heal and reclaim racing one another with loom
+234:  87b2b923 = 234:  b16a6ccc hvf: bound the sweep fault handler test by time, not by 50 sweeps
+235:  679c16ca = 235:  0f26da60 balloon: walk every sequence of reported runs through the coalescer
+236:  0fa25915 = 236:  5d6ceabb vmm: let the snapshot reader parse bytes already in memory, for fuzzing
+237:  055ff30d = 237:  88c58754 vmm: refuse a corrupt snapshot before it sizes an allocation or overflows
+238:  dd07178d = 238:  f0b68918 fuzz: read snapshot heads and apply snapshot RAM, seeded from a real snapshot
+239:  6ecfc535 = 239:  5572cbeb vmm: make the head corruption test reach the head CRC
+240:  cd703850 = 240:  dbb8d8a4 vcpu_sched: a band move is claimed before it is made
+241:  56022c46 = 241:  dbb6e671 power_watch: a loom model of the waiter protocol
+242:  24af6ba2 = 242:  310e9fd8 vstate: every park site answers a Snapshot
+243:  fccf8f35 = 243:  f9113984 Cargo.lock: record krun-devices' loom dev-dependency
+244:  77c33a61 = 244:  b651226a usb/xhci: post a control TD's Status event only when the guest asks
+245:  51ac1359 = 245:  6388697c hvf/released_ram: cast the fault handler through a pointer
+246:  a7fc8c32 = 246:  46b431b9 virtio/gpu: move the snapshot payload codec out of the journal, and fuzz it
+247:  4a38519c = 247:  09586492 virtio/gpu: bound a snapshot payload's counts and lengths by its bytes
+248:  7a692431 = 248:  f44b9716 virtio/gpu: build the snapshot payload codec in every test build
+249:  bfc46212 = 249:  e745f3b6 treewide: clean clippy on the workspace limina builds
+250:  c4c74633 = 250:  39afc0c5 virtio/gpu: present an unfenced venus scanout as an ordered copy
+251:  5752038c = 251:  0a2142a1 virtio/gpu: drop a frame rather than show a scanout the guest can reach
+252:  439f7a97 = 252:  3c71044a gpu: name the scanout a venus present copy is taken for
+253:  a1b5148e ! 253:  ad28cf08 treewide: clean clippy, fmt and the tests after the rebase onto upstream
+    @@ Cargo.lock: dependencies = [
+     + "syn 2.0.117",
+      ]
+      
+    - [[package]]
+    -@@ Cargo.lock: dependencies = [
+    -  "proc-macro2",
+    -  "quote",
+    -  "serde_json",
+    -- "syn",
+    -+ "syn 2.0.117",
+    - ]
+    - 
+      [[package]]
+     @@ Cargo.lock: version = "0.2.0"
+      source = "registry+https://github.com/rust-lang/crates.io-index"
+    @@ Cargo.lock: dependencies = [
+     + "crc32fast",
+       "crossbeam-channel",
+       "env_logger",
+    -  "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
+    +  "ffier",
+     @@ Cargo.lock: dependencies = [
+       "libloading",
+       "linux-loader",
+254:  3e517d92 = 254:  244537fe api: typed constructors for a Rust embedder of the display and input devices
+255:  cf4e5191 = 255:  78f43441 api: register each input device under its own id
+256:  1104aec6 = 256:  106b93e6 rutabaga: take the renderer's defaults for config the flags do not carry
+257:  90fd8ba7 = 257:  7fe3d740 virtio-gpu: report guest fences that stay parked, and where they stuck
+258:  94b934b4 = 258:  d701f8b7 rutabaga: pump virglrs's poll descriptor so waited-on GL queries finish
+259:  b9964f72 = 259:  f990ef7b vmm/macos: put vCPU threads in a latency-QoS tier on request
+260:  a111036d = 260:  d40dce61 hvf: chain a guest-address fault no settle sweep explains
+261:  99114071 = 261:  2c536685 hvf: hold a sweep window open until the fault-handler test touches it
+262:  748be46b = 262:  2839d2e2 rutabaga: survive a virglrs panic with 3D off instead of aborting
+263:  2b972958 = 263:  d9c65d59 vmm: refuse a restore whose devices offer the guest something else
+264:  bad2ba51 = 264:  bcbe73a0 virtio/net: reconnect to a network proxy that went away
+265:  dbc207a1 = 265:  3ded6888 virtio/net: remove the datagram backend's socket file on the way out
+266:  9967a247 = 266:  ada5975b vmm: hold device threads off guest RAM while a snapshot dumps it
+267:  440ad4b7 = 267:  ff6ba751 virtio/gpu: a test knob that holds back each control-queue drain
+268:  e86a3af7 = 268:  b39ef1e9 virtio/mmio: interrupt once when a re-armed queue holds unseen completions
+269:  c2a26761 = 269:  0b2cc290 vmm: a test knob that holds a restoring vCPU back, and say what a wake found
+270:  2b29e514 = 270:  1714648d vmm: hold a SYSTEM_SUSPEND wake that arrives before the park waits
+271:  7fb6cb60 = 271:  ec16e18c fuzz: build against the VMM in the libkrun crate
+272:  a8c114be = 272:  996fc8e4 devices/tpm: add a TPM 2.0 behind the TIS MMIO interface
+273:  0cffa619 = 273:  15f16f43 devices/tpm: check a non-active locality leaves the transaction alone
+274:  d40f29cb = 274:  84b384e8 devices/tpm: give janus the host's monotonic clock
+275:  13da329b = 275:  e9e41ca2 devices/tpm: keep the TPM's state in a file across runs
+276:  66404d67 = 276:  6d43994e devices/tpm: trace each command and its response code
+277:  25514a25 ! 277:  563f1f67 vmm: map a firmware's UEFI variable store from a file
+    @@ src/libkrun/src/vmm/builder.rs: use utils::eventfd::EventFd;
+      use vm_memory::Bytes;
+     -#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+      use vm_memory::FileOffset;
+    - #[cfg(feature = "tdx")]
+    + #[cfg(any(feature = "tdx", target_os = "linux"))]
+      use vm_memory::GuestMemoryRegion;
+     @@ src/libkrun/src/vmm/builder.rs: pub enum StartMicrovmError {
+          /// limina: the TPM's state file could not be read, restored or first written.
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            &Payload::Firmware,
+     +            #[cfg(target_os = "macos")]
+     +            false,
+    ++            #[cfg(target_os = "linux")]
+    ++            false,
+     +            #[cfg(feature = "tee")]
+     +            None,
+     +        )
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  &[],
+                  None,
+                  false,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +     #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    +     fn test_create_guest_memory_advises_huge_pages_only_when_asked() {
+    +         for thp in [true, false] {
+    +-            let (guest_memory, _info, _shm_manager, _payload_config) =
+    +-                create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, thp)
+    +-                    .unwrap();
+    ++            let (guest_memory, _info, _shm_manager, _payload_config) = create_guest_memory(
+    ++                64,
+    ++                None,
+    ++                None,
+    ++                None,
+    ++                &[],
+    ++                None,
+    ++                false,
+    ++                &Payload::Empty,
+    ++                thp,
+    ++            )
+    ++            .unwrap();
+    +             let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    +             for region in guest_memory.iter() {
+    +                 let start = format!("{:x}-", region.as_ptr() as usize);
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                      64,
+                      None,
+278:  9868f90b = 278:  b5679b2e vmm: carry the TPM through a snapshot
+279:  029ac089 = 279:  257163f0 vmm: write snapshots readable by their owner only
+280:  8efe8ccf = 280:  b5187cec fuzz: restore the TPM device mid-sequence and compare
+281:  e2d490f5 = 281:  2c5f2ed0 vmm: refuse by name a resume into a VM without its TPM
+282:  5729967e ! 282:  429ca412 gpu: carry a pipeline-cache key to the renderer
+    @@ src/libkrun/src/api/device_builders.rs: pub struct GpuDevice {
+     +    pipeline_cache_key: Option<devices::virtio::PipelineCacheKey>,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"gpu\""))]
+     @@ src/libkrun/src/api/device_builders.rs: impl GpuDevice {
+                  software_2d: false,
+                  backend,
+283:  f6a251a6 = 283:  3caab084 display: name the guest resource each present shows
+284:  0c875413 = 284:  d3211b32 hvf: give MDCR_EL2 its real register id
+285:  87d24700 = 285:  d35fe586 hvf/vmm: carry a nested guest's EL2 state through a snapshot
+286:  9e4096f1 = 286:  d4387380 hvf: name the system register a read failed on
+287:  a35cf814 ! 287:  f2c68043 virtio-gpu: an extension for a guest-driven native GPU context
+    @@ src/libkrun/src/api/device_builders.rs: pub struct GpuDevice {
+     +    ext: Option<(Arc<dyn GpuExtension>, usize)>,
+      }
+      
+    - #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
+    + #[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"gpu\""))]
+     @@ src/libkrun/src/api/device_builders.rs: impl GpuDevice {
+                  backend,
+                  shm_size: Self::DEFAULT_SHM_SIZE,
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                      None,
+                      &[],
+                      None,
+    ++                None,
+    +                 false,
+    +                 &Payload::Empty,
+    +                 thp,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 &[],
+    +                 None,
+     +                None,
+                      false,
+                      &Payload::Empty,
+288:  058a64c5 = 288:  e079a9fa virtio-gpu: share extension arenas as blob resources
+289:  a891d249 = 289:  3018e105 vmm/macos: an MMIO exit a device claims is no shm-window fault
+290:  d3b76142 = 290:  708125f0 virtio-gpu: fences for extension contexts
+291:  e557c69e = 291:  0cd5eacf virtio-gpu: surfaces for extension contexts, shared with every renderer
+292:  9001e477 = 292:  26b13278 virtio/gpu: let an extension context import a resource's surface
+293:  9a898d7b = 293:  791f74d7 rutabaga: name R8 and RG8 surfaces by their DRM fourcc
+294:  80c45b61 = 294:  0f8794f5 rutabaga: pass a SurfaceShape to resource_create_surface
+295:  5675dbc3 = 295:  912bb33e virtio-gpu: fail a restore whose replay dropped commands
+296:  5f081309 = 296:  d30220c7 virtio-gpu: carry the native-context extension across a snapshot
+297:  426827a6 = 297:  c6d35416 virtio-gpu: encode extension surface shapes field by field
+298:  3b2b905f = 298:  f3272f80 virtio-gpu: log the extension's surface ids across a snapshot
+299:  7c3dd68b = 299:  a5eaa25a virtio-gpu: say what protocol the extension's embedder speaks
+300:  73f649ae = 300:  089db453 virtio-gpu: answer an extension surface import again
+301:  e5f72d54 = 301:  51c45595 virtio-gpu: hold a fenced flush of an extension surface until it leaves glass
+302:  d6a65139 = 302:  9674047c limina ext: never free an arena the hypervisor would not unmap
+303:  a5623b8b = 303:  f5c3b70d virtio-gpu: an unref keeps the extension's holds until it succeeds, and a blob that would not unmap
+304:  75561634 = 304:  0f9d71fd limina ext: snapshot embedder surfaces by resource, not by the context that made them
+305:  37efc54b = 305:  6ef12733 virtio-gpu: say when a copied scanout's guest starts fencing
+306:  58a23463 = 306:  dabbf550 display: time the preferred mode at the host panel's exact rate
+307:  18c22959 = 307:  ed46373b hvf: a restore records the vtimer offset it writes
+308:  40c03da7 = 308:  a01f8e34 gpu: a timing page in the extension, in guest counter time
+309:  2f6f59d8 = 309:  2e395c5a vmm: move the timing page to the new counter time before resuming
+310:  cf363e3a = 310:  ac821845 virtio-gpu: present transport surfaces as copies, held only for the copy
+311:  6a67323a = 311:  e9d2d9a4 virtio-gpu: a fenced scanout is reported held by its fence, copied or not
+312:  0f0adfda = 312:  18ccf906 vmm: resume the vCPUs of a snapshot whose vCPU save failed
+313:  3d182602 = 313:  0c46cbc3 hvf: snapshot a vCPU whose pending interrupt lines HVF refuses
+314:  9d03cc4b = 314:  c93d863a virtio-gpu: an arena a restore cannot place loses only its contexts
+315:  8711ee8c = 315:  c185aade virtio-gpu: a limina fence names where its completed value is
+316:  55eff357 ! 316:  c15a64ee aarch64: describe the machine with ACPI for a firmware boot
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                      &[],
+                      None,
+                      None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 None,
+    ++                false,
+    +                 &[],
+    +                 None,
+    +                 None,
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+    @@ src/libkrun/src/vmm/mod.rs: impl Vmm {
+     
+      ## src/libkrun/src/vmm/resources.rs ##
+     @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+    -     pub ipa_granule: Option<IpaGranule>,
+    -     /// Whether to enable split irqchip
+    -     pub split_irqchip: bool,
+    +     /// Whether to ask for transparent huge pages for guest memory (Linux).
+    +     #[cfg(target_os = "linux")]
+    +     pub transparent_huge_pages: bool,
+     -    /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
+     -    /// discovered via the kernel command line and SMP uses the MP table.
+     +    /// Whether to expose ACPI tables. x86_64: when disabled, virtio-mmio devices are discovered
+317:  7ef6c481 = 317:  726b3a45 aarch64: ACPI power, sleep and wake buttons on the PL061
+318:  12fd30d0 = 318:  58bf8316 aarch64: describe the TPM under ACPI
+319:  abf14d36 = 319:  14243bd5 virtio/i2c: activate on a notification before DRIVER_OK
+320:  a36b70dc = 320:  16671743 aarch64: describe the SBS battery under ACPI
+321:  c0cc4958 = 321:  4948f8e6 hvf: sign-extend trapped MMIO loads as the instruction asks
+322:  c19699ca = 322:  fe591666 virtio/blk: report the bytes written to the guest as the used length
+323:  31186726 ! 323:  113626f8 virtio/net: add a vmnet backend for macOS
+    @@ src/libkrun/src/api/device_builders.rs: impl NetDevice {
+     +        }
+     +    }
+     +
+    -     // FIXME: use #[cfg(target_os = "linux")] on the method once ffier supports
+    -     // per-method cfg inside #[cfg_attr(feature = "ffi", ffier::export)] impl blocks.
+    -     pub fn new_tap(id: &str, tap_name: &str, mac: &[u8], features: u32) -> Result<Self, VmmError> {
+    +     // FIXME: use #[cfg(target_os = "linux")] on the method once the TAP test
+    +     // backend is Linux-gated too; it still calls this on macOS and relies on
+    +     // the runtime stub below.
+324:  c536bb2a = 324:  c8dabc55 virtio/net: let the embedder supply the backend
+325:  727fb210 = 325:  6f38b349 virtio/net: ask the guest for RX buffers after using the ones in hand
+326:  c572399c = 326:  40d6d81a virtio/net: let a backend gather several descriptors
+327:  5e3221da = 327:  bbc484aa virtio/net: report link status and let the embedder flap it
+328:  9e4d9818 = 328:  4de8429d virtio/net: report a vmnet interface's subnet
+329:  8dbb6ed5 = 329:  efb3556b virtio/net: name the vmnet status a start fails with
+330:  3a315f79 = 330:  01092405 devices/acpi: declare every device's DMA coherent
+331:  f332059c ! 331:  413440d6 devices/acpi: name the serial console in an SPCR on request
+    @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+          pub kernel_console: Option<String>,
+          /// Serial consoles to attach to the guest
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+    -             ipa_granule: None,
+    -             split_irqchip: false,
+    +             #[cfg(target_os = "linux")]
+    +             transparent_huge_pages: false,
+                  acpi_enabled: false,
+     +            acpi_spcr: false,
+                  serial_consoles: Vec::new(),
+332:  c152c925 ! 332:  08bb6099 fdt: hand the firmware arguments for a Linux kernel's command line
+    @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+          pub kernel_console: Option<String>,
+          /// Serial consoles to attach to the guest
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+    -             split_irqchip: false,
+    +             transparent_huge_pages: false,
+                  acpi_enabled: false,
+                  acpi_spcr: false,
+     +            extra_bootargs: None,
+333:  d16382c1 = 333:  ff85e233 devices/acpi: describe little vCPUs to an ACPI guest with CPPC
+334:  422033be = 334:  13def9df vmm: pass the GPU extension sizes in the variable-store test
+335:  9293db4b = 335:  ed2b6ffd vcpu_sched: a powered-off vCPU gives the band back
+336:  de6e1dd0 = 336:  a2cec2f2 virtio/gpu: never retire a guest fence ahead of an older one on its ring
+337:  3221be49 ! 337:  ad4328b9 vmm: hand the firmware a boot logo of the VMM's choosing
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+     +            &Payload::Firmware,
+     +            #[cfg(target_os = "macos")]
+     +            false,
+    ++            #[cfg(target_os = "linux")]
+    ++            false,
+     +            #[cfg(feature = "tee")]
+     +            None,
+     +        )
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                      &[],
+                      None,
+                      None,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 false,
+    ++                None,
+    +                 &[],
+    +                 None,
+    +                 None,
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+338:  025b4722 = 338:  48e212c8 fdt: let the VMM ask the firmware for the boot menu
+339:  ebf3808c ! 339:  a4d7223c hvf: build guest RAM from owned memory blocks
+    @@ src/hvf/src/released_ram.rs: mod loom_model {
+      ## src/libkrun/src/vmm/builder.rs ##
+     @@ src/libkrun/src/vmm/builder.rs: use vm_memory::Bytes;
+      use vm_memory::FileOffset;
+    - #[cfg(feature = "tdx")]
+    + #[cfg(any(feature = "tdx", target_os = "linux"))]
+      use vm_memory::GuestMemoryRegion;
+     -#[cfg(all(
+     -    target_arch = "x86_64",
+    @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+     +    #[cfg(target_os = "macos")] guest_ram_blocks: Option<&hvf::guest_ram::BlockLayout>,
+          payload: &Payload,
+          #[cfg(target_os = "macos")] ram_in_blocks: bool,
+    -     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
+    +     #[cfg(target_os = "linux")] transparent_huge_pages: bool,
+     @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+              // Guest memory takes its regions in address order, and the variable store and the ACPI
+              // window sit between the firmware and RAM.
+    @@ src/libkrun/src/vmm/builder.rs: pub fn create_guest_memory(
+     +        )?
+          };
+      
+    -     // Before anything is written to RAM, which this throws away.
+    +     #[cfg(target_os = "linux")]
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  None,
+                  None,
+    @@ src/libkrun/src/vmm/resources.rs: pub struct VmResources {
+     +    pub guest_ram_blocks: Option<BlockLayout>,
+          /// Whether to enable split irqchip
+          pub split_irqchip: bool,
+    -     /// Whether to expose ACPI tables. x86_64: when disabled, virtio-mmio devices are discovered
+    +     /// Whether to ask for transparent huge pages for guest memory (Linux).
+     @@ src/libkrun/src/vmm/resources.rs: mod tests {
+                  reset_exit_code: None,
+                  #[cfg(target_os = "macos")]
+    @@ src/libkrun/src/vmm/resources.rs: mod tests {
+     +            #[cfg(target_os = "macos")]
+     +            guest_ram_blocks: None,
+                  split_irqchip: false,
+    -             acpi_enabled: false,
+    -             acpi_spcr: false,
+    +             #[cfg(target_os = "linux")]
+    +             transparent_huge_pages: false,
+340:  140774a1 ! 340:  b61201cb virtio/mem: add a virtio-mem device over owned memory blocks
+    @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                  #[cfg(target_os = "macos")]
+                  None,
+                  &Payload::Empty,
+    +@@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+    +                 None,
+    +                 None,
+    +                 false,
+    ++                None,
+    +                 &Payload::Empty,
+    +                 thp,
+    +             )
+     @@ src/libkrun/src/vmm/builder.rs: pub mod tests {
+                      None,
+                      false,
+341:  10c55472 = 341:  8afc8ef4 vmm: carry virtio-mem's plugged blocks across a snapshot
+342:  99630d19 = 342:  7ff817c6 virtio/net: let a vmnet interface ask for its subnet
+343:  6df4acb5 = 343:  4982c595 balloon: refuse the Replace reporting mode next to ReleasedRam on macOS
+344:  0290ad54 = 344:  7c945acd hvf: release free pages of virtio-mem's plugged blocks
+345:  94396074 = 345:  9d40ded1 virtio/i2c: answer the SBS battery's time registers in every state
