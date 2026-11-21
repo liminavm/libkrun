@@ -79,6 +79,12 @@ pub struct MmioTransport {
     // guest command would wait forever (the M9.3 restore wedge, and equally an in-place s2idle).
     // When this is false at DRIVER_OK, `activate()` re-arms from `activated_queue_regs`.
     queues_programmed: bool,
+    // limina: did the driver read the device-features register since the last reset? Every probe
+    // does (Linux's `virtio_dev_probe`, the firmware's driver); a PM resume does not, whether it
+    // takes the bus fallback or the driver's own `.restore`, because `virtio_device_restore_priv`
+    // only writes back the features it cached at probe. So a DRIVER_OK with this false, after an
+    // earlier activation, is the same driver coming back from suspend — see `activate()`.
+    features_read: bool,
     // limina: notified whenever `device_status` changes, so the VMM can follow the guest into and
     // out of suspend without polling (see `GuestPowerWatch`). `None` until the VMM installs it.
     power_watch: Option<Arc<GuestPowerWatch>>,
@@ -254,6 +260,7 @@ impl MmioTransport {
             mmio_trace,
             trace_name: device_name,
             queues_programmed: false,
+            features_read: false,
             power_watch: None,
             status_changed_at: 0,
         })
@@ -451,16 +458,27 @@ impl MmioTransport {
     /// already-activated device after the live `Queue`s have moved into the device worker.
     fn activate(&mut self) {
         // limina M9.3: bus-fallback resume detection — see `rearm_queues_from_stash`.
-        // The verdict doubles as the thaw classification handed to the device below
-        // (host-sleep s2idle defer-and-classify): a re-armed activation is a thaw, a
-        // queue-programming one is a real re-init.
+        // The thaw classification handed to the device below (host-sleep s2idle
+        // defer-and-classify) builds on it: see `thaw`.
+        let was_activated = self.activated_queue_regs.iter().any(|r| r.ready);
         let rearmed = !self.queues_programmed
             && self
                 .state
                 .queues
                 .as_ref()
                 .is_some_and(|qs| qs.iter().all(|q| !q.ready))
-            && self.activated_queue_regs.iter().any(|r| r.ready);
+            && was_activated;
+        // A driver with PM ops of its own (virtio-gpu from 7.3) programs fresh queues on resume,
+        // so the re-arm signature misses it; not having read the device features this cycle
+        // catches both kinds of resume, and no probe.
+        let thaw = rearmed || (was_activated && !self.features_read);
+        if thaw && !rearmed {
+            info!(
+                "{}: DRIVER_OK with queues programmed but no device-features read this cycle \
+                 (driver PM resume)",
+                self.trace_name
+            );
+        }
         let event_idx =
             (self.locked_device().acked_features() & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
         let unannounced = rearmed && self.rearm_queues_from_stash(event_idx);
@@ -480,7 +498,7 @@ impl MmioTransport {
             })
             .collect();
 
-        self.locked_device().set_thaw_activation(rearmed);
+        self.locked_device().set_thaw_activation(thaw);
         self.state.activate(self.device_interrupt.clone());
         if unannounced {
             self.device_interrupt.signal_used_queue();
@@ -527,6 +545,7 @@ impl MmioTransport {
             // SURVIVES the reset — it is the fallback for a no-PM-ops driver's bus-fallback resume
             // (reset → features → DRIVER_OK with no queue writes), see `rearm_queues_from_stash`.
             self.queues_programmed = false;
+            self.features_read = false;
         }
         if !had_driver_ok
             && self.check_device_status(device_status::DRIVER_OK, 0)
@@ -552,6 +571,7 @@ impl BusDevice for MmioTransport {
                     0x08 => self.locked_device().device_type(),
                     0x0c => VENDOR_ID, // vendor id
                     0x10 => {
+                        self.features_read = true;
                         let mut features = self
                             .locked_device()
                             .avail_features_by_page(self.state.features_select);
@@ -774,6 +794,8 @@ pub(crate) mod tests {
         /// Whether a guest reset deactivates it, as a real device's `reset` does.
         resettable: bool,
         early: bool,
+        /// The thaw classification of the last activation, as the transport handed it over.
+        thaw: Option<bool>,
     }
 
     impl DummyDevice {
@@ -787,6 +809,7 @@ pub(crate) mod tests {
                 inline_notified: Vec::new(),
                 resettable: false,
                 early: false,
+                thaw: None,
             }
         }
 
@@ -858,6 +881,10 @@ pub(crate) mod tests {
 
         fn activates_before_driver_ok(&self) -> bool {
             self.early
+        }
+
+        fn set_thaw_activation(&mut self, thaw: bool) {
+            self.thaw = Some(thaw);
         }
     }
 
@@ -1361,6 +1388,57 @@ pub(crate) mod tests {
         set_device_status(&mut d, 0);
         negotiate_event_idx(&mut d, false);
         assert_eq!(d.interrupt.status(), 0);
+    }
+
+    /// Read the device-features register, as every probe does before negotiating.
+    fn read_device_features(d: &mut MmioTransport) {
+        let mut buf = [0; 4];
+        d.read(0, 0x10, &mut buf[..]);
+    }
+
+    /// A transport whose (resettable) dummy device a first probe has activated.
+    fn probed_transport() -> (MmioTransport, Arc<Mutex<DummyDevice>>) {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_avail_features(1 << VIRTIO_RING_F_EVENT_IDX);
+        dummy.resettable = true;
+        let dummy = Arc::new(Mutex::new(dummy));
+        let mut d = MmioTransport::new(m, DummyIrqChip::new().into(), dummy.clone()).unwrap();
+        read_device_features(&mut d);
+        negotiate_event_idx(&mut d, true);
+        assert_eq!(
+            dummy.lock().unwrap().thaw,
+            Some(false),
+            "a first probe is no thaw"
+        );
+        set_device_status(&mut d, 0);
+        (d, dummy)
+    }
+
+    /// A driver with PM ops of its own (virtio-gpu from 7.3) resumes by programming fresh
+    /// queues, without reading the device features: that is a thaw, like the bus fallback.
+    #[test]
+    fn test_a_pm_resume_that_programs_queues_is_a_thaw() {
+        let (mut d, dummy) = probed_transport();
+        negotiate_event_idx(&mut d, true);
+        assert_eq!(dummy.lock().unwrap().thaw, Some(true));
+    }
+
+    /// The bus-fallback resume (no queue writes) stays a thaw.
+    #[test]
+    fn test_a_bus_fallback_resume_is_a_thaw() {
+        let (mut d, dummy) = probed_transport();
+        negotiate_event_idx(&mut d, false);
+        assert_eq!(dummy.lock().unwrap().thaw, Some(true));
+    }
+
+    /// A re-probe (driver rebind, kexec, firmware to kernel) reads the device features: a re-init.
+    #[test]
+    fn test_a_reprobe_is_no_thaw() {
+        let (mut d, dummy) = probed_transport();
+        read_device_features(&mut d);
+        negotiate_event_idx(&mut d, true);
+        assert_eq!(dummy.lock().unwrap().thaw, Some(false));
     }
 
     fn activate_device(d: &mut MmioTransport) {
