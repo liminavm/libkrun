@@ -57,9 +57,9 @@ pub enum WorkerCmd {
         control_q: DeviceQueue,
         cursor_q: DeviceQueue,
         interrupt: InterruptTransport,
-        /// limina (host-sleep s2idle): the transport re-armed this activation's queues
-        /// from the previous activation's register file — a no-PM-ops driver's
-        /// bus-fallback thaw, not a real re-init. Classifies a parked session (below).
+        /// limina (host-sleep s2idle): the same driver is coming back from suspend (it did
+        /// not read the device features before this DRIVER_OK), not re-initializing.
+        /// Classifies a parked session (below).
         thaw: bool,
     },
     /// Stop servicing and release the transport, but keep the renderer alive (device reset).
@@ -226,10 +226,10 @@ impl Worker {
 
         // limina (host-sleep s2idle, defer-and-classify): a device reset no longer wipes the
         // session immediately — if it was quiescent, the bookkeeping is PARKED and this flag
-        // set, and the NEXT activation classifies it: a re-armed activation (`thaw`, the
-        // bus-fallback s2idle signature) adopts the parked world unchanged (the thawing guest
-        // is the same live kernel — its ids still match); a queue-programming activation is a
-        // real re-init (reboot, rebind, firmware hand-off) and runs the deferred wipe first.
+        // set, and the NEXT activation classifies it: a resume (`thaw` — the bus fallback, or
+        // a driver's own `.restore`) adopts the parked world unchanged (the thawing guest is the
+        // same live kernel — its ids still match); a probe is a real re-init (rebind, kexec,
+        // firmware hand-off) and runs the deferred wipe first.
         let mut parked_session = false;
 
         loop {
@@ -266,13 +266,13 @@ impl Worker {
                 parked_session = false;
                 if thaw {
                     info!(
-                        "gpu worker: adopting the parked session across a bus-fallback thaw \
+                        "gpu worker: adopting the parked session across a thaw \
                          (in-place s2idle; no replay needed)"
                     );
                 } else {
                     info!(
-                        "gpu worker: dropping the parked session — this activation programmed \
-                         its queues (real driver re-init)"
+                        "gpu worker: dropping the parked session — the driver probed the \
+                         device again (real driver re-init)"
                     );
                     virtio_gpu.reset_session();
                     self.reset_ext();
