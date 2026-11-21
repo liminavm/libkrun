@@ -201,8 +201,8 @@ pub struct Gpu {
     /// FATAL the ring.
     restore_done: Arc<(Mutex<bool>, Condvar)>,
     /// limina (host-sleep s2idle): set by the transport just before `activate` when this
-    /// activation's queues were re-armed from the stash (a bus-fallback s2idle thaw, not a
-    /// real driver re-init). Forwarded to the worker so it can classify a parked session —
+    /// activation is the driver resuming from suspend, not re-initializing (see
+    /// `VirtioDevice::set_thaw_activation`). Forwarded to the worker so it can classify a parked session —
     /// adopt it on a thaw, run the deferred `reset_session` on a re-init.
     thaw_activation: bool,
     /// Held closed by a snapshot while it copies guest RAM. The worker passes through it on
