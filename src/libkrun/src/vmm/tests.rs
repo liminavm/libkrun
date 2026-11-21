@@ -17,7 +17,12 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
     const CASE_ENV: &str = "LIBKRUN_TEST_VM_CONTROL_EXIT_CASE";
     let cases = [
         (Some(32), VcpuResponse::Reset, i32::MAX, 32),
-        (None, VcpuResponse::Reset, i32::MAX, 0),
+        (
+            None,
+            VcpuResponse::Reset,
+            i32::MAX,
+            DEFAULT_RESET_EXIT_CODE as i32,
+        ),
         (Some(32), VcpuResponse::Reset, 17, 17),
         (Some(32), VcpuResponse::Exited(1), i32::MAX, 1),
         (Some(32), VcpuResponse::Exited(1), 17, 17),
