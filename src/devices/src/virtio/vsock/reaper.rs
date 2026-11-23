@@ -57,10 +57,17 @@ impl ReaperThread {
     }
 
     fn work(&mut self) {
+        use crossbeam_channel::RecvTimeoutError;
         loop {
             let timeout = self.check_expiration();
-            if let Ok(id) = self.receiver.recv_timeout(timeout) {
-                self.released_map.insert(id, Instant::now());
+            match self.receiver.recv_timeout(timeout) {
+                Ok(id) => {
+                    self.released_map.insert(id, Instant::now());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                // All senders dropped: the muxer was torn down (device reset). Stop instead of
+                // busy-looping on the disconnected channel. See `VsockMuxer::deactivate`.
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
     }

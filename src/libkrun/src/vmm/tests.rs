@@ -17,7 +17,12 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
     const CASE_ENV: &str = "LIBKRUN_TEST_VM_CONTROL_EXIT_CASE";
     let cases = [
         (Some(32), VcpuResponse::Reset, i32::MAX, 32),
-        (None, VcpuResponse::Reset, i32::MAX, 0),
+        (
+            None,
+            VcpuResponse::Reset,
+            i32::MAX,
+            DEFAULT_RESET_EXIT_CODE as i32,
+        ),
         (Some(32), VcpuResponse::Reset, 17, 17),
         (Some(32), VcpuResponse::Exited(1), i32::MAX, 1),
         (Some(32), VcpuResponse::Exited(1), 17, 17),
@@ -44,7 +49,7 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         cases.into_iter().nth(case.parse().unwrap()).unwrap();
 
     let mut arch_memory_info = ArchMemoryInfo::default();
-    let vm = Vm::new(&mut arch_memory_info, false).unwrap();
+    let vm = Vm::new(&mut arch_memory_info, false, None).unwrap();
     let (event_sender, event_receiver) = unbounded();
     let (response_sender, response_receiver) = unbounded();
     let (id_sender, id_receiver) = unbounded();
@@ -86,6 +91,21 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         paused: resume,
         paused_at: unsafe { hvf::mach_absolute_time() },
         ram_in_blocks: false,
+        #[cfg(feature = "gpu")]
+        gpu_resize_handle: None,
+        balloon_control_handle: None,
+        #[cfg(target_os = "macos")]
+        vcpu_list: Arc::new(devices::legacy::VcpuList::new(1)),
+        #[cfg(feature = "gpu")]
+        gpu_device: None,
+        #[cfg(target_os = "macos")]
+        released_ram: Arc::new(hvf::ReleasedRam::new(Vec::new())),
+        #[cfg(target_os = "macos")]
+        vtimer_offset: 0,
+        #[cfg(feature = "gpu")]
+        gpu_timing: None,
+        #[cfg(not(feature = "tee"))]
+        mem_device: None,
     };
 
     match control {

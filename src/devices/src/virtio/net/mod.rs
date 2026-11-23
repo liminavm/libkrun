@@ -11,13 +11,15 @@ const QUEUE_SIZE: u16 = 1024;
 pub const NUM_QUEUES: usize = 2;
 pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
 
-mod backend;
+pub mod backend;
 pub mod device;
 #[cfg(target_os = "linux")]
 mod tap;
 #[cfg(unix)]
 mod unixgram;
 mod unixstream;
+#[cfg(target_os = "macos")]
+pub mod vmnet;
 mod worker;
 
 // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2050006
@@ -30,7 +32,9 @@ fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
     VNET_HDR_LEN
 }
 
-pub use self::device::Net;
+pub use self::device::{Net, NetLink};
+#[cfg(unix)]
+pub use self::unixgram::unlink_bound_sockets;
 #[derive(Debug)]
 pub enum Error {
     /// EventFd error.

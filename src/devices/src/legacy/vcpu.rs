@@ -1,6 +1,7 @@
 use crossbeam_channel::Sender;
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arch::aarch64::layout::VTIMER_IRQ;
 use arch::aarch64::sysreg::*;
@@ -9,6 +10,8 @@ use hvf::bindings::{
     hv_vcpu_get_sys_reg, hv_vcpu_set_sys_reg,
 };
 use hvf::{Vcpus, vcpu_request_exit};
+
+use super::GuestPowerWatch;
 
 // See https://developer.arm.com/documentation/ddi0595/2020-12/AArch64-Registers/ICC-IAR0-EL1--Interrupt-Controller-Interrupt-Acknowledge-Register-0
 const GIC_INTID_SPURIOUS: u32 = 1023;
@@ -23,6 +26,18 @@ struct PerCPUInterruptControllerState {
     status: VcpuStatus,
     pending_irqs: VecDeque<u32>,
     wfe_sender: Option<Sender<u32>>,
+    /// PSCI power state for CPU hotplug: `true` = ON, `false` = OFF (parked after CPU_OFF).
+    /// Read by AFFINITY_INFO so the guest's offline reaper sees the CPU report OFF. All vCPUs
+    /// start ON (the boot model brings every vCPU up).
+    online: bool,
+    /// True while this vCPU is blocked in a WFx wait (or parked offline): it is executing
+    /// no guest instructions and is not going to until something wakes it. Distinct from
+    /// "no recent vmexits", which a vCPU spinning in guest code also satisfies.
+    parked: bool,
+    /// A wake for this vCPU's PSCI `SYSTEM_SUSPEND` park that arrived before it was waiting,
+    /// held until the park looks. On the in-kernel GIC nothing else would reach it: the park
+    /// blocks outside `hv_vcpu_run`, and the kick for a `Running` vCPU is an `hv_vcpus_exit`.
+    system_wake: bool,
 }
 
 impl PerCPUInterruptControllerState {
@@ -32,6 +47,12 @@ impl PerCPUInterruptControllerState {
             self.vcpuid, irq
         );
         self.pending_irqs.push_back(irq);
+
+        // limina wake-probe: the return half of the venus wake chain starts here. `status` is
+        // the interesting part — a Waiting vCPU is parked in WFI/WFE and has to come back
+        // through its channel, a Running one is only kicked out of hv_vcpu_run, and those are
+        // very different costs. No-op unless LIMINA_WAKE_PROBE is set and the gpu worker armed.
+        crate::virtio::wake_probe::irq_raised(irq, matches!(self.status, VcpuStatus::Waiting));
 
         match self.status {
             VcpuStatus::Waiting => {
@@ -56,6 +77,28 @@ impl PerCPUInterruptControllerState {
         false
     }
 
+    /// Force this vCPU out to the top of its run loop so it notices a pending
+    /// [`VcpuEvent`](crate) (e.g. a snapshot Pause). Mirrors [`Self::set_irq_common`]'s wake
+    /// path but injects **no** interrupt: a WFE/WFI-parked vCPU (blocked in
+    /// `wait_for_event`'s channel `recv`) is woken via its wfe channel, while a running one is
+    /// kicked out of `hv_vcpu_run` with `hv_vcpus_exit`. Harmless if the vCPU is already at the
+    /// loop top: the spurious wakeup just re-evaluates `should_wait`.
+    fn kick(&mut self) {
+        match self.status {
+            VcpuStatus::Waiting => {
+                self.wfe_sender
+                    .as_mut()
+                    .unwrap()
+                    .send(self.vcpuid as u32)
+                    .unwrap();
+                self.status = VcpuStatus::Running;
+            }
+            VcpuStatus::Running => {
+                vcpu_request_exit(self.vcpuid).unwrap();
+            }
+        }
+    }
+
     fn has_pending_irq(&self) -> bool {
         !self.pending_irqs.is_empty()
     }
@@ -68,6 +111,14 @@ impl PerCPUInterruptControllerState {
 pub struct VcpuList {
     cpu_count: u64,
     vcpus: Vec<Mutex<PerCPUInterruptControllerState>>,
+    /// The vCPU currently parked in PSCI `SYSTEM_SUSPEND` (suspend-to-RAM), or -1 when the guest
+    /// is not system-suspended. At most one vCPU can be here: the call is only accepted from the
+    /// last core still online. Read by the VMM to decide whether the guest needs a host-driven
+    /// wake (there is no vCPU left to take a wake interrupt) and which vCPU to send it to.
+    system_suspended: AtomicI64,
+    /// limina: notified on every guest power-state transition — here, entering and leaving
+    /// `SYSTEM_SUSPEND`; the virtio-mmio transports share it for device status changes.
+    power_watch: Arc<GuestPowerWatch>,
 }
 
 impl VcpuList {
@@ -79,10 +130,18 @@ impl VcpuList {
                 status: VcpuStatus::Running,
                 pending_irqs: VecDeque::new(),
                 wfe_sender: None,
+                online: true,
+                parked: false,
+                system_wake: false,
             }));
         }
 
-        Self { cpu_count, vcpus }
+        Self {
+            cpu_count,
+            vcpus,
+            system_suspended: AtomicI64::new(-1),
+            power_watch: Arc::new(GuestPowerWatch::default()),
+        }
     }
 
     pub fn get_cpu_count(&self) -> u64 {
@@ -110,6 +169,116 @@ impl VcpuList {
         assert!(vcpuid < self.cpu_count);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
     }
+
+    /// Kick every vCPU out to the top of its run loop so each notices a pending
+    /// [`VcpuEvent`](crate) — used by the snapshot path to quiesce all vCPUs (M9). See
+    /// [`PerCPUInterruptControllerState::kick`].
+    pub fn kick_all(&self) {
+        for vcpu in &self.vcpus {
+            vcpu.lock().unwrap().kick();
+        }
+    }
+
+    /// True when every vCPU is blocked in a WFx wait (or parked offline) — the guest is
+    /// executing no instructions on any CPU. This is the signal that an s2idle entry has
+    /// actually completed: the `s2idle_enter` rendezvous needs every vCPU to be scheduled
+    /// to reach `tick_freeze()`, and only once the last one has does the guest stop
+    /// accounting elapsed time as running time.
+    pub fn all_parked(&self) -> bool {
+        self.park_holdouts().is_empty()
+    }
+
+    /// Record that `vcpuid` has parked in PSCI `SYSTEM_SUSPEND`. A restored vCPU records it
+    /// before the restore returns, so a wake sent right after the restore finds its target.
+    pub fn set_system_suspended(&self, vcpuid: u64) {
+        self.system_suspended.store(vcpuid as i64, Ordering::SeqCst);
+        self.power_watch.notify();
+    }
+
+    /// `vcpuid` has resumed from `SYSTEM_SUSPEND`. Cleared under the vCPU's lock, which
+    /// [`Self::wake_system_suspended`] holds while it checks the target, so a wake racing the
+    /// resume cannot leave a held wake behind for the next suspend.
+    pub fn end_system_suspend(&self, vcpuid: u64) {
+        let mut vcpu = self.vcpus[vcpuid as usize].lock().unwrap();
+        vcpu.system_wake = false;
+        self.system_suspended.store(-1, Ordering::SeqCst);
+        drop(vcpu);
+        self.power_watch.notify();
+    }
+
+    /// Whether `vcpuid`'s `SYSTEM_SUSPEND` park should block. False when a wake is already
+    /// held (consuming it) or an interrupt is pending; otherwise marks the vCPU waiting, in
+    /// the same locked step, so a wake from here on comes through its channel.
+    pub fn should_wait_system_suspended(&self, vcpuid: u64) -> bool {
+        let mut vcpu = self.vcpus[vcpuid as usize].lock().unwrap();
+        if std::mem::take(&mut vcpu.system_wake) {
+            return false;
+        }
+        vcpu.should_wait()
+    }
+
+    /// The guest power-state change counter shared by this VM's vCPUs and devices.
+    pub fn power_watch(&self) -> Arc<GuestPowerWatch> {
+        self.power_watch.clone()
+    }
+
+    /// The vCPU parked in PSCI `SYSTEM_SUSPEND`, if the guest is suspended to RAM.
+    pub fn system_suspended(&self) -> Option<u64> {
+        match self.system_suspended.load(Ordering::SeqCst) {
+            -1 => None,
+            v => Some(v as u64),
+        }
+    }
+
+    /// Wake a vCPU parked in PSCI `SYSTEM_SUSPEND`, if the guest is suspended to RAM. Returns
+    /// whether one was woken.
+    ///
+    /// The wake-key IRQ cannot do this job. A guest in suspend-to-RAM has handed wakeup duty to
+    /// firmware and torn its own interrupt state down on the way out (`GPIOMIS = istate & im`
+    /// never fires for a line the guest masked in its PL061 suspend), so the button press it
+    /// would normally see reaches nobody. Firmware — us — resumes the core; the guest then
+    /// re-arms its GIC and sees the button afterwards, which is the same order real hardware
+    /// produces.
+    ///
+    /// A target that is not waiting yet keeps the wake until its park looks
+    /// ([`Self::should_wait_system_suspended`]).
+    pub fn wake_system_suspended(&self) -> bool {
+        let Some(vcpuid) = self.system_suspended() else {
+            info!("wake: no vCPU is in SYSTEM_SUSPEND");
+            return false;
+        };
+        let mut vcpu = self.vcpus[vcpuid as usize].lock().unwrap();
+        if self.system_suspended() != Some(vcpuid) {
+            info!("wake: vCPU {vcpuid} resumed from SYSTEM_SUSPEND meanwhile");
+            return false;
+        }
+        match vcpu.status {
+            VcpuStatus::Waiting => {
+                info!("wake: vCPU {vcpuid} is in SYSTEM_SUSPEND and waiting");
+                vcpu.kick();
+            }
+            VcpuStatus::Running => {
+                info!(
+                    "wake: vCPU {vcpuid} is in SYSTEM_SUSPEND, not yet waiting; holding the wake"
+                );
+                vcpu.system_wake = true;
+            }
+        }
+        true
+    }
+
+    /// The vcpuids still executing guest instructions. Empty iff [`Self::all_parked`].
+    pub fn park_holdouts(&self) -> Vec<u64> {
+        self.vcpus
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                let v = v.lock().unwrap();
+                !(v.parked || !v.online)
+            })
+            .map(|(i, _)| i as u64)
+            .collect()
+    }
 }
 
 impl Vcpus for VcpuList {
@@ -132,6 +301,37 @@ impl Vcpus for VcpuList {
             .lock()
             .unwrap()
             .has_pending_irq()
+    }
+
+    fn set_online(&self, vcpuid: u64, online: bool) {
+        // A guest-supplied MPIDR (CPU_ON/CPU_OFF operand) is untrusted — ignore out-of-range
+        // rather than panic the VMM.
+        if let Some(vcpu) = self.vcpus.get(vcpuid as usize) {
+            vcpu.lock().unwrap().online = online;
+        }
+    }
+
+    fn is_online(&self, vcpuid: u64) -> bool {
+        // Out-of-range (a bad guest AFFINITY_INFO target) reports offline — a safe default that
+        // never panics.
+        self.vcpus
+            .get(vcpuid as usize)
+            .map(|v| v.lock().unwrap().online)
+            .unwrap_or(false)
+    }
+
+    fn others_all_offline(&self, vcpuid: u64) -> bool {
+        self.vcpus
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i as u64 != vcpuid)
+            .all(|(_, v)| !v.lock().unwrap().online)
+    }
+
+    fn set_parked(&self, vcpuid: u64, parked: bool) {
+        if let Some(vcpu) = self.vcpus.get(vcpuid as usize) {
+            vcpu.lock().unwrap().parked = parked;
+        }
     }
 
     fn get_pending_irq(&self, vcpuid: u64) -> u32 {
@@ -157,6 +357,16 @@ impl Vcpus for VcpuList {
                     .get_pending_irq() as u64,
             ),
             SYSREG_ICC_PMR_EL1 => Some(0),
+            // The OS lock / OS double lock status, read by arm64's `cpu_do_suspend`
+            // (arch/arm64/mm/proc.S) on its way into suspend-to-RAM and written straight back by
+            // `cpu_do_resume`. Nothing else in the kernel reads them, and we ignore the matching
+            // OSLAR_EL1/OSDLR_EL1 writes, so reporting "no lock held" is consistent: resume
+            // restores exactly the zero it saved.
+            //
+            // Unhandled here, these STOP THE VM — the sysreg trap has no NOT_SUPPORTED to fall
+            // back on, unlike the PSCI path. Advertising SYSTEM_SUSPEND without them turned
+            // `systemctl suspend` into a guest kill.
+            SYSREG_OSLSR_EL1 | SYSREG_OSDLR_EL1 => Some(0),
             SYSREG_ICC_CTLR_EL1 => Some(
                 (1 << ICC_CTLR_EL1_RSS_SHIFT)
                     | (1 << ICC_CTLR_EL1_A3V_SHIFT)
@@ -252,5 +462,52 @@ impl Vcpus for VcpuList {
             | SYSREG_OSDLR_EL1 => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wake_before_the_park_waits_is_held_for_it() {
+        let vcpus = VcpuList::new(2);
+        vcpus.set_system_suspended(1);
+        assert!(vcpus.wake_system_suspended());
+        assert!(!vcpus.should_wait_system_suspended(1));
+        assert!(
+            vcpus.should_wait_system_suspended(1),
+            "a held wake is used once"
+        );
+    }
+
+    #[test]
+    fn a_wake_with_no_suspended_vcpu_is_not_held() {
+        let vcpus = VcpuList::new(1);
+        assert!(!vcpus.wake_system_suspended());
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.should_wait_system_suspended(0));
+    }
+
+    #[test]
+    fn resuming_drops_a_held_wake() {
+        let vcpus = VcpuList::new(1);
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.wake_system_suspended());
+        vcpus.end_system_suspend(0);
+        assert_eq!(vcpus.system_suspended(), None);
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.should_wait_system_suspended(0));
+    }
+
+    #[test]
+    fn a_waiting_park_is_woken_through_its_channel() {
+        let vcpus = VcpuList::new(1);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        vcpus.register(0, tx);
+        vcpus.set_system_suspended(0);
+        assert!(vcpus.should_wait_system_suspended(0));
+        assert!(vcpus.wake_system_suspended());
+        assert_eq!(rx.try_recv(), Ok(0));
     }
 }

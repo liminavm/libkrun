@@ -8,7 +8,7 @@ use std::thread;
 use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, ProxyMap, push_packet};
+use super::muxer::{MuxerRx, ProxyMap, pop_rx, push_packet, signal_rx};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::packet::VsockPacket;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
@@ -32,6 +32,10 @@ pub struct MuxerThread {
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    // Read end of the muxer stop eventfd, owned by `VsockMuxer`. Registered in our epoll so a device
+    // reset (suspend/resume) can wake this thread out of its blocking `epoll.wait(-1)` and stop it,
+    // before the device is re-activated with a fresh queue. See `VsockMuxer::deactivate`.
+    stop_fd: RawFd,
 }
 
 impl MuxerThread {
@@ -46,6 +50,7 @@ impl MuxerThread {
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        stop_fd: RawFd,
     ) -> Self {
         MuxerThread {
             cid,
@@ -57,6 +62,7 @@ impl MuxerThread {
             interrupt,
             reaper_sender,
             unix_ipc_port_map,
+            stop_fd,
         }
     }
 
@@ -73,7 +79,7 @@ impl MuxerThread {
         let mut drained = false;
 
         while let Some(rx) = rxq.pop() {
-            if let Some(head) = queue.pop(&self.mem) {
+            if let Some(head) = pop_rx(&mut queue, &self.mem) {
                 if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
                     rx_to_pkt(self.cid, rx, &mut pkt);
                     if let Err(e) =
@@ -189,7 +195,7 @@ impl MuxerThread {
 
         if should_signal {
             debug!("signal IRQ");
-            self.interrupt.signal_used_queue();
+            signal_rx(&self.queue, &self.mem, &self.interrupt);
         }
     }
 
@@ -218,11 +224,17 @@ impl MuxerThread {
 
     fn work(mut self) {
         let mut thread_rng = rng();
+        // Register the stop eventfd so a device reset can wake us out of the blocking wait below.
+        let _ = self.epoll.ctl(
+            ControlOperation::Add,
+            self.stop_fd,
+            &EpollEvent::new(EventSet::IN, self.stop_fd as u64),
+        );
         self.create_listening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-        loop {
+        'poll: loop {
             if self.drain_rxq() {
-                self.interrupt.signal_used_queue();
+                signal_rx(&self.queue, &self.mem, &self.interrupt);
             }
 
             match self
@@ -232,6 +244,11 @@ impl MuxerThread {
                 Ok(ev_cnt) => {
                     for ev in &epoll_events[0..ev_cnt] {
                         debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
+                        // Device reset (suspend/resume): stop before touching the (soon-recreated)
+                        // queue, so a stale muxer thread can't write into freed guest RX memory.
+                        if ev.fd() == self.stop_fd {
+                            break 'poll;
+                        }
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
 

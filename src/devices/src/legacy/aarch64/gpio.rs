@@ -8,6 +8,9 @@
 //!
 
 use std::fmt;
+use std::sync::Arc;
+
+use crate::legacy::VcpuList;
 use std::os::fd::AsRawFd;
 use std::result;
 
@@ -38,6 +41,21 @@ const GPIO_ID: [u8; 8] = [0x61, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 const GPIO_ID_LOW: u64 = 0xfe0;
 const GPIO_ID_HIGH: u64 = 0x1000;
 
+// GPIO lines wired to `gpio-keys` buttons in the FDT (see `create_gpio_node`). Each is a
+// distinct key so the host can ask a cooperative guest to power off, suspend, or reboot:
+//   line 3 (0x8)  → KEY_POWER   (logind HandlePowerKey   → poweroff)   ← shutdown eventfd
+//   line 4 (0x10) → KEY_SLEEP   (logind HandleSuspendKey → suspend)    ← suspend eventfd
+//   line 5 (0x20) → KEY_RESTART (logind HandleRebootKey  → reboot)     ← restart eventfd
+//   line 6 (0x40) → KEY_WAKEUP  (a `wakeup-source` button)            ← wake eventfd
+// The wake button's FDT node carries `wakeup-source`, so the guest arms its irq for wake during
+// s2idle (`enable_irq_wake`); pulsing it is the only line that brings the guest OUT of suspend-to-idle
+// (M9 restore: the worker injects it after reloading a quiesced snapshot). The other buttons are not
+// wake sources — their edges are masked while suspended, so they do not wake the guest.
+const POWER_BIT: u32 = 0x8;
+const SUSPEND_BIT: u32 = 0x10;
+const RESTART_BIT: u32 = 0x20;
+const WAKE_BIT: u32 = 0x40;
+
 #[derive(Debug)]
 pub enum Error {
     BadWriteOffset(u64),
@@ -52,6 +70,23 @@ impl fmt::Display for Error {
 }
 
 type Result<T> = result::Result<T, Error>;
+
+/// The PL061 register file, for M9 snapshot save/restore. The GPIO registers are the one piece of
+/// device state that does NOT ride the guest RAM snapshot; restoring them into a fresh device
+/// before the guest resumes is what lets the injected wake demux correctly (`GPIOMIS = istate & im`
+/// — a fresh device's `im=0` would swallow the wake) and lets the guest's `pl061_resume` see the
+/// register state it left. ~32 bytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpioState {
+    pub data: u32,
+    pub dir: u32,
+    pub isense: u32,
+    pub ibe: u32,
+    pub iev: u32,
+    pub im: u32,
+    pub istate: u32,
+    pub afsel: u32,
+}
 
 /// A GPIO device following the PL061 specification.
 pub struct Gpio {
@@ -76,11 +111,23 @@ pub struct Gpio {
     intc: Option<IrqChip>,
     irq_line: Option<u32>,
     shutdown_efd: EventFd,
+    suspend_efd: EventFd,
+    restart_efd: EventFd,
+    wake_efd: EventFd,
+    /// Consulted on a wake pulse so suspend-to-RAM guests can be resumed, not just s2idle ones.
+    vcpu_list: Arc<VcpuList>,
 }
 
 impl Gpio {
     /// Constructs an PL061 GPIO device.
-    pub fn new(shutdown_efd: EventFd, interrupt_evt: EventFd) -> Self {
+    pub fn new(
+        shutdown_efd: EventFd,
+        suspend_efd: EventFd,
+        restart_efd: EventFd,
+        wake_efd: EventFd,
+        interrupt_evt: EventFd,
+        vcpu_list: Arc<VcpuList>,
+    ) -> Self {
         Self {
             data: 0,
             dir: 0,
@@ -94,11 +141,42 @@ impl Gpio {
             intc: None,
             irq_line: None,
             shutdown_efd,
+            suspend_efd,
+            restart_efd,
+            wake_efd,
+            vcpu_list,
         }
     }
 
     pub fn set_intc(&mut self, intc: IrqChip) {
         self.intc = Some(intc);
+    }
+
+    /// Capture the PL061 register file for a snapshot (M9 save).
+    pub fn save_state(&self) -> GpioState {
+        GpioState {
+            data: self.data,
+            dir: self.dir,
+            isense: self.isense,
+            ibe: self.ibe,
+            iev: self.iev,
+            im: self.im,
+            istate: self.istate,
+            afsel: self.afsel,
+        }
+    }
+
+    /// Restore the PL061 register file from a snapshot (M9 restore), before the guest resumes — so
+    /// the injected wake demuxes (`GPIOMIS = istate & im`) and `pl061_resume` sees its own state.
+    pub fn restore_state(&mut self, s: &GpioState) {
+        self.data = s.data;
+        self.dir = s.dir;
+        self.isense = s.isense;
+        self.ibe = s.ibe;
+        self.iev = s.iev;
+        self.im = s.im;
+        self.istate = s.istate;
+        self.afsel = s.afsel;
     }
 
     pub fn set_irq_line(&mut self, irq: u32) {
@@ -150,17 +228,48 @@ impl Gpio {
         Ok(())
     }
 
-    pub fn trigger_restart_key(&mut self, press: bool) {
-        if press {
-            debug!("Generate a restart key press event");
-            self.istate = 0x8;
-            self.data = 0x8;
-        } else {
-            debug!("Generate a restart key release event");
-            self.istate = 0x8;
-            self.data = 0x0;
-        }
+    pub fn trigger_power_key(&mut self, press: bool) {
+        debug!(
+            "Generate a power key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(POWER_BIT, press);
+    }
 
+    pub fn trigger_suspend_key(&mut self, press: bool) {
+        debug!(
+            "Generate a suspend key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(SUSPEND_BIT, press);
+    }
+
+    pub fn trigger_restart_key(&mut self, press: bool) {
+        debug!(
+            "Generate a restart key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(RESTART_BIT, press);
+    }
+
+    pub fn trigger_wake_key(&mut self, press: bool) {
+        debug!(
+            "Generate a wake key {} event",
+            if press { "press" } else { "release" }
+        );
+        self.trigger_key(WAKE_BIT, press);
+    }
+
+    /// Drive a single GPIO line (`bit`) high (press) or low (release) and raise the
+    /// shared interrupt. Per-line so multiple `gpio-keys` buttons (poweroff + suspend)
+    /// can coexist on the one PL061 without clobbering each other's data-register state.
+    fn trigger_key(&mut self, bit: u32, press: bool) {
+        self.istate |= bit;
+        if press {
+            self.data |= bit;
+        } else {
+            self.data &= !bit;
+        }
         self.trigger_gpio_interrupt();
     }
 
@@ -187,8 +296,9 @@ impl BusDevice for Gpio {
         } else if offset < OFS_DATA {
             value = self.data & ((offset >> 2) as u32);
             if value != 0 {
-                // Now that the guest has read it, send a key release event.
-                self.trigger_restart_key(false);
+                // Now that the guest has read it, send a key release event for exactly
+                // the line(s) it just read (so poweroff and suspend release independently).
+                self.trigger_key(value, false);
             }
         } else {
             value = match offset {
@@ -241,17 +351,39 @@ impl Subscriber for Gpio {
         match source {
             _ if source == self.shutdown_efd.as_raw_fd() => {
                 _ = self.shutdown_efd.read();
-                // Send a key press event.
+                // Send a poweroff (KEY_POWER) key press event.
+                self.trigger_power_key(true);
+            }
+            _ if source == self.suspend_efd.as_raw_fd() => {
+                _ = self.suspend_efd.read();
+                // Send a suspend (KEY_SLEEP) key press event.
+                self.trigger_suspend_key(true);
+            }
+            _ if source == self.restart_efd.as_raw_fd() => {
+                _ = self.restart_efd.read();
+                // Send a reboot (KEY_RESTART) key press event.
                 self.trigger_restart_key(true);
+            }
+            _ if source == self.wake_efd.as_raw_fd() => {
+                _ = self.wake_efd.read();
+                // A guest in PSCI SYSTEM_SUSPEND cannot be woken by the button: it has no vCPU
+                // left to take the IRQ, and it masked the line on its way into suspend. Resume
+                // the core first (the firmware half of a wakeup event), then deliver the press
+                // so the guest sees it once its own interrupt state is back.
+                self.vcpu_list.wake_system_suspended();
+                // Send a wake (KEY_WAKEUP) key press event — brings the guest out of s2idle.
+                self.trigger_wake_key(true);
             }
             _ => warn!("Unexpected gpio event received: {source:?}"),
         }
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
-            EventSet::IN,
-            self.shutdown_efd.as_raw_fd() as u64,
-        )]
+        vec![
+            EpollEvent::new(EventSet::IN, self.shutdown_efd.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.suspend_efd.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.restart_efd.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.wake_efd.as_raw_fd() as u64),
+        ]
     }
 }
