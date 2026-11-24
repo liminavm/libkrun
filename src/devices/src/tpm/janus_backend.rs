@@ -6,6 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{Locality, TpmBackend};
@@ -67,6 +68,29 @@ impl StateFile {
     }
 }
 
+/// Issues the certificate for an endorsement key: given the EK's public key as an uncompressed
+/// SEC1 point, returns the DER certificate the TPM holds for it. Who signs it is the VMM's.
+pub type EkCertifier = Arc<dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
+
+/// Gives a TPM without an EK certificate one, as its manufacturer would have. A TPM made or
+/// restored before there was a certifier gets it the next time it loads. When the certifier
+/// fails, the TPM comes up as before, without one: no consumer needs it to work.
+fn certify(tpm: &mut janus::Janus<Host>, certifier: Option<&EkCertifier>) {
+    let Some(certifier) = certifier else { return };
+    let profile = janus::EkProfile::EccNistP256;
+    if tpm.has_ek_certificate(profile) {
+        return;
+    }
+    let provisioned = certifier(&tpm.endorsement_key(profile)).and_then(|der| {
+        tpm.provision_ek_certificate(profile, &der)
+            .map_err(io::Error::other)
+    });
+    match provisioned {
+        Ok(()) => info!("tpm: provisioned an EK certificate"),
+        Err(e) => warn!("tpm: the TPM has no EK certificate: {e}"),
+    }
+}
+
 /// A janus TPM: in memory for the life of the VM, or kept in a state file across runs.
 pub struct JanusBackend {
     tpm: janus::Janus<Host>,
@@ -75,18 +99,20 @@ pub struct JanusBackend {
 
 impl JanusBackend {
     /// A freshly manufactured TPM that lives in memory: a new one every run.
-    pub fn new() -> Self {
-        JanusBackend {
-            tpm: janus::Janus::manufacture(Host::new()),
-            file: None,
-        }
+    pub fn new(certifier: Option<&EkCertifier>) -> Self {
+        let mut tpm = janus::Janus::manufacture(Host::new());
+        certify(&mut tpm, certifier);
+        JanusBackend { tpm, file: None }
     }
 
     /// The TPM `path` holds, or, when there is no such file, a freshly manufactured one written
     /// there at once. A file that is there but does not restore is an error, never replaced:
     /// a new TPM in its place would lose every secret sealed to the old one.
-    pub fn with_state_file(path: &Path) -> io::Result<Self> {
-        let (tpm, existing) = match fs::read(path) {
+    ///
+    /// A TPM without an EK certificate is given one by `certifier`, and the state file is
+    /// rewritten with it.
+    pub fn with_state_file(path: &Path, certifier: Option<&EkCertifier>) -> io::Result<Self> {
+        let (mut tpm, existing) = match fs::read(path) {
             Ok(bytes) => {
                 let tpm = janus::Janus::restore(Host::new(), &bytes).map_err(|e| {
                     io::Error::new(
@@ -101,6 +127,7 @@ impl JanusBackend {
             }
             Err(e) => return Err(e),
         };
+        certify(&mut tpm, certifier);
         let mut file = StateFile {
             path: path.to_owned(),
             written: existing.unwrap_or_default(),
@@ -132,12 +159,6 @@ impl JanusBackend {
                 file.path.display()
             );
         }
-    }
-}
-
-impl Default for JanusBackend {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -210,7 +231,7 @@ mod tests {
     #[test]
     fn a_state_file_carries_the_tpm_to_the_next_run() {
         let path = scratch("carry");
-        let mut first = JanusBackend::with_state_file(&path).unwrap();
+        let mut first = JanusBackend::with_state_file(&path, None).unwrap();
         let created = fs::read(&path).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -227,7 +248,7 @@ mod tests {
         let shut = fs::read(&path).unwrap();
         drop(first);
 
-        let mut second = JanusBackend::with_state_file(&path).unwrap();
+        let mut second = JanusBackend::with_state_file(&path, None).unwrap();
         assert_eq!(
             fs::read(&path).unwrap(),
             shut,
@@ -244,7 +265,7 @@ mod tests {
     #[test]
     fn a_snapshot_resumes_the_running_tpm_and_its_state_file() {
         let path = scratch("snapshot");
-        let mut tpm = JanusBackend::with_state_file(&path).unwrap();
+        let mut tpm = JanusBackend::with_state_file(&path, None).unwrap();
         tpm.init();
         assert_eq!(rc(&tpm.command(Locality::new(0).unwrap(), &STARTUP)), 0);
         let snapshot = tpm.snapshot();
@@ -252,7 +273,7 @@ mod tests {
         assert_eq!(rc(&tpm.command(Locality::new(0).unwrap(), &SHUTDOWN)), 0);
         drop(tpm);
 
-        let mut resumed = JanusBackend::with_state_file(&path).unwrap();
+        let mut resumed = JanusBackend::with_state_file(&path, None).unwrap();
         assert_ne!(
             fs::read(&path).unwrap(),
             then,
@@ -272,12 +293,57 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    fn counting(calls: &Arc<std::sync::atomic::AtomicUsize>) -> EkCertifier {
+        let calls = calls.clone();
+        Arc::new(move |point: &[u8]| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(point.len(), 65, "an uncompressed P-256 point");
+            Ok(b"a certificate".to_vec())
+        })
+    }
+
+    /// A TPM made before there was a certifier gets its certificate on the next load, in the
+    /// state file; one that has it is not certified again.
+    #[test]
+    fn a_tpm_without_an_ek_certificate_gets_one_once() {
+        let path = scratch("certify");
+        drop(JanusBackend::with_state_file(&path, None).unwrap());
+        let bare = fs::read(&path).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let certifier = counting(&calls);
+
+        let tpm = JanusBackend::with_state_file(&path, Some(&certifier)).unwrap();
+        assert!(tpm.tpm.has_ek_certificate(janus::EkProfile::EccNistP256));
+        assert_ne!(
+            fs::read(&path).unwrap(),
+            bare,
+            "the certificate was not written"
+        );
+        drop(tpm);
+        let certified = fs::read(&path).unwrap();
+
+        drop(JanusBackend::with_state_file(&path, Some(&certifier)).unwrap());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&path).unwrap(), certified);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A certifier that fails leaves the TPM as it was, running.
+    #[test]
+    fn a_failing_certifier_leaves_a_working_tpm() {
+        let failing: EkCertifier = Arc::new(|_: &[u8]| Err(io::Error::other("no CA")));
+        let mut tpm = JanusBackend::new(Some(&failing));
+        assert!(!tpm.tpm.has_ek_certificate(janus::EkProfile::EccNistP256));
+        tpm.init();
+        assert_eq!(rc(&tpm.command(Locality::new(0).unwrap(), &STARTUP)), 0);
+    }
+
     /// A file that is not a state is refused, and left as it was.
     #[test]
     fn a_damaged_state_file_is_refused_and_kept() {
         let path = scratch("damaged");
         fs::write(&path, b"not a TPM").unwrap();
-        let e = JanusBackend::with_state_file(&path).err().unwrap();
+        let e = JanusBackend::with_state_file(&path, None).err().unwrap();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&path).unwrap(), b"not a TPM");
         fs::remove_dir_all(path.parent().unwrap()).unwrap();

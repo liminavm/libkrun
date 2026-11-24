@@ -179,6 +179,10 @@ pub struct VmResources {
     /// `None` keeps it in memory for the life of the VM.
     #[cfg(feature = "tpm")]
     pub tpm_state: Option<std::path::PathBuf>,
+    /// limina: issues the TPM's EK certificate when it has none. `None` leaves a TPM without
+    /// one, as it was.
+    #[cfg(feature = "tpm")]
+    pub tpm_ek_certifier: Option<devices::tpm::EkCertifier>,
     /// limina: the file a firmware's UEFI variables live in across runs, mapped into the guest
     /// at `EFI_VARS_START` (aarch64, firmware boot only). Created when absent. `None` leaves the
     /// firmware's variables in RAM for one run.
@@ -359,6 +363,8 @@ mod tests {
             tpm: false,
             #[cfg(feature = "tpm")]
             tpm_state: None,
+            #[cfg(feature = "tpm")]
+            tpm_ek_certifier: None,
             efi_vars: None,
             little_vcpus: 0,
             #[cfg(feature = "usb")]

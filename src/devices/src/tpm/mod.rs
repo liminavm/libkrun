@@ -33,7 +33,7 @@ impl<B: TpmBackend> TpmDevice for TpmTis<B> {
 }
 
 #[cfg(feature = "tpm")]
-pub use janus_backend::JanusBackend;
+pub use janus_backend::{EkCertifier, JanusBackend};
 
 /// What executes TPM commands.
 pub trait TpmBackend: Send {

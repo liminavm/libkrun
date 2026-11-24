@@ -1445,10 +1445,11 @@ pub fn build_microvm(
         // limina: TPM 2.0 (opt-in). No IRQ either, so it goes last for the same reason.
         #[cfg(feature = "tpm")]
         if vm_resources.tpm {
+            let certifier = vm_resources.tpm_ek_certifier.as_ref();
             let backend = match &vm_resources.tpm_state {
-                Some(path) => devices::tpm::JanusBackend::with_state_file(path)
+                Some(path) => devices::tpm::JanusBackend::with_state_file(path, certifier)
                     .map_err(StartMicrovmError::TpmState)?,
-                None => devices::tpm::JanusBackend::new(),
+                None => devices::tpm::JanusBackend::new(certifier),
             };
             let tpm = devices::tpm::TpmTis::new(backend);
             mmio_device_manager
