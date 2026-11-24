@@ -1747,6 +1747,9 @@ impl VirtioGpu {
         // names each one itself, and reports the set at replay_end — so a fed call failing here
         // means the feed could not run at all, never that an entry was lost.
         let mut op_failed = 0u32;
+        // Blob contents put back at their creates, and those that could not be: the blob half of
+        // the content path, which a compositor allocating only blobs exercises alone.
+        let mut blob_contents = (0u32, 0u32);
         // Advance ctx's journal to `fence` (u64::MAX = to the end). The renderer holds the
         // cursor, because it holds the journal.
         macro_rules! journal_upto {
@@ -1867,10 +1870,13 @@ impl VirtioGpu {
                         op_failed += 1;
                         continue;
                     }
-                    if let Some(bytes) = contents.get(resource_id)
-                        && !self.blob_content_write(*resource_id, bytes)
-                    {
-                        warn!("gpu restore: content restore for blob {resource_id} failed");
+                    if let Some(bytes) = contents.get(resource_id) {
+                        if self.blob_content_write(*resource_id, bytes) {
+                            blob_contents.0 += 1;
+                        } else {
+                            blob_contents.1 += 1;
+                            warn!("gpu restore: content restore for blob {resource_id} failed");
+                        }
                     }
                 }
                 GpuJournalOp::MapBlob {
@@ -2217,6 +2223,12 @@ impl VirtioGpu {
         // log and in its own vocabulary. Counting it a second time here, in classes this layer
         // guesses at, is how a recorder gap came to read as a benign stale reference.
         info!("gpu restore: replay complete (session state re-created)");
+        if blob_contents != (0, 0) {
+            info!(
+                "gpu restore: blob content restored ({} blobs, {} failed)",
+                blob_contents.0, blob_contents.1
+            );
+        }
         // The re-created world is the payload's world (minus dropped stale writes); adopt
         // its journal so the next suspend records from a warm, accurate baseline.
         self.journal.restore_entries(ops);
